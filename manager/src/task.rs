@@ -1,0 +1,581 @@
+//! Process engine (design doc §3.4): spawn in a new session/process group,
+//! merged stdout+stderr tee (64KB memory ring + full disk append), kill helpers.
+//!
+//! Pipe creation uses `Stdio::piped()` (CLOEXEC, no raw fds). Session leadership
+//! and group signalling live in [`crate::sys`] — the only production `unsafe`.
+
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::sync::mpsc;
+
+pub use crate::sys::{pid_alive, signal_group, SIGKILL, SIGTERM};
+
+/// §3.4: in-memory ring buffer is 64KB; the disk file keeps the full stream.
+pub const RING_CAPACITY: usize = 64 * 1024;
+
+/// Cap on a single tee read / fanout chunk.
+const READ_CHUNK: usize = 8192;
+
+/// Bounded tee→fanout channel. Worst case ≈ `CAP * READ_CHUNK` bytes in flight
+/// (~512 KiB), so a slow watcher cannot grow process memory unboundedly.
+pub const CHUNK_CHANNEL_CAP: usize = 64;
+
+// ---------------------------------------------------------------------------
+// Output buffering
+// ---------------------------------------------------------------------------
+
+pub struct RingBuffer {
+    buf: VecDeque<u8>,
+    cap: usize,
+}
+
+impl RingBuffer {
+    pub fn new(cap: usize) -> Self {
+        RingBuffer {
+            buf: VecDeque::with_capacity(cap.min(1024)),
+            cap,
+        }
+    }
+
+    /// Hard capacity (always `RING_CAPACITY` for task output rings).
+    #[allow(dead_code)] // used by unit tests + memory-bound assertions
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    pub fn push(&mut self, data: &[u8]) {
+        if data.len() >= self.cap {
+            // Faster path: only the tail of a huge write survives.
+            self.buf.clear();
+            self.buf.extend(&data[data.len() - self.cap..]);
+            return;
+        }
+        self.buf.extend(data);
+        while self.buf.len() > self.cap {
+            self.buf.pop_front();
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Copy out `len` bytes starting at `skip` (from the oldest retained byte).
+    pub fn slice(&self, skip: usize, len: usize) -> Vec<u8> {
+        self.buf.iter().skip(skip).take(len).copied().collect()
+    }
+}
+
+/// Shared output state for a task: ring tail + full disk file + total size.
+/// `file` is None for re-adopted/loaded tasks (writes are done by the old
+/// manager's pipe, which is gone; the file is only read/tailed then).
+pub struct OutputState {
+    pub ring: RingBuffer,
+    pub total_size: u64,
+    pub file: Option<File>,
+}
+
+impl OutputState {
+    pub fn new(file: Option<File>, total_size: u64) -> Self {
+        OutputState {
+            ring: RingBuffer::new(RING_CAPACITY),
+            total_size,
+            file,
+        }
+    }
+
+    /// Append one chunk: disk (full) + ring (truncated). Returns next cursor.
+    pub fn append(&mut self, data: &[u8]) -> u64 {
+        if let Some(f) = self.file.as_mut() {
+            // Unbuffered write; readers opening the path see it immediately.
+            let _ = f.write_all(data);
+        }
+        self.ring.push(data);
+        self.total_size += data.len() as u64;
+        self.total_size
+    }
+}
+
+/// One tee'd chunk, delivered to the watch-event fanout task.
+pub struct OutputChunk {
+    pub bytes: Vec<u8>,
+    pub next_cursor: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Spawn
+// ---------------------------------------------------------------------------
+
+pub struct SpawnedTask {
+    pub child: Child,
+    pub pid: u32,
+    pub output: Arc<Mutex<OutputState>>,
+    pub chunks: mpsc::Receiver<OutputChunk>,
+    /// Strong count of active tee pumps (stdout + stderr). Starts at 2;
+    /// each pump drops its token on EOF. Tests wait until this hits 0.
+    #[allow(dead_code)] // observed by unit tests after spawn
+    pub tee_remaining: Arc<AtomicUsize>,
+}
+
+/// Sibling path for the stderr-only inspection file next to `<id>.output`.
+pub fn stderr_path_for(output_path: &Path) -> PathBuf {
+    let s = output_path.to_string_lossy();
+    if let Some(stem) = s.strip_suffix(".output") {
+        PathBuf::from(format!("{stem}.stderr"))
+    } else {
+        output_path.with_extension("stderr")
+    }
+}
+
+/// Spawn `sh -c <command>` as a session leader (setsid in pre_exec, §3.4) so
+/// the whole process tree can be signalled as one group.
+///
+/// stdout and stderr are read on separate pipes (`Stdio::piped`). Both are
+/// appended to the merged `.output` file + ring (protocol / agent view stays
+/// merged). stderr is additionally written to a sibling `.stderr` file for
+/// CLI inspection (`pbs-manager log -f --stderr <task_id>`).
+///
+/// Must be called from inside a Tokio runtime (tee pumps are `tokio::spawn`ed).
+pub fn spawn(
+    command: &str,
+    cwd: &str,
+    env: &HashMap<String, String>,
+    output_path: &Path,
+) -> io::Result<SpawnedTask> {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(command);
+    cmd.current_dir(cwd);
+    // §3.3: env is the complete environment; the client builds it.
+    cmd.env_clear().envs(env);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    // Safety net only — explicit group kills (stop/shutdown/timeout) are primary.
+    cmd.kill_on_drop(true);
+    crate::sys::apply_new_session_tokio(&mut cmd);
+
+    let mut child = cmd.spawn()?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::Other, "child stdout pipe missing")
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::Other, "child stderr pipe missing")
+    })?;
+    let pid = child.id().unwrap_or(0);
+
+    let out_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output_path)?;
+    let stderr_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(stderr_path_for(output_path))?;
+    let output = Arc::new(Mutex::new(OutputState::new(Some(out_file), 0)));
+    let (tx, rx) = mpsc::channel(CHUNK_CHANNEL_CAP);
+
+    let tee_remaining = Arc::new(AtomicUsize::new(2));
+
+    // Fan-in: both readers append to the same OutputState + chunk channel.
+    // stderr additionally mirrors into the .stderr inspection file.
+    let out_for_stdout = output.clone();
+    let tx_stdout = tx.clone();
+    let tee_stdout = tee_remaining.clone();
+    tokio::spawn(async move {
+        pump_stdout(stdout, out_for_stdout, tx_stdout).await;
+        tee_stdout.fetch_sub(1, Ordering::SeqCst);
+    });
+    let out_for_stderr = output.clone();
+    let tee_stderr = tee_remaining.clone();
+    tokio::spawn(async move {
+        pump_stderr(stderr, out_for_stderr, tx, Some(stderr_file)).await;
+        tee_stderr.fetch_sub(1, Ordering::SeqCst);
+    });
+
+    Ok(SpawnedTask {
+        child,
+        pid,
+        output,
+        chunks: rx,
+        tee_remaining,
+    })
+}
+
+async fn pump_stdout(
+    reader: ChildStdout,
+    out: Arc<Mutex<OutputState>>,
+    tx: mpsc::Sender<OutputChunk>,
+) {
+    pump_async(reader, out, tx, None).await;
+}
+
+async fn pump_stderr(
+    reader: ChildStderr,
+    out: Arc<Mutex<OutputState>>,
+    tx: mpsc::Sender<OutputChunk>,
+    mirror: Option<File>,
+) {
+    pump_async(reader, out, tx, mirror).await;
+}
+
+async fn pump_async<R: AsyncReadExt + Unpin>(
+    mut reader: R,
+    out: Arc<Mutex<OutputState>>,
+    tx: mpsc::Sender<OutputChunk>,
+    mut mirror: Option<File>,
+) {
+    let mut buf = [0u8; READ_CHUNK];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = buf[..n].to_vec();
+                if let Some(f) = mirror.as_mut() {
+                    let _ = f.write_all(&chunk);
+                }
+                let next_cursor = out.lock().unwrap().append(&chunk);
+                if tx
+                    .send(OutputChunk {
+                        bytes: chunk,
+                        next_cursor,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File reading (output requests & re-adopt tailing)
+// ---------------------------------------------------------------------------
+
+/// Read up to `max` bytes starting at byte `offset`. Missing file or an
+/// offset at/past EOF yields an empty chunk with the offset unchanged.
+pub fn read_file_range(path: &Path, offset: u64, max: usize) -> io::Result<(Vec<u8>, u64)> {
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), offset)),
+        Err(e) => return Err(e),
+    };
+    let len = f.metadata()?.len();
+    if offset >= len {
+        return Ok((Vec::new(), offset));
+    }
+    f.seek(SeekFrom::Start(offset))?;
+    let want = (len - offset).min(max as u64) as usize;
+    let mut buf = vec![0u8; want];
+    let mut read = 0usize;
+    while read < want {
+        match f.read(&mut buf[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(read);
+    Ok((buf, offset + read as u64))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::Duration;
+
+    #[test]
+    fn ring_buffer_caps_at_capacity() {
+        let mut r = RingBuffer::new(1024);
+        let data = vec![7u8; 3000];
+        r.push(&data);
+        assert_eq!(r.len(), 1024);
+        r.push(b"abc");
+        assert_eq!(r.len(), 1024);
+        let tail = r.slice(1021, 3);
+        assert_eq!(tail, b"abc");
+        // A write larger than the cap keeps only its tail.
+        r.push(&vec![1u8; 5000]);
+        assert_eq!(r.len(), 1024);
+        assert!(r.slice(0, 1024).iter().all(|b| *b == 1));
+    }
+
+    #[test]
+    fn output_state_ring_hard_cap_is_ring_capacity() {
+        let mut st = OutputState::new(None, 0);
+        assert_eq!(st.ring.capacity(), RING_CAPACITY);
+        let big = vec![9u8; RING_CAPACITY * 3];
+        st.append(&big);
+        assert_eq!(st.ring.len(), RING_CAPACITY);
+        assert_eq!(st.total_size, big.len() as u64);
+        assert_eq!(st.ring.capacity(), RING_CAPACITY);
+    }
+
+    #[test]
+    fn read_file_range_offsets() {
+        let dir = std::env::temp_dir().join(format!(
+            "pbs-task-test-{}-{}",
+            std::process::id(),
+            crate::proto::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.bin");
+        std::fs::write(&path, b"0123456789").unwrap();
+
+        let (bytes, next) = read_file_range(&path, 0, 4).unwrap();
+        assert_eq!(bytes, b"0123");
+        assert_eq!(next, 4);
+        let (bytes, next) = read_file_range(&path, next, 100).unwrap();
+        assert_eq!(bytes, b"456789");
+        assert_eq!(next, 10);
+        let (bytes, next) = read_file_range(&path, next, 100).unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(next, 10);
+        // Missing file -> empty, offset unchanged.
+        let (bytes, next) = read_file_range(&dir.join("nope"), 5, 10).unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(next, 5);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pid_alive_checks() {
+        assert!(pid_alive(std::process::id()));
+        assert!(!pid_alive(99_999_999)); // invalid/ESRCH/EINVAL all map to dead
+    }
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pbs-task-test-{tag}-{}-{}",
+            std::process::id(),
+            crate::proto::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn drain_chunks(rx: &mut mpsc::Receiver<OutputChunk>) -> Vec<u8> {
+        let mut collected = Vec::new();
+        let drain = async {
+            while let Some(c) = rx.recv().await {
+                collected.extend_from_slice(&c.bytes);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), drain)
+            .await
+            .expect("tee should reach EOF after child exit");
+        collected
+    }
+
+    /// Wait for the child while concurrently draining the bounded tee channel.
+    /// Draining after `wait` alone deadlocks once the channel fills (pump stops
+    /// reading → child blocks on write → wait never finishes).
+    async fn wait_and_drain(
+        t: &mut SpawnedTask,
+    ) -> (std::process::ExitStatus, Vec<u8>) {
+        let mut chunks = std::mem::replace(
+            &mut t.chunks,
+            mpsc::channel(1).1, // placeholder; unused after take
+        );
+        let wait = t.child.wait();
+        let drain = drain_chunks(&mut chunks);
+        let (status, collected) = tokio::join!(wait, drain);
+        (status.unwrap(), collected)
+    }
+
+    async fn wait_tee_idle(tee: &Arc<AtomicUsize>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tee.load(Ordering::SeqCst) != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "tee pumps did not finish; remaining={}",
+                tee.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_captures_merged_output_and_exit() {
+        let dir = unique_dir("echo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out_path = dir.join("t.output");
+        let env = HashMap::new();
+        let mut t = spawn(
+            "printf 'out-line\\n'; printf 'err-line\\n' >&2",
+            "/",
+            &env,
+            &out_path,
+        )
+        .unwrap();
+        let _ = &dir;
+        assert!(pid_alive(t.pid));
+        // Child leads its own process group/session (setsid, §3.4).
+        assert_eq!(crate::sys::getpgid(t.pid), Some(t.pid as i32));
+
+        let (status, collected) = wait_and_drain(&mut t).await;
+        assert_eq!(status.code(), Some(0));
+        wait_tee_idle(&t.tee_remaining).await;
+
+        let text = String::from_utf8_lossy(&collected);
+        assert!(text.contains("out-line"), "stdout captured: {text:?}");
+        assert!(text.contains("err-line"), "stderr merged: {text:?}");
+
+        let st = t.output.lock().unwrap();
+        assert_eq!(st.total_size, collected.len() as u64);
+        assert_eq!(st.ring.len(), collected.len());
+        drop(st);
+        // Disk holds the full merged stream.
+        let on_disk = std::fs::read(&out_path).unwrap();
+        assert_eq!(on_disk, collected);
+        // stderr-only inspection file holds only the err stream.
+        let err_disk = std::fs::read(stderr_path_for(&out_path)).unwrap();
+        assert_eq!(String::from_utf8_lossy(&err_disk), "err-line\n");
+        // stdout must not leak into the stderr file.
+        assert!(!err_disk.windows(b"out-line".len()).any(|w| w == b"out-line"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn signal_group_kills_whole_tree() {
+        let dir = unique_dir("kill");
+        let out_path = dir.join("t.output");
+        let env = HashMap::new();
+        // Grandchild inside the same group; killing the group must get both.
+        let mut t = spawn("sleep 30 & sleep 30", "/", &env, &out_path).unwrap();
+        assert!(pid_alive(t.pid));
+        signal_group(t.pid, SIGKILL).unwrap();
+        let (status, _) = wait_and_drain(&mut t).await;
+        assert_eq!(status.signal(), Some(SIGKILL));
+        // Signalling a dead group is a no-op, not an error.
+        signal_group(t.pid, SIGKILL).unwrap();
+        wait_tee_idle(&t.tee_remaining).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// (a) Multi-MB child output must not inflate the in-memory ring past 64KB;
+    /// disk + `total_size` still reflect the full stream.
+    #[tokio::test]
+    async fn large_output_keeps_ring_capped() {
+        let dir = unique_dir("large");
+        let out_path = dir.join("t.output");
+        let env = HashMap::new();
+        // 4 MiB of 'A' on stdout — well above RING_CAPACITY.
+        let bytes: usize = 4 * 1024 * 1024;
+        let cmd = format!(
+            "dd if=/dev/zero bs=1024 count={} 2>/dev/null | tr '\\0' 'A'",
+            bytes / 1024
+        );
+        let mut t = spawn(&cmd, "/", &env, &out_path).unwrap();
+        let (status, collected) = wait_and_drain(&mut t).await;
+        assert_eq!(status.code(), Some(0));
+        wait_tee_idle(&t.tee_remaining).await;
+
+        assert_eq!(collected.len(), bytes, "tee must forward full stream");
+        let st = t.output.lock().unwrap();
+        assert_eq!(st.ring.capacity(), RING_CAPACITY);
+        assert_eq!(st.ring.len(), RING_CAPACITY, "ring hard cap");
+        assert_eq!(st.total_size, bytes as u64);
+        drop(st);
+
+        let on_disk = std::fs::metadata(&out_path).unwrap().len();
+        assert_eq!(on_disk, bytes as u64, "disk must hold the full stream");
+        // Spot-check: ring tail is all 'A'.
+        let ring_tail = t.output.lock().unwrap().ring.slice(0, RING_CAPACITY);
+        assert!(ring_tail.iter().all(|b| *b == b'A'));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// (b) After exit + drain, chunk receiver is closed and tee pumps are gone.
+    #[tokio::test]
+    async fn tee_pumps_finish_after_exit() {
+        let dir = unique_dir("tee-join");
+        let out_path = dir.join("t.output");
+        let env = HashMap::new();
+        let mut t = spawn("printf 'hi\\n'", "/", &env, &out_path).unwrap();
+        assert_eq!(t.tee_remaining.load(Ordering::SeqCst), 2);
+        let (_, _) = wait_and_drain(&mut t).await;
+        wait_tee_idle(&t.tee_remaining).await;
+        // Further recv stays None (channel closed) — placeholder rx is empty/closed.
+        assert!(t.chunks.try_recv().is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// (d) Short-lived start/stop cycles must not panic; rings stay capped.
+    #[tokio::test]
+    async fn repeated_start_stop_stress() {
+        let dir = unique_dir("stress");
+        let env = HashMap::new();
+        for i in 0..50 {
+            let out_path = dir.join(format!("t{i}.output"));
+            let mut t = spawn("sleep 30", "/", &env, &out_path).unwrap();
+            // Concurrent drain while we signal — avoids bounded-channel stalls
+            // if the shell writes anything on signal.
+            let mut chunks = std::mem::replace(&mut t.chunks, mpsc::channel(1).1);
+            let tee = t.tee_remaining.clone();
+            let drain = tokio::spawn(async move { drain_chunks(&mut chunks).await });
+            signal_group(t.pid, SIGKILL).unwrap();
+            let status = t.child.wait().await.unwrap();
+            assert!(status.signal().is_some() || status.code().is_some());
+            let _ = drain.await.unwrap();
+            wait_tee_idle(&tee).await;
+            let st = t.output.lock().unwrap();
+            assert!(st.ring.len() <= RING_CAPACITY);
+            assert_eq!(st.ring.capacity(), RING_CAPACITY);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Optional RSS sanity: after multi-MB tee + drain, peak RSS should not
+    /// grow by anything close to the full output size (ring + bounded channel
+    /// dominate). Run with:
+    /// `cargo test -p pbs-manager rss_stays_bounded_after_large_output -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "RSS sampling is coarse; run manually on Darwin/Linux"]
+    async fn rss_stays_bounded_after_large_output() {
+        let before = crate::sys::max_rss_bytes();
+        let dir = unique_dir("rss");
+        let out_path = dir.join("t.output");
+        let env = HashMap::new();
+        let bytes: usize = 8 * 1024 * 1024;
+        let cmd = format!(
+            "dd if=/dev/zero bs=1024 count={} 2>/dev/null | tr '\\0' 'B'",
+            bytes / 1024
+        );
+        let mut t = spawn(&cmd, "/", &env, &out_path).unwrap();
+        let (_, collected) = wait_and_drain(&mut t).await;
+        wait_tee_idle(&t.tee_remaining).await;
+        assert_eq!(collected.len(), bytes);
+        assert_eq!(t.output.lock().unwrap().ring.len(), RING_CAPACITY);
+
+        let after = crate::sys::max_rss_bytes();
+        let growth = after.saturating_sub(before);
+        // Allow generous overhead (allocator, tokio, copies) but far below 8 MiB.
+        let ceiling = 3 * 1024 * 1024u64;
+        assert!(
+            growth < ceiling,
+            "RSS grew by {growth} bytes (before={before}, after={after}); \
+             expected << full {bytes}-byte stream (ring is {RING_CAPACITY}B, \
+             chunk channel ≤ {}B). Re-run with --nocapture for detail.",
+            CHUNK_CHANNEL_CAP * READ_CHUNK
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

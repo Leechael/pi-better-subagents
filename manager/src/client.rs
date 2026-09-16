@@ -1,0 +1,659 @@
+//! CLI client (design doc §3.1 startup flow, §3.5 subcommands).
+//! Every subcommand except `daemon`/`doctor`/`log` is a short-lived socket
+//! client: connect -> hello -> one request -> response -> close.
+//! (`output -f` and `log -f` are the long-lived exceptions.)
+
+use crate::lifecycle;
+use crate::proto::*;
+use crate::task;
+use interprocess::local_socket::tokio::prelude::*; // trait for Stream::connect
+use interprocess::local_socket::tokio::Stream;
+use interprocess::local_socket::{GenericFilePath, ToFsName};
+use serde::de::DeserializeOwned;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::{ReadHalf, WriteHalf};
+
+/// How this client presents itself in the hello handshake (§3.3).
+pub enum HelloMode {
+    Cli,
+    /// CLI `start` needs a session to own the task (start is session-bound).
+    Extension { session_id: String },
+}
+
+pub struct Conn {
+    rd: ReadHalf<Stream>,
+    wr: WriteHalf<Stream>,
+}
+
+impl Conn {
+    /// Send one request, wait for its matching response (events and other
+    /// frames are skipped — a short-lived CLI has no event consumer).
+    pub async fn roundtrip<T: DeserializeOwned>(&mut self, kind: RequestKind) -> Result<T, String> {
+        let id = new_request_id();
+        let req = Request {
+            v: Some(PROTO_VERSION),
+            id: id.clone(),
+            kind,
+        };
+        write_frame(&mut self.wr, &encode(&req))
+            .await
+            .map_err(|e| format!("send: {e}"))?;
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(30), read_frame(&mut self.rd))
+                .await
+                .map_err(|_| "response timed out".to_string())?
+                .map_err(|e| format!("recv: {e}"))?
+                .ok_or_else(|| "manager closed the connection".to_string())?;
+            let v: serde_json::Value =
+                serde_json::from_slice(&frame).map_err(|e| format!("bad response JSON: {e}"))?;
+            if v.get("id").and_then(|x| x.as_str()) != Some(id.as_str()) {
+                continue; // event or unrelated frame
+            }
+            if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
+                let resp: Response<T> = serde_json::from_value(v)
+                    .map_err(|e| format!("bad response payload: {e}"))?;
+                return Ok(resp.body);
+            }
+            let err: Response<ErrorBody> =
+                serde_json::from_value(v).map_err(|e| format!("bad error payload: {e}"))?;
+            return Err(format!("{}: {}", err.body.error.code, err.body.error.message));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connect + spawn flow (§3.1)
+// ---------------------------------------------------------------------------
+
+async fn try_connect_and_hello(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
+    let sock = lifecycle::socket_path(home);
+    let name = sock
+        .as_os_str()
+        .to_fs_name::<GenericFilePath>()
+        .map_err(|e| format!("bad socket path: {e}"))?;
+    let stream = Stream::connect(name)
+        .await
+        .map_err(|e| format!("connect {}: {e}", sock.display()))?;
+    let (rd, wr) = tokio::io::split(stream);
+    let mut conn = Conn { rd, wr };
+    let hello = match mode {
+        HelloMode::Cli => RequestKind::Hello {
+            client_kind: ClientKind::Cli,
+            session_id: None,
+            pi_pid: None,
+        },
+        HelloMode::Extension { session_id } => RequestKind::Hello {
+            client_kind: ClientKind::Extension,
+            session_id: Some(session_id.clone()),
+            pi_pid: Some(std::process::id()),
+        },
+    };
+    let _: HelloOk = conn.roundtrip(hello).await?;
+    Ok(conn)
+}
+
+async fn wait_for_socket(home: &Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let sock = lifecycle::socket_path(home);
+        if let Ok(name) = sock.as_os_str().to_fs_name::<GenericFilePath>() {
+            if Stream::connect(name).await.is_ok() {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// Spawn `pbs-manager daemon` detached (own session, output to manager.log)
+/// so it outlives this short-lived CLI process (§3.1 step 3).
+fn spawn_daemon(home: &Path) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(lifecycle::log_path(home))
+        .map_err(|e| format!("open manager.log: {e}"))?;
+    let log_err = log.try_clone().map_err(|e| e.to_string())?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--home")
+        .arg(home)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(log_err);
+    crate::sys::apply_new_session_std(&mut cmd);
+    cmd.spawn().map_err(|e| format!("spawn daemon: {e}"))?;
+    Ok(())
+}
+
+/// §3.1 client startup flow: connect; on failure take the spawn lock and
+/// spawn (or wait for the in-progress spawn); on zombie socket, clean and
+/// retry once.
+pub async fn connect(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
+    let mut last_err = String::new();
+    for attempt in 0..2 {
+        match try_connect_and_hello(home, mode).await {
+            Ok(c) => return Ok(c),
+            Err(e) => last_err = e,
+        }
+        if attempt > 0 {
+            break;
+        }
+        // Step 5: zombie socket — if the recorded pid is dead, clean up.
+        match lifecycle::read_pid_file(home) {
+            Some(pf) if !task::pid_alive(pf.pid) => {
+                let _ = lifecycle::cleanup_stale_files(home);
+            }
+            None => {
+                let _ = std::fs::remove_file(lifecycle::socket_path(home));
+            }
+            _ => {}
+        }
+        // Steps 2–4: spawn lock; winner spawns, losers wait for the socket.
+        match lifecycle::try_acquire_spawn_lock(home) {
+            Ok(Some(guard)) => {
+                spawn_daemon(home)?;
+                let ok = wait_for_socket(home, Duration::from_secs(2)).await;
+                drop(guard); // release the spawn lock (§3.1 step 3)
+                if !ok {
+                    last_err = "spawned daemon did not create its socket within 2s".into();
+                }
+            }
+            Ok(None) => {
+                // Someone else is spawning; just wait.
+                if !wait_for_socket(home, Duration::from_secs(2)).await {
+                    last_err = "another client is spawning the manager, but it did not come up".into();
+                }
+            }
+            Err(e) => last_err = format!("spawn lock: {e}"),
+        }
+    }
+    Err(format!("cannot reach pbs-manager: {last_err}"))
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand implementations
+// ---------------------------------------------------------------------------
+
+pub async fn cmd_status(home: &Path) -> Result<(), String> {
+    let mut conn = connect(home, &HelloMode::Cli).await?;
+    let st: StatusOk = conn.roundtrip(RequestKind::Status).await?;
+    println!("version:  {}", st.version);
+    println!("pid:      {}", st.pid);
+    println!("uptime:   {}.{:03}s", st.uptime_ms / 1000, st.uptime_ms % 1000);
+    println!("sessions: {} ({} connected)", st.sessions.len(), st.sessions.iter().filter(|s| s.connected).count());
+    println!("tasks:    {} running, {} terminal", st.task_counts.running, st.task_counts.terminal);
+    Ok(())
+}
+
+pub async fn cmd_sessions(home: &Path) -> Result<(), String> {
+    let mut conn = connect(home, &HelloMode::Cli).await?;
+    let st: StatusOk = conn.roundtrip(RequestKind::Status).await?;
+    if st.sessions.is_empty() {
+        println!("no sessions");
+        return Ok(());
+    }
+    println!("{:<36} {:>8} CONNECTED", "SESSION_ID", "PI_PID");
+    for s in st.sessions {
+        println!("{:<36} {:>8} {}", s.session_id, s.pi_pid, s.connected);
+    }
+    Ok(())
+}
+
+pub async fn cmd_list(home: &Path, session: Option<String>, include_exited: bool) -> Result<(), String> {
+    let mut conn = connect(home, &HelloMode::Cli).await?;
+    // CLI is admin: with no --session filter the daemon returns every session.
+    let res: ListOk = conn
+        .roundtrip(RequestKind::List {
+            all: true,
+            session_id: session,
+        })
+        .await?;
+    let tasks: Vec<_> = res
+        .tasks
+        .into_iter()
+        .filter(|t| include_exited || !t.status.is_terminal())
+        .collect();
+    if tasks.is_empty() {
+        println!(
+            "{}",
+            if include_exited {
+                "no tasks"
+            } else {
+                "no running tasks (use -a / --all to include exited)"
+            }
+        );
+        return Ok(());
+    }
+    println!(
+        "{:<14} {:<8} {:<10} {:>7} {:>5} {:>9} COMMAND",
+        "TASK_ID", "SESSION", "STATUS", "PID", "EXIT", "SIZE"
+    );
+    for t in tasks {
+        let session = truncate(&t.session_id, 8);
+        let exit = t
+            .exit_code
+            .map(|c| c.to_string())
+            .or_else(|| t.signal.map(|s| format!("sig{s}")))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<14} {:<8} {:<10} {:>7} {:>5} {:>9} {}",
+            t.task_id,
+            session,
+            serde_json::to_string(&t.status).unwrap_or_default().trim_matches('"'),
+            t.pid,
+            exit,
+            t.output_size,
+            truncate_command(&t.command, 60),
+        );
+    }
+    Ok(())
+}
+
+pub async fn cmd_output(
+    home: &Path,
+    task_id: &str,
+    follow: bool,
+    max_bytes: u64,
+) -> Result<(), String> {
+    let mut conn = connect(home, &HelloMode::Cli).await?;
+    let mut cursor = 0u64;
+    let stdout = std::io::stdout();
+    loop {
+        let resp: OutputOk = conn
+            .roundtrip(RequestKind::Output {
+                task_id: task_id.to_string(),
+                cursor,
+                max_bytes,
+            })
+            .await?;
+        {
+            let mut out = stdout.lock();
+            out.write_all(resp.chunk.as_bytes()).map_err(|e| e.to_string())?;
+            out.flush().map_err(|e| e.to_string())?;
+        }
+        cursor = resp.next_cursor;
+        let caught_up = cursor >= resp.total_size;
+        if resp.status.is_terminal() && caught_up {
+            break;
+        }
+        if !follow && caught_up {
+            break;
+        }
+        if resp.chunk.is_empty() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_stop(home: &Path, task_id: &str) -> Result<(), String> {
+    let mut conn = connect(home, &HelloMode::Cli).await?;
+    let _: UnitOk = conn
+        .roundtrip(RequestKind::Stop {
+            task_id: task_id.to_string(),
+        })
+        .await?;
+    println!("stopped {task_id}");
+    Ok(())
+}
+
+/// kill-session is built from list + stop so the wire protocol stays exactly
+/// as documented (§3.3 has no cross-session shutdown message).
+pub async fn cmd_kill_session(home: &Path, session_id: &str) -> Result<(), String> {
+    let mut conn = connect(home, &HelloMode::Cli).await?;
+    let res: ListOk = conn
+        .roundtrip(RequestKind::List {
+            all: true,
+            session_id: Some(session_id.to_string()),
+        })
+        .await?;
+    let mut stopped = 0usize;
+    for t in res.tasks {
+        if t.status == TaskStatus::Running {
+            let _: UnitOk = conn
+                .roundtrip(RequestKind::Stop {
+                    task_id: t.task_id.clone(),
+                })
+                .await?;
+            println!("stopped {}", t.task_id);
+            stopped += 1;
+        }
+    }
+    println!("session {session_id}: stopped {stopped} task(s)");
+    Ok(())
+}
+
+pub async fn cmd_shutdown(home: &Path) -> Result<(), String> {
+    let mut conn = connect(home, &HelloMode::Cli).await?;
+    let _: UnitOk = conn.roundtrip(RequestKind::Shutdown).await?;
+    println!("manager shutting down");
+    Ok(())
+}
+
+/// Extra CLI convenience (not in §3.5): start a task. Needs a session to own
+/// the task, so this hellos as an extension connection.
+pub async fn cmd_start(
+    home: &Path,
+    session: &str,
+    kind: &str,
+    cwd: Option<String>,
+    timeout_ms: Option<u64>,
+    background: bool,
+    command: &str,
+) -> Result<(), String> {
+    let kind = match kind {
+        "shell" => TaskKind::Shell,
+        "monitor" => TaskKind::Monitor,
+        other => return Err(format!("unknown kind {other:?} (expected shell|monitor)")),
+    };
+    let cwd = match cwd {
+        Some(c) => Some(c),
+        None => Some(
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .map_err(|e| e.to_string())?,
+        ),
+    };
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let mut conn = connect(
+        home,
+        &HelloMode::Extension {
+            session_id: session.to_string(),
+        },
+    )
+    .await?;
+    let res: StartOk = conn
+        .roundtrip(RequestKind::Start {
+            kind,
+            command: command.to_string(),
+            cwd,
+            env,
+            run_in_background: background,
+            timeout_ms,
+        })
+        .await?;
+    println!("task_id={} pid={}", res.task_id, res.pid);
+    Ok(())
+}
+
+/// Extra CLI convenience (not in §3.5): budget-wait on a task.
+pub async fn cmd_wait(home: &Path, task_id: &str, budget_ms: u64) -> Result<(), String> {
+    let mut conn = connect(home, &HelloMode::Cli).await?;
+    let res: WaitOk = conn
+        .roundtrip(RequestKind::Wait {
+            task_id: task_id.to_string(),
+            budget_ms,
+        })
+        .await?;
+    if res.done {
+        match res.exit_code {
+            Some(c) => println!("done exit_code={c}"),
+            None => println!("done exit_code=null"),
+        }
+    } else {
+        println!("not done (budget expired; task still running)");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Offline subcommands: doctor & log (no socket needed)
+// ---------------------------------------------------------------------------
+
+/// §3.5 doctor: socket/pid/lock consistency check; clean zombie files.
+pub async fn cmd_doctor(home: &Path) -> i32 {
+    println!("home:   {}", home.display());
+    println!("socket: {}", lifecycle::socket_path(home).display());
+    println!("pid:    {}", lifecycle::pid_path(home).display());
+    println!("lock:   {}", lifecycle::lock_path(home).display());
+    let mut problems = 0;
+    match lifecycle::read_pid_file(home) {
+        Some(pf) => {
+            println!("pid file: pid={} version={} started_at={}", pf.pid, pf.version, pf.started_at);
+            if task::pid_alive(pf.pid) {
+                println!("process {} is alive", pf.pid);
+                match try_connect_and_hello(home, &HelloMode::Cli).await {
+                    Ok(_) => println!("socket: hello ok"),
+                    Err(e) => {
+                        println!("socket: NOT responding ({e}) — pid is alive, not cleaning");
+                        problems += 1;
+                    }
+                }
+            } else {
+                println!("process {} is DEAD — cleaning stale pid/socket files", pf.pid);
+                if let Err(e) = lifecycle::cleanup_stale_files(home) {
+                    println!("cleanup failed: {e}");
+                } else {
+                    println!("cleaned");
+                }
+                problems += 1;
+            }
+        }
+        None => {
+            println!("pid file: absent");
+            if lifecycle::socket_path(home).exists() {
+                println!("stale socket without pid file — removing");
+                let _ = std::fs::remove_file(lifecycle::socket_path(home));
+                problems += 1;
+            } else {
+                println!("socket: absent (manager not running)");
+            }
+        }
+    }
+    if lifecycle::lock_path(home).exists() {
+        println!("lock:   present (held only while a client is spawning)");
+    }
+    if problems == 0 {
+        println!("ok");
+    } else {
+        println!("{problems} problem(s) found");
+    }
+    0
+}
+
+/// §3.5 log: tail manager.log; -f follows by polling the file size.
+pub async fn cmd_log(
+    home: &Path,
+    follow: bool,
+    lines: usize,
+    task_id: Option<&str>,
+    stderr: bool,
+) -> Result<(), String> {
+    match task_id {
+        None => {
+            if stderr {
+                return Err("--stderr requires a TASK_ID (manager.log has no stderr stream)".into());
+            }
+            cmd_log_manager(home, follow, lines).await
+        }
+        Some(id) => cmd_log_task(home, id, follow, lines, stderr).await,
+    }
+}
+
+async fn cmd_log_manager(home: &Path, follow: bool, lines: usize) -> Result<(), String> {
+    let path = lifecycle::log_path(home);
+    tail_file(&path, follow, lines).await
+}
+
+async fn cmd_log_task(
+    home: &Path,
+    task_id: &str,
+    follow: bool,
+    lines: usize,
+    stderr: bool,
+) -> Result<(), String> {
+    // Resolve the on-disk path via list (works for any session the CLI can see).
+    let mut conn = connect(home, &HelloMode::Cli).await?;
+    let res: ListOk = conn
+        .roundtrip(RequestKind::List {
+            all: true,
+            session_id: None,
+        })
+        .await?;
+    let known: Vec<String> = res.tasks.iter().map(|t| t.task_id.clone()).collect();
+    let task_id = resolve_task_id(task_id, &known)?;
+    let task = res
+        .tasks
+        .into_iter()
+        .find(|t| t.task_id == task_id)
+        .ok_or_else(|| format!("unknown task_id {task_id}"))?;
+    let path = if stderr {
+        task::stderr_path_for(Path::new(&task.output_path))
+    } else {
+        PathBuf::from(&task.output_path)
+    };
+    if !path.exists() {
+        if stderr {
+            return Err(format!(
+                "no stderr file for {task_id} yet (path {}); task may have written nothing to stderr, or it was started before stderr capture was added — restart the task",
+                path.display()
+            ));
+        }
+        return Err(format!("no output file at {}", path.display()));
+    }
+    // Drop the short-lived list connection before a long follow so we don't
+    // keep an idle hello slot open for the whole -f session.
+    drop(conn);
+    tail_file(&path, follow, lines).await
+}
+
+/// Resolve a user-typed task id against the known set.
+/// Accepts exact match, unique suffix/prefix/substring, and unique near-miss
+/// (Levenshtein ≤ 2) so typos like `cmon_…` for `mon_…` still work.
+fn resolve_task_id(typed: &str, known: &[String]) -> Result<String, String> {
+    if known.iter().any(|k| k == typed) {
+        return Ok(typed.to_string());
+    }
+    let hits: Vec<&String> = known
+        .iter()
+        .filter(|k| {
+            k.ends_with(typed)
+                || typed.ends_with(k.as_str())
+                || k.contains(typed)
+                || typed.contains(k.as_str())
+        })
+        .collect();
+    if hits.len() == 1 {
+        eprintln!("note: resolved '{typed}' → '{}'", hits[0]);
+        return Ok(hits[0].clone());
+    }
+    if hits.len() > 1 {
+        return Err(format!(
+            "ambiguous task_id '{typed}' (matches: {}); pick one",
+            hits.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    // Near-miss suggestion.
+    let mut best: Option<(&String, usize)> = None;
+    for k in known {
+        let d = edit_distance(typed, k);
+        if d <= 2 && best.map(|(_, bd)| d < bd).unwrap_or(true) {
+            best = Some((k, d));
+        }
+    }
+    let known_list = if known.is_empty() {
+        "none".into()
+    } else {
+        known.join(", ")
+    };
+    Err(match best {
+        Some((k, _)) => format!("unknown task_id '{typed}' (did you mean '{k}'?). known: {known_list}"),
+        None => format!("unknown task_id '{typed}'. known: {known_list}"),
+    })
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (n, m) = (a.len(), b.len());
+    if n.abs_diff(m) > 2 {
+        return 3; // early out: already worse than our suggestion threshold
+    }
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur = vec![0; m + 1];
+    for i in 1..=n {
+        cur[0] = i;
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[m]
+}
+
+async fn tail_file(path: &Path, follow: bool, lines: usize) -> Result<(), String> {
+    let data = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let text = String::from_utf8_lossy(&data);
+    let all: Vec<&str> = text.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    for line in &all[start..] {
+        println!("{line}");
+    }
+    if !follow {
+        return Ok(());
+    }
+    let mut offset = data.len() as u64;
+    let stdout = std::io::stdout();
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let size = match std::fs::metadata(path) {
+            Ok(m) => m.len(),
+            Err(_) => continue,
+        };
+        if size < offset {
+            offset = 0; // truncated/rotated
+        }
+        if size > offset {
+            let (bytes, next) = task::read_file_range(path, offset, (size - offset) as usize)
+                .map_err(|e| e.to_string())?;
+            let mut out = stdout.lock();
+            out.write_all(&bytes).map_err(|e| e.to_string())?;
+            out.flush().map_err(|e| e.to_string())?;
+            offset = next;
+        }
+    }
+}
+
+/// COMMAND column: first line only, then char-cap (heredocs / multiline stay readable).
+fn truncate_command(s: &str, max: usize) -> String {
+    let first = s.lines().next().unwrap_or("");
+    truncate(first, max)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::resolve_task_id;
+
+    #[test]
+    fn exact_and_typo_prefix() {
+        let known = vec!["mon_e1351cb1".into(), "sh_071f52c1".into()];
+        assert_eq!(resolve_task_id("mon_e1351cb1", &known).unwrap(), "mon_e1351cb1");
+        assert_eq!(resolve_task_id("cmon_e1351cb1", &known).unwrap(), "mon_e1351cb1");
+        assert_eq!(resolve_task_id("e1351cb1", &known).unwrap(), "mon_e1351cb1");
+    }
+
+    #[test]
+    fn unknown_suggests() {
+        let known = vec!["mon_e1351cb1".into()];
+        let err = resolve_task_id("mon_e1351cb2", &known).unwrap_err();
+        assert!(err.contains("did you mean"), "{err}");
+        assert!(err.contains("mon_e1351cb1"), "{err}");
+    }
+}
