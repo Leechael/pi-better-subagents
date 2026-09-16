@@ -1,0 +1,30 @@
+# Rust
+manager/target/
+
+# Node
+extension/node_modules/
+extension/dist/
+*.tsbuildinfo
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Local / secrets
+.env
+.env.*
+!.env.example
+*.pem
+
+# Test / coverage
+coverage/
+.nyc_output/
+*.lcov
+
+# Misc
+*.log
+tmp/
+.temp/
