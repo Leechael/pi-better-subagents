@@ -1,0 +1,92 @@
+/**
+ * M3 subagent core types (design doc Appendix B).
+ *
+ * This module is pi-free: no runtime dependency on
+ * `@earendil-works/pi-coding-agent` (and no type imports either), so every
+ * consumer stays testable with plain fakes.
+ */
+
+/**
+ * Mirror of the M5 `AgentDefinition` (design doc Appendix B, src/agents/).
+ * Structurally compatible with the M5 definition, so the real agent loader
+ * can be wired in at integration time without changes here.
+ */
+export interface AgentDefinition {
+  name: string; // ^[a-z][a-z0-9-]*$
+  description: string; // required, non-empty
+  tools: string[]; // default ["read","bash","edit","write"]
+  model?: string; // "provider:id" | bare id
+  thinking?: "minimal" | "low" | "medium" | "high" | "xhigh";
+  systemPrompt: string; // frontmatter body, trimmed
+  source: "builtin" | "user" | "project";
+  path?: string; // builtins have no path
+}
+
+export type ChildStatus = "pending" | "running" | "completed" | "failed" | "interrupted";
+
+export interface ChildResult {
+  status: "completed" | "failed" | "interrupted";
+  text: string; // getLastAssistantText() or "(no output)"
+  error?: string;
+  /** Non-fatal caveat, e.g. agent-definition model fell back to parent model. */
+  warning?: string;
+  durationMs: number;
+}
+
+export interface ChildRunRequest {
+  childId: string; // assigned by the registry: "ch_" + 8
+  runId: string; // "run_" + 8
+  name: string; // display name (tasks[].name or agent name or ordinal)
+  prompt: string; // already interpolated
+  agent: AgentDefinition; // already resolved
+  model?: string; // subagent() parameter-level override
+  timeoutMs: number;
+  depth: number; // main session = 0, child = 1
+}
+
+export interface ChildHandle {
+  readonly childId: string;
+  readonly result: Promise<ChildResult>; // resolves exactly once per generation;
+  // after resume() the new generation's promise is exposed via
+  // registry.getResult() (and via this getter, which always returns the
+  // current generation's promise).
+  steer(message: string): Promise<void>; // while running; terminal -> throw
+  followUp(message: string): Promise<void>; // same, queued delivery
+  resume(message: string): Promise<void>; // terminal -> continue running
+  interrupt(): Promise<void>; // abort; result resolves as interrupted
+  status(): ChildStatus;
+  lastEventAt(): number; // for the stall watchdog / status display
+}
+
+/**
+ * Child session adapter — the dynamic-import product of pi-runtime.ts is
+ * wrapped into this interface; tests use fakes.
+ */
+export interface ChildSessionAdapter {
+  /** Non-fatal setup caveat (e.g. model fallback); copied to ChildResult. */
+  readonly warning?: string;
+  prompt(text: string): Promise<void>;
+  steer(text: string): Promise<void>;
+  followUp(text: string): Promise<void>;
+  abort(): Promise<void>;
+  waitForIdle(): Promise<void>;
+  getLastAssistantText(): string | undefined;
+  isStreaming(): boolean;
+  subscribe(listener: (event: { type: string }) => void): () => void;
+  dispose(): void;
+}
+
+export type CreateSessionFn = (req: ChildRunRequest) => Promise<ChildSessionAdapter>;
+
+export interface ChildRunner {
+  start(req: ChildRunRequest): Promise<ChildHandle>;
+}
+
+/**
+ * Extension beyond Appendix B: handles produced by InProcessRunner own a
+ * live session that must be disposed on run/session teardown. The registry
+ * duck-types this to release sessions in disposeRun().
+ */
+export interface DisposableChildHandle extends ChildHandle {
+  dispose(): void;
+}

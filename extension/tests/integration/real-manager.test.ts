@@ -1,0 +1,189 @@
+/**
+ * End-to-end integration: TS ManagerClient <-> real pbs-manager binary.
+ *
+ * Opt-in (spawns real processes, takes ~10s including the idle-reaper check):
+ *   PBS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts
+ *
+ * Uses the release binary at ../../manager/target/release/pbs-manager unless
+ * PBS_MANAGER_PATH overrides it. Runs in an isolated PBS_HOME under tmpdir.
+ */
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, describe, expect, it } from "vitest";
+import { ManagerClient, type ManagerEvent } from "../../src/manager-client";
+import { pbsPaths } from "../../src/config";
+
+const RUN = process.env.PBS_INTEG === "1";
+const BIN =
+  process.env.PBS_MANAGER_PATH ??
+  join(__dirname, "../../../manager/target/release/pbs-manager");
+
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+describe.skipIf(!RUN || !existsSync(BIN))("real pbs-manager integration", () => {
+  const home = mkdtempSync(join(tmpdir(), "pbs-integ-"));
+  const paths = pbsPaths(home);
+  const events: ManagerEvent[] = [];
+  let client: ManagerClient;
+
+  afterAll(async () => {
+    await client?.close();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("spawns the daemon on first connect (cold start, §3.1)", async () => {
+    client = new ManagerClient({ home, sessionId: "integ", managerPath: BIN });
+    client.onEvent((e) => events.push(e));
+    const ok = await client.connect();
+    expect(ok).toBe(true);
+    expect(client.isAvailable()).toBe(true);
+    expect(existsSync(paths.socket)).toBe(true);
+    expect(existsSync(paths.pidFile)).toBe(true);
+  }, 15000);
+
+  it("runs a quick task: start -> wait done -> output (§3.3)", async () => {
+    const { task_id, pid } = await client.start({
+      kind: "shell",
+      command: "echo hello-integ",
+      cwd: "/tmp",
+      env: {},
+    });
+    expect(task_id.length).toBeGreaterThan(0);
+    expect(pid).toBeGreaterThan(0);
+
+    const w = await client.wait(task_id, 5000);
+    expect(w.done).toBe(true);
+    expect(w.exit_code).toBe(0);
+
+    const out = await client.output(task_id, 0, 65536);
+    expect(out.chunk).toContain("hello-integ");
+    expect(out.status).toBe("completed"); // §3.4 terminal status, not "exited"
+    expect(out.exit_code).toBe(0);
+    expect(out.total_size).toBeGreaterThan(0);
+  });
+
+  it("pushes task_started / task_exited events to the owning session", async () => {
+    const before = events.length;
+    const { task_id } = await client.start({
+      kind: "shell",
+      command: "true",
+      cwd: "/tmp",
+      env: {},
+    });
+    await client.wait(task_id, 5000);
+    await delay(200); // allow event delivery
+    const mine = events.slice(before).filter((e) => e.task_id === task_id);
+    expect(mine.some((e) => e.event === "task_started")).toBe(true);
+    expect(mine.some((e) => e.event === "task_exited")).toBe(true);
+  });
+
+  it("wait budget expires with done:false while the task keeps running", async () => {
+    const { task_id } = await client.start({
+      kind: "shell",
+      command: "sleep 30",
+      cwd: "/tmp",
+      env: {},
+    });
+    const w = await client.wait(task_id, 300);
+    expect(w.done).toBe(false);
+
+    await client.stop(task_id);
+    const w2 = await client.wait(task_id, 5000);
+    expect(w2.done).toBe(true);
+
+    const rec = (await client.list()).find((t) => t.task_id === task_id);
+    expect(rec).toBeDefined();
+    expect(["killed", "completed"]).toContain(rec!.status);
+    if (rec!.status === "killed") expect(rec!.exit_code).toBeNull();
+  });
+
+  it("streams output events to watchers (watch/unwatch)", async () => {
+    const before = events.length;
+    const { task_id } = await client.start({
+      kind: "monitor",
+      command: "printf 'line-a\\n'; sleep 0.3; printf 'line-b\\n'",
+      cwd: "/tmp",
+      env: {},
+    });
+    await client.watch(task_id);
+    await client.wait(task_id, 5000);
+    await delay(300);
+    await client.unwatch(task_id);
+
+    const chunks = events
+      .slice(before)
+      .filter((e) => e.event === "output" && e.task_id === task_id)
+      .map((e) => e.chunk ?? "")
+      .join("");
+    expect(chunks).toContain("line-a");
+    expect(chunks).toContain("line-b");
+  });
+
+  it("list shows session tasks; CLI status works against the same daemon", async () => {
+    const tasks = await client.list();
+    expect(tasks.length).toBeGreaterThanOrEqual(3);
+    expect(tasks.every((t) => t.session_id === "integ")).toBe(true);
+
+    const sessions = execFileSync(BIN, ["--home", home, "sessions"], {
+      encoding: "utf8",
+    });
+    expect(sessions).toMatch(/integ/);
+  });
+
+  it("shutdown_session kills the session's running tasks", async () => {
+    const { task_id } = await client.start({
+      kind: "shell",
+      command: "sleep 30",
+      cwd: "/tmp",
+      env: {},
+    });
+    await delay(200);
+    const killed = await client.shutdownSession();
+    expect(killed).toContain(task_id);
+
+    // §3.3: the response means signals are sent; the status flips when the
+    // exit watcher reaps the process (SIGTERM -> 2s grace -> SIGKILL).
+    let status = "running";
+    const deadline = Date.now() + 6000;
+    while (Date.now() < deadline) {
+      const rec = (await client.list()).find((t) => t.task_id === task_id);
+      status = rec?.status ?? "missing";
+      if (status !== "running") break;
+      await delay(200);
+    }
+    expect(status).toBe("killed");
+  });
+
+  it("idle reaper: manager exits ~5s after the last connection closes (§3.2)", async () => {
+    await client.close();
+    const deadline = Date.now() + 12000;
+    let gone = false;
+    while (Date.now() < deadline) {
+      if (!existsSync(paths.socket) && !existsSync(paths.pidFile)) {
+        gone = true;
+        break;
+      }
+      await delay(250);
+    }
+    expect(gone).toBe(true);
+
+    // Log should record the shutdown reason for postmortems.
+    if (existsSync(paths.log)) {
+      expect(readFileSync(paths.log, "utf8")).toMatch(/shutdown|idle|exit/i);
+    }
+  }, 20000);
+
+  it("cold restart re-adopts history (tasks survive daemon restart)", async () => {
+    // Daemon is down now; a fresh client respawns it and sees prior tasks.
+    const client2 = new ManagerClient({ home, sessionId: "integ", managerPath: BIN });
+    const ok = await client2.connect();
+    expect(ok).toBe(true);
+    const tasks = await client2.list();
+    expect(tasks.length).toBeGreaterThanOrEqual(4); // tasks from earlier its
+    await client2.close();
+  }, 15000);
+});

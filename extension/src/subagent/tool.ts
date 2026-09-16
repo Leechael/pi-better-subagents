@@ -1,0 +1,627 @@
+/**
+ * subagent tool (design doc §4.6).
+ *
+ * - `tasks`: parallel worker pool (ordinal-preserved results, fail_fast stops
+ *   only not-yet-started children);
+ * - `chain`: sequential steps with {previous} / {outputs.<label>}
+ *   interpolation (unknown labels rejected before anything starts);
+ * - sync wait bounded by subagentBudgetMs (default 45000, config subagent
+ *   section); on expiry the run continues in the background and completion is
+ *   delivered via a <subagent-notification> through the NotifyCenter;
+ * - management actions: list / get / status / interrupt / resume / steer.
+ *
+ * pi-free apart from type-only imports; the registry, runner and session
+ * factory are injected.
+ */
+import { Type } from "typebox";
+import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { formatSubagentNotification, truncateTail } from "../format";
+import type { NotifyCenter } from "../notify";
+import { runChain, runTasks, validateChainSteps } from "./pool";
+import type { RunRecord, SubagentRegistry } from "./registry";
+import type { AgentDefinition, ChildResult, ChildRunRequest } from "./types";
+
+export const SUBAGENT_NOTIFICATION_CUSTOM_TYPE = "pbs-subagent-notification";
+
+/** Overall result text cap (§4.6: truncateTail 512 lines / 48KB). */
+const RESULT_MAX_LINES = 512;
+const RESULT_MAX_BYTES = 48 * 1024;
+
+const MAX_TIMEOUT_MS = 3_600_000;
+const MIN_TIMEOUT_MS = 1_000;
+
+// ---------------------------------------------------------------------------
+// Schema (§4.6 field-name contract)
+// ---------------------------------------------------------------------------
+
+const taskItem = Type.Object({
+  agent: Type.Optional(Type.String({ description: "Agent definition name (default: worker)" })),
+  prompt: Type.String({ description: "Task prompt for this subagent" }),
+  name: Type.Optional(Type.String({ description: "Display name (default: agent name + ordinal)" })),
+});
+
+const chainItem = Type.Object({
+  agent: Type.Optional(Type.String({ description: "Agent definition name (default: worker)" })),
+  prompt: Type.String({
+    description: "Prompt for this step; {previous} and {outputs.<label>} interpolate earlier results",
+  }),
+  label: Type.Optional(Type.String({ description: "Label for referencing this step's output later" })),
+});
+
+const subagentParameters = Type.Object({
+  tasks: Type.Optional(
+    Type.Array(taskItem, { minItems: 1, maxItems: 10, description: "Subagents to run in parallel" }),
+  ),
+  chain: Type.Optional(
+    Type.Array(chainItem, { minItems: 1, description: "Steps to run sequentially (always awaited)" }),
+  ),
+  async: Type.Optional(
+    Type.Boolean({ description: "Return immediately with a run_id; completion arrives via notification" }),
+  ),
+  concurrency: Type.Optional(
+    Type.Number({ minimum: 1, maximum: 8, description: "Max parallel subagents for tasks (default 4)" }),
+  ),
+  fail_fast: Type.Optional(
+    Type.Boolean({
+      description: "Cancel not-yet-started subagents on first failure (already-started ones finish)",
+    }),
+  ),
+  model: Type.Optional(
+    Type.String({
+      description:
+        'Model override for all subagents: fuzzy ("haiku"), qualified ("provider/id"), ' +
+        'optionally with ":<thinking>" suffix. Default: current model. ' +
+        'Use action:"models" to list selectable values.',
+    }),
+  ),
+  timeout_ms: Type.Optional(
+    Type.Number({
+      description: `Hard timeout per subagent in ms (default 600000, max ${MAX_TIMEOUT_MS})`,
+      maximum: MAX_TIMEOUT_MS,
+    }),
+  ),
+  action: Type.Optional(
+    Type.Union(
+      [
+        Type.Literal("list"),
+        Type.Literal("get"),
+        Type.Literal("status"),
+        Type.Literal("interrupt"),
+        Type.Literal("resume"),
+        Type.Literal("steer"),
+        Type.Literal("models"),
+      ],
+      { description: "Manage an existing run (or list selectable models) instead of starting a new one" },
+    ),
+  ),
+  run_id: Type.Optional(Type.String({ description: "Target run for action" })),
+  child_id: Type.Optional(Type.String({ description: "Target child (id or name) for steer/interrupt/resume" })),
+  message: Type.Optional(Type.String({ description: "Message content for steer/resume" })),
+});
+
+type SubagentParams = {
+  tasks?: { agent?: string; prompt: string; name?: string }[];
+  chain?: { agent?: string; prompt: string; label?: string }[];
+  async?: boolean;
+  concurrency?: number;
+  fail_fast?: boolean;
+  model?: string;
+  timeout_ms?: number;
+  action?: "list" | "get" | "status" | "interrupt" | "resume" | "steer" | "models";
+  run_id?: string;
+  child_id?: string;
+  message?: string;
+};
+
+// ---------------------------------------------------------------------------
+// Deps
+// ---------------------------------------------------------------------------
+
+export interface SubagentToolDeps {
+  getRegistry: () => SubagentRegistry | null;
+  getNotifyCenter: () => Pick<NotifyCenter, "notify"> | null;
+  /** Sync-wait budget in ms (config subagent.budgetMs / subagentBudgetMs). */
+  budgetMs: () => number;
+  /** Default per-child hard timeout in ms. */
+  defaultTimeoutMs: number;
+  /** Default tasks worker-pool concurrency. */
+  defaultConcurrency: number;
+  /** Agent definition resolver (M5 wires the real loader; default: worker). */
+  resolveAgent?: (name: string | undefined) => AgentDefinition;
+  /** Selectable models for action:"models" (§4.6); absent → action errors. */
+  listModels?: () => {
+    provider: string;
+    id: string;
+    name?: string;
+    current: boolean;
+    scoped: boolean;
+  }[];
+}
+
+/** M3 stopgap resolver until M5 wires the real agent loader (§4.8). */
+const BUILTIN_WORKER: AgentDefinition = {
+  name: "worker",
+  description: "General-purpose subagent with the full default tool set",
+  tools: ["read", "bash", "edit", "write"],
+  systemPrompt: "",
+  source: "builtin",
+};
+
+function defaultResolveAgent(name: string | undefined): AgentDefinition {
+  if (name === undefined || name === BUILTIN_WORKER.name) return BUILTIN_WORKER;
+  throw new Error(`unknown agent "${name}" (available: ${BUILTIN_WORKER.name})`);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function errorText(message: string): never {
+  throw new Error(message);
+}
+
+function buildPrompt(agent: AgentDefinition, prompt: string): string {
+  const system = agent.systemPrompt.trim();
+  if (!system) return prompt;
+  return `${system}\n\n---\n\n${prompt}`;
+}
+
+function clampTimeout(timeoutMs: number | undefined, fallback: number): number {
+  if (timeoutMs === undefined) return fallback;
+  if (!Number.isFinite(timeoutMs)) return fallback;
+  return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.round(timeoutMs)));
+}
+
+function formatDurationMs(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
+}
+
+function runDurationMs(record: RunRecord, now: number): number {
+  const end = record.children.reduce((acc, c) => Math.max(acc, c.endedAt ?? 0), 0);
+  return Math.max(0, (end || now) - record.createdAt);
+}
+
+/** Per-child sections plus a summary header, capped to 512 lines / 48KB. */
+export function formatRunResults(record: RunRecord, now: number = Date.now()): string {
+  const completed = record.children.filter((c) => c.status === "completed").length;
+  const header =
+    `Run ${record.runId} [${record.kind}] ${record.status} — ` +
+    `${completed}/${record.children.length} subagents completed in ${formatDurationMs(runDurationMs(record, now))}.`;
+  const sections = record.children.map((child) => {
+    const lines = [`## ${child.name} (${child.status})`];
+    if (child.result?.warning) lines.push(`Warning: ${child.result.warning}`);
+    if (child.result?.error) lines.push(`Error: ${child.result.error}`);
+    if (child.result) lines.push(child.result.text || "(no output)");
+    else lines.push("(still running)");
+    return lines.join("\n");
+  });
+  const full = [header, "", ...sections].join("\n\n");
+  const t = truncateTail(full, RESULT_MAX_LINES, RESULT_MAX_BYTES);
+  return t.truncated
+    ? `… (truncated: showing last ${t.text.split("\n").length} of ${t.totalLines} lines)\n${t.text}`
+    : full;
+}
+
+function toNotificationInfo(record: RunRecord, now: number) {
+  return {
+    runId: record.runId,
+    status: record.status as "completed" | "partial" | "failed" | "interrupted",
+    durationMs: runDurationMs(record, now),
+    children: record.children.map((c) => ({
+      name: c.name,
+      status: c.status,
+      text: c.result?.text ?? "",
+      error: c.result?.error,
+    })),
+  };
+}
+
+interface RaceOutcome<T> {
+  done: boolean;
+  value?: T;
+}
+
+/** Race a promise against the foreground budget and the tool abort signal. */
+function raceBudget<T>(
+  promise: Promise<T>,
+  budgetMs: number,
+  signal: AbortSignal | undefined,
+): Promise<RaceOutcome<T>> {
+  return new Promise((resolve) => {
+    let finished = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const settle = (outcome: RaceOutcome<T>) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      resolve(outcome);
+    };
+    const timer = setTimeout(() => settle({ done: false }), budgetMs);
+    timer.unref?.();
+    const onAbort = () => settle({ done: false });
+    if (signal?.aborted) {
+      settle({ done: false });
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => settle({ done: true, value }),
+      () => settle({ done: false }),
+    );
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Tool factory
+// ---------------------------------------------------------------------------
+
+export function createSubagentTool(
+  deps: SubagentToolDeps,
+): ToolDefinition<typeof subagentParameters, unknown> {
+  const resolveAgent = deps.resolveAgent ?? defaultResolveAgent;
+
+  const requireRegistry = (): SubagentRegistry => {
+    const registry = deps.getRegistry();
+    if (!registry) {
+      throw new Error("subagent system is not initialized (no active session)");
+    }
+    return registry;
+  };
+
+  const notifyRunCompleted = (registry: SubagentRegistry, runId: string): void => {
+    const record = registry.get(runId);
+    if (!record) return;
+    deps.getNotifyCenter()?.notify({
+      customType: SUBAGENT_NOTIFICATION_CUSTOM_TYPE,
+      content: formatSubagentNotification(toNotificationInfo(record, Date.now())),
+      details: { run_id: runId },
+    });
+  };
+
+  const startRun = async (
+    params: SubagentParams,
+    signal: AbortSignal | undefined,
+  ): Promise<AgentToolResult<unknown>> => {
+    const registry = requireRegistry();
+    const kind = params.tasks !== undefined ? ("tasks" as const) : ("chain" as const);
+    const items = (params.tasks ?? params.chain)!;
+
+    if (kind === "chain") validateChainSteps(items);
+
+    const timeoutMs = clampTimeout(params.timeout_ms, deps.defaultTimeoutMs);
+    const concurrency = Math.min(
+      8,
+      Math.max(1, Math.round(params.concurrency ?? deps.defaultConcurrency)),
+    );
+    const failFast = params.fail_fast === true;
+
+    const resolved = items.map((item, i) => {
+      const agent = resolveAgent(item.agent);
+      const label = "name" in item ? item.name : undefined;
+      const chainLabel = "label" in item ? item.label : undefined;
+      const name = label ?? chainLabel ?? `${agent.name}-${i + 1}`;
+      return { agent, name, prompt: item.prompt };
+    });
+
+    const run = registry.createRun(kind);
+    const childIds = resolved.map((r) =>
+      registry.addChild(run.runId, { name: r.name, agent: r.agent.name }),
+    );
+
+    const makeRequest = (ordinal: number, prompt: string): ChildRunRequest => ({
+      childId: childIds[ordinal],
+      runId: run.runId,
+      name: resolved[ordinal].name,
+      prompt: buildPrompt(resolved[ordinal].agent, prompt),
+      agent: resolved[ordinal].agent,
+      model: params.model,
+      timeoutMs,
+      depth: 1,
+    });
+
+    const completion: Promise<ChildResult[]> =
+      kind === "tasks"
+        ? runTasks(items, {
+            concurrency,
+            failFast,
+            startChild: (_task, ordinal, ctx) =>
+              registry
+                .startChild(makeRequest(ordinal, resolved[ordinal].prompt), {
+                  shouldStart: () => !ctx.cancelled(),
+                })
+                .then((handle) => handle.result),
+          })
+        : runChain(items, {
+            startChild: (_step, ordinal, interpolated) =>
+              registry.startChild(makeRequest(ordinal, interpolated)).then((handle) => handle.result),
+          });
+
+    const tracked = completion.then((results) => {
+      registry.finalizeRun(
+        run.runId,
+        kind === "tasks" ? "cancelled (fail_fast)" : "skipped (chain aborted)",
+      );
+      return results;
+    });
+
+    // Completion notification: only when the result was not delivered
+    // synchronously (backgrounded or async runs, and aborted waits).
+    let deliveredSync = false;
+    let settleSync: () => void = () => {};
+    const syncSettled = new Promise<void>((resolve) => {
+      settleSync = resolve;
+    });
+    void tracked.then(async () => {
+      await syncSettled;
+      if (!deliveredSync) notifyRunCompleted(registry, run.runId);
+    });
+
+    const backgroundedText = (reason: string): AgentToolResult<unknown> => ({
+      content: [
+        {
+          type: "text",
+          text:
+            `Started ${items.length} subagent(s) in run ${run.runId}. ${reason}\n` +
+            `You will be notified via <subagent-notification> when the run completes. ` +
+            `Do not poll or sleep to wait for it. ` +
+            `Use subagent({action:"status", run_id:"${run.runId}"}) only if you must inspect progress, ` +
+            `and subagent({action:"get", run_id:"${run.runId}"}) to read final results.`,
+        },
+      ],
+      details: { run_id: run.runId, status: "backgrounded" },
+    });
+
+    if (params.async === true) {
+      settleSync();
+      return backgroundedText("The run is executing in the background.");
+    }
+
+    const budgetMs = deps.budgetMs();
+    const outcome = await raceBudget(tracked, budgetMs, signal);
+    if (outcome.done) {
+      deliveredSync = true;
+      settleSync();
+      const record = registry.get(run.runId);
+      const text = record
+        ? formatRunResults(record)
+        : `Run ${run.runId} finished but its record is gone.`;
+      return {
+        content: [{ type: "text", text }],
+        details: { run_id: run.runId, status: record?.status ?? "completed", results: outcome.value },
+      };
+    }
+    settleSync();
+    return backgroundedText(
+      `The foreground budget (${Math.round(budgetMs / 1000)}s) elapsed and the run continues in the background.`,
+    );
+  };
+
+  // -------------------------------------------------------------------------
+  // Management actions
+  // ---------------------------------------------------------------------------
+
+  const requireRun = (registry: SubagentRegistry, runId: string | undefined): RunRecord => {
+    if (!runId) throw new Error(`run_id is required for this action`);
+    const record = registry.get(runId);
+    if (!record) {
+      const known = registry
+        .list()
+        .map((r) => r.runId)
+        .join(", ");
+      throw new Error(`unknown run_id "${runId}" (known runs: ${known || "none"})`);
+    }
+    return record;
+  };
+
+  const runAction = async (params: SubagentParams): Promise<AgentToolResult<unknown>> => {
+    const action = params.action!;
+
+    // "models" needs neither a registry nor a run: list selectable models.
+    if (action === "models") {
+      if (!deps.listModels) {
+        return errorText('action "models" is not available in this session');
+      }
+      const models = deps.listModels();
+      if (models.length === 0) {
+        return { content: [{ type: "text", text: "No models available." }], details: { models: [] } };
+      }
+      const scoped = models.some((m) => m.scoped);
+      const lines = models.map((m) => {
+        const marks = [m.current ? "current" : "", m.scoped ? "scoped" : ""]
+          .filter(Boolean)
+          .join(", ");
+        return `${m.provider}/${m.id}${m.name ? ` — ${m.name}` : ""}${marks ? ` (${marks})` : ""}`;
+      });
+      const header = scoped
+        ? `${models.length} selectable model(s) (whitelist via enabledModels/--models is active):`
+        : `${models.length} selectable model(s):`;
+      return {
+        content: [{ type: "text", text: `${header}\n${lines.join("\n")}` }],
+        details: { models },
+      };
+    }
+
+    const registry = requireRegistry();
+
+    if (action === "list") {
+      const runs = registry.list();
+      if (runs.length === 0) {
+        return { content: [{ type: "text", text: "No subagent runs in this session." }], details: { runs: [] } };
+      }
+      const now = Date.now();
+      const lines = runs.map((run) => {
+        const counts = new Map<string, number>();
+        for (const c of run.children) counts.set(c.status, (counts.get(c.status) ?? 0) + 1);
+        const summary = [...counts.entries()].map(([s, n]) => `${n} ${s}`).join(", ");
+        const ago = formatDurationMs(now - run.createdAt);
+        return `${run.runId} [${run.kind}] ${run.status} — ${run.children.length} children (${summary}), created ${ago} ago`;
+      });
+      return {
+        content: [{ type: "text", text: `${runs.length} run(s):\n${lines.join("\n")}` }],
+        details: { runs },
+      };
+    }
+
+    const record = requireRun(registry, params.run_id);
+
+    if (action === "get") {
+      return {
+        content: [{ type: "text", text: formatRunResults(record) }],
+        details: { run_id: record.runId, status: record.status },
+      };
+    }
+
+    if (action === "status") {
+      const now = Date.now();
+      const lines = record.children.map((child) => {
+        const elapsed = formatDurationMs((child.endedAt ?? now) - child.startedAt);
+        let line = `${child.name} (${child.childId}): ${child.status}, ${elapsed} elapsed`;
+        if (child.status === "running" || child.status === "pending") {
+          const last = registry.handle(child.childId)?.lastEventAt() ?? child.startedAt;
+          line += `, last event ${formatDurationMs(now - last)} ago`;
+        }
+        if (child.result?.error) line += `, error: ${child.result.error}`;
+        return line;
+      });
+      const header = `Run ${record.runId} [${record.kind}] ${record.status}:`;
+      return {
+        content: [{ type: "text", text: [header, ...lines].join("\n") }],
+        details: { run_id: record.runId, status: record.status },
+      };
+    }
+
+    if (action === "interrupt") {
+      const targets = record.children.filter((c) => {
+        if (params.child_id && c.childId !== params.child_id && c.name !== params.child_id) return false;
+        return c.status === "running" || c.status === "pending";
+      });
+      if (params.child_id && !record.children.some((c) => c.childId === params.child_id || c.name === params.child_id)) {
+        const known = record.children.map((c) => `${c.name} (${c.childId})`).join(", ");
+        throw new Error(`no child "${params.child_id}" in run ${record.runId} (children: ${known})`);
+      }
+      for (const child of targets) {
+        await registry.handle(child.childId)?.interrupt();
+      }
+      const scope = params.child_id ? `subagent ${params.child_id}` : `${targets.length} subagent(s)`;
+      return {
+        content: [{ type: "text", text: `Interrupted ${scope} in run ${record.runId}.` }],
+        details: { run_id: record.runId, interrupted: targets.map((c) => c.childId) },
+      };
+    }
+
+    if (action === "steer") {
+      if (!params.message) throw new Error("message is required for steer");
+      const handle = resolveSingleActiveChild(registry, record, params.child_id, "steer");
+      await handle.steer(params.message);
+      return {
+        content: [{ type: "text", text: `Steered subagent in run ${record.runId}: delivered "${params.message}".` }],
+        details: { run_id: record.runId },
+      };
+    }
+
+    // resume
+    if (!params.message) throw new Error("message is required for resume");
+    const child = resolveSingleTerminalChild(record, params.child_id);
+    const handle = registry.handle(child.childId);
+    if (!handle) throw new Error(`subagent ${child.childId} has no live session to resume`);
+    await handle.resume(params.message);
+    // Resume is inherently asynchronous: always notify on completion.
+    void registry.getResult(child.childId)?.then(() => notifyRunCompleted(registry, record.runId));
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            `Resumed subagent ${child.name} (${child.childId}) in run ${record.runId}. ` +
+            "You will be notified via <subagent-notification> when it completes. Do not poll.",
+        },
+      ],
+      details: { run_id: record.runId, child_id: child.childId },
+    };
+  };
+
+  return {
+    name: "subagent",
+    label: "Subagent",
+    description:
+      "Run subagents in parallel (tasks) or sequentially (chain with {previous}/{outputs.<label>} " +
+      "interpolation). By default the call waits up to a foreground budget (default 45s); longer runs " +
+      "continue in the background and completion arrives via <subagent-notification> — never poll or " +
+      "sleep to wait. Use action=list/get/status/interrupt/resume/steer to manage existing runs.",
+    promptSnippet: "Fan out subagents in parallel or sequence them in a chain",
+    promptGuidelines: [
+      "Subagent runs that exceed the foreground budget continue in the background; you are notified on completion — do not poll.",
+      "A failed subagent does not fail the whole run; inspect per-subagent sections in the result.",
+      "<subagent-notification> is a system notification, not a user reply.",
+    ],
+    parameters: subagentParameters,
+    async execute(_toolCallId, rawParams, signal, _onUpdate, _ctx) {
+      const params = rawParams as SubagentParams;
+      const hasTasks = params.tasks !== undefined;
+      const hasChain = params.chain !== undefined;
+      const hasAction = params.action !== undefined;
+      if (hasAction && (hasTasks || hasChain)) {
+        return errorText("action is mutually exclusive with tasks/chain");
+      }
+      if (hasTasks && hasChain) {
+        return errorText("tasks and chain are mutually exclusive");
+      }
+      if (!hasAction && !hasTasks && !hasChain) {
+        return errorText("one of tasks, chain, or action is required");
+      }
+      if (hasAction) return runAction(params);
+      return startRun(params, signal);
+    },
+  };
+}
+
+function resolveSingleActiveChild(
+  registry: SubagentRegistry,
+  record: RunRecord,
+  childIdOrName: string | undefined,
+  what: string,
+) {
+  if (childIdOrName) {
+    const handle = registry.findChild(record.runId, childIdOrName);
+    if (!handle) {
+      const known = record.children.map((c) => `${c.name} (${c.childId})`).join(", ");
+      throw new Error(`no child "${childIdOrName}" in run ${record.runId} (children: ${known})`);
+    }
+    return handle;
+  }
+  const active = record.children.filter((c) => c.status === "running");
+  if (active.length === 1) {
+    const handle = registry.handle(active[0].childId);
+    if (handle) return handle;
+  }
+  throw new Error(
+    `cannot ${what}: run ${record.runId} has ${active.length} running subagents; specify child_id ` +
+      `(${record.children.map((c) => `${c.name} (${c.childId}): ${c.status}`).join(", ") || "none"})`,
+  );
+}
+
+function resolveSingleTerminalChild(record: RunRecord, childIdOrName: string | undefined) {
+  const matches = (c: RunRecord["children"][number]) =>
+    c.status === "completed" || c.status === "failed" || c.status === "interrupted";
+  if (childIdOrName) {
+    const child = record.children.find((c) => c.childId === childIdOrName || c.name === childIdOrName);
+    if (!child) {
+      const known = record.children.map((c) => `${c.name} (${c.childId})`).join(", ");
+      throw new Error(`no child "${childIdOrName}" in run ${record.runId} (children: ${known})`);
+    }
+    if (!matches(child)) {
+      throw new Error(`subagent ${child.name} (${child.childId}) is still ${child.status}; use steer instead`);
+    }
+    return child;
+  }
+  const terminal = record.children.filter(matches);
+  if (terminal.length === 1 && record.children.length === 1) return terminal[0];
+  throw new Error(
+    `resume requires child_id (children: ${record.children.map((c) => `${c.name} (${c.childId}): ${c.status}`).join(", ") || "none"})`,
+  );
+}

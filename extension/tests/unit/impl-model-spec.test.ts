@@ -1,0 +1,133 @@
+/**
+ * resolveModelSpec pure-function tests (design doc §4.6 模型解析, appendix B).
+ */
+import { describe, expect, it } from "vitest";
+import {
+  modelResolutionError,
+  resolveModelSpec,
+  splitThinkingSuffix,
+  type ModelCandidate,
+} from "../../src/subagent/model-spec";
+
+const CANDIDATES: ModelCandidate[] = [
+  { provider: "anthropic", id: "claude-opus-4-6", name: "Claude Opus 4.6" },
+  { provider: "anthropic", id: "claude-haiku-4-5", name: "Claude Haiku 4.5" },
+  { provider: "openai", id: "gpt-5.2", name: "GPT-5.2" },
+  { provider: "openai", id: "gpt-5.2-mini", name: "GPT-5.2 Mini" },
+  { provider: "openrouter", id: "openai/gpt-5.2:exacto" },
+];
+
+describe("splitThinkingSuffix", () => {
+  it("strips a valid thinking level", () => {
+    expect(splitThinkingSuffix("claude-haiku-4-5:high")).toEqual({
+      base: "claude-haiku-4-5",
+      thinking: "high",
+    });
+  });
+  it("keeps unrecognized suffixes as part of the id", () => {
+    expect(splitThinkingSuffix("openai/gpt-5.2:exacto")).toEqual({
+      base: "openai/gpt-5.2:exacto",
+      thinking: undefined,
+    });
+  });
+  it("ignores trailing/leading colons", () => {
+    expect(splitThinkingSuffix(":")).toEqual({ base: ":" });
+    expect(splitThinkingSuffix("model:")).toEqual({ base: "model:" });
+  });
+});
+
+describe("resolveModelSpec", () => {
+  it("resolves provider-qualified specs with / separator", () => {
+    expect(resolveModelSpec("anthropic/claude-opus-4-6", CANDIDATES)).toEqual({
+      ok: true,
+      provider: "anthropic",
+      id: "claude-opus-4-6",
+      thinking: undefined,
+    });
+  });
+
+  it("resolves provider-qualified specs with : separator", () => {
+    expect(resolveModelSpec("openai:gpt-5.2", CANDIDATES)).toEqual({
+      ok: true,
+      provider: "openai",
+      id: "gpt-5.2",
+      thinking: undefined,
+    });
+  });
+
+  it("resolves a bare id when unique across providers", () => {
+    const res = resolveModelSpec("claude-haiku-4-5", CANDIDATES);
+    expect(res).toMatchObject({ ok: true, provider: "anthropic" });
+  });
+
+  it("rejects an ambiguous bare id with the qualified matches", () => {
+    const dupes: ModelCandidate[] = [
+      { provider: "a", id: "same" },
+      { provider: "b", id: "same" },
+    ];
+    const res = resolveModelSpec("same", dupes);
+    expect(res).toMatchObject({ ok: false, error: "ambiguous" });
+    expect((res as { candidates: string[] }).candidates).toEqual(["a/same", "b/same"]);
+  });
+
+  it("fuzzy-matches a unique substring of the id, case-insensitively", () => {
+    const res = resolveModelSpec("HAIKU", CANDIDATES);
+    expect(res).toMatchObject({ ok: true, id: "claude-haiku-4-5" });
+  });
+
+  it("fuzzy-matches display names", () => {
+    const res = resolveModelSpec("opus 4.6", CANDIDATES);
+    expect(res).toMatchObject({ ok: true, id: "claude-opus-4-6" });
+  });
+
+  it("reports ambiguity for multi-hit substrings", () => {
+    const res = resolveModelSpec("gpt-5.2", CANDIDATES);
+    // bare exact hit on openai/gpt-5.2 wins over substring ambiguity
+    expect(res).toMatchObject({ ok: true, provider: "openai", id: "gpt-5.2" });
+    const res2 = resolveModelSpec("mini", CANDIDATES);
+    expect(res2).toMatchObject({ ok: true, id: "gpt-5.2-mini" });
+  });
+
+  it("handles ids containing separators (openrouter :exacto)", () => {
+    const res = resolveModelSpec("openai/gpt-5.2:exacto", CANDIDATES);
+    expect(res).toMatchObject({ ok: true, provider: "openrouter", id: "openai/gpt-5.2:exacto" });
+  });
+
+  it("parses thinking suffix together with a fuzzy base", () => {
+    const res = resolveModelSpec("haiku:low", CANDIDATES);
+    expect(res).toMatchObject({ ok: true, id: "claude-haiku-4-5", thinking: "low" });
+  });
+
+  it("no-match lists the full candidate set", () => {
+    const res = resolveModelSpec("nonexistent", CANDIDATES);
+    expect(res).toMatchObject({ ok: false, error: "no-match" });
+    expect((res as { candidates: string[] }).candidates).toHaveLength(CANDIDATES.length);
+  });
+
+  it("empty candidate set yields no-match with empty list", () => {
+    expect(resolveModelSpec("anything", [])).toMatchObject({
+      ok: false,
+      error: "no-match",
+      candidates: [],
+    });
+  });
+});
+
+describe("modelResolutionError", () => {
+  it("no-match message points at action:models", () => {
+    const res = resolveModelSpec("zzz", CANDIDATES);
+    const msg = modelResolutionError("zzz", res as never);
+    expect(msg).toContain('"zzz"');
+    expect(msg).toContain('action:"models"');
+    expect(msg).toContain("anthropic/claude-opus-4-6");
+  });
+  it("ambiguous message suggests provider qualification", () => {
+    const dupes: ModelCandidate[] = [
+      { provider: "a", id: "x" },
+      { provider: "b", id: "x" },
+    ];
+    const msg = modelResolutionError("x", resolveModelSpec("x", dupes) as never);
+    expect(msg).toContain("ambiguous");
+    expect(msg).toContain("provider/<id>");
+  });
+});

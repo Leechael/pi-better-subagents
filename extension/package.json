@@ -1,0 +1,32 @@
+{
+  "name": "pi-better-subagents",
+  "version": "0.1.0",
+  "description": "Subagents, monitoring, and auto-backgrounding bash for pi",
+  "type": "module",
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "typebox": "^1.3.7"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0",
+    "typescript": "^5.5.0",
+    "@types/node": "^24.0.0",
+    "@earendil-works/pi-coding-agent": "0.85.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
+  }
+}

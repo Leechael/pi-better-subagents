@@ -1,0 +1,325 @@
+import { describe, expect, it, vi } from "vitest";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SubagentRegistry } from "../../src/subagent/registry";
+import { InProcessRunner } from "../../src/subagent/runner";
+import { createSubagentTool, SUBAGENT_NOTIFICATION_CUSTOM_TYPE } from "../../src/subagent/tool";
+import { SessionFactory, tick } from "./subagent-fakes";
+
+function makeStack(opts: { budgetMs?: number; autoComplete?: string | null } = {}) {
+  const registry = new SubagentRegistry({});
+  const factory = new SessionFactory();
+  factory.autoComplete = opts.autoComplete === undefined ? "done" : opts.autoComplete;
+  const runner = new InProcessRunner({
+    createSession: factory.fn,
+    acquire: (req) => registry.admitChild(req.childId),
+  });
+  registry.setRunner(runner);
+  const notify = vi.fn();
+  const tool = createSubagentTool({
+    getRegistry: () => registry,
+    getNotifyCenter: () => ({ notify }),
+    budgetMs: () => opts.budgetMs ?? 45_000,
+    defaultTimeoutMs: 600_000,
+    defaultConcurrency: 4,
+  });
+  const ctx = { cwd: "/tmp" } as ExtensionContext;
+  const exec = (params: Record<string, unknown>, signal?: AbortSignal) =>
+    tool.execute("tc", params as never, signal, undefined, ctx);
+  return { registry, factory, notify, exec };
+}
+
+describe("subagent tool — validation", () => {
+  it("requires one of tasks/chain/action", async () => {
+    const { exec } = makeStack();
+    await expect(exec({})).rejects.toThrow(/one of tasks, chain, or action/);
+  });
+
+  it("tasks and chain are mutually exclusive", async () => {
+    const { exec } = makeStack();
+    await expect(
+      exec({ tasks: [{ prompt: "a" }], chain: [{ prompt: "b" }] }),
+    ).rejects.toThrow(/mutually exclusive/);
+  });
+
+  it("action is mutually exclusive with tasks/chain", async () => {
+    const { exec } = makeStack();
+    await expect(exec({ action: "list", tasks: [{ prompt: "a" }] })).rejects.toThrow(
+      /mutually exclusive/,
+    );
+  });
+
+  it("rejects an unknown agent name and lists available ones", async () => {
+    const { exec } = makeStack();
+    await expect(exec({ tasks: [{ agent: "nope", prompt: "a" }] })).rejects.toThrow(
+      /unknown agent "nope" \(available: worker\)/,
+    );
+  });
+
+  it("rejects unknown chain label references before starting", async () => {
+    const { exec, factory } = makeStack();
+    await expect(
+      exec({ chain: [{ prompt: "a" }, { prompt: "{outputs.missing}" }] }),
+    ).rejects.toThrow(/unknown label reference/);
+    expect(factory.sessions).toHaveLength(0);
+    // Nothing was registered as a run either.
+    // (validation happens before createRun)
+  });
+});
+
+describe("subagent tool — tasks", () => {
+  it("runs tasks in parallel and returns ordinal-preserved sections", async () => {
+    const { exec, factory, notify } = makeStack();
+    const result = await exec({ tasks: [{ prompt: "a" }, { prompt: "b", name: "second" }] });
+    const text = result.content[0].type === "text" ? result.content[0].text : "";
+    expect(text).toContain("2/2 subagents completed");
+    expect(text).toContain("## worker-1 (completed)");
+    expect(text).toContain("## second (completed)");
+    expect(text.indexOf("worker-1")).toBeLessThan(text.indexOf("second"));
+    expect(factory.sessions).toHaveLength(2);
+    expect(factory.sessions[0].prompts).toEqual(["a"]);
+    expect(factory.sessions[1].prompts).toEqual(["b"]);
+    const details = result.details as { run_id: string; status: string };
+    expect(details.run_id).toMatch(/^run_[0-9a-f]{8}$/);
+    expect(details.status).toBe("completed");
+    // Synchronous delivery: no notification.
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("a failed child does not drag down the group", async () => {
+    const { exec, factory } = makeStack();
+    factory.configure = (session, req) => {
+      if (req.name === "worker-2") session.promptError = new Error("boom");
+    };
+    const result = await exec({ tasks: [{ prompt: "a" }, { prompt: "b" }] });
+    const text = result.content[0].type === "text" ? result.content[0].text : "";
+    expect(text).toContain("## worker-1 (completed)");
+    expect(text).toContain("## worker-2 (failed)");
+    expect(text).toContain("Error: boom");
+    expect((result.details as { status: string }).status).toBe("partial");
+  });
+
+  it("fail_fast cancels not-yet-started children", async () => {
+    const { exec, factory } = makeStack({ autoComplete: null });
+    factory.configure = (session, req) => {
+      if (req.name === "worker-2") session.promptError = new Error("boom");
+    };
+    const pending = exec({
+      tasks: [{ prompt: "slow" }, { prompt: "fails" }, { prompt: "never" }],
+      concurrency: 2,
+      fail_fast: true,
+    });
+    // worker-1 is still running (manual); wait for the workers to spin up,
+    // then complete it to let the run finish.
+    await vi.waitFor(() => expect(factory.sessions.length).toBeGreaterThanOrEqual(2));
+    factory.sessions[0].complete("finally");
+    const settled = await pending;
+    const text = settled.content[0].type === "text" ? settled.content[0].text : "";
+    expect(text).toContain("## worker-1 (completed)");
+    expect(text).toContain("## worker-2 (failed)");
+    expect(text).toContain("## worker-3 (interrupted)");
+    expect(text).toContain("cancelled (fail_fast)");
+    expect(factory.sessions).toHaveLength(2); // third never spawned
+  });
+
+  it("backgrounds the run when the foreground budget elapses, then notifies", async () => {
+    const { exec, factory, notify } = makeStack({ budgetMs: 50, autoComplete: null });
+    const result = await exec({ tasks: [{ prompt: "slow" }] });
+    const text = result.content[0].type === "text" ? result.content[0].text : "";
+    expect(text).toContain("run_");
+    expect(text).toContain("background");
+    expect(text).toContain("Do not poll");
+    expect((result.details as { status: string }).status).toBe("backgrounded");
+    const runId = (result.details as { run_id: string }).run_id;
+
+    // Complete the child later -> completion notification fires.
+    await vi.waitFor(() => expect(factory.sessions).toHaveLength(1));
+    factory.sessions[0].complete("late result");
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    const message = notify.mock.calls[0][0];
+    expect(message.customType).toBe(SUBAGENT_NOTIFICATION_CUSTOM_TYPE);
+    expect(message.content).toContain("<subagent-notification>");
+    expect(message.content).toContain(`<run-id>${runId}</run-id>`);
+    expect(message.content).toContain("<status>completed</status>");
+    expect(message.content).toContain("late result");
+    expect(message.details).toEqual({ run_id: runId });
+  });
+
+  it("async: true returns immediately and still notifies on completion", async () => {
+    const { exec, factory, notify } = makeStack({ autoComplete: null });
+    const result = await exec({ tasks: [{ prompt: "x" }, { prompt: "y" }], async: true });
+    const text = result.content[0].type === "text" ? result.content[0].text : "";
+    expect(text).toContain("Do not poll");
+    expect((result.details as { status: string }).status).toBe("backgrounded");
+    expect(notify).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(factory.sessions).toHaveLength(2));
+    factory.sessions[0].complete("r1");
+    factory.sessions[1].complete("r2");
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    expect(notify.mock.calls[0][0].content).toContain("2/2 subagents completed");
+  });
+
+  it("an aborted sync wait backgrounds the run rather than killing it", async () => {
+    const { exec, factory } = makeStack({ autoComplete: null });
+    const controller = new AbortController();
+    const pending = exec({ tasks: [{ prompt: "slow" }] }, controller.signal);
+    controller.abort();
+    const result = await pending;
+    expect((result.details as { status: string }).status).toBe("backgrounded");
+    // The child is still running (not interrupted).
+    await vi.waitFor(() => expect(factory.sessions).toHaveLength(1));
+    expect(factory.sessions[0].isStreaming()).toBe(true);
+    factory.sessions[0].complete("done");
+  });
+});
+
+describe("subagent tool — chain", () => {
+  it("runs steps sequentially with interpolation", async () => {
+    const { exec, factory } = makeStack();
+    factory.autoComplete = "step-output";
+    const result = await exec({
+      chain: [
+        { prompt: "first", label: "one" },
+        { prompt: "second uses {outputs.one} and {previous}" },
+      ],
+    });
+    const text = result.content[0].type === "text" ? result.content[0].text : "";
+    expect(text).toContain("2/2 subagents completed");
+    expect(factory.sessions[1].prompts).toEqual(["second uses step-output and step-output"]);
+    // Sequential: the second session was created after the first completed.
+    expect(factory.sessions).toHaveLength(2);
+  });
+});
+
+describe("subagent tool — management actions", () => {
+  it("list reports runs and their status", async () => {
+    const { exec } = makeStack();
+    const empty = await exec({ action: "list" });
+    expect(empty.content[0].type === "text" && empty.content[0].text).toContain("No subagent runs");
+    const started = await exec({ tasks: [{ prompt: "a" }] });
+    const runId = (started.details as { run_id: string }).run_id;
+    const listed = await exec({ action: "list" });
+    const text = listed.content[0].type === "text" ? listed.content[0].text : "";
+    expect(text).toContain(runId);
+    expect(text).toContain("completed");
+  });
+
+  it("get returns the full results of a run", async () => {
+    const { exec } = makeStack();
+    const started = await exec({ tasks: [{ prompt: "a", name: "solo" }] });
+    const runId = (started.details as { run_id: string }).run_id;
+    const got = await exec({ action: "get", run_id: runId });
+    const text = got.content[0].type === "text" ? got.content[0].text : "";
+    expect(text).toContain("## solo (completed)");
+    expect(text).toContain("done");
+  });
+
+  it("get/status reject unknown run_id with the known list", async () => {
+    const { exec } = makeStack();
+    await expect(exec({ action: "get", run_id: "run_nope0000" })).rejects.toThrow(/unknown run_id/);
+  });
+
+  it("status shows per-child state and elapsed time", async () => {
+    const { exec, factory } = makeStack({ autoComplete: null });
+    const started = await exec({ tasks: [{ prompt: "a", name: "longrunner" }], async: true });
+    const runId = (started.details as { run_id: string }).run_id;
+    await vi.waitFor(() => expect(factory.sessions).toHaveLength(1));
+    const status = await exec({ action: "status", run_id: runId });
+    const text = status.content[0].type === "text" ? status.content[0].text : "";
+    expect(text).toContain("longrunner");
+    expect(text).toContain("running");
+    expect(text).toContain("last event");
+    factory.sessions[0].complete("done");
+  });
+
+  it("interrupt aborts a running child", async () => {
+    const { exec, factory, registry } = makeStack({ autoComplete: null });
+    const started = await exec({ tasks: [{ prompt: "a" }], async: true });
+    const runId = (started.details as { run_id: string }).run_id;
+    // Wait until the handle is registered (implies the session is assigned
+    // inside the handle and the prompt was issued).
+    await vi.waitFor(() => {
+      const rec = registry.get(runId)!;
+      expect(rec.children).toHaveLength(1);
+      expect(registry.handle(rec.children[0].childId)).toBeDefined();
+    });
+    const result = await exec({ action: "interrupt", run_id: runId });
+    const text = result.content[0].type === "text" ? result.content[0].text : "";
+    expect(text).toContain("Interrupted 1 subagent(s)");
+    expect(factory.sessions[0].aborts).toBe(1);
+    const record = registry.get(runId)!;
+    expect(record.children[0].status).toBe("interrupted");
+    expect(record.status).toBe("interrupted");
+  });
+
+  it("interrupt with child_id only hits that child", async () => {
+    const { exec, factory, registry } = makeStack({ autoComplete: null });
+    const started = await exec({ tasks: [{ prompt: "a" }, { prompt: "b" }], async: true });
+    const runId = (started.details as { run_id: string }).run_id;
+    await vi.waitFor(() => {
+      const rec = registry.get(runId)!;
+      expect(rec.children).toHaveLength(2);
+      expect(registry.handle(rec.children[0].childId)).toBeDefined();
+      expect(registry.handle(rec.children[1].childId)).toBeDefined();
+    });
+    await exec({ action: "interrupt", run_id: runId, child_id: "worker-1" });
+    expect(factory.sessions[0].aborts).toBe(1);
+    expect(factory.sessions[1].aborts).toBe(0);
+    factory.sessions[1].complete("b done");
+  });
+
+  it("steer delivers a message to the single running child", async () => {
+    const { exec, factory, registry } = makeStack({ autoComplete: null });
+    const started = await exec({ tasks: [{ prompt: "a" }], async: true });
+    const runId = (started.details as { run_id: string }).run_id;
+    await vi.waitFor(() => {
+      const rec = registry.get(runId)!;
+      expect(rec.children).toHaveLength(1);
+      expect(registry.handle(rec.children[0].childId)).toBeDefined();
+    });
+    const result = await exec({ action: "steer", run_id: runId, message: "focus on tests" });
+    expect(factory.sessions[0].steers).toEqual(["focus on tests"]);
+    expect(result.content[0].type === "text" && result.content[0].text).toContain("Steered");
+    factory.sessions[0].complete("done");
+  });
+
+  it("steer requires a message and a running target", async () => {
+    const { exec } = makeStack();
+    const started = await exec({ tasks: [{ prompt: "a" }] });
+    const runId = (started.details as { run_id: string }).run_id;
+    await expect(exec({ action: "steer", run_id: runId })).rejects.toThrow(/message is required/);
+    await expect(exec({ action: "steer", run_id: runId, message: "x" })).rejects.toThrow(
+      /cannot steer/,
+    );
+  });
+
+  it("resume re-prompts a finished child and notifies on completion", async () => {
+    const { exec, factory, notify } = makeStack();
+    const started = await exec({ tasks: [{ prompt: "a" }] });
+    const runId = (started.details as { run_id: string }).run_id;
+    expect(notify).not.toHaveBeenCalled(); // delivered synchronously
+
+    factory.sessions[0].autoComplete = null;
+    const resumed = await exec({ action: "resume", run_id: runId, message: "now do more" });
+    expect(resumed.content[0].type === "text" && resumed.content[0].text).toContain("Resumed");
+    expect(factory.sessions[0].prompts).toEqual(["a", "now do more"]);
+
+    factory.sessions[0].complete("second result");
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    expect(notify.mock.calls[0][0].content).toContain("second result");
+  });
+
+  it("resume requires the child to be terminal", async () => {
+    const { exec, factory, registry } = makeStack({ autoComplete: null });
+    const started = await exec({ tasks: [{ prompt: "a" }], async: true });
+    const runId = (started.details as { run_id: string }).run_id;
+    await vi.waitFor(() => {
+      const rec = registry.get(runId)!;
+      expect(rec.children).toHaveLength(1);
+      expect(registry.handle(rec.children[0].childId)).toBeDefined();
+    });
+    await expect(
+      exec({ action: "resume", run_id: runId, child_id: "worker-1", message: "x" }),
+    ).rejects.toThrow(/still running/);
+    factory.sessions[0].complete("done");
+  });
+});
