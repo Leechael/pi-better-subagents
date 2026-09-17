@@ -10,6 +10,7 @@ use interprocess::local_socket::tokio::prelude::*; // trait for Stream::connect
 use interprocess::local_socket::tokio::Stream;
 use interprocess::local_socket::{GenericFilePath, ToFsName};
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -211,16 +212,26 @@ pub async fn cmd_list(home: &Path, session: Option<String>, include_exited: bool
     let res: ListOk = conn
         .roundtrip(RequestKind::List {
             all: true,
-            session_id: session,
+            session_id: session.clone(),
         })
         .await?;
-    let terminal = res.tasks.iter().filter(|t| t.status.is_terminal()).count();
+    let agents = load_agent_records(home, session.as_deref());
+    let terminal_shells = res.tasks.iter().filter(|t| t.status.is_terminal()).count();
+    let terminal_agents = agents
+        .iter()
+        .filter(|a| agent_status_terminal(&a.status))
+        .count();
     let tasks: Vec<_> = res
         .tasks
         .into_iter()
         .filter(|t| include_exited || !t.status.is_terminal())
         .collect();
-    if tasks.is_empty() {
+    let agents: Vec<_> = agents
+        .into_iter()
+        .filter(|a| include_exited || !agent_status_terminal(&a.status))
+        .collect();
+    if tasks.is_empty() && agents.is_empty() {
+        let terminal = terminal_shells + terminal_agents;
         if include_exited {
             println!("no tasks");
         } else if terminal > 0 {
@@ -236,7 +247,7 @@ pub async fn cmd_list(home: &Path, session: Option<String>, include_exited: bool
         "{:<14} {:<8} {:<10} {:>7} {:>5} {:>9} COMMAND",
         "TASK_ID", "SESSION", "STATUS", "PID", "EXIT", "SIZE"
     );
-    for t in tasks {
+    for t in &tasks {
         let session = truncate(&t.session_id, 8);
         let exit = t
             .exit_code
@@ -254,7 +265,81 @@ pub async fn cmd_list(home: &Path, session: Option<String>, include_exited: bool
             truncate_command(&t.command, 60),
         );
     }
+    for a in &agents {
+        let session = truncate(&a.session_id, 8);
+        let model = a
+            .model
+            .as_deref()
+            .map(|m| format!(" {m}"))
+            .unwrap_or_default();
+        let cmd = format!("agent:{} ({}){model}", a.name, a.agent);
+        println!(
+            "{:<14} {:<8} {:<10} {:>7} {:>5} {:>9} {}",
+            a.child_id,
+            session,
+            a.status,
+            "-",
+            "-",
+            "-",
+            truncate_command(&cmd, 60),
+        );
+    }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentRecordFile {
+    child_id: String,
+    session_id: String,
+    name: String,
+    agent: String,
+    model: Option<String>,
+    status: String,
+}
+
+fn agent_status_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "interrupted")
+}
+
+/// Read `<home>/sessions/*/agents/*.json` written by the extension (§4.3).
+fn load_agent_records(home: &Path, session_filter: Option<&str>) -> Vec<AgentRecordFile> {
+    let sessions = home.join("sessions");
+    let Ok(entries) = std::fs::read_dir(&sessions) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let sid = entry.file_name();
+        let sid = sid.to_string_lossy();
+        if let Some(want) = session_filter {
+            if sid.as_ref() != want {
+                continue;
+            }
+        }
+        let agents_dir = entry.path().join("agents");
+        let Ok(files) = std::fs::read_dir(agents_dir) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name();
+            let name = name.to_string_lossy();
+            if !name.ends_with(".json") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(file.path()) else {
+                continue;
+            };
+            let Ok(rec) = serde_json::from_slice::<AgentRecordFile>(&bytes) else {
+                continue;
+            };
+            out.push(rec);
+        }
+    }
+    out.sort_by(|a, b| a.child_id.cmp(&b.child_id));
+    out
 }
 
 pub async fn cmd_output(

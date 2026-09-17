@@ -283,7 +283,7 @@ execute:
 
 ### 4.3 task_* 工具 (`src/task-tools.ts`)
 
-- `task_list({all?})` → manager list(合并未来进程内 subagent run)
+- `task_list({all?})` → manager list **合并**进程内 subagent children(扩展 registry + `sessions/<sid>/agents/*.json`);`pbs-manager ls` 同步读该落盘记录
 - `task_output({task_id, cursor?, max_bytes?})` → manager output;返回尾部 + 文件指针
 - `task_stop({task_id})` → manager stop
 

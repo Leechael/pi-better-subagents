@@ -4,9 +4,19 @@
 import { Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ManagerClient, TaskRecord } from "./manager-client";
+import {
+  formatAgentCommand,
+  isAgentStatusActive,
+  loadAgentChildRecords,
+} from "./subagent/agent-records";
+import type { SubagentRegistry } from "./subagent/registry";
 
 export interface TaskToolsDeps {
   getClient: () => ManagerClient | null;
+  /** Optional: merge in-process subagent children into task_list (§4.3). */
+  getRegistry?: () => SubagentRegistry | null;
+  home?: string;
+  sessionId?: () => string;
 }
 
 function requireClient(deps: TaskToolsDeps): Promise<ManagerClient> {
@@ -56,25 +66,65 @@ const taskListParameters = Type.Object({
 
 export function createTaskListTool(
   deps: TaskToolsDeps,
-): ToolDefinition<typeof taskListParameters, { tasks: TaskRecord[] }> {
+): ToolDefinition<typeof taskListParameters, { tasks: TaskRecord[]; agents: string[] }> {
   return {
     name: "task_list",
     label: "Task List",
     description:
-      "List background tasks (shell commands and monitors) managed by pbs-manager. " +
-      "By default only tasks of the current session are shown.",
-    promptSnippet: "List background shell/monitor tasks",
+      "List background work: pbs-manager shell/monitor tasks plus in-process subagent children. " +
+      "By default only the current session is shown.",
+    promptSnippet: "List background shell/monitor tasks and subagents",
     parameters: taskListParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const client = await requireClient(deps);
       const tasks = await client.list(params.all === true);
-      if (tasks.length === 0) {
-        return { content: [{ type: "text", text: "No tasks." }], details: { tasks: [] } };
+      const agentLines: string[] = [];
+
+      // Live registry is authoritative for this pi process.
+      const live = deps.getRegistry?.()?.activeChildren() ?? [];
+      const liveIds = new Set(live.map((c) => c.childId));
+      for (const c of live) {
+        const model = c.model ? ` ${c.model}` : "";
+        agentLines.push(
+          `${c.childId} [agent] ${c.status} (run=${c.runId}) "${c.name} (${c.agent})${model}"`,
+        );
+      }
+      // Disk records: other sessions / already-terminal children when all=true.
+      if (deps.home) {
+        const disk = loadAgentChildRecords(deps.home, {
+          sessionId: params.all === true ? undefined : deps.sessionId?.(),
+          includeTerminal: params.all === true,
+        });
+        for (const rec of disk) {
+          if (liveIds.has(rec.child_id)) continue;
+          if (!params.all && !isAgentStatusActive(rec.status)) continue;
+          agentLines.push(
+            `${rec.child_id} [agent] ${rec.status} (run=${rec.run_id}) "${formatAgentCommand(rec).replace(/^agent:/, "")}"`,
+          );
+        }
+      }
+
+      if (tasks.length === 0 && agentLines.length === 0) {
+        return {
+          content: [{ type: "text", text: "No tasks." }],
+          details: { tasks: [], agents: [] },
+        };
       }
       const running = tasks.filter((t) => t.status === "running").length;
-      const header = `${tasks.length} task(s), ${running} running:`;
-      const text = [header, ...tasks.map(formatTaskLine)].join("\n");
-      return { content: [{ type: "text", text }], details: { tasks } };
+      const header =
+        `${tasks.length} shell/monitor task(s) (${running} running), ` +
+        `${agentLines.length} subagent(s):`;
+      const lines: string[] = [];
+      if (tasks.length > 0) {
+        lines.push("## shell / monitor", ...tasks.map(formatTaskLine));
+      }
+      if (agentLines.length > 0) {
+        lines.push("## subagents", ...agentLines);
+      }
+      return {
+        content: [{ type: "text", text: [header, ...lines].join("\n") }],
+        details: { tasks, agents: agentLines },
+      };
     },
   };
 }

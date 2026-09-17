@@ -37,6 +37,7 @@ export interface RunRecord {
     childId: string;
     name: string;
     agent: string;
+    model?: string;
     status: ChildStatus;
     result?: ChildResult;
     startedAt: number;
@@ -84,6 +85,7 @@ export interface ActiveChildInfo {
   runId: string;
   name: string;
   agent: string;
+  model?: string;
   status: ChildStatus;
   startedAt: number;
   lastEventAt: number;
@@ -94,6 +96,8 @@ interface InternalChild {
   runId: string;
   name: string;
   agent: string;
+  /** Best-effort model id for fleet / ls (set when startChild runs). */
+  model?: string;
   status: ChildStatus;
   result?: ChildResult;
   startedAt: number;
@@ -282,6 +286,7 @@ export class SubagentRegistry implements RunRegistry {
     const child = this.children.get(req.childId);
     if (!child) throw new Error(`unknown child ${req.childId} (addChild first)`);
     child.shouldStart = opts?.shouldStart;
+    child.model = req.model ?? req.agent.model;
 
     const runner = this.runner;
     if (!runner) {
@@ -377,6 +382,7 @@ export class SubagentRegistry implements RunRegistry {
         runId: child.runId,
         name: child.name,
         agent: child.agent,
+        model: child.model,
         status: child.status,
         startedAt: child.startedAt,
         lastEventAt: child.handle?.lastEventAt() ?? child.startedAt,
@@ -514,6 +520,7 @@ function snapshot(run: InternalRun): RunRecord {
       childId: c.childId,
       name: c.name,
       agent: c.agent,
+      ...(c.model !== undefined ? { model: c.model } : {}),
       status: c.status,
       result: c.result,
       startedAt: c.startedAt,

@@ -21,6 +21,10 @@ import { ManagerClient, type ManagerEvent } from "./manager-client";
 import { createMonitorTool, MonitorRegistry } from "./monitor";
 import { NotifyCenter } from "./notify";
 import { createChildBashTool } from "./subagent/child-bash";
+import {
+  writeAgentChildRecord,
+  type AgentChildRecord,
+} from "./subagent/agent-records";
 import { FleetWidget } from "./subagent/fleet-widget";
 import { createPiSessionFn, modelCandidates } from "./subagent/pi-runtime";
 import { SubagentRegistry } from "./subagent/registry";
@@ -107,6 +111,7 @@ export default function (pi: ExtensionAPI): void {
     sessionEnv,
     trackTask,
     markNotifyOnExit,
+    getRegistry: () => subagentRegistry,
   };
 
   monitorRegistry = new MonitorRegistry({
@@ -288,6 +293,27 @@ export default function (pi: ExtensionAPI): void {
     });
     registry.setRunner(runner);
     subagentRegistry = registry;
+    // Persist child records so `pbs-manager ls` / task_list can see in-process agents.
+    const sessionIdForAgents = () => startCtx.sessionManager.getSessionId();
+    registry.onTransition((run) => {
+      const sid = sessionIdForAgents();
+      for (const c of run.children) {
+        const rec: AgentChildRecord = {
+          v: 1,
+          kind: "agent",
+          child_id: c.childId,
+          run_id: run.runId,
+          session_id: sid,
+          name: c.name,
+          agent: c.agent,
+          ...(c.model !== undefined ? { model: c.model } : {}),
+          status: c.status,
+          started_at: c.startedAt,
+          ...(c.endedAt !== undefined ? { ended_at: c.endedAt } : {}),
+        };
+        writeAgentChildRecord(home, rec);
+      }
+    });
     if (startCtx.hasUI) {
       fleetWidget = new FleetWidget({
         source: {
