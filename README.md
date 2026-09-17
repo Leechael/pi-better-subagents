@@ -23,7 +23,10 @@ Design doc (wire protocol, state machines, interface contracts): [docs/design.md
 # 1. Build and install the manager (the extension auto-discovers it
 #    at ~/.pi/agent/pbs/bin/)
 cd manager && cargo build --release
-mkdir -p ~/.pi/agent/pbs/bin && cp target/release/pbs-manager ~/.pi/agent/pbs/bin/
+mkdir -p ~/.pi/agent/pbs/bin
+# Atomic replace (new inode). In-place `cp` onto an existing binary breaks
+# macOS code-signing and the next run dies with SIGKILL / "killed".
+install -m 755 target/release/pbs-manager ~/.pi/agent/pbs/bin/pbs-manager
 
 # 2. Load the extension
 pi -e /path/to/pi-better-subagents/extension   # local trial (recommended first)

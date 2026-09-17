@@ -9,9 +9,14 @@ The pi extension talks to the daemon over a socket. These subcommands are the hu
 ```bash
 cd manager && cargo build --release
 mkdir -p ~/.pi/agent/pbs/bin
-cp target/release/pbs-manager ~/.pi/agent/pbs/bin/
+# Use `install` (or cp→mv) so the path gets a new inode. Overwriting the
+# existing file in place invalidates macOS's code-signing cache and the next
+# exec is SIGKILL'd (`killed`, exit 137) even when `codesign -vv` still says valid.
+install -m 755 target/release/pbs-manager ~/.pi/agent/pbs/bin/pbs-manager
 export PATH="$HOME/.pi/agent/pbs/bin:$PATH"
 ```
+
+If you already hit `killed` after a reinstall, fix with another atomic replace (same `install` line above), or `cp …/pbs-manager …/pbs-manager.new && mv …/pbs-manager.new …/pbs-manager`.
 
 The extension discovers the same path, or an override via `PBS_MANAGER_PATH` / `managerPath` in config.
 
