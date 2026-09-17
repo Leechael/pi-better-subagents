@@ -2,12 +2,17 @@
  * Integration test for ManagerClient against an in-process fake pbs-manager
  * speaking the real §3.3 wire protocol (u32 BE length + JSON frames).
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ManagerClient, type ManagerEvent } from "../../src/manager-client";
+import {
+  ManagerClient,
+  releaseSpawnLockFile,
+  tryAcquireSpawnLockFile,
+  type ManagerEvent,
+} from "../../src/manager-client";
 
 interface FakeManager {
   server: net.Server;
@@ -213,5 +218,54 @@ describe("ManagerClient (integration, fake manager)", () => {
     expect(await lone.connect()).toBe(false);
     expect(lone.isAvailable()).toBe(false);
     await lone.close();
+  });
+
+  it("cold-starts past an empty Rust leftover spawn.lock (does not wait forever)", async () => {
+    await fake.close();
+    writeFileSync(join(home, "manager.spawn.lock"), "");
+    const lone = new ManagerClient({ home, sessionId: "sess-lock", managerPath: null });
+    expect(await lone.connect()).toBe(false);
+    // Reclaimed the empty lock and attempted spawn; no binary → explicit error.
+    // (Pre-fix: empty lock looked held → "timed out waiting for pbs-manager socket".)
+    expect(lone.lastError()).toMatch(/binary not found/i);
+    await lone.close();
+  });
+});
+
+describe("tryAcquireSpawnLockFile", () => {
+  let dir: string;
+  let lockPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "pbs-lock-"));
+    lockPath = join(dir, "manager.spawn.lock");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("acquires when the lock file is absent", () => {
+    expect(tryAcquireSpawnLockFile(lockPath, process.pid)).toBe(true);
+    expect(readFileSync(lockPath, "utf8")).toBe(String(process.pid));
+    releaseSpawnLockFile(lockPath);
+  });
+
+  it("reclaims an empty lock left by the Rust fd-lock CLI", () => {
+    writeFileSync(lockPath, "");
+    expect(tryAcquireSpawnLockFile(lockPath, process.pid)).toBe(true);
+    expect(readFileSync(lockPath, "utf8")).toBe(String(process.pid));
+    releaseSpawnLockFile(lockPath);
+  });
+
+  it("reclaims a lock whose holder pid is dead", () => {
+    writeFileSync(lockPath, "999999999");
+    expect(tryAcquireSpawnLockFile(lockPath, process.pid)).toBe(true);
+    releaseSpawnLockFile(lockPath);
+  });
+
+  it("refuses when another live process holds the lock", () => {
+    writeFileSync(lockPath, String(process.pid));
+    expect(tryAcquireSpawnLockFile(lockPath, process.pid + 1)).toBe(false);
   });
 });

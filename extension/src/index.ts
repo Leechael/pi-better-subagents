@@ -307,8 +307,11 @@ export default function (pi: ExtensionAPI): void {
       .connect()
       .then((ok) => {
         if (!ok && startCtx.hasUI) {
+          const detail = c.lastError();
           startCtx.ui.notify(
-            "pbs-manager unavailable: bash runs locally, task_*/monitor tools are disabled",
+            detail
+              ? `pbs-manager unavailable (${detail}): bash runs locally, task_*/monitor tools are disabled`
+              : "pbs-manager unavailable: bash runs locally, task_*/monitor tools are disabled",
             "warning",
           );
         }

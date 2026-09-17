@@ -155,6 +155,47 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+/**
+ * O_EXCL pid-file lock used by the extension while spawning the daemon.
+ * The Rust CLI uses an fd-lock on the same path and leaves an empty file after
+ * release — treat empty / non-pid / dead-pid contents as stale and break them.
+ * Exported for unit tests.
+ */
+export function tryAcquireSpawnLockFile(lockPath: string, pid: number = process.pid): boolean {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      writeFileSync(lockPath, String(pid), { flag: "wx" });
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") return false;
+      let stale = false;
+      try {
+        const raw = readFileSync(lockPath, "utf8").trim();
+        const holderPid = Number.parseInt(raw, 10);
+        // Empty (Rust leftover), unparseable, or dead holder → reclaim.
+        stale = raw === "" || !Number.isFinite(holderPid) || !pidAlive(holderPid);
+      } catch {
+        stale = true;
+      }
+      if (!stale) return false;
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+export function releaseSpawnLockFile(lockPath: string): void {
+  try {
+    unlinkSync(lockPath);
+  } catch {
+    // already gone
+  }
+}
+
 function delay(ms: number): Promise<void> {
   // NOTE: timers here must stay ref'd. Awaited connect/request paths rely on
   // them; with unref'd timers a print-mode pi process can exit mid-handshake
@@ -182,6 +223,7 @@ export class ManagerClient {
   private rebound = false;
   private reconnecting: Promise<void> | null = null;
   private lastFailureAt = 0;
+  private lastFailureMessage = "";
 
   constructor(options: ManagerClientOptions) {
     this.home = options.home;
@@ -193,6 +235,11 @@ export class ManagerClient {
 
   isAvailable(): boolean {
     return this.state === "connected";
+  }
+
+  /** Last connect/reconnect failure reason (empty when never failed / currently connected). */
+  lastError(): string {
+    return this.lastFailureMessage;
   }
 
   /**
@@ -238,6 +285,7 @@ export class ManagerClient {
       this.log(`connect failed: ${(err as Error).message}`);
       this.state = "unavailable";
       this.lastFailureAt = Date.now();
+      this.lastFailureMessage = (err as Error).message;
       return false;
     }
   }
@@ -369,38 +417,17 @@ export class ManagerClient {
   }
 
   /**
-   * Simulate the fd-lock with an O_EXCL file create. The file holds the
-   * creator's pid so a stale lock left by a dead process can be broken.
+   * Exclusive create of manager.spawn.lock with our pid as contents.
+   * Compatible with the Rust CLI's fd-lock on the same path: that lock leaves
+   * an empty file behind after release, which must not look like a live hold.
+   * Returns false only when another live holder (numeric pid still alive) owns it.
    */
   private tryAcquireSpawnLock(lockPath: string): boolean {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        writeFileSync(lockPath, String(process.pid), { flag: "wx" });
-        return true;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "EEXIST") return false;
-        // Lock held: break it only if the holder is dead.
-        try {
-          const holderPid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
-          if (Number.isFinite(holderPid) && !pidAlive(holderPid)) {
-            unlinkSync(lockPath);
-            continue;
-          }
-        } catch {
-          // unreadable lock file; treat as held
-        }
-        return false;
-      }
-    }
-    return false;
+    return tryAcquireSpawnLockFile(lockPath, process.pid);
   }
 
   private releaseSpawnLock(lockPath: string): void {
-    try {
-      unlinkSync(lockPath);
-    } catch {
-      // already gone
-    }
+    releaseSpawnLockFile(lockPath);
   }
 
   private spawnManager(): void {
@@ -619,6 +646,7 @@ export class ManagerClient {
     }
     this.state = "unavailable";
     this.lastFailureAt = Date.now();
+    this.lastFailureMessage = "reconnect exhausted";
     this.log("giving up on pbs-manager; bash falls back to local execution");
   }
 
