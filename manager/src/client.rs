@@ -214,20 +214,22 @@ pub async fn cmd_list(home: &Path, session: Option<String>, include_exited: bool
             session_id: session,
         })
         .await?;
+    let terminal = res.tasks.iter().filter(|t| t.status.is_terminal()).count();
     let tasks: Vec<_> = res
         .tasks
         .into_iter()
         .filter(|t| include_exited || !t.status.is_terminal())
         .collect();
     if tasks.is_empty() {
-        println!(
-            "{}",
-            if include_exited {
-                "no tasks"
-            } else {
-                "no running tasks (use -a / --all to include exited)"
-            }
-        );
+        if include_exited {
+            println!("no tasks");
+        } else if terminal > 0 {
+            println!(
+                "no running tasks ({terminal} exited; use -a / --all to include them)"
+            );
+        } else {
+            println!("no running tasks");
+        }
         return Ok(());
     }
     println!(

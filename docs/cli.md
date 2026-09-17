@@ -94,7 +94,7 @@ pbs-manager sessions
 
 ### `list` / `ls`
 
-List tasks. Alias: `ls`. As a CLI client you are admin: with no `--session`, you see every session. **Default: running tasks only.**
+List tasks. Alias: `ls`. As a CLI client you are admin: with no `--session`, you see every session. **Default: running tasks only.** Empty running list prints how many exited tasks exist and points at `-a`. Shell/monitor processes only — in-process subagent LLM turns are not listed here (see the pi fleet widget / `/tasks`).
 
 ```bash
 pbs-manager list
