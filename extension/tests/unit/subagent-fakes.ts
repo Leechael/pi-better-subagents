@@ -26,6 +26,8 @@ export class FakeChildSession implements ChildSessionAdapter {
   disposed = false;
   lastText: string | undefined;
   streaming = false;
+  /** When set, runner prepends "You are running as model …" on first prompt. */
+  resolvedModel?: string;
   /** When non-null, prompt() completes immediately with this text. */
   autoComplete: string | null = null;
   /** When set, prompt() rejects with this error. */

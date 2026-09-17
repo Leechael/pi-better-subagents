@@ -27,6 +27,8 @@ export interface ChildHandle {
   interrupt(): Promise<void>;
   status(): ChildStatus;
   lastEventAt(): number;
+  /** Resolved `provider/id` once the child session exists (optional for stubs). */
+  resolvedModel?(): string | undefined;
 }
 
 // ---------- comms contract (appendix B, verbatim) ----------

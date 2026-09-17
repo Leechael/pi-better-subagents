@@ -161,6 +161,10 @@ class FailedChildHandle implements ChildHandle {
   lastEventAt(): number {
     return this.at;
   }
+
+  resolvedModel(): string | undefined {
+    return undefined;
+  }
 }
 
 export class SubagentRegistry implements RunRegistry {
@@ -300,6 +304,10 @@ export class SubagentRegistry implements RunRegistry {
 
     const handle = await runner.start(req);
     child.handle = handle;
+    // Prefer the actually resolved provider/id over the request-time spec
+    // (inherits parent model when neither param nor agent.model is set).
+    const resolved = handle.resolvedModel();
+    if (resolved) child.model = resolved;
     // Generation-1 result wiring (later generations are wired in admitChild,
     // where the handle is already visible).
     handle.result.then((result) => this.settleChild(child.childId, result));
@@ -307,6 +315,10 @@ export class SubagentRegistry implements RunRegistry {
     // states are left to the result wiring above so the result is recorded.
     if (handle.status() === "running" && child.status === "pending") {
       this.transitionChild(child, "running");
+    } else if (resolved) {
+      // Model became known after session create — refresh observers/disk.
+      const run = this.runs.get(child.runId);
+      if (run) this.emit(run);
     }
     return handle;
   }

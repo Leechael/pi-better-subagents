@@ -56,6 +56,8 @@ export interface ChildHandle {
   interrupt(): Promise<void>; // abort; result resolves as interrupted
   status(): ChildStatus;
   lastEventAt(): number; // for the stall watchdog / status display
+  /** Resolved `provider/id` once the child session has been constructed. */
+  resolvedModel(): string | undefined;
 }
 
 /**
@@ -65,6 +67,11 @@ export interface ChildHandle {
 export interface ChildSessionAdapter {
   /** Non-fatal setup caveat (e.g. model fallback); copied to ChildResult. */
   readonly warning?: string;
+  /**
+   * Resolved model label (`provider/id`) after session construction.
+   * Used for fleet/ls persistence and so the child prompt can name its model.
+   */
+  readonly resolvedModel?: string;
   prompt(text: string): Promise<void>;
   steer(text: string): Promise<void>;
   followUp(text: string): Promise<void>;

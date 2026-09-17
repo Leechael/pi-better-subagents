@@ -146,8 +146,13 @@ function resolveModel(deps: PiRuntimeDeps, req: ChildRunRequest): ResolvedModel 
 }
 
 /** Wrap a real AgentSession into the pi-free ChildSessionAdapter. */
-function wrapSession(session: PiAgentSession): ChildSessionAdapter {
+function wrapSession(
+  session: PiAgentSession,
+  extras: { warning?: string; resolvedModel?: string } = {},
+): ChildSessionAdapter {
   return {
+    ...(extras.warning !== undefined ? { warning: extras.warning } : {}),
+    ...(extras.resolvedModel !== undefined ? { resolvedModel: extras.resolvedModel } : {}),
     prompt: (text) => session.prompt(text),
     steer: (text) => session.steer(text),
     followUp: (text) => session.followUp(text),
@@ -181,10 +186,12 @@ export function createPiSessionFn(deps: PiRuntimeDeps): CreateSessionFn {
       customTools: customTools.length > 0 ? customTools : undefined,
       sessionManager: pi.SessionManager.inMemory(deps.getCwd()),
     });
-    const adapter = wrapSession(session);
-    if (resolved.warning) {
-      (adapter as { warning?: string }).warning = resolved.warning;
-    }
-    return adapter;
+    const resolvedModel = resolved.model
+      ? `${resolved.model.provider}/${resolved.model.id}`
+      : undefined;
+    return wrapSession(session, {
+      ...(resolved.warning !== undefined ? { warning: resolved.warning } : {}),
+      ...(resolvedModel !== undefined ? { resolvedModel } : {}),
+    });
   };
 }

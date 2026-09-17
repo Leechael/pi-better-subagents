@@ -71,6 +71,7 @@ class InProcessChildHandle implements DisposableChildHandle {
   private readonly acquire?: (req: ChildRunRequest) => Promise<() => void>;
 
   private session: ChildSessionAdapter | null = null;
+  private resolvedModel_: string | undefined;
   private unsubscribe: (() => void) | null = null;
   private status_: ChildStatus = "pending";
   private lastEvent: number;
@@ -112,6 +113,10 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   lastEventAt(): number {
     return this.lastEvent;
+  }
+
+  resolvedModel(): string | undefined {
+    return this.resolvedModel_ ?? this.session?.resolvedModel;
   }
 
   /** Launch generation 1. Resolves once the prompt is issued (not completed). */
@@ -225,6 +230,7 @@ class InProcessChildHandle implements DisposableChildHandle {
     if (first) {
       try {
         this.session = await this.createSession(this.req);
+        this.resolvedModel_ = this.session.resolvedModel;
       } catch (err) {
         this.settle(gen, {
           status: "failed",
@@ -258,8 +264,13 @@ class InProcessChildHandle implements DisposableChildHandle {
 
     this.armTimeout(gen);
     this.armStall(gen);
+    // Tell the child which model it is — otherwise only the parent/fleet knows.
+    const prompted =
+      first && session.resolvedModel
+        ? `You are running as model ${session.resolvedModel}.\n\n${prompt}`
+        : prompt;
     // Floating: prompt() resolves when the whole run settles (pi semantics).
-    session.prompt(prompt).then(
+    session.prompt(prompted).then(
       () => {
         void this.finishGeneration(gen);
       },

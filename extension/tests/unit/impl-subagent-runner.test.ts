@@ -30,6 +30,39 @@ describe("InProcessRunner", () => {
     expect(handle.status()).toBe("completed");
   });
 
+  it("tells the child its resolved model on the first prompt", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = "ok";
+    factory.configure = (session) => {
+      session.resolvedModel = "openai/gpt-5.6-sol";
+    };
+    const runner = new InProcessRunner({ createSession: factory.fn });
+    const handle = await runner.start(makeReq());
+    await handle.result;
+    expect(handle.resolvedModel()).toBe("openai/gpt-5.6-sol");
+    expect(factory.sessions[0].prompts[0]).toBe(
+      "You are running as model openai/gpt-5.6-sol.\n\ndo the thing",
+    );
+  });
+
+  it("does not re-announce the model on resume prompts", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = "first";
+    factory.configure = (session) => {
+      session.resolvedModel = "openai/gpt-5.6-sol";
+    };
+    const runner = new InProcessRunner({ createSession: factory.fn });
+    const handle = await runner.start(makeReq());
+    await handle.result;
+    factory.sessions[0].autoComplete = "second";
+    await handle.resume("keep going");
+    await handle.result;
+    expect(factory.sessions[0].prompts).toEqual([
+      "You are running as model openai/gpt-5.6-sol.\n\ndo the thing",
+      "keep going",
+    ]);
+  });
+
   it('maps empty output to "(no output)"', async () => {
     const factory = new SessionFactory();
     factory.autoComplete = "";

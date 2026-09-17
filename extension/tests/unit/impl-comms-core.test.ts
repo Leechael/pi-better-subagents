@@ -35,6 +35,7 @@ function fakeHandle(childId: string, calls: HandleCalls, failSteer = false): Chi
     interrupt: async () => {},
     status: () => "running",
     lastEventAt: () => 0,
+    resolvedModel: () => undefined,
   };
 }
 

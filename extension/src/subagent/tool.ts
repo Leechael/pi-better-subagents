@@ -191,6 +191,7 @@ export function formatRunResults(record: RunRecord, now: number = Date.now()): s
     `${completed}/${record.children.length} subagents completed in ${formatDurationMs(runDurationMs(record, now))}.`;
   const sections = record.children.map((child) => {
     const lines = [`## ${child.name} (${child.status})`];
+    if (child.model) lines.push(`Model: ${child.model}`);
     if (child.result?.warning) lines.push(`Warning: ${child.result.warning}`);
     if (child.result?.error) lines.push(`Error: ${child.result.error}`);
     if (child.result) lines.push(child.result.text || "(no output)");
@@ -481,6 +482,7 @@ export function createSubagentTool(
       const lines = record.children.map((child) => {
         const elapsed = formatDurationMs((child.endedAt ?? now) - child.startedAt);
         let line = `${child.name} (${child.childId}): ${child.status}, ${elapsed} elapsed`;
+        if (child.model) line += `, model ${child.model}`;
         if (child.status === "running" || child.status === "pending") {
           const last = registry.handle(child.childId)?.lastEventAt() ?? child.startedAt;
           line += `, last event ${formatDurationMs(now - last)} ago`;

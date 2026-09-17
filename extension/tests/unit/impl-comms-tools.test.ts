@@ -38,6 +38,7 @@ function fakeHandle(childId: string, calls: HandleCalls): ChildHandle {
     interrupt: async () => {},
     status: () => "running",
     lastEventAt: () => 0,
+    resolvedModel: () => undefined,
   };
 }
 

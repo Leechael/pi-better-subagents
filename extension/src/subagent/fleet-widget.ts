@@ -316,7 +316,10 @@ export class FleetWidget {
       const elapsed = formatElapsed(now - item.child.startedAt);
       const name = theme.fg("toolTitle", item.child.name);
       const agent = theme.fg("muted", `(${item.child.agent})`);
-      body = `${name} ${agent} · ${item.child.status} · ${theme.fg("dim", elapsed)}`;
+      const model = item.child.model
+        ? ` · ${theme.fg("dim", item.child.model)}`
+        : "";
+      body = `${name} ${agent}${model} · ${item.child.status} · ${theme.fg("dim", elapsed)}`;
     } else if (item.kind === "monitor") {
       const elapsed = formatElapsed(now - item.mon.startedAt);
       const desc = theme.fg("accent", truncate(item.mon.description, 40));
@@ -404,7 +407,7 @@ export class FleetWidget {
       if (action?.startsWith("status")) {
         const detail =
           item.kind === "agent"
-            ? `${item.child.name} (${item.child.agent}) · ${item.child.status} · ${item.child.childId}`
+            ? `${item.child.name} (${item.child.agent}) · ${item.child.model ?? "model?"} · ${item.child.status} · ${item.child.childId}`
             : item.kind === "monitor"
               ? `${item.mon.description} · ${item.mon.taskId}`
               : `${item.shell.taskId} · ${item.shell.command.split("\n")[0]}`;
