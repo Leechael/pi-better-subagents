@@ -61,6 +61,9 @@ describe("child bash (no-background variant)", () => {
       kind: "shell",
       command: "echo hello",
     });
+    // Child-bash must not opt into parent <task-notification> wakes — it has no
+    // markNotifyOnExit hook (sync wait already returns the output to the child).
+    expect(deps).not.toHaveProperty("markNotifyOnExit");
     const text = result.content[0].type === "text" ? result.content[0].text : "";
     expect(text).toBe("hello\n");
     expect((result.details as { task_id?: string }).task_id).toBe("sh_test1234");

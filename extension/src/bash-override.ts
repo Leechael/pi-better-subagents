@@ -64,6 +64,12 @@ export interface BashOverrideDeps {
   sessionEnv: (ctx: ExtensionContext) => Record<string, string>;
   /** Register task metadata so exit notifications can describe the task. */
   trackTask: (taskId: string, meta: { kind: string; command: string }) => void;
+  /**
+   * Mark a task so its task_exited event becomes a parent <task-notification>.
+   * Only backgrounded parent bash should call this — sync waits (foreground
+   * budget hit, child-bash) must not wake the parent session.
+   */
+  markNotifyOnExit: (taskId: string) => void;
 }
 
 /**
@@ -362,6 +368,7 @@ export function createBashOverride(
       const outputPath = taskOutputPath(deps.home, deps.sessionId(), start.task_id);
 
       if (input.run_in_background === true) {
+        deps.markNotifyOnExit(start.task_id);
         return {
           content: [
             { type: "text", text: formatBackgroundNotice(start.task_id, input.command, outputPath) },
@@ -381,6 +388,7 @@ export function createBashOverride(
           throw new Error("Command aborted (background task stopped)");
         }
         // Lost contact with the manager while waiting; the task may still run.
+        deps.markNotifyOnExit(start.task_id);
         return {
           content: [
             {
@@ -396,6 +404,7 @@ export function createBashOverride(
       }
 
       if (!waitResult.done) {
+        deps.markNotifyOnExit(start.task_id);
         return {
           content: [
             { type: "text", text: formatBackgroundNotice(start.task_id, input.command, outputPath) },

@@ -27,6 +27,7 @@ import { SubagentRegistry } from "./subagent/registry";
 import { InProcessRunner } from "./subagent/runner";
 import { createSubagentTool } from "./subagent/tool";
 import { createTaskListTool, createTaskOutputTool, createTaskStopTool } from "./task-tools";
+import { shouldNotifyTaskExit } from "./task-exit-notify";
 import { registerPbsMessageRenderers } from "./tui/message-renderers";
 import { registerTasksCommand } from "./tui/tasks-command";
 
@@ -75,9 +76,19 @@ export default function (pi: ExtensionAPI): void {
   let agentLoader: AgentLoader | null = null;
   /** task_id -> metadata, for exit notifications (task_exited carries no command). */
   const taskMeta = new Map<string, { kind: string; command: string }>();
+  /**
+   * task_ids whose task_exited should wake the parent via <task-notification>.
+   * Parent bash only adds ids when it actually backgrounded the command.
+   * Child-bash (sync wait) must not — otherwise every subagent shell completion
+   * is mis-labeled as a parent "Background command" wake (§4.2 / §4.6).
+   */
+  const notifyOnExit = new Set<string>();
 
   const trackTask = (taskId: string, meta: { kind: string; command: string }) => {
     taskMeta.set(taskId, meta);
+  };
+  const markNotifyOnExit = (taskId: string) => {
+    notifyOnExit.add(taskId);
   };
 
   const sessionEnv = (c: ExtensionContext): Record<string, string> => ({
@@ -95,6 +106,7 @@ export default function (pi: ExtensionAPI): void {
     sessionId: () => ctx?.sessionManager.getSessionId() ?? "",
     sessionEnv,
     trackTask,
+    markNotifyOnExit,
   };
 
   monitorRegistry = new MonitorRegistry({
@@ -190,7 +202,21 @@ export default function (pi: ExtensionAPI): void {
           monitorRegistry.handleExit(event.task_id, event);
           return;
         }
+        // Sync-awaited shells (parent fg within budget, child-bash) already
+        // delivered output via the tool result — do not wake the parent.
+        if (
+          !shouldNotifyTaskExit({
+            taskId: event.task_id,
+            isMonitor: false,
+            notifyOnExit,
+          })
+        ) {
+          taskMeta.delete(event.task_id);
+          return;
+        }
+        notifyOnExit.delete(event.task_id);
         const meta = taskMeta.get(event.task_id);
+        taskMeta.delete(event.task_id);
         notifyCenter?.notifyTaskExit({
           taskId: event.task_id,
           kind: meta?.kind ?? "shell",
