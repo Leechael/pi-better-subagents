@@ -124,10 +124,24 @@ describe("parseAgentMarkdown", () => {
     ).toThrow(/thinking.*turbo/);
   });
 
-  it("rejects non-array tools syntax", () => {
+  it("accepts bare comma-separated tools lists", () => {
+    const def = parseAgentMarkdown(
+      agentMd("scout", "d", "tools: read, grep, find, ls, bash"),
+      "user",
+      "/tmp/x.md",
+    );
+    expect(def.tools).toEqual(["read", "grep", "find", "ls", "bash"]);
+  });
+
+  it("accepts a single bare tool name", () => {
+    const def = parseAgentMarkdown(agentMd("scout", "d", "tools: read"), "user", "/tmp/x.md");
+    expect(def.tools).toEqual(["read"]);
+  });
+
+  it("rejects half-open tools brackets", () => {
     expect(() =>
-      parseAgentMarkdown(agentMd("scout", "d", "tools: read"), "user", "/tmp/x.md"),
-    ).toThrow(/tools.*array/);
+      parseAgentMarkdown(agentMd("scout", "d", "tools: [read, grep"), "user", "/tmp/x.md"),
+    ).toThrow(/tools.*(array|comma)/);
   });
 });
 

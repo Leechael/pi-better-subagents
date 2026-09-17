@@ -415,7 +415,7 @@ markdown 文件,frontmatter(yaml 子集,手写解析,不引依赖):
 ---
 name: explorer
 description: Fast codebase exploration — finds files, symbols, answers structure questions
-tools: [read, bash, grep, find, ls]     # allowlist; 缺省 = [read, bash, edit, write]
+tools: [read, bash, grep, find, ls]     # 或 `read, bash, grep, find, ls`; 缺省 = [read, bash, edit, write]
 model: anthropic:claude-haiku-4-5       # 可选; "provider:id" 或裸 id
 thinking: high                          # 可选: minimal|low|medium|high|xhigh
 ---
