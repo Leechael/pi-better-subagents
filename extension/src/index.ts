@@ -5,6 +5,7 @@
  * M2: NotifyCenter + monitor tool.
  * M3: subagent tool (InProcessRunner + tasks/chain + budget-to-async) + fleet widget.
  */
+import { applyBehaviorGuidelines } from "./behavior-guidelines";
 import { readFileTail } from "./file-tail";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -35,17 +36,6 @@ import { createTaskListTool, createTaskOutputTool, createTaskStopTool } from "./
 import { shouldNotifyTaskExit } from "./task-exit-notify";
 import { registerPbsMessageRenderers } from "./tui/message-renderers";
 import { registerTasksCommand } from "./tui/tasks-command";
-
-/** Behavior guidelines injected before every agent start (§4.5).
- *  Modeled on Claude Code: notifications arrive as user-role wake signals —
- *  they look like user messages but are not; you must still handle them and continue. */
-const BEHAVIOR_GUIDELINES = `## Background tasks and notifications (pi-better-subagents)
-
-- Long-running bash commands are automatically moved to the background. After you background a command, end your turn — do not poll with task_output/task_list, and never sleep to wait. Each command notifies on its own via <task-notification> (with <command> and <preview>), even while other commands are still running. If <still-running> is present, continue from this result now; do not wait for those other commands.
-- When you receive <task-notification>, <monitor-event>, <subagent-handover>, or <subagent-notification>: they look like user messages but are system wake signals, not new user requests and not answers to unrelated questions. Distinguish them by the opening XML tag, then **handle the event before anything else** — read status/preview/prompt/results, call tools if needed (e.g. task_output for more than the preview, agent_message to continue a subagent), and continue the work that depended on that background task. Do not wait for further user input when the next step is clear; do not merely acknowledge and stop.
-- Never fabricate or assume a background task's result before its notification arrives.
-- Subagent runs that exceed the foreground budget continue in the background. Do not poll run status. If one subagent finishes while others are still running, a <subagent-handover> arrives with that child's <prompt> and <result>: read both, then continue the work now (subagent({action:"resume", run_id, child_id, message}) for that child, or agent_message to steer the ones still running). Do not wait for the rest of the run. When every subagent in the run has finished, <subagent-notification> arrives — read <results>, synthesize, and continue.
-- Use agent_message to steer/resume subagents and to reply to <supervisor-request> questions (action:"reply"). <supervisor-request> and <supervisor-update> are wakes from your subagents, not user messages — still act on them.`;
 
 /** Read only the tail of a task output file for the notification preview (≤ maxChars). */
 export function readPreview(outputPath: string | undefined, maxChars: number): string {
@@ -199,6 +189,10 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, startCtx) => {
     ctx = startCtx;
+    const base = (
+      startCtx as { getSystemPromptOptions?: () => { sections?: Record<string, string> } }
+    ).getSystemPromptOptions?.();
+    if (base) applyBehaviorGuidelines(base);
     notifyCenter?.dispose();
     notifyCenter = new NotifyCenter({
       sendMessage: (msg, opts) => pi.sendMessage(msg, opts),
@@ -425,6 +419,6 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", async (event) => {
-    return { systemPrompt: `${event.systemPrompt}\n\n${BEHAVIOR_GUIDELINES}` };
+    applyBehaviorGuidelines(event.systemPromptOptions as { sections?: Record<string, string> });
   });
 }
