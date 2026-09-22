@@ -1,28 +1,63 @@
 /**
- * /tasks — list running subagents, monitors, and shell workers.
+ * /tasks — one live overlay for shells, monitors, and subagents.
  *
- * View opens a full-screen scrollable panel (mouse wheel + terminal selection).
- * Subagents show their conversation. Monitors and shells have output / stderr tabs.
- * A finished subagent stays listed only while its detail view is open.
+ * ↑↓ select, Enter views, s stops, Esc backs out of a detail or closes the list.
+ * Finished items stay viewable while they remain in the work index.
  */
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { ManagerClient, TaskRecord } from "../manager-client";
-import type { MonitorRegistry } from "../monitor";
+import { DynamicBorder, keyHint, rawKeyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ManagerClient } from "../manager-client";
 import { formatConversation } from "../subagent/conversation";
-import type { RunRecord, SubagentRegistry } from "../subagent/registry";
-import { readTaskFileTail, stderrPathFor } from "./task-output-paths";
-import { isSubagentPinned, pinSubagent, unpinSubagent } from "./tasks-pin";
+import type { SubagentRegistry } from "../subagent/registry";
+import { formatAge, type WorkIndex, type WorkItem } from "../work-index";
 import { notifyPlainFallback, showScrollDetail } from "./scroll-detail-view";
+import { readTaskFileTailCached, stderrPathFor } from "./task-output-paths";
+import { loadPiTui, truncateToWidth } from "./pi-tui-load";
+
+const AGE_TICK_MS = 1000;
+
+function isLive(item: WorkItem): boolean {
+  return item.status === "pending" || item.status === "running";
+}
+
+/** Selection follows the item id so a reorder (active first) cannot move the cursor. */
+export function selectedIndex(items: readonly WorkItem[], selectedId: string | undefined): number {
+  if (items.length === 0) return 0;
+  if (!selectedId) return 0;
+  const i = items.findIndex((item) => item.id === selectedId);
+  return i >= 0 ? i : 0;
+}
+
+export function moveSelection(
+  items: readonly WorkItem[],
+  selectedId: string | undefined,
+  dir: -1 | 1,
+): string | undefined {
+  if (items.length === 0) return undefined;
+  const i = selectedIndex(items, selectedId);
+  const next = Math.max(0, Math.min(items.length - 1, i + dir));
+  return items[next]?.id;
+}
+
+export function stopChoice(
+  items: readonly WorkItem[],
+  selectedId: string | undefined,
+): { action: "stop" | "already-finished" | "none"; id?: string } {
+  if (items.length === 0) return { action: "none" };
+  const item = items[selectedIndex(items, selectedId)];
+  if (!item) return { action: "none" };
+  if (!isLive(item)) return { action: "already-finished", id: item.id };
+  return { action: "stop", id: item.id };
+}
 
 export interface TasksCommandDeps {
   getRegistry: () => SubagentRegistry | null;
-  getMonitors: () => MonitorRegistry | null;
+  getIndex: () => WorkIndex | null;
   getClient: () => ManagerClient | null;
 }
 
 export function registerTasksCommand(pi: ExtensionAPI, deps: TasksCommandDeps): void {
   pi.registerCommand("tasks", {
-    description: "List running subagents, monitors, and shell tasks",
+    description: "List background shells, monitors, and subagents",
     handler: async (_args, ctx) => {
       await openTasksUi(ctx, deps);
     },
@@ -35,162 +70,216 @@ export function registerTasksCommand(pi: ExtensionAPI, deps: TasksCommandDeps): 
   });
 }
 
-interface TaskOption {
-  key: string;
-  label: string;
-  stop: () => Promise<void>;
-  view: (ctx: ExtensionContext) => Promise<void>;
+export function formatWorkRows(
+  items: readonly WorkItem[],
+  selectedId: string | undefined,
+  now: number,
+  width: number,
+): string[] {
+  if (items.length === 0) {
+    return [truncateToWidth("No background tasks.", Math.max(1, width), "")];
+  }
+  const selected = selectedIndex(items, selectedId);
+  return items.map((item, i) => {
+    const mark = i === selected ? "▸" : " ";
+    const age = formatAge(item.startedAt, item.endedAt, now);
+    const raw = `${mark} ${item.kind.padEnd(7)} ${item.status.padEnd(11)} ${age.padEnd(6)} ${item.title}`;
+    return truncateToWidth(raw, Math.max(1, width), "…");
+  });
 }
 
-/** Running children, plus finished ones whose detail view is still open. */
-export function visibleSubagentChildren(runs: readonly RunRecord[]): RunRecord["children"] {
-  const children: RunRecord["children"] = [];
-  for (const run of runs) {
-    for (const child of run.children) {
-      const active = child.status === "pending" || child.status === "running";
-      if (active || isSubagentPinned(child.childId)) children.push(child);
-    }
+function selectorHint(theme: { fg(color: string, text: string): string }): string {
+  try {
+    return [
+      keyHint("tui.select.up", ""),
+      keyHint("tui.select.down", ""),
+      keyHint("tui.select.confirm", "view"),
+      rawKeyHint("s", "stop"),
+      keyHint("tui.select.cancel", "close"),
+    ].join("  ");
+  } catch {
+    // keyHint reads the pi theme singleton (globalThis). Unit tests and a
+    // jiti cache that has not called initTheme() throw; the running TUI has it.
+    return theme.fg("dim", "↑↓ select · Enter view · s stop · Esc close");
   }
-  return children;
+}
+
+export interface TaskListChoice {
+  action: "close" | "view" | "stop" | "already-finished";
+  id?: string;
 }
 
 async function openTasksUi(ctx: ExtensionContext, deps: TasksCommandDeps): Promise<void> {
-  const options = await collectOptions(deps);
+  const index = deps.getIndex();
+  const items = () => index?.list() ?? [];
   if (!ctx.hasUI) {
+    const list = items();
     ctx.ui.notify(
-      options.length ? options.map((o) => o.label).join("\n") : "No background tasks.",
+      list.length
+        ? formatWorkRows(list, undefined, Date.now(), 100).join("\n")
+        : "No background tasks.",
       "info",
     );
     return;
   }
-  if (options.length === 0) {
+  if (!index) {
     ctx.ui.notify("No background tasks.", "info");
     return;
   }
 
-  const labels = [...options.map((o) => o.label), "↻ Refresh", "Close"];
-  const picked = await ctx.ui.select("Background tasks", labels);
-  if (!picked || picked === "Close") return;
-  if (picked === "↻ Refresh") {
-    await openTasksUi(ctx, deps);
-    return;
-  }
-  const item = options.find((o) => o.label === picked);
-  if (!item) return;
-
-  const action = await ctx.ui.select(picked, ["View", "Stop / interrupt", "Back"]);
-  if (action === "View") {
-    await item.view(ctx);
-    await openTasksUi(ctx, deps);
-    return;
-  }
-  if (action !== "Stop / interrupt") {
-    await openTasksUi(ctx, deps);
-    return;
-  }
-  try {
-    await item.stop();
-    ctx.ui.notify(`Stopped ${item.key}`, "info");
-  } catch (err) {
-    ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
-  }
-}
-
-async function collectOptions(deps: TasksCommandDeps): Promise<TaskOption[]> {
-  const options: TaskOption[] = [];
-  const registry = deps.getRegistry();
-  const client = deps.getClient();
-  const tasks = await listManagerTasks(client);
-
-  for (const child of visibleSubagentChildren(registry?.list() ?? [])) {
-    options.push({
-      key: child.childId,
-      label: `subagent · ${child.name} (${child.agent}) · ${child.status} · ${child.childId}`,
-      stop: async () => {
-        await registry?.handle(child.childId)?.interrupt();
-      },
-      view: (ctx) => viewSubagent(ctx, registry, child.childId, child.name),
-    });
-  }
-
-  for (const mon of deps.getMonitors()?.listActive() ?? []) {
-    const record = tasks.find((t) => t.task_id === mon.taskId);
-    options.push({
-      key: mon.taskId,
-      label: `monitor · ${mon.description} · ${mon.taskId}`,
-      stop: async () => {
-        await client?.ensureAvailable();
-        await client?.stop(mon.taskId);
-      },
-      view: (ctx) => viewTaskLogs(ctx, `monitor ${mon.description}`, record?.output_path ?? ""),
-    });
-  }
-
-  for (const t of tasks.filter((x) => x.status === "running" && x.kind === "shell")) {
-    const command = (t.command.split("\n")[0] ?? "").slice(0, 60);
-    options.push({
-      key: t.task_id,
-      label: `worker · ${command} · ${t.task_id}`,
-      stop: async () => {
-        await client?.ensureAvailable();
-        await client?.stop(t.task_id);
-      },
-      view: (ctx) => viewTaskLogs(ctx, `worker ${t.task_id}`, t.output_path),
-    });
-  }
-  return options;
-}
-
-async function listManagerTasks(client: ManagerClient | null): Promise<TaskRecord[]> {
-  if (!client?.isAvailable()) return [];
-  try {
-    return await client.list();
-  } catch {
-    return [];
-  }
-}
-
-async function viewSubagent(
-  ctx: ExtensionContext,
-  registry: SubagentRegistry | null,
-  childId: string,
-  name: string,
-): Promise<void> {
-  pinSubagent(childId);
-  try {
-    const read = () => formatConversation(registry?.handle(childId)?.conversation() ?? []);
-    if (!ctx.hasUI) return;
-    try {
-      await showScrollDetail(ctx.ui, {
-        title: `subagent ${name}`,
-        content: read,
-        pollMs: 500,
-      });
-    } catch {
-      notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), `subagent ${name}`, read());
+  let selectedId: string | undefined;
+  for (;;) {
+    const choice = await showTaskList(ctx, () => index.list(), (cb) => index.onChange(cb), selectedId);
+    if (!choice || choice.action === "close") return;
+    selectedId = choice.id ?? selectedId;
+    if (!choice.id) continue;
+    const item = index.get(choice.id);
+    if (!item) continue;
+    if (choice.action === "already-finished") {
+      ctx.ui.notify(`${item.id} already finished`, "info");
+      continue;
     }
-  } finally {
-    unpinSubagent(childId);
+    if (choice.action === "stop") {
+      try {
+        await stopItem(item, deps);
+        ctx.ui.notify(`Stopped ${item.id}`, "info");
+      } catch (err) {
+        ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+      }
+      continue;
+    }
+    await viewItem(ctx, item, deps);
   }
 }
 
-async function viewTaskLogs(ctx: ExtensionContext, title: string, outputPath: string): Promise<void> {
+async function showTaskList(
+  ctx: ExtensionContext,
+  getItems: () => WorkItem[],
+  subscribe: (cb: () => void) => () => void,
+  initialSelectedId: string | undefined,
+): Promise<TaskListChoice | undefined> {
+  const piTui = loadPiTui();
+  if (!piTui) {
+    const items = getItems();
+    notifyPlainFallback(
+      ctx.ui.notify.bind(ctx.ui),
+      "Background tasks",
+      items.length ? formatWorkRows(items, initialSelectedId, Date.now(), 100).join("\n") : "No background tasks.",
+    );
+    return { action: "close" };
+  }
+  const { matchesKey } = piTui;
+
+  return ctx.ui.custom<TaskListChoice | undefined>(
+    (tui, theme, kb, done) => {
+      let selectedId = initialSelectedId;
+      const unsub = subscribe(() => tui.requestRender());
+      const ageTimer = setInterval(() => tui.requestRender(), AGE_TICK_MS);
+      ageTimer.unref?.();
+      const border = new DynamicBorder((text) => theme.fg("border", text));
+      const matches = (
+        data: string,
+        id: "tui.select.up" | "tui.select.down" | "tui.select.confirm" | "tui.select.cancel",
+      ) => {
+        try {
+          return kb.matches(data, id);
+        } catch {
+          return false;
+        }
+      };
+      return {
+        render(width: number) {
+          const items = getItems();
+          selectedId = items[selectedIndex(items, selectedId)]?.id;
+          const inner = Math.max(1, width);
+          const title = truncateToWidth(theme.fg("accent", "Background tasks"), inner, "…");
+          const hint = truncateToWidth(selectorHint(theme), inner, "…");
+          const rows = formatWorkRows(items, selectedId, Date.now(), inner);
+          return [...border.render(inner), title, hint, ...rows, ...border.render(inner)];
+        },
+        invalidate() {
+          border.invalidate();
+        },
+        handleInput(data: string) {
+          const items = getItems();
+          if (matches(data, "tui.select.cancel") || matchesKey(data, "escape") || data === "q") {
+            done({ action: "close", id: selectedId });
+            return;
+          }
+          if (matches(data, "tui.select.up") || matchesKey(data, "up")) {
+            selectedId = moveSelection(items, selectedId, -1);
+            tui.requestRender();
+            return;
+          }
+          if (matches(data, "tui.select.down") || matchesKey(data, "down")) {
+            selectedId = moveSelection(items, selectedId, 1);
+            tui.requestRender();
+            return;
+          }
+          if (matches(data, "tui.select.confirm") || matchesKey(data, "enter") || data === "\r") {
+            const item = items[selectedIndex(items, selectedId)];
+            if (!item) return;
+            done({ action: "view", id: item.id });
+            return;
+          }
+          if (data === "s") {
+            const choice = stopChoice(items, selectedId);
+            if (choice.action === "none" || !choice.id) return;
+            done({ action: choice.action, id: choice.id });
+          }
+        },
+        dispose() {
+          clearInterval(ageTimer);
+          unsub();
+        },
+      };
+    },
+    {
+      overlay: true,
+      overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%", row: 0, col: 0, margin: 0 },
+    },
+  );
+}
+
+async function stopItem(item: WorkItem, deps: TasksCommandDeps): Promise<void> {
+  if (item.kind === "agent") {
+    const handle = deps.getRegistry()?.handle(item.id);
+    if (!handle) throw new Error(`no live subagent ${item.id}`);
+    await handle.interrupt();
+    return;
+  }
+  const client = deps.getClient();
+  if (!client) throw new Error("pbs-manager is not available");
+  await client.ensureAvailable();
+  await client.stop(item.id);
+}
+
+async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksCommandDeps): Promise<void> {
   if (!ctx.hasUI) return;
-  const stderrPath = stderrPathFor(outputPath);
-  const read = () => ({
-    output: readTaskFileTail(outputPath),
-    stderr: readTaskFileTail(stderrPath),
-  });
+  if (item.kind === "agent") {
+    const read = () =>
+      formatConversation(deps.getRegistry()?.handle(item.id)?.conversation() ?? []) ||
+      item.text ||
+      "(no output)";
+    try {
+      await showScrollDetail(ctx.ui, { title: `subagent ${item.title}`, content: read, pollMs: 500 });
+    } catch {
+      notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), item.title, read());
+    }
+    return;
+  }
+  const outputPath = item.outputPath ?? "";
+  const stderrPath = item.stderrPath || stderrPathFor(outputPath);
   try {
     await showScrollDetail(ctx.ui, {
-      title,
+      title: `${item.kind} ${item.title}`,
       tabs: {
-        output: () => read().output,
-        stderr: () => read().stderr,
+        output: () => readTaskFileTailCached(outputPath),
+        stderr: () => readTaskFileTailCached(stderrPath),
       },
       pollMs: 500,
     });
   } catch {
-    notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), title, read().output);
+    notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), item.title, readTaskFileTailCached(outputPath));
   }
 }

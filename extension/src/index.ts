@@ -140,7 +140,7 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool(createMonitorTool(monitorRegistry));
   registerTasksCommand(pi, {
     getRegistry: () => subagentRegistry,
-    getMonitors: () => monitorRegistry,
+    getIndex: () => workIndex,
     getClient: () => client,
   });
   monitorRegistry.onChange(() => {

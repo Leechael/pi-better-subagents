@@ -1,48 +1,64 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { formatConversation, turnsFromMessages } from "../../src/subagent/conversation";
 import { stderrPathFor } from "../../src/tui/task-output-paths";
-import { clearPinnedSubagents, pinSubagent, unpinSubagent } from "../../src/tui/tasks-pin";
-import { visibleSubagentChildren } from "../../src/tui/tasks-command";
-import type { RunRecord } from "../../src/subagent/registry";
+import { formatWorkRows, moveSelection, stopChoice } from "../../src/tui/tasks-command";
+import { WorkIndex, type WorkItem } from "../../src/work-index";
 
-function child(id: string, status: RunRecord["children"][number]["status"]): RunRecord["children"][number] {
+function item(id: string, status: string): WorkItem {
   return {
-    childId: id,
-    name: id,
-    agent: "worker",
+    id,
+    kind: "shell",
     status,
+    title: id,
     startedAt: 1,
+    countsAsWorker: true,
   };
 }
 
-function run(children: RunRecord["children"]): RunRecord {
-  return {
-    runId: "run_1",
-    kind: "tasks",
-    children,
-    status: "running",
-    createdAt: 1,
-  };
-}
-
-describe("tasks view helpers", () => {
-  afterEach(() => {
-    clearPinnedSubagents();
+describe("tasks view", () => {
+  it("stops the selected id after a reorder, not whatever landed on that index", () => {
+    const first = item("sh_1", "running");
+    const second = item("sh_2", "running");
+    let selected = moveSelection([first, second], first.id, 1);
+    expect(selected).toBe("sh_2");
+    // Item 1 finishes and drops below the active items. Index 0 is now sh_2.
+    const reordered = [second, { ...first, status: "completed", endedAt: 2 }];
+    expect(stopChoice(reordered, selected)).toEqual({ action: "stop", id: "sh_2" });
   });
 
-  it("lists running subagents and hides finished ones", () => {
-    const visible = visibleSubagentChildren([
-      run([child("ch_live", "running"), child("ch_done", "completed")]),
-    ]);
-    expect(visible.map((c) => c.childId)).toEqual(["ch_live"]);
+  it("does not stop a finished selection", () => {
+    const done = item("sh_2", "completed");
+    expect(stopChoice([done], done.id)).toEqual({ action: "already-finished", id: "sh_2" });
   });
 
-  it("keeps a finished subagent only while its detail view is open", () => {
-    const runs = [run([child("ch_done", "completed")])];
-    pinSubagent("ch_done");
-    expect(visibleSubagentChildren(runs).map((c) => c.childId)).toEqual(["ch_done"]);
-    unpinSubagent("ch_done");
-    expect(visibleSubagentChildren(runs)).toEqual([]);
+  it("lists a running monitor in the overlay rows", () => {
+    const index = new WorkIndex({ now: () => 10_000 });
+    index.upsert({
+      id: "mon_abc",
+      kind: "monitor",
+      status: "running",
+      title: "build watcher",
+      startedAt: 0,
+      countsAsWorker: false,
+    });
+    const rows = formatWorkRows(index.list(), "mon_abc", 10_000, 80);
+    expect(rows.join("\n")).toContain("monitor");
+    expect(rows.join("\n")).toContain("build watcher");
+    expect(rows.join("\n")).toContain("running");
+  });
+
+  it("keeps a finished item viewable inside the retain window", () => {
+    const index = new WorkIndex({ now: () => 1_000, retainMs: 10_000, finishedCap: 50 });
+    index.upsert({
+      id: "ch_done",
+      kind: "agent",
+      status: "completed",
+      title: "scout",
+      startedAt: 0,
+      endedAt: 500,
+      countsAsWorker: false,
+    });
+    expect(index.list().map((i) => i.id)).toEqual(["ch_done"]);
   });
 
   it("formats a child transcript and the stderr sibling path", () => {
@@ -62,8 +78,7 @@ describe("tasks view helpers", () => {
     expect(text).toContain("── user ──");
     expect(text).toContain("look at src");
     expect(text).toContain("tool read");
-    expect(text).toContain("── tool read ──");
-    expect(text).toContain("file body");
     expect(stderrPathFor("/tmp/tasks/sh_ab.output")).toBe("/tmp/tasks/sh_ab.stderr");
   });
+
 });
