@@ -105,9 +105,15 @@ function statusPhrase(info: TaskExitInfo): string {
 /** Lead-in so the model treats the injection as a wake to act on (Claude Code pattern). */
 const TASK_NOTIFICATION_WAKE =
   "Background task update (system wake — not a new user message). " +
-  "Handle each task-notification block below before anything else: read status and preview, " +
+  "Handle each task-notification block below before anything else: read <command> and <preview>, " +
   "use task_output only if you need more than the preview, then continue the work that " +
   "depended on this command. Do not wait for further user input when the next step is clear.";
+
+const TASK_COMMAND_CHARS = 2000;
+
+function capCommand(command: string): string {
+  return command.length > TASK_COMMAND_CHARS ? `${command.slice(0, TASK_COMMAND_CHARS)}…` : command;
+}
 
 function formatOneTaskNotification(info: TaskExitInfo): string {
   const summary = `Background command "${displayCommand(info.command)}" ${statusPhrase(info)}`;
@@ -116,6 +122,7 @@ function formatOneTaskNotification(info: TaskExitInfo): string {
     `  <task-id>${escapeXml(info.taskId)}</task-id><kind>${escapeXml(info.kind)}</kind>`,
     `  <status>${info.status}</status>`,
     `  <summary>${escapeXml(summary)}</summary>`,
+    `  <command>\n${escapeXml(capCommand(info.command))}\n  </command>`,
     `  <output-file>${escapeXml(info.outputPath)}</output-file>`,
     `  <preview>${escapeXml(info.preview)}</preview>`,
     `  <duration-ms>${Math.round(info.durationMs)}</duration-ms>`,
@@ -128,8 +135,18 @@ function formatOneTaskNotification(info: TaskExitInfo): string {
  * Multiple events are merged into a list of <task-notification> blocks (§4.5).
  * Prefixed with a wake instruction so idle→triggerTurn turns continue work.
  */
-export function formatTaskNotification(events: TaskExitInfo[]): string {
-  return [TASK_NOTIFICATION_WAKE, ...events.map(formatOneTaskNotification)].join("\n\n");
+export function formatTaskNotification(events: TaskExitInfo[], stillRunning: string[] = []): string {
+  const wake =
+    stillRunning.length > 0
+      ? `${TASK_NOTIFICATION_WAKE} Other background tasks are still running. ` +
+        "Continue from this result now. Do not wait for <still-running>."
+      : TASK_NOTIFICATION_WAKE;
+  const parts = [wake];
+  if (stillRunning.length > 0) {
+    parts.push(`<still-running>${escapeXml(stillRunning.join(", "))}</still-running>`);
+  }
+  parts.push(...events.map(formatOneTaskNotification));
+  return parts.join("\n\n");
 }
 
 /** Tool-result text returned when a foreground command is moved to the background (§4.2). */
@@ -140,7 +157,7 @@ export function formatBackgroundNotice(
 ): string {
   return [
     `Command "${displayCommand(command)}" moved to background (task_id: ${taskId}). Output: ${outputPath}.`,
-    "You will be notified when it completes. Do not poll or sleep — end your turn and continue from the <task-notification> when it arrives.",
+    "You will be notified when it completes, even if other commands are still running. Do not poll or sleep — end your turn and continue from the <task-notification> when it arrives.",
   ].join("\n");
 }
 

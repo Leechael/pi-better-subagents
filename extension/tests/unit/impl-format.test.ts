@@ -86,6 +86,9 @@ describe("formatTaskNotification", () => {
         "  <task-id>sh_a1b2c3d4</task-id><kind>shell</kind>",
         "  <status>completed</status>",
         '  <summary>Background command "npm test" completed (exit code 0)</summary>',
+        "  <command>",
+        "npm test",
+        "  </command>",
         "  <output-file>/home/u/.pi/agent/pbs/sessions/s/tasks/sh_a1b2c3d4.output</output-file>",
         "  <preview>all tests passed</preview>",
         "  <duration-ms>12345</duration-ms>",
@@ -126,7 +129,15 @@ describe("formatTaskNotification", () => {
   it("truncates very long commands in the summary", () => {
     const xml = formatTaskNotification([exitInfo({ command: `cmd ${"x".repeat(200)}` })]);
     expect(xml).toContain("…");
-    expect(xml.length).toBeLessThan(1000);
+    expect(xml.length).toBeLessThan(1500);
+  });
+
+  it("names background tasks that are still running", () => {
+    const xml = formatTaskNotification([exitInfo()], ["sleep 30 (sh_other)"]);
+    expect(xml).toContain("<still-running>sleep 30 (sh_other)</still-running>");
+    expect(xml).toContain("Do not wait for <still-running>");
+    expect(xml).toContain("<command>");
+    expect(xml).toContain("npm test");
   });
 });
 
@@ -135,7 +146,8 @@ describe("formatBackgroundNotice", () => {
     const text = formatBackgroundNotice("sh_a1b2c3d4", "npm run build", "/tmp/out.log");
     expect(text).toContain("task_id: sh_a1b2c3d4");
     expect(text).toContain("Output: /tmp/out.log");
-    expect(text).toContain("You will be notified when it completes. Do not poll or sleep");
+    expect(text).toContain("even if other commands are still running");
+    expect(text).toContain("Do not poll or sleep");
     expect(text).toContain("<task-notification>");
     expect(text).toContain('"npm run build"');
   });

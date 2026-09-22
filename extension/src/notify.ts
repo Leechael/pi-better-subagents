@@ -24,6 +24,11 @@ export interface NotifyCenterDeps {
   isIdle: () => boolean;
   /** Batching window for task exit notifications (ms). Default 200. */
   batchMs?: number;
+  /**
+   * Background tasks still awaiting their own exit wake.
+   * Read at flush time so siblings that exit in the same window are not listed.
+   */
+  listStillRunning?: () => string[];
 }
 
 export const TASK_NOTIFICATION_CUSTOM_TYPE = "pbs-task-notification";
@@ -94,7 +99,7 @@ export class NotifyCenter {
     this.pendingExits = [];
     this.deliver({
       customType: TASK_NOTIFICATION_CUSTOM_TYPE,
-      content: formatTaskNotification(events),
+      content: formatTaskNotification(events, this.deps.listStillRunning?.() ?? []),
       details: { tasks: events.map((e) => e.taskId) },
     });
   }
