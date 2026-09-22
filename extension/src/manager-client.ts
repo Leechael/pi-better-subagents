@@ -105,6 +105,13 @@ export interface ManagerClientOptions {
   log?: (message: string) => void;
 }
 
+export interface SessionInfo {
+  session_id: string;
+  pi_pid: number;
+  connected: boolean;
+  cwd?: string;
+}
+
 type ClientState = "disconnected" | "connected" | "unavailable";
 
 type EventHandler = (event: ManagerEvent) => void;
@@ -336,6 +343,12 @@ export class ManagerClient {
   async list(all = false): Promise<TaskRecord[]> {
     const res = await this.request({ type: "list", all });
     return ((res.tasks as TaskRecord[] | undefined) ?? []) as TaskRecord[];
+  }
+
+  /** Connected sessions (status). Older managers may reject this for extension clients. */
+  async sessions(): Promise<SessionInfo[]> {
+    const res = await this.request({ type: "status" });
+    return ((res.sessions as SessionInfo[] | undefined) ?? []) as SessionInfo[];
   }
 
   async watch(taskId: string): Promise<void> {

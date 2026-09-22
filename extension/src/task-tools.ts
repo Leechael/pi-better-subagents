@@ -10,11 +10,15 @@ import {
   loadAgentChildRecords,
 } from "./subagent/agent-records";
 import type { SubagentRegistry } from "./subagent/registry";
+import type { WorkIndex, WorkItem } from "./work-index";
+import { formatAge } from "./work-index";
 
 export interface TaskToolsDeps {
   getClient: () => ManagerClient | null;
   /** Optional: merge in-process subagent children into task_list (§4.3). */
   getRegistry?: () => SubagentRegistry | null;
+  /** Fleet /tasks / task_list share this index when present. */
+  getIndex?: () => WorkIndex | null;
   home?: string;
   sessionId?: () => string;
 }
@@ -32,6 +36,20 @@ function requireClient(deps: TaskToolsDeps): Promise<ManagerClient> {
     }
     return client;
   });
+}
+
+function agentTextFor(deps: TaskToolsDeps, id: string): string | undefined {
+  const indexed = deps.getIndex?.()?.get(id);
+  const isAgent = indexed?.kind === "agent" || id.startsWith("ch_");
+  if (!isAgent && !deps.getRegistry?.()?.handle(id)) return undefined;
+  const handle = deps.getRegistry?.()?.handle(id);
+  const convo = handle?.conversation?.();
+  if (convo && convo.length > 0) {
+    return convo.map((t) => `${t.role}: ${t.text}`).join("\n");
+  }
+  if (indexed?.text) return indexed.text;
+  if (isAgent) return indexed?.text ?? "";
+  return undefined;
 }
 
 function formatDuration(startedAt: number, endedAt: number | null): string {
@@ -78,25 +96,51 @@ export function createTaskListTool(
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const client = await requireClient(deps);
       const tasks = await client.list(params.all === true);
-      const agentLines: string[] = [];
+      const index = deps.getIndex?.() ?? null;
+      const lines: string[] = [];
+      const seen = new Set<string>();
 
-      // Live registry is authoritative for this pi process.
+      const pushItem = (item: WorkItem) => {
+        if (seen.has(item.id)) return;
+        if (!params.all && item.status !== "running" && item.status !== "pending") return;
+        seen.add(item.id);
+        const age = formatAge(item.startedAt, item.endedAt, Date.now());
+        lines.push(`${item.id} [${item.kind}] ${item.status} (${age}) "${item.title}"`);
+      };
+
+      if (index) {
+        for (const item of index.list()) pushItem(item);
+      }
+      for (const task of tasks) {
+        if (seen.has(task.task_id)) continue;
+        if (!params.all && task.status !== "running") continue;
+        // Sync-waited shells are not in the index and must not be listed as workers.
+        if (task.kind === "shell" && !index?.get(task.task_id)) continue;
+        seen.add(task.task_id);
+        lines.push(formatTaskLine(task));
+      }
+
+      const agentLines: string[] = [];
       const live = deps.getRegistry?.()?.activeChildren() ?? [];
       const liveIds = new Set(live.map((c) => c.childId));
-      for (const c of live) {
-        const model = c.model ? ` ${c.model}` : "";
-        agentLines.push(
-          `${c.childId} [agent] ${c.status} (run=${c.runId}) "${c.name} (${c.agent})${model}"`,
-        );
+      let connected: Set<string> | undefined;
+      try {
+        const sessions = await client.sessions();
+        connected = new Set(sessions.filter((s) => s.connected).map((s) => s.session_id));
+        const own = deps.sessionId?.();
+        if (own) connected.add(own);
+      } catch {
+        const own = deps.sessionId?.();
+        connected = own ? new Set([own]) : undefined;
       }
-      // Disk records: other sessions / already-terminal children when all=true.
       if (deps.home) {
         const disk = loadAgentChildRecords(deps.home, {
           sessionId: params.all === true ? undefined : deps.sessionId?.(),
           includeTerminal: params.all === true,
+          ...(connected ? { connectedSessionIds: connected } : {}),
         });
         for (const rec of disk) {
-          if (liveIds.has(rec.child_id)) continue;
+          if (liveIds.has(rec.child_id) || seen.has(rec.child_id)) continue;
           if (!params.all && !isAgentStatusActive(rec.status)) continue;
           agentLines.push(
             `${rec.child_id} [agent] ${rec.status} (run=${rec.run_id}) "${formatAgentCommand(rec).replace(/^agent:/, "")}"`,
@@ -104,25 +148,17 @@ export function createTaskListTool(
         }
       }
 
-      if (tasks.length === 0 && agentLines.length === 0) {
+      if (lines.length === 0 && agentLines.length === 0) {
         return {
           content: [{ type: "text", text: "No tasks." }],
           details: { tasks: [], agents: [] },
         };
       }
-      const running = tasks.filter((t) => t.status === "running").length;
-      const header =
-        `${tasks.length} shell/monitor task(s) (${running} running), ` +
-        `${agentLines.length} subagent(s):`;
-      const lines: string[] = [];
-      if (tasks.length > 0) {
-        lines.push("## shell / monitor", ...tasks.map(formatTaskLine));
-      }
-      if (agentLines.length > 0) {
-        lines.push("## subagents", ...agentLines);
-      }
+      const header = `${lines.length + agentLines.length} background item(s):`;
+      const body = [...lines];
+      if (agentLines.length > 0) body.push("## other sessions", ...agentLines);
       return {
-        content: [{ type: "text", text: [header, ...lines].join("\n") }],
+        content: [{ type: "text", text: [header, ...body].join("\n") }],
         details: { tasks, agents: agentLines },
       };
     },
@@ -165,6 +201,21 @@ export function createTaskOutputTool(
     promptSnippet: "Read background task output",
     parameters: taskOutputParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const agentText = agentTextFor(deps, params.task_id);
+      if (agentText !== undefined) {
+        const body = agentText || "(no output yet)";
+        return {
+          content: [{ type: "text", text: body }],
+          details: {
+            task_id: params.task_id,
+            status: deps.getIndex?.()?.get(params.task_id)?.status ?? "unknown",
+            exit_code: null,
+            cursor: 0,
+            next_cursor: 0,
+            total_size: body.length,
+          },
+        };
+      }
       const client = await requireClient(deps);
       const maxBytes =
         params.max_bytes !== undefined && params.max_bytes > 0
@@ -212,6 +263,17 @@ export function createTaskStopTool(
     promptSnippet: "Stop a background task",
     parameters: taskStopParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx: ExtensionContext) {
+      const agent = deps.getRegistry?.()?.handle(params.task_id);
+      if (agent || params.task_id.startsWith("ch_") || deps.getIndex?.()?.get(params.task_id)?.kind === "agent") {
+        if (!agent) {
+          throw new Error(`no live subagent ${params.task_id}`);
+        }
+        await agent.interrupt();
+        return {
+          content: [{ type: "text", text: `Subagent ${params.task_id} interrupted.` }],
+          details: { task_id: params.task_id, stopped: true },
+        };
+      }
       const client = await requireClient(deps);
       await client.stop(params.task_id);
       return {
