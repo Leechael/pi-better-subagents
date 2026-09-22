@@ -7,7 +7,7 @@
  * can copy the visible text.
  */
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { loadPiTui } from "./pi-tui-load";
+import { fitLines, loadPiTui, truncateToWidth } from "./pi-tui-load";
 
 export type TaskLogTab = "output" | "stderr";
 
@@ -22,17 +22,13 @@ export interface ScrollDetailOptions {
   followEnd?: boolean;
 }
 
-function wrapLines(text: string, width: number): string[] {
-  const limit = Math.max(1, width);
-  const out: string[] = [];
-  for (const raw of text.split("\n")) {
-    if (raw.length <= limit) {
-      out.push(raw);
-      continue;
-    }
-    for (let i = 0; i < raw.length; i += limit) out.push(raw.slice(i, i + limit));
-  }
-  return out.length > 0 ? out : [""];
+/** Wrap on visible width. ANSI is preserved; CJK is not split by JS length. */
+export function wrapLines(text: string, width: number): string[] {
+  return fitLines(text, Math.max(1, width));
+}
+
+export function fitTitle(title: string, width: number): string {
+  return truncateToWidth(title, Math.max(1, width), "…");
 }
 
 export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDetailOptions): Promise<void> {
@@ -84,7 +80,7 @@ export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDe
 
           const dim = (s: string) => theme.fg("dim", s);
           const accent = (s: string) => theme.fg("accent", s);
-          const head = accent(options.title);
+          const head = accent(fitTitle(options.title, Math.max(1, width - 2)));
           const tabLine = options.tabs
             ? `${tab === "output" ? accent("▸ output") : dim("  output")}    ${
                 tab === "stderr" ? accent("▸ stderr") : dim("  stderr")

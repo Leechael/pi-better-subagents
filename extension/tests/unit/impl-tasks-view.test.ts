@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { formatConversation, turnsFromMessages } from "../../src/subagent/conversation";
 import { stderrPathFor } from "../../src/tui/task-output-paths";
 import { formatWorkRows, moveSelection, stopChoice } from "../../src/tui/tasks-command";
+import { wrapLines } from "../../src/tui/scroll-detail-view";
 import { WorkIndex, type WorkItem } from "../../src/work-index";
 
 function item(id: string, status: string): WorkItem {
@@ -81,4 +82,10 @@ describe("tasks view", () => {
     expect(stderrPathFor("/tmp/tasks/sh_ab.output")).toBe("/tmp/tasks/sh_ab.stderr");
   });
 
+  it("wraps ANSI and CJK by visible width", () => {
+    const colored = `\x1b[31m${"字".repeat(10)}\x1b[0m`;
+    const lines = wrapLines(colored, 4);
+    expect(lines.length).toBeGreaterThan(1);
+    for (const line of lines) expect(line).not.toMatch(/\uFFFD/);
+  });
 });

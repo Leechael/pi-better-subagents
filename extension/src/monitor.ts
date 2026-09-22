@@ -12,6 +12,7 @@ import { formatMonitorEvent } from "./format";
 import type { ManagerClient, ManagerEvent } from "./manager-client";
 import { LineBatcher, RateLimiter } from "./monitor-batching";
 import type { NotifyCenter } from "./notify";
+import { statusGlyph, toolComponent } from "./tui/tool-component";
 
 export const MONITOR_EVENT_CUSTOM_TYPE = "pbs-monitor-event";
 
@@ -325,17 +326,19 @@ export function createMonitorTool(
     },
     renderCall(args, theme) {
       const desc = String((args as { description?: string }).description ?? "monitor");
-      return {
-        render: () => [`${theme.fg("toolTitle", "Monitor")} ${theme.fg("muted", desc)}`],
-      } as never;
+      return toolComponent([
+        `${theme.fg("toolTitle", "Monitor")} ${theme.fg("muted", desc)}`,
+      ]) as never;
     },
     renderResult(result, { expanded }, theme) {
       const text = result.content
         .filter((c): c is { type: "text"; text: string } => c.type === "text")
         .map((c) => c.text)
         .join("\n");
-      const line = `${theme.fg("success", "✓")} ${text}${expanded ? "" : theme.fg("dim", "  · ↓ manage via /tasks")}`;
-      return { render: () => [line] } as never;
+      const failed = /\b(failed|killed|orphaned|error)\b/i.test(text);
+      const { color, glyph } = statusGlyph(failed ? "failed" : "completed", failed);
+      const line = `${theme.fg(color as "error", glyph)} ${text}${expanded ? "" : theme.fg("dim", "  · ↓ manage via /tasks")}`;
+      return toolComponent([line]) as never;
     },
   };
 }
