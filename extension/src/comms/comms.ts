@@ -148,8 +148,13 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
         child.status === "failed" ||
         child.status === "interrupted"
       ) {
-        // §4.7: messaging a finished child resumes it (fire-and-resume).
-        await child.handle.resume(message);
+        // Lifecycle (resume) belongs to the subagent tool. Resuming here never
+        // wired a completion wake, so the parent hung.
+        throw new Error(
+          `Child ${toChildId} (${child.name}) has finished (${child.status}). ` +
+            `agent_message does not resume children. ` +
+            `Use subagent({ action: "resume", run_id: "${child.runId}", child_id: "${toChildId}", message: "..." }).`,
+        );
       } else {
         throw new Error(
           `Child ${toChildId} (${child.name}) is ${child.status}; ` +

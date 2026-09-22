@@ -267,7 +267,7 @@ export function formatSubagentHandover(info: SubagentHandoverInfo): string {
     "Subagent handover (system wake — not a new user message). " +
       "One subagent finished while others are still running. " +
       "Read <prompt> and <result> now, then continue the work: " +
-      "use agent_message to resume this child or steer the ones still running. " +
+      "use subagent({ action: \"resume\", run_id, child_id, message }) for this child, or agent_message to steer the ones still running. " +
       "Do not wait for the rest of the run. Do not merely acknowledge.",
     "<subagent-handover>",
     `  <run-id>${escapeXml(info.runId)}</run-id>`,

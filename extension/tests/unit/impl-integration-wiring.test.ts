@@ -83,7 +83,7 @@ describe("registry-host adapter over a real registry", () => {
 });
 
 describe("comms tools over the real registry", () => {
-  it("parent send steers a running child; send to a terminal child resumes it", async () => {
+  it("parent send steers a running child; send to a terminal child does not resume it", async () => {
     const { registry, factory, comms, host } = makeStack();
     factory.autoComplete = null;
     const run = registry.createRun("tasks");
@@ -102,8 +102,8 @@ describe("comms tools over the real registry", () => {
     const r2 = (await execTool(tool, { action: "send", to: "alpha", message: "now docs" })) as {
       details: { ok: boolean };
     };
-    expect(r2.details.ok).toBe(true);
-    expect(factory.sessions[0].prompts).toEqual(["do alpha", "now docs"]);
+    expect(r2.details.ok).toBe(false);
+    expect(factory.sessions[0].prompts).toEqual(["do alpha"]);
   });
 
   it("need_decision blocks the child until the parent replies via the tool", async () => {

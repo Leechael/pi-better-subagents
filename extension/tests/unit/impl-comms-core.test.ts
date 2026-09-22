@@ -226,16 +226,17 @@ describe("send", () => {
   });
 
   it.each(["completed", "failed", "interrupted"] as const)(
-    "terminal (%s) child is resumed with the message",
+    "terminal (%s) child is not resumed; the error points at subagent resume",
     async (status) => {
       const host = new FakeHost();
       const calls = host.add("ch_a", "run_1", "explorer", status);
       const comms = createComms(host);
 
-      await comms.send("ch_a", "one more thing", "steer");
-      expect(calls.resume).toEqual(["one more thing"]);
+      await expect(comms.send("ch_a", "one more thing", "steer")).rejects.toThrow(
+        /subagent\(\{ action: "resume", run_id: "run_1", child_id: "ch_a"/,
+      );
+      expect(calls.resume).toEqual([]);
       expect(calls.steer).toEqual([]);
-      expect(calls.followUp).toEqual([]);
     },
   );
 

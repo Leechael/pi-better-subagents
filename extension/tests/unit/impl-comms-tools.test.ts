@@ -171,7 +171,7 @@ describe("agent_message tool (parent sender)", () => {
     expect(b.steer).toEqual([]);
   });
 
-  it("send to a finished child resumes it", async () => {
+  it("send to a finished child errors and points at subagent resume", async () => {
     const { tool, host } = setup();
     const res = await tool.execute(
       "t3",
@@ -180,9 +180,10 @@ describe("agent_message tool (parent sender)", () => {
       undefined,
       CTX,
     );
-    expect(res.details).toMatchObject({ ok: true });
-    expect(host.calls.get("ch_c")!.resume).toEqual(["again please"]);
-    expect(textOf(res)).toContain("resumed");
+    expect(res.details).toMatchObject({ ok: false });
+    expect(host.calls.get("ch_c")!.resume).toEqual([]);
+    expect(textOf(res)).toContain('action: "resume"');
+    expect(textOf(res)).toContain("ch_c");
   });
 
   it("send without to or message returns a clear error text", async () => {

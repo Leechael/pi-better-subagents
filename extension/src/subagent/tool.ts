@@ -425,8 +425,8 @@ export function createSubagentTool(
           text:
             `Started ${items.length} subagent(s) in run ${run.runId}. ${reason}\n` +
             `While others are still running, each finished subagent arrives as <subagent-handover> ` +
-            `with that child's prompt and result. Read it and continue: agent_message resume for that child, ` +
-            `or steer the ones still running. Do not wait for the whole run. Do not poll. ` +
+            `with that child's prompt and result. Read it and continue: subagent({action:"resume", run_id, child_id, message}) for that child, ` +
+            `or agent_message to steer the ones still running. Do not wait for the whole run. Do not poll. ` +
             `<subagent-notification> arrives when every subagent in the run has finished. ` +
             `Use subagent({action:"get", run_id:"${run.runId}"}) if you need the full record.`,
         },
@@ -624,7 +624,7 @@ export function createSubagentTool(
       "Never poll or sleep to wait. Use action=list/get/status/interrupt/resume/steer to manage existing runs.",
     promptSnippet: "Fan out subagents in parallel or sequence them in a chain",
     promptGuidelines: [
-      "When a <subagent-handover> arrives, read <prompt> and <result> immediately and continue: agent_message resume for that child, or steer children that are still running. Do not wait for the rest of the run.",
+      'When a <subagent-handover> arrives, read <prompt> and <result> immediately and continue: subagent({action:"resume", run_id, child_id, message}) for that child, or agent_message to steer children that are still running. Do not wait for the rest of the run.',
       "Subagent runs that exceed the foreground budget continue in the background; you are notified per finished child and again when the run completes — do not poll.",
       "A failed subagent does not fail the whole run; inspect per-subagent sections in the result.",
       "<subagent-handover> and <subagent-notification> are system wakes, not user replies.",

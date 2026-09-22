@@ -95,7 +95,7 @@ const agentMessageParameters = Type.Object({
     Type.Union([Type.Literal("steer"), Type.Literal("queue")], {
       description:
         '"steer" (default) injects into a running child immediately; "queue" delivers after ' +
-        "its current turn. Sending to a finished child always resumes it.",
+        'its current turn. Sending to a finished child is an error — resume with subagent({action:"resume"}).',
     }),
   ),
 });
@@ -209,11 +209,13 @@ export function createAgentMessageTool(
     label: "Agent Message",
     description: isChild
       ? "Message sibling subagents in your run, or list pending requests. " +
-        '"send" delivers to a running sibling (or resumes a finished one); ' +
+        '"send" delivers to a running sibling. Sending to a finished sibling errors and does not resume it; ' +
+        'resume with subagent({ action: "resume", run_id, child_id, message }). ' +
         '"broadcast" steers every running sibling in your run; "list" shows pending ' +
         "decision requests and recent traffic. Cross-run messaging is rejected."
       : "Message your subagents. " +
-        '"send" steers/queues a running child (or resumes a finished one); ' +
+        '"send" steers or queues a running child. Sending to a finished child errors ' +
+        '(it does not resume) and points at subagent({ action: "resume", run_id, child_id, message }). ' +
         '"reply" answers a child\'s pending decision request; "broadcast" steers every ' +
         'running child of a run (to = run_id); "list" shows children, pending decision ' +
         "requests, and recent traffic.",
@@ -325,11 +327,7 @@ export function createAgentMessageTool(
         });
       }
       const how =
-        target.status === "running"
-          ? delivery === "steer"
-            ? "steered into the running child"
-          : "queued for the running child"
-        : "sent; the finished child is resumed with it";
+        delivery === "steer" ? "steered into the running child" : "queued for the running child";
       return okResult("send", `Message to ${target.childId} (${target.name}) ${how}.`, {
         to: target.childId,
         delivery,
