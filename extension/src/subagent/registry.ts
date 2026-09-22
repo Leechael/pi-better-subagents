@@ -17,6 +17,7 @@
  * Zero pi dependency.
  */
 import { randomBytes } from "node:crypto";
+import { Effect } from "./effect-imports";
 import type {
   ChildHandle,
   ChildResult,
@@ -183,14 +184,14 @@ export class SubagentRegistry implements RunRegistry {
   private readonly runs = new Map<string, InternalRun>();
   private readonly children = new Map<string, InternalChild>();
   private readonly transitionCbs = new Set<(run: RunRecord) => void>();
-  private activeSlots = 0;
-  private readonly slotWaiters: (() => void)[] = [];
+  private readonly slots: Effect.Semaphore;
   private spawnTimes: number[] = [];
 
   constructor(opts: SubagentRegistryOptions = {}) {
     this.maxChildren = opts.maxConcurrentChildren ?? 8;
     this.spawnBudget = opts.spawnBudgetPerHour ?? 32;
     this.now = opts.now ?? Date.now;
+    this.slots = Effect.runSync(Effect.makeSemaphore(this.maxChildren));
   }
 
   /** Late-bound to break the registry <-> runner construction cycle. */
@@ -524,23 +525,11 @@ export class SubagentRegistry implements RunRegistry {
   }
 
   private acquireSlot(): Promise<void> {
-    if (this.activeSlots < this.maxChildren) {
-      this.activeSlots++;
-      return Promise.resolve();
-    }
-    return new Promise((resolve) => {
-      this.slotWaiters.push(resolve);
-    });
+    return Effect.runPromise(this.slots.take(1)).then(() => undefined);
   }
 
   private releaseSlot(): void {
-    const next = this.slotWaiters.shift();
-    if (next) {
-      // Hand the slot off directly; the count stays at the cap.
-      next();
-    } else {
-      this.activeSlots = Math.max(0, this.activeSlots - 1);
-    }
+    Effect.runSync(this.slots.release(1));
   }
 }
 
