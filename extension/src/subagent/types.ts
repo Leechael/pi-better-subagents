@@ -87,6 +87,9 @@ export interface ChildSessionAdapter {
   waitForIdle(): Promise<void>;
   getLastAssistantText(): string | undefined;
   getConversation(): ConversationTurn[];
+  /** Introspection for child-session orchestration and contract tests. */
+  getActiveToolNames?(): string[];
+  getSystemPrompt?(): string;
   isStreaming(): boolean;
   subscribe(listener: (event: { type: string }) => void): () => void;
   dispose(): void;

@@ -168,6 +168,8 @@ function wrapSession(
     waitForIdle: () => session.waitForIdle(),
     getLastAssistantText: () => session.getLastAssistantText(),
     getConversation: () => turnsFromMessages(session.messages),
+    getActiveToolNames: () => session.getActiveToolNames(),
+    getSystemPrompt: () => session.systemPrompt,
     isStreaming: () => session.isStreaming,
     subscribe: (listener) => session.subscribe((event) => listener({ type: event.type })),
     dispose: () => session.dispose(),
