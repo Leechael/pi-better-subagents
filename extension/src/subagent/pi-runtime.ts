@@ -39,6 +39,12 @@ type Model = NonNullable<ExtensionContext["model"]>;
 export interface PiRuntimeDeps {
   /** Parent session model registry (ctx.modelRegistry). */
   getModelRegistry: () => ModelRegistry | null;
+  /**
+   * Parent ModelRuntime, including providers registered by other extensions.
+   * createAgentSession without this builds a fresh runtime and fails those
+   * providers with "No API key found".
+   */
+  getModelRuntime?: () => unknown;
   /** Parent session current model (ctx.model) — default for children. */
   getParentModel: () => Model | undefined;
   /** Parent session thinking level (ctx.thinkingLevel). */
@@ -167,6 +173,32 @@ function wrapSession(
   };
 }
 
+/** Options passed to createAgentSession. Tested without loading pi. */
+export function childSessionCreateOptions(input: {
+  cwd: string;
+  model: unknown;
+  thinkingLevel: unknown;
+  tools?: string[];
+  customTools?: unknown[];
+  modelRuntime?: unknown;
+}): {
+  cwd: string;
+  model: unknown;
+  thinkingLevel: unknown;
+  tools?: string[];
+  customTools?: unknown[];
+  modelRuntime?: unknown;
+} {
+  return {
+    cwd: input.cwd,
+    model: input.model,
+    thinkingLevel: input.thinkingLevel,
+    ...(input.tools && input.tools.length > 0 ? { tools: input.tools } : {}),
+    ...(input.customTools && input.customTools.length > 0 ? { customTools: input.customTools } : {}),
+    ...(input.modelRuntime ? { modelRuntime: input.modelRuntime } : {}),
+  };
+}
+
 /**
  * Build the CreateSessionFn for InProcessRunner. All deps are getters so
  * model/cwd changes in the parent session are picked up per child.
@@ -180,14 +212,19 @@ export function createPiSessionFn(deps: PiRuntimeDeps): CreateSessionFn {
       req.agent.thinking ??
       deps.getParentThinkingLevel();
     const customTools = deps.customTools?.(req) ?? [];
-    const { session } = await pi.createAgentSession({
+    const modelRuntime = deps.getModelRuntime?.();
+    const options = childSessionCreateOptions({
       cwd: deps.getCwd(),
       model: resolved.model,
       thinkingLevel,
       tools: req.agent.tools.length > 0 ? [...req.agent.tools] : undefined,
       customTools: customTools.length > 0 ? customTools : undefined,
-      sessionManager: pi.SessionManager.inMemory(deps.getCwd()),
+      modelRuntime,
     });
+    const { session } = await pi.createAgentSession({
+      ...options,
+      sessionManager: pi.SessionManager.inMemory(deps.getCwd()),
+    } as never);
     const resolvedModel = resolved.model
       ? `${resolved.model.provider}/${resolved.model.id}`
       : undefined;

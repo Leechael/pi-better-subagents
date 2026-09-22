@@ -4,6 +4,7 @@ import {
   BEHAVIOR_GUIDELINES_SECTION,
   wakePromptFromSections,
 } from "../../src/behavior-guidelines";
+import { childSessionCreateOptions } from "../../src/subagent/pi-runtime";
 
 describe("wake turns keep behavior guidelines", () => {
   it("writes a persistent section and does not replace other extensions' sections", () => {
@@ -16,6 +17,21 @@ describe("wake turns keep behavior guidelines", () => {
     expect(wake).toContain("<task-notification>");
     expect(wake).toContain("other_extension");
     expect(wake).not.toContain("forceSystemPrompt");
+  });
+});
+
+describe("child sessions reuse the parent model runtime", () => {
+  it("passes the parent's modelRuntime into createAgentSession options", () => {
+    const runtime = { id: "parent-runtime" };
+    const options = childSessionCreateOptions({
+      cwd: "/tmp",
+      model: { provider: "ext", id: "custom" },
+      thinkingLevel: "low",
+      tools: ["read"],
+      modelRuntime: runtime,
+    });
+    expect(options.modelRuntime).toBe(runtime);
+    expect(options.cwd).toBe("/tmp");
   });
 });
 

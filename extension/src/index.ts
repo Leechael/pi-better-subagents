@@ -304,6 +304,10 @@ export default function (pi: ExtensionAPI): void {
     }
     const createSession = createPiSessionFn({
       getModelRegistry: () => ctx?.modelRegistry ?? null,
+      getModelRuntime: () => {
+        const registry = ctx?.modelRegistry as { runtime?: unknown } | null | undefined;
+        return registry?.runtime;
+      },
       getParentModel: () => ctx?.model,
       getParentThinkingLevel: () => ctx?.thinkingLevel,
       getScopedModels: () => ctx?.scopedModels ?? [],
