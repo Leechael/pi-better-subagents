@@ -300,7 +300,7 @@ export default function (pi: ExtensionAPI): void {
       void monitorRegistry?.rewatchAll();
     });
 
-    // M3: subagent registry + in-process runner + fleet widget. The runner's
+    // M3: subagent registry + Effect runner + fleet widget. The runner's
     // per-generation admission goes through the registry (global concurrency
     // cap); the session factory resolves models/cwd lazily from ctx.
     const registry = new SubagentRegistry({

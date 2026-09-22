@@ -110,6 +110,43 @@ describe("EffectChildRunner with TestClock", () => {
     expect(result.outcome).toMatchObject({ status: "failed", error: "stalled" });
   });
 
+  it("does not rearm a stall watchdog from events after settlement", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = "quick";
+    const result = await runWithTestClock((clock) =>
+      Effect.gen(function* () {
+        const runner = new EffectChildRunner({ createSession: factory.fn, stallMs: 500, clock });
+        const handle = yield* Effect.promise(() => runner.start(request({ timeoutMs: 0 })));
+        const outcome = yield* Effect.promise(() => handle.result);
+        factory.sessions[0].event();
+        yield* clock.adjust(1_000);
+        yield* flushQueuedTimerCallback();
+        return { outcome, status: handle.status() };
+      }),
+    );
+    expect(result.outcome).toMatchObject({ status: "completed", text: "quick" });
+    expect(result.status).toBe("completed");
+  });
+
+  it("updates lastEventAt from child activity using the injected clock", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = null;
+    const result = await runWithTestClock((clock) =>
+      Effect.gen(function* () {
+        const runner = new EffectChildRunner({ createSession: factory.fn, stallMs: 2_000, clock });
+        const handle = yield* Effect.promise(() => runner.start(request({ timeoutMs: 0 })));
+        const atStart = handle.lastEventAt();
+        yield* clock.adjust(200);
+        factory.sessions[0].event();
+        const afterEvent = handle.lastEventAt();
+        factory.sessions[0].complete();
+        yield* Effect.promise(() => handle.result);
+        return { atStart, afterEvent };
+      }),
+    );
+    expect(result.afterEvent).toBeGreaterThan(result.atStart);
+  });
+
   it("starts an independently timed generation after a timeout and resume", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = null;

@@ -43,7 +43,7 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
     ├─ bash 覆盖 ────► manager client ───────────┤─ 事件推送 (task_started/exited/output)
     ├─ monitor 工具 ──► start + watch 输出流       └─ 生命周期: 连接归零 → 清算退出
     ├─ task_list/output/stop
-    ├─ subagent 工具 ──► ChildRunner 接缝 (v1: InProcessRunner)
+    ├─ subagent 工具 ──► ChildRunner 接缝 (当前实现: EffectChildRunner)
     ├─ comms ──► 进程内 mailbox (contact_supervisor / agent_message)
     └─ NotifyCenter ──► 唯一注入出口 (triggerTurn/steer)
 ```
@@ -346,7 +346,7 @@ export const PBS_WAKE_LEAD_IN =
 
 ### 4.6 subagent 工具 (M3)
 
-模块: `src/subagent/`(types.ts / runner.ts / registry.ts / pool.ts / tool.ts / child-bash.ts / pi-runtime.ts / fleet-widget.ts)
+模块: `src/subagent/`(types.ts / effect-runner.ts / registry.ts / pool.ts / tool.ts / child-bash.ts / pi-runtime.ts / fleet-widget.ts)
 
 **pi 运行时隔离铁律**: `createAgentSession` 只能在 `pi-runtime.ts` 里 **动态 import**(`await import("@earendil-works/pi-coding-agent")`),其余所有模块零运行时 pi 依赖(可 `import type`)。runner 通过注入的 `CreateSessionFn` 工厂创建子会话,测试用 fake。动态 import 失败时 subagent 工具返回明确错误文本,不影响其他工具。
 
