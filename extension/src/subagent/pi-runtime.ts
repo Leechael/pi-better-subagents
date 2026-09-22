@@ -11,10 +11,10 @@
  * allowlist plus injected custom tools (child bash, M4 comms), and wraps it
  * into a ChildSessionAdapter.
  *
- * Child sessions never bind extensions (createAgentSession only returns
- * extensionsResult; binding is a separate explicit step we skip), so the
- * subagent tool itself is never present in a child session — the depth-1 cap
- * holds by construction.
+ * Child sessions receive an isolated DefaultResourceLoader with extensions
+ * disabled; createAgentSession binds whatever the loader returns. Thus the
+ * subagent tool is never present in a child session — the depth-1 cap holds
+ * by construction.
  */
 import type {
   ExtensionContext,
@@ -175,6 +175,26 @@ function wrapSession(
 }
 
 /** Options passed to createAgentSession. Tested without loading pi. */
+export function childResourceLoaderOptions(input: { cwd: string; agentDir: string }): {
+  cwd: string;
+  agentDir: string;
+  noExtensions: true;
+  noSkills: true;
+  noPromptTemplates: true;
+  noThemes: true;
+  noContextFiles: true;
+} {
+  return {
+    cwd: input.cwd,
+    agentDir: input.agentDir,
+    noExtensions: true,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+  };
+}
+
 export function childSessionCreateOptions(input: {
   cwd: string;
   model: unknown;
@@ -182,6 +202,7 @@ export function childSessionCreateOptions(input: {
   tools?: string[];
   customTools?: unknown[];
   modelRuntime?: unknown;
+  resourceLoader?: unknown;
 }): {
   cwd: string;
   model: unknown;
@@ -189,6 +210,7 @@ export function childSessionCreateOptions(input: {
   tools?: string[];
   customTools?: unknown[];
   modelRuntime?: unknown;
+  resourceLoader?: unknown;
 } {
   const tools = input.tools && input.tools.length > 0 ? [...input.tools] : undefined;
   const customTools = input.customTools?.map((customTool) => {
@@ -214,6 +236,7 @@ export function childSessionCreateOptions(input: {
     ...(tools ? { tools } : {}),
     ...(customTools && customTools.length > 0 ? { customTools } : {}),
     ...(input.modelRuntime ? { modelRuntime: input.modelRuntime } : {}),
+    ...(input.resourceLoader ? { resourceLoader: input.resourceLoader } : {}),
   };
 }
 
@@ -229,19 +252,25 @@ export function createPiSessionFn(deps: PiRuntimeDeps): CreateSessionFn {
       (resolved.thinkingOverride as ExtensionContext["thinkingLevel"]) ??
       req.agent.thinking ??
       deps.getParentThinkingLevel();
+    const cwd = deps.getCwd();
+    const resourceLoader = new pi.DefaultResourceLoader(
+      childResourceLoaderOptions({ cwd, agentDir: pi.getAgentDir() }),
+    );
+    await resourceLoader.reload();
     const customTools = deps.customTools?.(req) ?? [];
     const modelRuntime = deps.getModelRuntime?.();
     const options = childSessionCreateOptions({
-      cwd: deps.getCwd(),
+      cwd,
       model: resolved.model,
       thinkingLevel,
       tools: req.agent.tools.length > 0 ? [...req.agent.tools] : undefined,
       customTools: customTools.length > 0 ? customTools : undefined,
       modelRuntime,
+      resourceLoader,
     });
     const { session } = await pi.createAgentSession({
       ...options,
-      sessionManager: pi.SessionManager.inMemory(deps.getCwd()),
+      sessionManager: pi.SessionManager.inMemory(cwd),
     } as never);
     const resolvedModel = resolved.model
       ? `${resolved.model.provider}/${resolved.model.id}`

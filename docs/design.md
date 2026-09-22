@@ -377,6 +377,7 @@ subagent({
 - 单个子代理失败不拖垮整组: 结果数组该项标 `status:"failed", error`;fail_fast=true 时取消未启动项
 - 结果文本: 每个子代理取 `session.getLastAssistantText()`;空 → "(no output)"
 - 深度: 扩展记录自身 depth(主=0);子会话工具集中**不含 subagent**(depth 1 硬上限,v1 不开放更深)
+- **child session isolation**: `createPiSessionFn` 显式传入 `DefaultResourceLoader({ cwd, agentDir, noExtensions:true, noSkills:true, noPromptTemplates:true, noThemes:true, noContextFiles:true })`;不加载 user/project extensions、skills、prompt templates、themes 或 context files。特别是不能加载父 extension,否则它的 session_start / before_agent_start 会把 parent wake guidelines 注入 child prompt。child 仍单独注入 `CHILD_BEHAVIOR_GUIDELINES`;没有配置开关。
 - 子代理 bash: `child-bash.ts` 禁后台变体——schema 无 `run_in_background`;execute 走 manager start + wait(timeout_ms 全程),到期 SIGKILL 并返回超时错误(不转后台);裸 sleep 拦截规则与主 bash 相同
 - 限制: 全局并发 8(跨 run);stall watchdog——子代理 10min 无任何事件 → abort 标记 `failed (stalled)`;session 级 spawn 预算 32 个子代理/小时,超限报错
 - 管理 action: `list`(本 session 全部 run + 状态), `get`(run_id → 完整结果), `status`(run_id → 每子代理状态/耗时/最后事件), `interrupt`(abort 子代理或整 run), `steer`(运行中子代理 → `session.steer(message)`), `resume`(已结束子代理 → `session.prompt(message)` 续跑, 结果完成时再通知), **`models`(列出可指定的模型, 供调用前自查)**
