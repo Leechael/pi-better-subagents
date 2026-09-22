@@ -407,6 +407,7 @@ pub async fn cmd_output(
     follow: bool,
     max_bytes: u64,
 ) -> Result<(), String> {
+    let task_id = resolve_cli_task_id(home, task_id).await?;
     let mut conn = connect(home, &HelloMode::Cli).await?;
     let mut cursor = 0u64;
     let stdout = std::io::stdout();
@@ -439,6 +440,7 @@ pub async fn cmd_output(
 }
 
 pub async fn cmd_stop(home: &Path, task_id: &str) -> Result<(), String> {
+    let task_id = resolve_cli_task_id(home, task_id).await?;
     let mut conn = connect(home, &HelloMode::Cli).await?;
     let _: UnitOk = conn
         .roundtrip(RequestKind::Stop {
@@ -530,6 +532,7 @@ pub async fn cmd_start(
 
 /// Extra CLI convenience (not in §3.5): budget-wait on a task.
 pub async fn cmd_wait(home: &Path, task_id: &str, budget_ms: u64) -> Result<(), String> {
+    let task_id = resolve_cli_task_id(home, task_id).await?;
     let mut conn = connect(home, &HelloMode::Cli).await?;
     let res: WaitOk = conn
         .roundtrip(RequestKind::Wait {
@@ -667,6 +670,19 @@ async fn cmd_log_task(
     // keep an idle hello slot open for the whole -f session.
     drop(conn);
     tail_file(&path, follow, lines).await
+}
+
+/// Fuzzy-resolve a task id the same way `log`/`tail` do (note on stderr).
+async fn resolve_cli_task_id(home: &Path, typed: &str) -> Result<String, String> {
+    let mut conn = connect(home, &HelloMode::Cli).await?;
+    let res: ListOk = conn
+        .roundtrip(RequestKind::List {
+            all: true,
+            session_id: None,
+        })
+        .await?;
+    let known: Vec<String> = res.tasks.iter().map(|t| t.task_id.clone()).collect();
+    resolve_task_id(typed, &known)
 }
 
 /// Resolve a user-typed task id against the known set.
