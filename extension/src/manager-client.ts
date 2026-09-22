@@ -232,6 +232,8 @@ export class ManagerClient {
   private intentionalClose = false;
   private rebound = false;
   private reconnecting: Promise<void> | null = null;
+  /** One in-flight connect shared by session_start and ensureAvailable. */
+  private connecting: Promise<boolean> | null = null;
   private lastFailureAt = 0;
   private lastFailureMessage = "";
 
@@ -260,6 +262,7 @@ export class ManagerClient {
    */
   async ensureAvailable(): Promise<boolean> {
     if (this.state === "connected") return true;
+    if (this.connecting) return this.connecting;
     if (this.reconnecting) {
       await this.reconnecting;
       return this.isAvailable();
@@ -287,18 +290,26 @@ export class ManagerClient {
    */
   async connect(): Promise<boolean> {
     if (this.state === "connected") return true;
+    if (this.connecting) return this.connecting;
     this.intentionalClose = false;
-    try {
-      await this.connectFlow(true);
-      this.state = "connected";
-      return true;
-    } catch (err) {
-      this.log(`connect failed: ${(err as Error).message}`);
-      this.state = "unavailable";
-      this.lastFailureAt = Date.now();
-      this.lastFailureMessage = (err as Error).message;
-      return false;
-    }
+    let run!: Promise<boolean>;
+    run = (async (): Promise<boolean> => {
+      try {
+        await this.connectFlow(true);
+        this.state = "connected";
+        return true;
+      } catch (err) {
+        this.log(`connect failed: ${(err as Error).message}`);
+        this.state = "unavailable";
+        this.lastFailureAt = Date.now();
+        this.lastFailureMessage = (err as Error).message;
+        return false;
+      } finally {
+        if (this.connecting === run) this.connecting = null;
+      }
+    })();
+    this.connecting = run;
+    return run;
   }
 
   /** Graceful session shutdown: stop all tasks of this session, then disconnect. */
@@ -503,11 +514,26 @@ export class ManagerClient {
   }
 
   private attachSocket(socket: net.Socket): void {
+    const previous = this.socket;
+    if (previous && previous !== socket) {
+      // Drop the old socket's handlers before it can close and tear down the new one.
+      previous.removeAllListeners();
+      previous.destroy();
+    }
     this.socket = socket;
     this.decoder.reset();
-    socket.on("data", (data) => this.onData(data));
-    socket.on("close", () => this.onClose());
-    socket.on("error", (err) => this.log(`socket error: ${err.message}`));
+    socket.on("data", (data) => {
+      if (this.socket !== socket) return;
+      this.onData(data);
+    });
+    socket.on("close", () => {
+      if (this.socket !== socket) return;
+      this.onClose();
+    });
+    socket.on("error", (err) => {
+      if (this.socket !== socket) return;
+      this.log(`socket error: ${err.message}`);
+    });
   }
 
   private detachSocket(): void {
@@ -569,7 +595,8 @@ export class ManagerClient {
     if (msg.type === "event") {
       const event = msg as unknown as ManagerEvent;
       if (event.event === "session_rebound") {
-        // Another connection claimed this session id; the server will close us.
+        // Only the socket that is still current lost the session. A stale
+        // hello's rebound must not disable reconnect on the winning socket.
         this.rebound = true;
       }
       for (const handler of this.eventHandlers) {

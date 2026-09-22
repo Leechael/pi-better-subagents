@@ -140,6 +140,15 @@ describe("ManagerClient (integration, fake manager)", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
+  it("dedupes a connect that overlaps session_start", async () => {
+    const [a, b] = await Promise.all([client.connect(), client.ensureAvailable()]);
+    expect(a).toBe(true);
+    expect(b).toBe(true);
+    expect(fake.received.filter((m) => m.type === "hello")).toHaveLength(1);
+    expect(fake.sockets.size).toBe(1);
+    expect(client.isAvailable()).toBe(true);
+  });
+
   it("connects and completes the hello handshake", async () => {
     expect(await client.connect()).toBe(true);
     expect(client.isAvailable()).toBe(true);
