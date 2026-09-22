@@ -21,6 +21,7 @@ import type {
   ModelRegistry,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { CHILD_BEHAVIOR_GUIDELINES } from "../behavior-guidelines";
 import {
   modelResolutionError,
   resolveModelSpec,
@@ -190,8 +191,18 @@ export function childSessionCreateOptions(input: {
   modelRuntime?: unknown;
 } {
   const tools = input.tools && input.tools.length > 0 ? [...input.tools] : undefined;
-  if (tools && input.customTools) {
-    for (const customTool of input.customTools) {
+  const customTools = input.customTools?.map((customTool) => {
+    const tool = customTool as { name?: unknown; promptGuidelines?: string[] };
+    if (tool.name === "contact_supervisor") {
+      return {
+        ...tool,
+        promptGuidelines: [...(tool.promptGuidelines ?? []), CHILD_BEHAVIOR_GUIDELINES],
+      };
+    }
+    return customTool;
+  });
+  if (tools && customTools) {
+    for (const customTool of customTools) {
       const name = (customTool as { name?: unknown }).name;
       if (typeof name === "string" && !tools.includes(name)) tools.push(name);
     }
@@ -201,7 +212,7 @@ export function childSessionCreateOptions(input: {
     model: input.model,
     thinkingLevel: input.thinkingLevel,
     ...(tools ? { tools } : {}),
-    ...(input.customTools && input.customTools.length > 0 ? { customTools: input.customTools } : {}),
+    ...(customTools && customTools.length > 0 ? { customTools } : {}),
     ...(input.modelRuntime ? { modelRuntime: input.modelRuntime } : {}),
   };
 }

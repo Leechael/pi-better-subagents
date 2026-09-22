@@ -8,6 +8,14 @@
  */
 export const BEHAVIOR_GUIDELINES_SECTION = "pi-better-subagents";
 
+/** Child-only instructions injected through the contact_supervisor tool guideline. */
+export const CHILD_BEHAVIOR_GUIDELINES = `## Child agent behavior (pi-better-subagents)
+
+- Do not background work; bash runs to completion.
+- When blocked, use contact_supervisor with need_decision; use progress_update for status.
+- Use agent_message only to communicate with siblings in this same run.
+- Your final message is your result.`;
+
 export const BEHAVIOR_GUIDELINES = `## Background tasks and notifications (pi-better-subagents)
 
 - Long-running bash commands are automatically moved to the background. After you background a command, end your turn — do not poll with task_output/task_list, and never sleep to wait. Each command notifies on its own via <pbs-wake kind="task"> (with <command> and <preview>), even while other commands are still running. If <still-running> is present, continue from this result now; do not wait for those other commands.
