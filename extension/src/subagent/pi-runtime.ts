@@ -189,11 +189,18 @@ export function childSessionCreateOptions(input: {
   customTools?: unknown[];
   modelRuntime?: unknown;
 } {
+  const tools = input.tools && input.tools.length > 0 ? [...input.tools] : undefined;
+  if (tools && input.customTools) {
+    for (const customTool of input.customTools) {
+      const name = (customTool as { name?: unknown }).name;
+      if (typeof name === "string" && !tools.includes(name)) tools.push(name);
+    }
+  }
   return {
     cwd: input.cwd,
     model: input.model,
     thinkingLevel: input.thinkingLevel,
-    ...(input.tools && input.tools.length > 0 ? { tools: input.tools } : {}),
+    ...(tools ? { tools } : {}),
     ...(input.customTools && input.customTools.length > 0 ? { customTools: input.customTools } : {}),
     ...(input.modelRuntime ? { modelRuntime: input.modelRuntime } : {}),
   };
