@@ -107,11 +107,12 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 
 **hello** — 连接后第一个消息,必须是它:
 ```json
-→ {"type":"hello", "client_kind":"extension", "session_id":"<pi session id>", "pi_pid":1234}
+→ {"type":"hello", "client_kind":"extension", "session_id":"<pi session id>", "pi_pid":1234, "cwd":"/path"}
 → {"type":"hello", "client_kind":"cli"}
 ← {"ok":true, "version":"0.1.0", "pid":4321, "started_at":1726...}
 ```
 - `extension` 必须带 `session_id` + `pi_pid`;此后该连接接收此 session 的事件
+- `cwd` 可选(向后兼容)。扩展在 hello 里带上 session cwd;manager 存入 session 并在 status/sessions 里返回。旧客户端省略该字段仍可握手
 - 同一 `session_id` 重复 hello: 新连接赢,旧连接收到 `{"type":"event","event":"session_rebound"}` 后由服务端关闭
 - `cli` 不带 session;可访问跨 session 的只读/管理操作
 
@@ -175,7 +176,7 @@ SIGTERM 进程组 → 2s → SIGKILL。终态 `killed`。
 ```json
 → {"type":"status"}
 ← {"ok":true, "version":"0.1.0", "pid":4321, "uptime_ms":3600000,
-   "sessions":[{"session_id":"...","pi_pid":1234,"connected":true}],
+   "sessions":[{"session_id":"...","pi_pid":1234,"connected":true,"cwd":"/path"}],
    "task_counts":{"running":2,"terminal":5}}
 ```
 

@@ -86,7 +86,7 @@ pbs-manager status
 
 ### `sessions`
 
-Table of connected pi sessions: `SESSION_ID`, `PI_PID`, connected flag.
+Table of pi sessions: `SESSION_ID`, `PI_PID`, `CONNECTED`, `CWD`. `CWD` comes from the extension hello (`cwd` is optional; older clients show `-`).
 
 ```bash
 pbs-manager sessions
@@ -104,7 +104,9 @@ pbs-manager list -a                 # include exited / terminal tasks
 pbs-manager ls --all
 ```
 
-Columns: `TASK_ID SESSION STATUS PID EXIT SIZE COMMAND`.
+Columns: `TASK_ID KIND SESSION STATUS PID EXIT SIZE COMMAND`.
+
+`KIND` is `shell`, `monitor`, or `agent`. Running monitors are ordinary manager tasks (`mon_…`) and appear in the default running list. Agent rows whose session is not connected are not shown as running.
 
 - `COMMAND` is the **first line only**, then truncated (~60 chars).
 - `EXIT` is an exit code, `sigN`, or `-` while running.
@@ -233,9 +235,9 @@ Prints `manager shutting down`. After ~5s with zero connections the daemon also 
 
 ---
 
-## Task id resolution (`log` / `tail` only)
+## Task id resolution (`log` / `tail` / `stop` / `wait` / `output`)
 
-When `log` or `tail` takes a `TASK_ID`, the typed string is resolved against the current task list:
+When a subcommand takes a `TASK_ID`, the typed string is resolved against the current task list:
 
 1. Exact id (`mon_e1351cb1`)
 2. Unique prefix / suffix / substring (`e1351cb1`, `mon_e135`)
@@ -243,7 +245,7 @@ When `log` or `tail` takes a `TASK_ID`, the typed string is resolved against the
 
 Ambiguous matches error with the candidate list. Unknown ids suggest the closest known id when possible. A successful fuzzy match prints `note: resolved '…' → '…'` on stderr.
 
-`stop`, `wait`, and `output` require the exact id.
+A successful fuzzy match prints `note: resolved '…' → '…'` on stderr (including `stop`, `wait`, and `output`).
 
 ## `log` / `tail` vs `output`
 
@@ -252,7 +254,7 @@ Ambiguous matches error with the candidate list. Unknown ids suggest the closest
 | Source | On-disk `.output` / `.stderr` | Protocol cursor (ring + file) |
 | Best for | Watching a build by hand | Scripts matching extension semantics |
 | Follow | File poll (~200ms) | Request loop until terminal |
-| Fuzzy ids | Yes | No |
+| Fuzzy ids | Yes | Yes |
 
 Merged stream = stdout + stderr tee’d into `<id>.output`. stderr is also mirrored to `<id>.stderr` for `--stderr`.
 

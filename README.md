@@ -50,7 +50,7 @@ subagent({ action: "list|get|status|interrupt|resume|steer|models", run_id?, chi
 ```
 - Synchronous wait up to 45s (`subagent.budgetMs`); on expiry the run continues in the background with a `run_id`, and completion arrives via `<subagent-notification>`. **Never poll.**
 - `model` accepts fuzzy specs (`"haiku"`, `"openai/gpt-5.2"`, `"luna:high"`); the candidate set respects pi's whitelist (`enabledModels` / `--models`). Use `action:"models"` to list selectable values before choosing.
-- Subagents run in-process via `createAgentSession`, capped at depth 1 (no nesting), with a no-background bash variant, and a 10-minute stall watchdog.
+- Subagents run in-process via `createAgentSession`, capped at depth 1 (no nesting), with a no-background bash variant. The stall watchdog is 5 minutes of inactivity, paused while a tool is executing or a `need_decision` is pending. The hard child timeout is 30 minutes. A decision request waits 10 minutes.
 
 ### monitor
 ```
@@ -65,7 +65,7 @@ Manage shell/monitor tasks held by the manager.
 ```
 agent_message({ action: "send|reply|broadcast|list", to?, message?, delivery?: "steer"|"queue" })
 ```
-Children additionally get `contact_supervisor({ reason: "need_decision"|"progress_update", message })` — `need_decision` blocks the child until the parent replies (10-minute timeout).
+Children additionally get `contact_supervisor({ reason: "need_decision"|"progress_update", message })` — `need_decision` blocks the child until the parent replies (10-minute timeout, `decisionTimeoutMs`). `agent_message` send to a finished child **errors** and tells you to resume with `subagent({ action: "resume", run_id, child_id, message })`. It does not resume the child.
 
 ## Agent definitions
 
@@ -89,10 +89,19 @@ You are a reviewer… (body = system prompt segment)
   "foregroundBudgetMs": 20000,
   "managerPath": null,
   "logLevel": "info",
-  "subagent": { "budgetMs": 45000, "timeoutMs": 600000, "stallMs": 600000,
+  "subagent": { "budgetMs": 45000, "timeoutMs": 1800000, "stallMs": 300000,
+                "decisionTimeoutMs": 600000,
                 "concurrency": 4, "maxConcurrentChildren": 8, "spawnBudgetPerHour": 32 }
 }
 ```
+
+Timeouts are staggered so they do not fire together:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `stallMs` | 300000 (5 min) | No session events. Paused during `tool_execution_start`…`end` and while a `need_decision` is pending. Streaming providers emit `message_update` on `thinking_delta` / `text_delta` (pi agent-loop), which resets this. Not every provider streams partial thinking, so 2 min can kill a slow reasoning turn; 5 min is the default. |
+| `decisionTimeoutMs` | 600000 (10 min) | Parent did not reply to `need_decision`. |
+| `timeoutMs` | 1800000 (30 min) | Hard cap on one child generation. |
 
 ## Manager CLI
 
@@ -112,9 +121,9 @@ Counts sit on one line under the editor. Inspection is `/tasks` (alias `/bashes`
 
 | Surface | Behavior |
 |---------|----------|
-| Fleet line (below editor) | `2 workers · 1 subagent · 1 monitor · 4 tasks` — counts only, no keys |
-| `/tasks` | Running subagents, monitors, and shell workers. View or stop |
-| Subagent view | That child's conversation. Stays listed after it finishes only while the view is open |
+| Fleet line (below editor) | `2 workers · 1 subagent · 1 monitor` — counts only, no total, no poll |
+| `/tasks` | Live list of shells, monitors, and subagents. ↑↓ select, Enter view, s stop, Esc close |
+| Finished items | Stay viewable for 10 minutes (cap 50). Sync-waited shells are not workers |
 | Monitor / shell view | Two pages: merged output, and stderr. Wheel / PgUp / PgDn scroll; terminal selection copies |
 | Transcript pills | Compact renderers for task / subagent / **monitor** / supervisor notifications |
 | Monitor events | Injected as `Monitor event: "desc"` + `<event>` body (model turn / steer); lifecycle (exit / timeout / rate-limit) also fires a TUI toast |
@@ -123,7 +132,7 @@ Counts sit on one line under the editor. Inspection is `/tasks` (alias `/bashes`
 Print mode (`pi -p`) skips widgets; notifications still inject as before.
 
 ```bash
-cd manager && cargo test                             # Rust: 24 unit + 12 protocol black-box
-cd extension && npx tsc --noEmit && npx vitest run   # TS: 253 tests
+cd manager && cargo test                             # Rust: 31 unit + 13 protocol (1 RSS test ignored)
+cd extension && npx tsc --noEmit && npx vitest run   # TS: 289 passed, 9 skipped
 PBS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts  # TS↔real daemon e2e (9)
 ```
