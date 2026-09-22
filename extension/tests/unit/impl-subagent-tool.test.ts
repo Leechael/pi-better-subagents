@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SubagentRegistry } from "../../src/subagent/registry";
-import { InProcessRunner } from "../../src/subagent/runner";
+import { EffectChildRunner } from "../../src/subagent/effect-runner";
 import { createSubagentTool } from "../../src/subagent/tool";
 import { PBS_WAKE_CUSTOM_TYPE } from "../../src/wake";
 import { SessionFactory, tick } from "./subagent-fakes";
@@ -10,7 +10,7 @@ function makeStack(opts: { budgetMs?: number; autoComplete?: string | null } = {
   const registry = new SubagentRegistry({});
   const factory = new SessionFactory();
   factory.autoComplete = opts.autoComplete === undefined ? "done" : opts.autoComplete;
-  const runner = new InProcessRunner({
+  const runner = new EffectChildRunner({
     createSession: factory.fn,
     acquire: (req) => registry.admitChild(req.childId),
   });

@@ -6,7 +6,7 @@
  * src/subagent/ is pi-free and testable with fakes.
  *
  * `createPiSessionFn(deps)` returns the CreateSessionFn injected into
- * InProcessRunner: it resolves the model spec against the parent's model
+ * the EffectChildRunner: it resolves the model spec against the parent's model
  * registry, creates an in-memory child AgentSession with the agent's tool
  * allowlist plus injected custom tools (child bash, M4 comms), and wraps it
  * into a ChildSessionAdapter.
@@ -243,7 +243,7 @@ export function childSessionCreateOptions(input: {
 }
 
 /**
- * Build the CreateSessionFn for InProcessRunner. All deps are getters so
+ * Build the CreateSessionFn for EffectChildRunner. All deps are getters so
  * model/cwd changes in the parent session are picked up per child.
  */
 export function createPiSessionFn(deps: PiRuntimeDeps): CreateSessionFn {
