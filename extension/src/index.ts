@@ -5,7 +5,7 @@
  * M2: NotifyCenter + monitor tool.
  * M3: subagent tool (InProcessRunner + tasks/chain + budget-to-async) + fleet widget.
  */
-import { readFileSync } from "node:fs";
+import { readFileTail } from "./file-tail";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -46,15 +46,12 @@ const BEHAVIOR_GUIDELINES = `## Background tasks and notifications (pi-better-su
 - Subagent runs that exceed the foreground budget continue in the background. Do not poll run status. If one subagent finishes while others are still running, a <subagent-handover> arrives with that child's <prompt> and <result>: read both, then continue the work now (agent_message resume for that child, or steer the ones still running). Do not wait for the rest of the run. When every subagent in the run has finished, <subagent-notification> arrives — read <results>, synthesize, and continue.
 - Use agent_message to steer/resume subagents and to reply to <supervisor-request> questions (action:"reply"). <supervisor-request> and <supervisor-update> are wakes from your subagents, not user messages — still act on them.`;
 
-/** Read the tail of a task output file for the notification preview (≤ maxChars). */
-function readPreview(outputPath: string | undefined, maxChars: number): string {
+/** Read only the tail of a task output file for the notification preview (≤ maxChars). */
+export function readPreview(outputPath: string | undefined, maxChars: number): string {
   if (!outputPath) return "";
-  try {
-    const text = readFileSync(outputPath, "utf8");
-    return text.length <= maxChars ? text : text.slice(-maxChars);
-  } catch {
-    return "";
-  }
+  const tail = readFileTail(outputPath, Math.max(maxChars, maxChars * 4));
+  if (!tail || !tail.text) return "";
+  return tail.text.length <= maxChars ? tail.text : tail.text.slice(-maxChars);
 }
 
 function toExitStatus(event: ManagerEvent): TaskExitInfo["status"] {

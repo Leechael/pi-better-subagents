@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
+import { readFileTail } from "../file-tail";
 
 /** Sibling stderr file next to `<id>.output` (matches pbs-manager). */
 export function stderrPathFor(outputPath: string): string {
@@ -8,16 +9,38 @@ export function stderrPathFor(outputPath: string): string {
   return `${outputPath}.stderr`;
 }
 
+const tailCache = new Map<string, { size: number; mtimeMs: number; text: string }>();
+
 export function readTaskFileTail(path: string, maxBytes = 512_000): string {
   if (!path) return "(no output path)";
-  if (!existsSync(path)) return "(empty)";
+  const tail = readFileTail(path, maxBytes);
+  if (!tail) return "(empty)";
+  if (tail.size === 0) return "(empty)";
+  if (tail.size <= maxBytes) return tail.text;
+  return `… (${tail.size} bytes total, showing last ${maxBytes})\n${tail.text}`;
+}
+
+/**
+ * Tail read cached by size+mtime. Callers should only ask for the tab they are showing.
+ */
+export function readTaskFileTailCached(path: string, maxBytes = 512_000): string {
+  if (!path) return "(no output path)";
+  let size = 0;
+  let mtimeMs = 0;
   try {
-    const size = statSync(path).size;
-    if (size === 0) return "(empty)";
-    const buf = readFileSync(path);
-    if (buf.length <= maxBytes) return buf.toString("utf8");
-    return `… (${size} bytes total, showing last ${maxBytes})\n${buf.subarray(buf.length - maxBytes).toString("utf8")}`;
-  } catch (err) {
-    return err instanceof Error ? err.message : String(err);
+    const st = statSync(path);
+    size = st.size;
+    mtimeMs = st.mtimeMs;
+  } catch {
+    return readTaskFileTail(path, maxBytes);
   }
+  const hit = tailCache.get(path);
+  if (hit && hit.size === size && hit.mtimeMs === mtimeMs) return hit.text;
+  const text = readTaskFileTail(path, maxBytes);
+  tailCache.set(path, { size, mtimeMs, text });
+  return text;
+}
+
+export function clearTaskFileTailCache(): void {
+  tailCache.clear();
 }
