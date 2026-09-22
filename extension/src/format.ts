@@ -170,6 +170,8 @@ export interface SubagentChildInfo {
   status: "pending" | "running" | "completed" | "failed" | "interrupted";
   text: string;
   error?: string;
+  /** Task prompt that was sent to this child. */
+  prompt?: string;
 }
 
 export interface SubagentNotificationInfo {
@@ -182,6 +184,31 @@ export interface SubagentNotificationInfo {
 /** Per-child result text is capped to its tail inside notifications (§4.6). */
 const SUBAGENT_NOTIFICATION_CHILD_CHARS = 2000;
 
+function capTail(text: string): string {
+  return text.length > SUBAGENT_NOTIFICATION_CHILD_CHARS
+    ? text.slice(-SUBAGENT_NOTIFICATION_CHILD_CHARS)
+    : text;
+}
+
+/** Keep the start of a task prompt; the assignment is at the beginning. */
+function capPrompt(text: string): string {
+  return text.length > SUBAGENT_NOTIFICATION_CHILD_CHARS
+    ? `${text.slice(0, SUBAGENT_NOTIFICATION_CHILD_CHARS)}…`
+    : text;
+}
+
+export interface SubagentHandoverInfo {
+  runId: string;
+  childId: string;
+  name: string;
+  status: "completed" | "failed" | "interrupted";
+  prompt: string;
+  text: string;
+  error?: string;
+  /** Names of children that are still pending or running. */
+  stillRunning: string[];
+}
+
 /**
  * Format a finished subagent run as a <subagent-notification> payload.
  * Each child contributes `## name (status)` plus the tail of its result text.
@@ -191,12 +218,10 @@ export function formatSubagentNotification(info: SubagentNotificationInfo): stri
   const summary = `${completed}/${info.children.length} subagents completed in ${Math.round(info.durationMs)}ms`;
   const results = info.children
     .map((child) => {
-      const tail =
-        child.text.length > SUBAGENT_NOTIFICATION_CHILD_CHARS
-          ? child.text.slice(-SUBAGENT_NOTIFICATION_CHILD_CHARS)
-          : child.text;
+      const tail = capTail(child.text);
       const errorLine = child.error ? `Error: ${child.error}\n` : "";
-      return `## ${child.name} (${child.status})\n${errorLine}${tail}`;
+      const promptLine = child.prompt ? `Prompt: ${capPrompt(child.prompt)}\n` : "";
+      return `## ${child.name} (${child.status})\n${promptLine}${errorLine}${tail}`;
     })
     .join("\n\n");
   return [
@@ -209,5 +234,33 @@ export function formatSubagentNotification(info: SubagentNotificationInfo): stri
     `  <summary>${escapeXml(summary)}</summary>`,
     `  <results>\n${escapeXml(results)}\n  </results>`,
     "</subagent-notification>",
+  ].join("\n");
+}
+
+/**
+ * One child finished while others in the same run are still going.
+ * The parent must see the original prompt and the result, then keep working.
+ */
+export function formatSubagentHandover(info: SubagentHandoverInfo): string {
+  const others =
+    info.stillRunning.length === 0 ? "(none)" : info.stillRunning.join(", ");
+  const summary = `${info.name} ${info.status}; ${info.stillRunning.length} still running`;
+  const errorLine = info.error ? `Error: ${info.error}\n` : "";
+  return [
+    "Subagent handover (system wake — not a new user message). " +
+      "One subagent finished while others are still running. " +
+      "Read <prompt> and <result> now, then continue the work: " +
+      "use agent_message to resume this child or steer the ones still running. " +
+      "Do not wait for the rest of the run. Do not merely acknowledge.",
+    "<subagent-handover>",
+    `  <run-id>${escapeXml(info.runId)}</run-id>`,
+    `  <child-id>${escapeXml(info.childId)}</child-id>`,
+    `  <name>${escapeXml(info.name)}</name>`,
+    `  <status>${info.status}</status>`,
+    `  <summary>${escapeXml(summary)}</summary>`,
+    `  <still-running>${escapeXml(others)}</still-running>`,
+    `  <prompt>\n${escapeXml(capPrompt(info.prompt))}\n  </prompt>`,
+    `  <result>\n${escapeXml(errorLine + capTail(info.text))}\n  </result>`,
+    "</subagent-handover>",
   ].join("\n");
 }

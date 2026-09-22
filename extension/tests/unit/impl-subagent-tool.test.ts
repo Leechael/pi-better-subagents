@@ -153,9 +153,15 @@ describe("subagent tool — tasks", () => {
     expect(notify).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(factory.sessions).toHaveLength(2));
     factory.sessions[0].complete("r1");
-    factory.sessions[1].complete("r2");
     await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
-    expect(notify.mock.calls[0][0].content).toContain("2/2 subagents completed");
+    const handover = notify.mock.calls[0][0].content as string;
+    expect(handover).toContain("<subagent-handover>");
+    expect(handover).toContain("<prompt>");
+    expect(handover).toContain("r1");
+    expect(handover).toContain("still running");
+    factory.sessions[1].complete("r2");
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(2));
+    expect(notify.mock.calls[1][0].content).toContain("2/2 subagents completed");
   });
 
   it("an aborted sync wait backgrounds the run rather than killing it", async () => {

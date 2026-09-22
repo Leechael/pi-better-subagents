@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatSubagentNotification } from "../../src/format";
+import { formatSubagentHandover, formatSubagentNotification } from "../../src/format";
 
 describe("formatSubagentNotification", () => {
   it("produces the §4.6 XML structure", () => {
@@ -62,5 +62,36 @@ describe("formatSubagentNotification", () => {
     // The full 3000-char body must not appear; its 2000-char tail does.
     expect(text).not.toContain(long);
     expect(text).toContain("x".repeat(2000));
+  });
+
+  it("includes each child's prompt in the run results", () => {
+    const text = formatSubagentNotification({
+      runId: "run_x",
+      status: "completed",
+      durationMs: 1,
+      children: [{ name: "a", status: "completed", text: "done", prompt: "look at src" }],
+    });
+    expect(text).toContain("Prompt: look at src");
+  });
+});
+
+describe("formatSubagentHandover", () => {
+  it("gives the parent the prompt, the result, and who is still running", () => {
+    const text = formatSubagentHandover({
+      runId: "run_a",
+      childId: "ch_1",
+      name: "worker-1",
+      status: "completed",
+      prompt: "inspect the loader",
+      text: "loader reads mtime",
+      stillRunning: ["worker-2 (ch_2)"],
+    });
+    expect(text).toContain("<subagent-handover>");
+    expect(text).toContain("Do not wait for the rest of the run");
+    expect(text).toContain("<prompt>");
+    expect(text).toContain("inspect the loader");
+    expect(text).toContain("loader reads mtime");
+    expect(text).toContain("worker-2 (ch_2)");
+    expect(text).toContain("<child-id>ch_1</child-id>");
   });
 });

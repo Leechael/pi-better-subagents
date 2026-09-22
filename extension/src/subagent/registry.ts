@@ -39,6 +39,8 @@ export interface RunRecord {
     agent: string;
     model?: string;
     status: ChildStatus;
+    /** Prompt actually sent to the child (after chain interpolation). */
+    prompt?: string;
     result?: ChildResult;
     startedAt: number;
     endedAt?: number;
@@ -99,6 +101,7 @@ interface InternalChild {
   /** Best-effort model id for fleet / ls (set when startChild runs). */
   model?: string;
   status: ChildStatus;
+  prompt?: string;
   result?: ChildResult;
   startedAt: number;
   endedAt?: number;
@@ -294,6 +297,7 @@ export class SubagentRegistry implements RunRegistry {
     const child = this.children.get(req.childId);
     if (!child) throw new Error(`unknown child ${req.childId} (addChild first)`);
     child.shouldStart = opts?.shouldStart;
+    child.prompt = req.prompt;
     child.model = req.model ?? req.agent.model;
 
     const runner = this.runner;
@@ -538,6 +542,7 @@ function snapshot(run: InternalRun): RunRecord {
       agent: c.agent,
       ...(c.model !== undefined ? { model: c.model } : {}),
       status: c.status,
+      ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
       result: c.result,
       startedAt: c.startedAt,
       endedAt: c.endedAt,

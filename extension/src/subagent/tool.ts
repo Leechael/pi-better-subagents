@@ -15,11 +15,11 @@
  */
 import { Type } from "typebox";
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { formatSubagentNotification, truncateTail } from "../format";
+import { formatSubagentHandover, formatSubagentNotification, truncateTail } from "../format";
 import type { NotifyCenter } from "../notify";
 import { runChain, runTasks, validateChainSteps } from "./pool";
 import type { RunRecord, SubagentRegistry } from "./registry";
-import type { AgentDefinition, ChildResult, ChildRunRequest } from "./types";
+import type { AgentDefinition, ChildHandle, ChildResult, ChildRunRequest } from "./types";
 
 export const SUBAGENT_NOTIFICATION_CUSTOM_TYPE = "pbs-subagent-notification";
 
@@ -215,6 +215,7 @@ function toNotificationInfo(record: RunRecord, now: number) {
       status: c.status,
       text: c.result?.text ?? "",
       error: c.result?.error,
+      ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
     })),
   };
 }
@@ -284,6 +285,43 @@ export function createSubagentTool(
     });
   };
 
+  /**
+   * A child settled while siblings are still in flight. Returns true when a
+   * handover was sent. The run-complete notification covers the last child.
+   */
+  const notifyChildHandover = (
+    registry: SubagentRegistry,
+    runId: string,
+    childId: string,
+    handedOver: Set<string>,
+  ): boolean => {
+    if (handedOver.has(childId)) return false;
+    const record = registry.get(runId);
+    if (!record) return false;
+    const child = record.children.find((c) => c.childId === childId);
+    if (!child || child.status === "pending" || child.status === "running") return false;
+    const stillRunning = record.children
+      .filter((c) => c.status === "pending" || c.status === "running")
+      .map((c) => `${c.name} (${c.childId})`);
+    if (stillRunning.length === 0) return false;
+    handedOver.add(childId);
+    deps.getNotifyCenter()?.notify({
+      customType: SUBAGENT_NOTIFICATION_CUSTOM_TYPE,
+      content: formatSubagentHandover({
+        runId,
+        childId: child.childId,
+        name: child.name,
+        status: child.status,
+        prompt: child.prompt ?? "",
+        text: child.result?.text ?? "",
+        ...(child.result?.error !== undefined ? { error: child.result.error } : {}),
+        stillRunning,
+      }),
+      details: { run_id: runId, child_id: childId, handover: true },
+    });
+    return true;
+  };
+
   const startRun = async (
     params: SubagentParams,
     signal: AbortSignal | undefined,
@@ -325,21 +363,39 @@ export function createSubagentTool(
       depth: 1,
     });
 
+    const handedOver = new Set<string>();
+    let backgrounded = false;
+    const armBackground = (): void => {
+      backgrounded = true;
+      for (const childId of childIds) {
+        notifyChildHandover(registry, run.runId, childId, handedOver);
+      }
+    };
+    const watchChild = (ordinal: number, started: Promise<ChildHandle>): Promise<ChildResult> =>
+      started.then((handle) => {
+        void handle.result.then(() => {
+          if (!backgrounded) return;
+          notifyChildHandover(registry, run.runId, childIds[ordinal], handedOver);
+        });
+        return handle.result;
+      });
+
     const completion: Promise<ChildResult[]> =
       kind === "tasks"
         ? runTasks(items, {
             concurrency,
             failFast,
             startChild: (_task, ordinal, ctx) =>
-              registry
-                .startChild(makeRequest(ordinal, resolved[ordinal].prompt), {
+              watchChild(
+                ordinal,
+                registry.startChild(makeRequest(ordinal, resolved[ordinal].prompt), {
                   shouldStart: () => !ctx.cancelled(),
-                })
-                .then((handle) => handle.result),
+                }),
+              ),
           })
         : runChain(items, {
             startChild: (_step, ordinal, interpolated) =>
-              registry.startChild(makeRequest(ordinal, interpolated)).then((handle) => handle.result),
+              watchChild(ordinal, registry.startChild(makeRequest(ordinal, interpolated))),
           });
 
     const tracked = completion.then((results) => {
@@ -368,16 +424,18 @@ export function createSubagentTool(
           type: "text",
           text:
             `Started ${items.length} subagent(s) in run ${run.runId}. ${reason}\n` +
-            `You will be notified via <subagent-notification> when the run completes. ` +
-            `Do not poll or sleep to wait for it. ` +
-            `Use subagent({action:"status", run_id:"${run.runId}"}) only if you must inspect progress, ` +
-            `and subagent({action:"get", run_id:"${run.runId}"}) to read final results.`,
+            `While others are still running, each finished subagent arrives as <subagent-handover> ` +
+            `with that child's prompt and result. Read it and continue: agent_message resume for that child, ` +
+            `or steer the ones still running. Do not wait for the whole run. Do not poll. ` +
+            `<subagent-notification> arrives when every subagent in the run has finished. ` +
+            `Use subagent({action:"get", run_id:"${run.runId}"}) if you need the full record.`,
         },
       ],
       details: { run_id: run.runId, status: "backgrounded" },
     });
 
     if (params.async === true) {
+      armBackground();
       settleSync();
       return backgroundedText("The run is executing in the background.");
     }
@@ -396,6 +454,7 @@ export function createSubagentTool(
         details: { run_id: run.runId, status: record?.status ?? "completed", results: outcome.value },
       };
     }
+    armBackground();
     settleSync();
     return backgroundedText(
       `The foreground budget (${Math.round(budgetMs / 1000)}s) elapsed and the run continues in the background.`,
@@ -532,15 +591,22 @@ export function createSubagentTool(
     const handle = registry.handle(child.childId);
     if (!handle) throw new Error(`subagent ${child.childId} has no live session to resume`);
     await handle.resume(params.message);
-    // Resume is inherently asynchronous: always notify on completion.
-    void registry.getResult(child.childId)?.then(() => notifyRunCompleted(registry, record.runId));
+    // Resume is asynchronous. If siblings are still running, hand this child
+    // back as soon as it finishes; otherwise the run-complete wake covers it.
+    const handedOver = new Set<string>();
+    void registry.getResult(child.childId)?.then(() => {
+      if (!notifyChildHandover(registry, record.runId, child.childId, handedOver)) {
+        notifyRunCompleted(registry, record.runId);
+      }
+    });
     return {
       content: [
         {
           type: "text",
           text:
             `Resumed subagent ${child.name} (${child.childId}) in run ${record.runId}. ` +
-            "You will be notified via <subagent-notification> when it completes. Do not poll.",
+            "You will be notified via <subagent-handover> if others are still running, " +
+            "otherwise via <subagent-notification> when it completes. Do not poll.",
         },
       ],
       details: { run_id: record.runId, child_id: child.childId },
@@ -553,13 +619,15 @@ export function createSubagentTool(
     description:
       "Run subagents in parallel (tasks) or sequentially (chain with {previous}/{outputs.<label>} " +
       "interpolation). By default the call waits up to a foreground budget (default 45s); longer runs " +
-      "continue in the background and completion arrives via <subagent-notification> — never poll or " +
-      "sleep to wait. Use action=list/get/status/interrupt/resume/steer to manage existing runs.",
+      "continue in the background. Each child that finishes while others are still running wakes you with " +
+      "<subagent-handover> (its prompt and result). The whole run wakes you with <subagent-notification>. " +
+      "Never poll or sleep to wait. Use action=list/get/status/interrupt/resume/steer to manage existing runs.",
     promptSnippet: "Fan out subagents in parallel or sequence them in a chain",
     promptGuidelines: [
-      "Subagent runs that exceed the foreground budget continue in the background; you are notified on completion — do not poll.",
+      "When a <subagent-handover> arrives, read <prompt> and <result> immediately and continue: agent_message resume for that child, or steer children that are still running. Do not wait for the rest of the run.",
+      "Subagent runs that exceed the foreground budget continue in the background; you are notified per finished child and again when the run completes — do not poll.",
       "A failed subagent does not fail the whole run; inspect per-subagent sections in the result.",
-      "<subagent-notification> is a system notification, not a user reply.",
+      "<subagent-handover> and <subagent-notification> are system wakes, not user replies.",
     ],
     parameters: subagentParameters,
     async execute(_toolCallId, rawParams, signal, _onUpdate, _ctx) {
