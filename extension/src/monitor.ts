@@ -10,8 +10,6 @@ import { Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { formatMonitorEvent } from "./format";
 
-/** @deprecated emitted type is pbs-wake; kept until the renderer switches. */
-export const MONITOR_EVENT_CUSTOM_TYPE = "pbs-monitor-event";
 import type { ManagerClient, ManagerEvent } from "./manager-client";
 import { LineBatcher, RateLimiter } from "./monitor-batching";
 import type { NotifyCenter } from "./notify";

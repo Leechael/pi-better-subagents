@@ -8,8 +8,6 @@
 import type { SubagentRegistry } from "../subagent/registry";
 import { PBS_WAKE_CUSTOM_TYPE } from "../wake";
 
-/** @deprecated emitted type is pbs-wake; kept until the renderer switches. */
-export const SUPERVISOR_NOTIFICATION_CUSTOM_TYPE = "pbs-supervisor-message";
 import type { CommsHost } from "./types";
 
 export interface RegistryHostDeps {

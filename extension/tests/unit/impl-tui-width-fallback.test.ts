@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createMonitorTool, MonitorRegistry } from "../../src/monitor";
-import { TASK_NOTIFICATION_CUSTOM_TYPE } from "../../src/notify";
+import { PBS_WAKE_CUSTOM_TYPE } from "../../src/wake";
 import { registerPbsMessageRenderers } from "../../src/tui/message-renderers";
 import { setPiTuiForTests, visibleWidth } from "../../src/tui/pi-tui-load";
 
@@ -38,8 +38,27 @@ describe("tool rows stay within width without pi-tui", () => {
       },
     } as never);
     const summary = `Background command "${"宽".repeat(30)}${"x".repeat(80)}" failed`;
-    const component = map.get(TASK_NOTIFICATION_CUSTOM_TYPE)!(
-      { content: `<task-notification><status>failed</status><summary>${summary}</summary></task-notification>` },
+    const component = map.get(PBS_WAKE_CUSTOM_TYPE)!(
+      {
+        content: `<pbs-wake kind="task"><summary>${summary}</summary></pbs-wake>`,
+        details: {
+          kind: "task",
+          stillRunning: [],
+          tasks: [
+            {
+              id: "sh_1",
+              taskKind: "shell",
+              status: "failed",
+              summary,
+              command: "x",
+              outputPath: "/tmp/x",
+              preview: "",
+              durationMs: 1,
+              exitCode: 1,
+            },
+          ],
+        },
+      },
       { expanded: false, outputPad: 1 },
       theme,
     );

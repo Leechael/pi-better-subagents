@@ -11,8 +11,6 @@
 import { formatTaskNotification, type TaskExitInfo } from "./format";
 import { PBS_WAKE_CUSTOM_TYPE, type WakeItem } from "./wake";
 
-/** @deprecated emitted type is pbs-wake; kept until the renderer switches. */
-export const TASK_NOTIFICATION_CUSTOM_TYPE = "pbs-task-notification";
 
 export interface NotifyMessage {
   customType: string;

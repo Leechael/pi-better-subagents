@@ -6,10 +6,7 @@
  * custom-message boxes which use `new Box(1, 1, bg)`.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { SUPERVISOR_NOTIFICATION_CUSTOM_TYPE } from "../comms/registry-host";
-import { MONITOR_EVENT_CUSTOM_TYPE } from "../monitor";
-import { TASK_NOTIFICATION_CUSTOM_TYPE } from "../notify";
-import { SUBAGENT_NOTIFICATION_CUSTOM_TYPE } from "../subagent/tool";
+import { PBS_WAKE_CUSTOM_TYPE, type PbsWake, type TaskWake } from "../wake";
 import { fitLines, loadPiTui } from "./pi-tui-load";
 import { statusGlyph } from "./tool-component";
 
@@ -23,54 +20,74 @@ type PillComponent = {
   invalidate(): void;
 };
 
-function asText(content: string | unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((c) => (c && typeof c === "object" && "text" in c ? String((c as { text: unknown }).text) : ""))
-      .join("\n");
+const STATUS_ORDER = [
+  "completed",
+  "failed",
+  "interrupted",
+  "killed",
+  "orphaned",
+  "pending",
+  "running",
+  "partial",
+  "timeout",
+  "stopped",
+];
+
+function countStatuses(statuses: string[]): string {
+  const counts = new Map<string, number>();
+  for (const status of statuses) counts.set(status, (counts.get(status) ?? 0) + 1);
+  const parts = STATUS_ORDER.filter((status) => counts.has(status)).map(
+    (status) => `${counts.get(status)} ${status}`,
+  );
+  return parts.join(" · ");
+}
+
+function badExit(status: string | undefined, exitCode?: number | null): boolean {
+  if (exitCode !== undefined && exitCode !== null && exitCode !== 0) return true;
+  return status === "failed" || status === "killed" || status === "orphaned" || status === "interrupted";
+}
+
+function taskHead(tasks: TaskWake[]): string {
+  if (tasks.length <= 1) return tasks[0]?.summary || "Background task finished";
+  return `${tasks.length} tasks · ${countStatuses(tasks.map((task) => task.status))}`;
+}
+
+function collapsedText(details: PbsWake, theme: Theme): string {
+  switch (details.kind) {
+    case "task": {
+      const bad = details.tasks.some((task) => badExit(task.status, task.exitCode));
+      const { color, glyph } = statusGlyph(bad ? "failed" : "completed");
+      return `${theme.fg(color, glyph)} ${theme.fg("muted", "task")} ${taskHead(details.tasks)}`;
+    }
+    case "monitor": {
+      const preview = details.event.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "(event)";
+      const { color, glyph } = statusGlyph(details.status);
+      const statusBit = details.status ? ` ${theme.fg("dim", `· ${details.status}`)}` : "";
+      return `${theme.fg(color, glyph)} ${theme.fg("muted", "monitor")} ${theme.fg("accent", `"${details.description}"`)}${statusBit}\n${theme.fg("dim", preview)}`;
+    }
+    case "subagent-handover": {
+      const { color, glyph } = statusGlyph(details.status);
+      return `${theme.fg(color, glyph)} ${theme.fg("muted", "handover")} ${details.name} ${details.status}`;
+    }
+    case "subagent-done": {
+      const bad = details.children.some((child) => badExit(child.status));
+      const { color, glyph } = statusGlyph(bad ? "failed" : details.status);
+      return `${theme.fg(color, glyph)} ${theme.fg("muted", "subagent")} ${countStatuses(details.children.map((child) => child.status))}`;
+    }
+    case "supervisor-request":
+      return [
+        `${theme.fg("warning", "?")} ${theme.fg("muted", "supervisor request")} ${details.message.slice(0, 100)}`,
+        theme.fg("dim", 'reply with agent_message { action:"reply", to, message }'),
+      ].join("\n");
+    case "supervisor-update":
+      return `${theme.fg("muted", "↑")} ${theme.fg("muted", "supervisor update")} ${details.message.slice(0, 100)}`;
   }
-  return String(content ?? "");
 }
 
-function stripXml(text: string): string {
-  return text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function extractTag(text: string, tag: string): string | undefined {
-  const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "i"));
-  return m?.[1]?.trim();
-}
-
-function unescapeXml(text: string): string {
-  return text
-    .replace(/&quot;/g, '"')
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&");
-}
-
-/** Real `<event>` body. The wake lead-in also mentions `<event>` inline — ignore that. */
-export function extractMonitorEventBody(content: string): string {
-  const block = content.match(/<event>\r?\n([\s\S]*?)\r?\n<\/event>/i);
-  if (block) return block[1].trim();
-  const tagged = extractTag(content, "event");
-  if (tagged && !/^before other work/i.test(tagged)) return tagged;
-  return "";
-}
-
-export function extractMonitorDescription(
-  content: string,
-  details?: { description?: string },
-): string {
-  if (details?.description) return details.description;
-  const attr = content.match(/\bdescription="([^"]*)"/)?.[1];
-  if (attr) return unescapeXml(attr);
-  const modern = content.match(/Monitor event \(system wake[^)]*\):\s*"([^"]*)"/);
-  if (modern) return modern[1];
-  const legacy = content.match(/Monitor event:\s*"([^"]*)"/);
-  if (legacy) return legacy[1];
-  return "monitor";
+function wakeDetails(message: { details?: unknown }): PbsWake | undefined {
+  const details = message.details as PbsWake | undefined;
+  if (!details || typeof details !== "object" || !("kind" in details)) return undefined;
+  return details;
 }
 
 function makeComponent(pad: number, theme: Theme, text: string): PillComponent {
@@ -96,55 +113,11 @@ function makeComponent(pad: number, theme: Theme, text: string): PillComponent {
 }
 
 export function registerPbsMessageRenderers(pi: ExtensionAPI): void {
-  pi.registerMessageRenderer(TASK_NOTIFICATION_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
-    const content = asText(message.content);
-    const status = extractTag(content, "status") ?? "";
-    const summary =
-      extractTag(content, "summary") || stripXml(content).slice(0, 120) || "Background task finished";
-    const { color, glyph } = statusGlyph(status);
-    const head = `${theme.fg(color as "error", glyph)} ${theme.fg("muted", "task")} ${summary}`;
-    const body = expanded ? `\n${theme.fg("dim", content)}` : "";
-    return makeComponent(outputPad, theme, head + body) as never;
-  });
-
-  pi.registerMessageRenderer(SUBAGENT_NOTIFICATION_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
-    const content = asText(message.content);
-    const summary =
-      extractTag(content, "summary") || stripXml(content).slice(0, 120) || "Subagent run finished";
-    const status = extractTag(content, "status") ?? "";
-    const { color, glyph } = statusGlyph(status || "completed");
-    const head = `${theme.fg(color as "error", glyph)} ${theme.fg("muted", "subagent")} ${summary}`;
-    const body = expanded ? `\n${theme.fg("dim", content)}` : "";
-    return makeComponent(outputPad, theme, head + body) as never;
-  });
-
-  pi.registerMessageRenderer(MONITOR_EVENT_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
-    const content = asText(message.content);
-    const details = message.details as { description?: string; status?: string } | undefined;
-    const desc = extractMonitorDescription(content, details);
-    const status = details?.status ?? content.match(/\bstatus="([^"]*)"/)?.[1];
-    const eventBody = extractMonitorEventBody(content) || "(event)";
-    const preview = eventBody.split("\n").find((l) => l.trim().length > 0)?.trim() ?? "(event)";
-    const lead = `${theme.fg("accent", "●")} ${theme.fg("muted", "Monitor event:")} ${theme.fg("accent", `"${desc}"`)}`;
-    const statusBit = status ? ` ${theme.fg("dim", `· ${status}`)}` : "";
-    const head = `${lead}${statusBit}\n${theme.fg("dim", preview)}`;
-    const body = expanded ? `\n${theme.fg("dim", content)}` : "";
-    return makeComponent(outputPad, theme, head + body) as never;
-  });
-
-  pi.registerMessageRenderer(SUPERVISOR_NOTIFICATION_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
-    const content = asText(message.content);
-    const isRequest = /supervisor-request/i.test(content);
-    const label = isRequest ? "supervisor request" : "supervisor update";
-    const color = isRequest ? "warning" : "muted";
-    const glyph = isRequest ? "?" : "↑";
-    const preview = stripXml(content).slice(0, 100);
-    const head = `${theme.fg(color, glyph)} ${theme.fg("muted", label)} ${preview}`;
-    const hint =
-      isRequest && !expanded
-        ? `\n${theme.fg("dim", '  reply with agent_message { action:"reply", to, message }')}`
-        : "";
-    const body = expanded ? `\n${theme.fg("dim", content)}` : hint;
+  pi.registerMessageRenderer(PBS_WAKE_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
+    const details = wakeDetails(message);
+    const content = typeof message.content === "string" ? message.content : "";
+    const head = details ? collapsedText(details, theme) : theme.fg("muted", "wake");
+    const body = expanded && content ? `\n${theme.fg("dim", content)}` : "";
     return makeComponent(outputPad, theme, head + body) as never;
   });
 }

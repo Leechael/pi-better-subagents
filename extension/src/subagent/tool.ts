@@ -17,8 +17,6 @@ import { Type } from "typebox";
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { formatSubagentHandover, formatSubagentNotification, truncateTail } from "../format";
 
-/** @deprecated emitted type is pbs-wake; kept until the renderer switches. */
-export const SUBAGENT_NOTIFICATION_CUSTOM_TYPE = "pbs-subagent-notification";
 import type { NotifyCenter } from "../notify";
 import { runChain, runTasks, validateChainSteps } from "./pool";
 import type { RunRecord, SubagentRegistry } from "./registry";

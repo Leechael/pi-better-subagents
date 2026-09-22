@@ -8,6 +8,8 @@ import {
   type TaskExitInfo,
 } from "../../src/format";
 import { formatPbsWake, PBS_WAKE_CUSTOM_TYPE, PBS_WAKE_LEAD_IN } from "../../src/wake";
+import { registerPbsMessageRenderers } from "../../src/tui/message-renderers";
+import { setPiTuiForTests, visibleWidth } from "../../src/tui/pi-tui-load";
 
 describe("pbs-wake envelope", () => {
   it("wraps a task batch in one envelope and keeps a comma inside an item title", () => {
@@ -311,5 +313,157 @@ describe("pbs-wake envelope", () => {
       name: "explorer",
       message: "Which file?",
     });
+  });
+});
+
+describe("pbs-wake pill", () => {
+  it("colors from details status and exitCode, not from the summary words", () => {
+    setPiTuiForTests(null);
+    const map = new Map<string, Function>();
+    registerPbsMessageRenderers({
+      registerMessageRenderer(type: string, fn: unknown) {
+        map.set(type, fn as never);
+      },
+    } as never);
+    expect([...map.keys()]).toEqual([PBS_WAKE_CUSTOM_TYPE]);
+    const theme = {
+      fg: (_c: string, text: string) => text,
+      bg: (_c: string, text: string) => text,
+    };
+    const render = (details: unknown) =>
+      map.get(PBS_WAKE_CUSTOM_TYPE)!(
+        { content: `${PBS_WAKE_LEAD_IN}\n\n<pbs-wake kind="task">`, details },
+        { expanded: false, outputPad: 0 },
+        theme,
+      ).render(80) as string[];
+
+    const failedSummary = render({
+      kind: "task",
+      stillRunning: [],
+      tasks: [
+        {
+          id: "sh_1",
+          taskKind: "shell",
+          status: "completed",
+          summary: "Background command completed",
+          command: "npm test",
+          outputPath: "/tmp/x",
+          preview: "",
+          durationMs: 1,
+          exitCode: 1,
+        },
+      ],
+    });
+    expect(failedSummary.join("")).toContain("✗");
+    expect(failedSummary.join("")).not.toContain("✓");
+
+    const lyingSummary = render({
+      kind: "task",
+      stillRunning: [],
+      tasks: [
+        {
+          id: "sh_1",
+          taskKind: "shell",
+          status: "completed",
+          summary: "failed failed failed",
+          command: "npm test",
+          outputPath: "/tmp/x",
+          preview: "",
+          durationMs: 1,
+          exitCode: 0,
+        },
+      ],
+    });
+    expect(lyingSummary.join("")).toContain("✓");
+    expect(lyingSummary.join("")).not.toContain("✗");
+  });
+
+  it("shows per-status counts and the monitor event, not the lead-in", () => {
+    setPiTuiForTests(null);
+    const map = new Map<string, Function>();
+    registerPbsMessageRenderers({
+      registerMessageRenderer(type: string, fn: unknown) {
+        map.set(type, fn as never);
+      },
+    } as never);
+    const theme = {
+      fg: (_c: string, text: string) => text,
+      bg: (_c: string, text: string) => text,
+    };
+    const done = map.get(PBS_WAKE_CUSTOM_TYPE)!(
+      {
+        content: PBS_WAKE_LEAD_IN,
+        details: {
+          kind: "subagent-done",
+          runId: "run_a",
+          status: "partial",
+          durationMs: 1,
+          summary: "should not be the pill",
+          children: [
+            { childId: "c1", name: "a", status: "completed", prompt: "", result: "" },
+            { childId: "c2", name: "b", status: "completed", prompt: "", result: "" },
+            { childId: "c3", name: "c", status: "completed", prompt: "", result: "" },
+            { childId: "c4", name: "d", status: "failed", prompt: "", result: "", error: "x" },
+          ],
+        },
+      },
+      { expanded: false, outputPad: 0 },
+      theme,
+    ).render(80) as string[];
+    expect(done.join("")).toContain("3 completed · 1 failed");
+    expect(done.join("")).not.toContain(PBS_WAKE_LEAD_IN);
+
+    const monitor = map.get(PBS_WAKE_CUSTOM_TYPE)!(
+      {
+        content: `${PBS_WAKE_LEAD_IN}\nHandle <event> before other work.`,
+        details: { kind: "monitor", id: "mon_1", description: "watch tests", event: "line1\nline2" },
+      },
+      { expanded: false, outputPad: 0 },
+      theme,
+    ).render(80) as string[];
+    const text = monitor.join("\n");
+    expect(text).toContain("line1");
+    expect(text).not.toContain(PBS_WAKE_LEAD_IN);
+    expect(text).not.toContain("before other work");
+  });
+
+  it("keeps a wide pill inside the terminal width", () => {
+    setPiTuiForTests(null);
+    const map = new Map<string, Function>();
+    registerPbsMessageRenderers({
+      registerMessageRenderer(type: string, fn: unknown) {
+        map.set(type, fn as never);
+      },
+    } as never);
+    const theme = {
+      fg: (color: string, text: string) => `\x1b[31m${text}\x1b[0m`,
+      bg: (_c: string, text: string) => text,
+    };
+    const lines = map.get(PBS_WAKE_CUSTOM_TYPE)!(
+      {
+        content: "x".repeat(400),
+        details: {
+          kind: "task",
+          stillRunning: [],
+          tasks: [
+            {
+              id: "sh_1",
+              taskKind: "shell",
+              status: "failed",
+              summary: `Background command "${"宽".repeat(30)}${"x".repeat(80)}" failed`,
+              command: "x",
+              outputPath: "/tmp/x",
+              preview: "",
+              durationMs: 1,
+              exitCode: 1,
+            },
+          ],
+        },
+      },
+      { expanded: false, outputPad: 1 },
+      theme,
+    ).render(40) as string[];
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(40);
   });
 });
