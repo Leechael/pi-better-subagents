@@ -15,7 +15,7 @@ import {
 } from "../../src/comms/registry-host";
 import { createAgentMessageTool, createContactSupervisorTool } from "../../src/comms/tools";
 import { SubagentRegistry } from "../../src/subagent/registry";
-import { EffectChildRunner } from "../../src/subagent/effect-runner";
+import { InProcessRunner } from "../../src/subagent/runner";
 import { createSubagentTool } from "../../src/subagent/tool";
 import type { ChildRunRequest } from "../../src/subagent/types";
 import { SessionFactory, tick, WORKER_AGENT } from "./subagent-fakes";
@@ -23,7 +23,7 @@ import { SessionFactory, tick, WORKER_AGENT } from "./subagent-fakes";
 function makeStack() {
   const registry = new SubagentRegistry({ maxConcurrentChildren: 8, spawnBudgetPerHour: 32 });
   const factory = new SessionFactory();
-  const runner = new EffectChildRunner({
+  const runner = new InProcessRunner({
     createSession: factory.fn,
     acquire: (req) => registry.admitChild(req.childId),
   });
@@ -211,7 +211,7 @@ describe("subagent tool with the real agents loader", () => {
 
     const registry = new SubagentRegistry({ maxConcurrentChildren: 8, spawnBudgetPerHour: 32 });
     const factory = new SessionFactory(); // autoComplete "done"
-    const runner = new EffectChildRunner({
+    const runner = new InProcessRunner({
       createSession: factory.fn,
       acquire: (req) => registry.admitChild(req.childId),
     });

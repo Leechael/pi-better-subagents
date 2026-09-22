@@ -102,7 +102,7 @@ export interface ChildRunner {
 }
 
 /**
- * Extension beyond Appendix B: handles produced by the ChildRunner own a
+ * Extension beyond Appendix B: handles produced by InProcessRunner own a
  * live session that must be disposed on run/session teardown. The registry
  * duck-types this to release sessions in disposeRun().
  */

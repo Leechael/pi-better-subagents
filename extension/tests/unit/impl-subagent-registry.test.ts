@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SubagentRegistry, type RunRecord } from "../../src/subagent/registry";
-import { EffectChildRunner } from "../../src/subagent/effect-runner";
+import { InProcessRunner } from "../../src/subagent/runner";
 import type { ChildRunRequest } from "../../src/subagent/types";
 import { SessionFactory, tick, WORKER_AGENT } from "./subagent-fakes";
 
@@ -10,7 +10,7 @@ function makeStack(opts: { maxConcurrentChildren?: number; spawnBudgetPerHour?: 
     spawnBudgetPerHour: opts.spawnBudgetPerHour ?? 32,
   });
   const factory = new SessionFactory();
-  const runner = new EffectChildRunner({
+  const runner = new InProcessRunner({
     createSession: factory.fn,
     acquire: (req) => registry.admitChild(req.childId),
   });

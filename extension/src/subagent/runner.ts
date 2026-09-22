@@ -1,7 +1,6 @@
 /**
- * EffectChildRunner (design doc §4.6): ChildRunner with Effect-managed
- * generation state, completion, timeout, stall, and resource scopes. The pi
- * session adapter remains behind the injected CreateSessionFn boundary.
+ * InProcessRunner (design doc §4.6): ChildRunner backed by an in-process
+ * child session created through an injected CreateSessionFn.
  *
  * Zero pi dependency — the real session factory lives in pi-runtime.ts and
  * tests inject fakes.
@@ -11,7 +10,7 @@
  * - a per-generation admission slot is acquired via the optional `acquire`
  *   hook (the registry uses it for the global concurrency cap);
  * - `timeoutMs` is a hard timeout: abort -> result {status:"interrupted", error:"timeout"};
- * - a stall watchdog aborts the child after `stallMs` (default 5min) without
+ * - a stall watchdog aborts the child after `stallMs` (default 10min) without
  *   any session event -> {status:"failed", error:"stalled"};
  * - session/prompt exceptions -> {status:"failed", error}.
  *
@@ -20,7 +19,6 @@
  * waitForIdle() is awaited afterwards as belt-and-braces for queued
  * steer/followUp processing.
  */
-import { Clock, Deferred, Duration, Effect, Exit, Fiber, Ref, Scope } from "./effect-imports";
 import type {
   ChildResult,
   ChildRunRequest,
@@ -34,12 +32,12 @@ import type {
 /** Inactivity abort. Paused while a tool is executing or a need_decision is pending. */
 export const DEFAULT_STALL_MS = 5 * 60 * 1000;
 
-export interface EffectChildRunnerOptions {
+export interface InProcessRunnerOptions {
   createSession: CreateSessionFn;
   /** Stall watchdog timeout (ms). Default 10 minutes. */
   stallMs?: number;
-  /** Optional Effect clock (e.g. TestClock); omitted means the live clock. */
-  clock?: Clock.Clock;
+  /** Clock override for tests. */
+  now?: () => number;
   /**
    * Per-generation admission hook. Awaited before each (re)start; the
    * resolved releaser is called when the generation settles. Rejecting
@@ -52,25 +50,25 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-export class EffectChildRunner implements ChildRunner {
-  private readonly opts: EffectChildRunnerOptions;
+export class InProcessRunner implements ChildRunner {
+  private readonly opts: InProcessRunnerOptions;
 
-  constructor(opts: EffectChildRunnerOptions) {
+  constructor(opts: InProcessRunnerOptions) {
     this.opts = opts;
   }
 
   async start(req: ChildRunRequest): Promise<DisposableChildHandle> {
-    const handle = new EffectChildHandle(req, this.opts);
+    const handle = new InProcessChildHandle(req, this.opts);
     await handle.launch();
     return handle;
   }
 }
 
-class EffectChildHandle implements DisposableChildHandle {
+class InProcessChildHandle implements DisposableChildHandle {
   private readonly req: ChildRunRequest;
   private readonly createSession: CreateSessionFn;
   private readonly stallMs: number;
-  private readonly clock?: Clock.Clock;
+  private readonly now: () => number;
   private readonly acquire?: (req: ChildRunRequest) => Promise<() => void>;
 
   private session: ChildSessionAdapter | null = null;
@@ -80,12 +78,11 @@ class EffectChildHandle implements DisposableChildHandle {
   private lastEvent: number;
   private startedAt: number;
   private generation = 0;
-  private settled = Effect.runSync(Ref.make(false));
-  private resultDeferred = Effect.runSync(Deferred.make<ChildResult>());
-  private generationScope: Scope.CloseableScope | null = null;
-  private timerFibers = new Set<Fiber.RuntimeFiber<void, never>>();
-  private timeoutFiber: Fiber.RuntimeFiber<void, never> | null = null;
-  private stallFiber: Fiber.RuntimeFiber<void, never> | null = null;
+  private settledFlag = false;
+  private resolveResult!: (result: ChildResult) => void;
+  private resultPromise: Promise<ChildResult>;
+  private timeoutTimer: NodeJS.Timeout | null = null;
+  private stallTimer: NodeJS.Timeout | null = null;
   private releaseSlot: (() => void) | null = null;
   private disposed = false;
   /** Nested tool_execution_start/end. Stall stays paused while > 0. */
@@ -93,14 +90,17 @@ class EffectChildHandle implements DisposableChildHandle {
   /** contact_supervisor need_decision. Stall stays paused while true. */
   private decisionPaused = false;
 
-  constructor(req: ChildRunRequest, opts: EffectChildRunnerOptions) {
+  constructor(req: ChildRunRequest, opts: InProcessRunnerOptions) {
     this.req = req;
     this.createSession = opts.createSession;
     this.stallMs = opts.stallMs ?? DEFAULT_STALL_MS;
-    this.clock = opts.clock;
+    this.now = opts.now ?? Date.now;
     this.acquire = opts.acquire;
     this.startedAt = this.now();
     this.lastEvent = this.startedAt;
+    this.resultPromise = new Promise((resolve) => {
+      this.resolveResult = resolve;
+    });
   }
 
   get childId(): string {
@@ -109,7 +109,7 @@ class EffectChildHandle implements DisposableChildHandle {
 
   /** Current generation's result promise (see Appendix B note on resume). */
   get result(): Promise<ChildResult> {
-    return this.runPromise(Deferred.await(this.resultDeferred));
+    return this.resultPromise;
   }
 
   status(): ChildStatus {
@@ -171,9 +171,11 @@ class EffectChildHandle implements DisposableChildHandle {
     if (!this.session) {
       throw new Error(`subagent ${this.req.childId} has no session to resume`);
     }
-    // Replace the completed generation's deferred before admission so callers
-    // observe the new result while this generation is starting.
-    this.resultDeferred = Effect.runSync(Deferred.make<ChildResult>());
+    // Swap in the new generation's result promise synchronously so that
+    // registry.getResult() observes it before/while admission runs.
+    this.resultPromise = new Promise((resolve) => {
+      this.resolveResult = resolve;
+    });
     await this.beginGeneration(message, false);
   }
 
@@ -221,21 +223,7 @@ class EffectChildHandle implements DisposableChildHandle {
 
   private async beginGeneration(prompt: string, first: boolean): Promise<void> {
     const gen = ++this.generation;
-    this.settled = Effect.runSync(Ref.make(false));
-    this.generationScope = this.sync(Scope.make());
-    this.timerFibers = new Set();
-    this.sync(
-      Scope.addFinalizer(
-        this.generationScope,
-        Effect.suspend(() =>
-          Effect.forEach(
-            Array.from(this.timerFibers),
-            (fiber) => Fiber.interruptFork(fiber),
-            { discard: true },
-          ),
-        ),
-      ),
-    );
+    this.settledFlag = false;
     this.status_ = "pending";
     this.startedAt = this.now();
     this.lastEvent = this.startedAt;
@@ -362,17 +350,16 @@ class EffectChildHandle implements DisposableChildHandle {
   }
 
   private isSettled(gen: number): boolean {
-    return gen !== this.generation || this.sync(Ref.get(this.settled));
+    return gen !== this.generation || this.settledFlag;
   }
 
   private isCurrent(gen: number): boolean {
-    return gen === this.generation && !this.sync(Ref.get(this.settled)) && !this.disposed;
+    return gen === this.generation && !this.settledFlag && !this.disposed;
   }
 
   private settle(gen: number, result: ChildResult): void {
-    if (gen !== this.generation || this.sync(Ref.get(this.settled))) return;
-    if (!this.sync(Deferred.succeed(this.resultDeferred, result))) return;
-    this.sync(Ref.set(this.settled, true));
+    if (gen !== this.generation || this.settledFlag) return;
+    this.settledFlag = true;
     this.clearTimers();
     // Surface non-fatal setup caveats (e.g. agent-def model fallback) once.
     if (result.warning === undefined && this.session?.warning) {
@@ -380,6 +367,7 @@ class EffectChildHandle implements DisposableChildHandle {
     }
     this.status_ = result.status;
     this.release();
+    this.resolveResult(result);
   }
 
   private release(): void {
@@ -395,11 +383,13 @@ class EffectChildHandle implements DisposableChildHandle {
   }
 
   private armTimeout(gen: number): void {
-    this.cancelFiber(this.timeoutFiber);
-    this.timeoutFiber = null;
+    if (this.timeoutTimer !== null) {
+      clearTimeout(this.timeoutTimer);
+      this.timeoutTimer = null;
+    }
     if (!(this.req.timeoutMs > 0)) return;
-    this.timeoutFiber = this.schedule(this.req.timeoutMs, () => {
-      this.timeoutFiber = null;
+    this.timeoutTimer = setTimeout(() => {
+      this.timeoutTimer = null;
       if (!this.isCurrent(gen)) return;
       this.settle(gen, {
         status: "interrupted",
@@ -408,14 +398,18 @@ class EffectChildHandle implements DisposableChildHandle {
         durationMs: this.now() - this.startedAt,
       });
       void this.session?.abort().catch(() => {});
-    });
+    }, this.req.timeoutMs);
+    this.timeoutTimer.unref?.();
   }
 
   private armStall(gen: number): void {
-    this.clearStall();
+    if (this.stallTimer !== null) {
+      clearTimeout(this.stallTimer);
+      this.stallTimer = null;
+    }
     if (!(this.stallMs > 0)) return;
-    this.stallFiber = this.schedule(this.stallMs, () => {
-      this.stallFiber = null;
+    this.stallTimer = setTimeout(() => {
+      this.stallTimer = null;
       if (!this.isCurrent(gen)) return;
       this.settle(gen, {
         status: "failed",
@@ -424,58 +418,22 @@ class EffectChildHandle implements DisposableChildHandle {
         durationMs: this.now() - this.startedAt,
       });
       void this.session?.abort().catch(() => {});
-    });
+    }, this.stallMs);
+    this.stallTimer.unref?.();
   }
 
   private clearStall(): void {
-    this.cancelFiber(this.stallFiber);
-    this.stallFiber = null;
+    if (this.stallTimer !== null) {
+      clearTimeout(this.stallTimer);
+      this.stallTimer = null;
+    }
   }
 
   private clearTimers(): void {
-    this.cancelFiber(this.timeoutFiber);
-    this.timeoutFiber = null;
+    if (this.timeoutTimer !== null) {
+      clearTimeout(this.timeoutTimer);
+      this.timeoutTimer = null;
+    }
     this.clearStall();
-    const scope = this.generationScope;
-    this.generationScope = null;
-    if (scope) void this.runPromise(Scope.close(scope, Exit.succeed(undefined))).catch(() => {});
-  }
-
-  private schedule(ms: number, callback: () => void): Fiber.RuntimeFiber<void, never> {
-    const scope = this.generationScope;
-    if (!scope) throw new Error("cannot schedule a child timer without a generation scope");
-    let fiber: Fiber.RuntimeFiber<void, never>;
-    const timer = Effect.tap(Clock.sleep(Duration.millis(ms)), () =>
-      Effect.sync(() =>
-        queueMicrotask(() => {
-          this.timerFibers.delete(fiber);
-          callback();
-        }),
-      ),
-    );
-    const clockedTimer = this.clock ? Effect.withClock(timer, this.clock) : timer;
-    fiber = this.sync(Effect.forkDaemon(clockedTimer));
-    this.timerFibers.add(fiber);
-    return fiber;
-  }
-
-  private cancelFiber(fiber: Fiber.RuntimeFiber<void, never> | null): void {
-    if (!fiber) return;
-    this.timerFibers.delete(fiber);
-    this.sync(Fiber.interruptFork(fiber));
-  }
-
-  private now(): number {
-    return this.sync(Clock.currentTimeMillis);
-  }
-
-  private sync<A, E>(effect: Effect.Effect<A, E>): A {
-    const program = this.clock ? Effect.withClock(effect, this.clock) : effect;
-    return Effect.runSync(program);
-  }
-
-  private runPromise<A, E>(effect: Effect.Effect<A, E>): Promise<A> {
-    const program = this.clock ? Effect.withClock(effect, this.clock) : effect;
-    return Effect.runPromise(program);
   }
 }

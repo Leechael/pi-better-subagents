@@ -3,7 +3,7 @@
  *
  * M1: bash override (auto-backgrounding) + task_* tools + manager client.
  * M2: NotifyCenter + monitor tool.
- * M3: subagent tool (EffectChildRunner + tasks/chain + budget-to-async) + fleet widget.
+ * M3: subagent tool (InProcessRunner + tasks/chain + budget-to-async) + fleet widget.
  */
 import { applyBehaviorGuidelines } from "./behavior-guidelines";
 import { ExitNotifyGate } from "./exit-notify-gate";
@@ -31,7 +31,7 @@ import { FleetWidget } from "./subagent/fleet-widget";
 import { WorkIndex, type WorkItem } from "./work-index";
 import { createPiSessionFn, modelCandidates } from "./subagent/pi-runtime";
 import { SubagentRegistry } from "./subagent/registry";
-import { EffectChildRunner } from "./subagent/effect-runner";
+import { InProcessRunner } from "./subagent/runner";
 import { createSubagentTool } from "./subagent/tool";
 import { createTaskListTool, createTaskOutputTool, createTaskStopTool } from "./task-tools";
 import { registerPbsMessageRenderers } from "./tui/message-renderers";
@@ -300,7 +300,7 @@ export default function (pi: ExtensionAPI): void {
       void monitorRegistry?.rewatchAll();
     });
 
-    // M3: subagent registry + Effect runner + fleet widget. The runner's
+    // M3: subagent registry + in-process runner + fleet widget. The runner's
     // per-generation admission goes through the registry (global concurrency
     // cap); the session factory resolves models/cwd lazily from ctx.
     const registry = new SubagentRegistry({
@@ -352,7 +352,7 @@ export default function (pi: ExtensionAPI): void {
         return tools;
       },
     });
-    const runner = new EffectChildRunner({
+    const runner = new InProcessRunner({
       createSession,
       stallMs: subagentConfig.stallMs,
       acquire: (req) => registry.admitChild(req.childId),
