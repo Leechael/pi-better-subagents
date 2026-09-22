@@ -1,23 +1,36 @@
 # Effect-TS child runner pilot
 
-**Status:** completed on `pilot/effect-runner`; production wiring uses the pilot implementation.  
-**Decision:** keep the bounded Effect use for child lifecycle, registry admission, and virtual-clock tests; do not expand Effect usage to unrelated extension modules without another measured pilot.
+**Status:** Rejected. The pilot is preserved on `pilot/effect-runner`; `prelaunch-polish` briefly merged it for review history, then restored the Promise implementation.  
+**Decision:** Do not adopt Effect in the extension. Continue with the Promise runner/registry and the separately approved explicit `Clock` plus per-generation `TimerScope` design.
 
 ## Scope and outcome
 
-The pilot directly replaces the Promise/global-timer child runner:
+The isolated pilot replaced the child runner and registry admission on `pilot/effect-runner`:
 
-- `EffectChildRunner` uses `Deferred` for generation results, `Ref` for exactly-once settlement, `Scope` and `Fiber` for timer ownership/cancellation, and `Clock`/`Duration` for timeout and stall deadlines.
-- `SubagentRegistry` uses Effect's FIFO semaphore for concurrent-child slots. Its Promise-facing API and the pi `CreateSessionFn` boundary remain unchanged.
-- The child session adapter is still Promise-based because pi exposes Promise APIs. Effect does not wrap or replace the pi runtime.
-- Production wiring and registry/tool/integration tests now exercise `EffectChildRunner`; the previous `InProcessRunner` implementation was removed.
-- The Effect lifecycle suite has active `TestClock` cases for hard timeout, disposal, activity-reset stall time, resume generations, pending supervisor decisions, tool execution, settled-event behavior, and event timestamps. Existing registry tests exercise admission, FIFO behavior, and release paths.
+- `EffectChildRunner` used `Deferred` for generation results, `Ref` for settlement state, `Scope`/`Fiber` for timer ownership, and `Clock`/`Duration` for timeout and stall deadlines.
+- `SubagentRegistry` used Effect's FIFO semaphore for concurrent-child slots.
+- Production wiring and the registry/tool/integration tests exercised the Effect implementation. The pilot branch removed the old `InProcessRunner` rather than keeping two production implementations.
+- pi's session API remained Promise-based, so the runner needed Promise edges for session calls, `start`/`resume`/`interrupt`, and the child result surface.
 
-The pilot does **not** make arbitrary JavaScript state transitions type-safe or automatically eliminate lifecycle bugs. The value demonstrated here is explicit ownership of timer fibers/scopes, a controllable clock at the runner boundary, and a FIFO admission primitive. Behavioral tests remain essential.
+The pilot was merged to `prelaunch-polish` for history, verified green, then reverted. The pilot branch remains available for comparison; no push was made.
+
+## Decision rationale
+
+The pilot's costs outweighed its benefits:
+
+- Runner source grew from **439 to 481 LOC** (+42). Registry source changed from **565 to 554 LOC** (−11), for **1,004 to 1,035 LOC** combined (+31).
+- Associated runner/registry/tool/integration tests were **1,212 LOC before** and **1,345 LOC in the pilot** (+133, including the new TestClock suite). Combined source and tests grew from **2,216 to 2,380 LOC** (+164).
+- The unbundled `effect@3.22.2` dependency occupied **33 MB** on disk and added about **60 ms median** to pi's extension startup.
+- Effect did not make lifecycle scenarios test-free or prevent all state-machine bugs structurally; every behavioral test remained necessary.
+- TestClock tests needed extra scheduling and callback-flush helpers (`awaitScheduledTimer` / `flushQueuedTimerCallback`). TestClock controls Effect's clock, not arbitrary native timers.
+
+The structural property worth keeping is **per-generation timer ownership**: settling, interrupting, resuming, or disposing a generation must cancel its timers so they cannot affect a later generation. The plain `TimerScope` provides that guarantee without a second lifecycle paradigm or dependency.
+
+Keep the pilot's scenario list as the contract for ManualClock regression tests: timeout mid-tool then resume; stall pause during tool execution and pending decision; events after settlement; disposal closes generation timers; fail-fast while queued; and exactly-once permit release.
 
 ## Measurements
 
-Measurements were taken on Node **v24.21.0**. Values below are fresh-process samples (10 runs); medians and nearest-rank p90 are reported. The pi load comparison used paired runs. One baseline sample was a cold-start outlier at 790 ms (retained in the sample; it does not affect the reported median or p90).
+Measurements were taken on Node **v24.21.0**. Import and bundle figures are 10 fresh-process runs; medians and nearest-rank p90 are reported. The pi load comparison used paired runs. One baseline sample was a cold-start outlier at 790 ms (retained in the sample; it does not affect median or p90).
 
 | Variant | Measurement | Median | p90 |
 | --- | --- | ---: | ---: |
@@ -28,21 +41,15 @@ Measurements were taken on Node **v24.21.0**. Values below are fresh-process sam
 | pi/jiti extension load, Effect pilot | Same command against the pilot extension | 320 ms | 340 ms |
 | Paired pi/jiti overhead | Pilot minus baseline, same-order paired runs | +60 ms | +60 ms |
 
-The unbundled `effect@3.22.2` package occupies **33 MB** on disk in this install. This extension currently runs TypeScript through pi/jiti rather than shipping a bundle, so it pays the measured import/startup cost and needs the Effect package installed. The bundle measurement is an alternative deployment shape, not the current one.
-
-A prior minimal pilot-shaped bundle measured 324,306 B raw / 67,940 B gzip. The source-backed runner+registry bundle above is the more representative figure and is larger because it includes the actual pilot modules and their reachable code.
+The extension does not ship a bundle, so the bundle is an alternative deployment measurement, not the current runtime shape. A prior minimal pilot-shaped bundle measured 324,306 B raw / 67,940 B gzip; the source-backed runner+registry bundle is the more representative figure.
 
 ## TypeScript 7 upgrade
 
-The branch was upgraded to TypeScript **7.0.2** before the pilot. On the same working tree, `npm run typecheck` measured **3.68 s before** and **0.74 s on the first post-upgrade run**; another post-upgrade run measured **3.14 s**, showing substantial process/cache variance. Do not treat one timing as a stable compiler speedup. No source or `tsconfig` compatibility fixes were required; Vitest and the suite continued to run. A repository search found no dependency on TypeScript's old JavaScript compiler API (`createProgram`, `createSourceFile`, `transpileModule`, `tsserverlibrary`, or `typescript/lib`).
+TypeScript **7.0.2** was upgraded before the Effect pilot. On the same working tree, `npm run typecheck` measured **3.68 s before** and **0.74 s** on the first post-upgrade run; another post-upgrade run measured **3.14 s**, showing process/cache variance. No source or `tsconfig` compatibility fixes were required. A repository search found no dependency on TypeScript's old JavaScript compiler API (`createProgram`, `createSourceFile`, `transpileModule`, `tsserverlibrary`, or `typescript/lib`). TypeScript 7 remains on `prelaunch-polish`.
 
 ## Verification
 
-- TypeScript 7.0.2 typecheck passed after the upgrade and after the Effect replacement.
-- Final pilot suite: **313 passed, 9 skipped**; the nine skips are the separately opt-in real-manager integration tests. No new Effect lifecycle tests remain skipped.
-- `npm test` full-suite wall duration in the final run: **3.58 s** (Vitest-reported 3.09 s test time); concurrent benchmark/test activity can change wall duration.
-- No manager code was changed for the pilot. No changes were pushed or squashed.
-
-## Follow-up boundary
-
-Keep Effect imports centralized in `extension/src/subagent/effect-imports.ts` and restricted to public deep subpaths. Expand only when another measured lifecycle or concurrency seam has a concrete ownership/testing benefit that justifies its import and startup cost. The existing Promise adapter at pi's session boundary is intentional.
+- The merged pilot passed TypeScript 7.0.2 typecheck and the full suite: **313 passed, 9 skipped**. The nine skips were the separately opt-in real-manager integration tests.
+- The final pilot full-suite wall duration was **3.58 s** (Vitest reported 3.09 s test time).
+- After the revert, TypeScript 7.0.2 typecheck passed and the Promise implementation suite reported **312 passed, 9 skipped** (real-manager integration). Full-suite wall duration was **2.93 s** (Vitest-reported 2.16 s test time). The plain Clock commits will update the final counts and wall-time report.
+- No manager code was changed for the pilot. `.claude/` remains untracked and outside the commits.
