@@ -90,6 +90,12 @@ export class FakeChildSession implements ChildSessionAdapter {
     return this.lastText;
   }
 
+  getConversation() {
+    const turns = this.prompts.map((text) => ({ role: "user", text }));
+    if (this.lastText !== undefined) turns.push({ role: "assistant", text: this.lastText });
+    return turns;
+  }
+
   isStreaming(): boolean {
     return this.streaming;
   }

@@ -337,15 +337,6 @@ export default function (pi: ExtensionAPI): void {
               return [];
             }
           },
-          stopTask: async (taskId) => {
-            const c = client;
-            if (!c) throw new Error("no manager");
-            await c.ensureAvailable();
-            await c.stop(taskId);
-          },
-          interruptChild: async (childId) => {
-            await registry.handle(childId)?.interrupt();
-          },
         },
         getUi: () => (ctx?.hasUI ? (ctx.ui as never) : null),
       });

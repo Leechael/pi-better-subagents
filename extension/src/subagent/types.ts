@@ -33,6 +33,12 @@ export interface ChildResult {
   durationMs: number;
 }
 
+/** One turn of a child session, for the /tasks conversation view. */
+export interface ConversationTurn {
+  role: string;
+  text: string;
+}
+
 export interface ChildRunRequest {
   childId: string; // assigned by the registry: "ch_" + 8
   runId: string; // "run_" + 8
@@ -58,6 +64,8 @@ export interface ChildHandle {
   lastEventAt(): number; // for the stall watchdog / status display
   /** Resolved `provider/id` once the child session has been constructed. */
   resolvedModel(): string | undefined;
+  /** Live child transcript. Empty when the session never started. */
+  conversation(): ConversationTurn[];
 }
 
 /**
@@ -78,6 +86,7 @@ export interface ChildSessionAdapter {
   abort(): Promise<void>;
   waitForIdle(): Promise<void>;
   getLastAssistantText(): string | undefined;
+  getConversation(): ConversationTurn[];
   isStreaming(): boolean;
   subscribe(listener: (event: { type: string }) => void): () => void;
   dispose(): void;

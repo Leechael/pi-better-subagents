@@ -26,6 +26,7 @@ import {
   resolveModelSpec,
   type ModelCandidate,
 } from "./model-spec";
+import { turnsFromMessages } from "./conversation";
 import type { ChildRunRequest, ChildSessionAdapter, CreateSessionFn } from "./types";
 
 /** Structural subset of the pi module namespace we rely on. */
@@ -159,6 +160,7 @@ function wrapSession(
     abort: () => session.abort(),
     waitForIdle: () => session.waitForIdle(),
     getLastAssistantText: () => session.getLastAssistantText(),
+    getConversation: () => turnsFromMessages(session.messages),
     isStreaming: () => session.isStreaming,
     subscribe: (listener) => session.subscribe((event) => listener({ type: event.type })),
     dispose: () => session.dispose(),

@@ -165,6 +165,10 @@ class FailedChildHandle implements ChildHandle {
   resolvedModel(): string | undefined {
     return undefined;
   }
+
+  conversation() {
+    return [];
+  }
 }
 
 export class SubagentRegistry implements RunRegistry {

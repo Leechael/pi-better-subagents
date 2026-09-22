@@ -1,11 +1,18 @@
 /**
- * /tasks slash command — Claude Code `/tasks` analogue.
- * Lists running agents, monitors, and shell tasks; offers stop actions.
+ * /tasks — list running subagents, monitors, and shell workers.
+ *
+ * View opens a full-screen scrollable panel (mouse wheel + terminal selection).
+ * Subagents show their conversation. Monitors and shells have output / stderr tabs.
+ * A finished subagent stays listed only while its detail view is open.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { ManagerClient } from "../manager-client";
+import type { ManagerClient, TaskRecord } from "../manager-client";
 import type { MonitorRegistry } from "../monitor";
-import type { SubagentRegistry } from "../subagent/registry";
+import { formatConversation } from "../subagent/conversation";
+import type { RunRecord, SubagentRegistry } from "../subagent/registry";
+import { readTaskFileTail, stderrPathFor } from "./task-output-paths";
+import { isSubagentPinned, pinSubagent, unpinSubagent } from "./tasks-pin";
+import { notifyPlainFallback, showScrollDetail } from "./scroll-detail-view";
 
 export interface TasksCommandDeps {
   getRegistry: () => SubagentRegistry | null;
@@ -15,7 +22,7 @@ export interface TasksCommandDeps {
 
 export function registerTasksCommand(pi: ExtensionAPI, deps: TasksCommandDeps): void {
   pi.registerCommand("tasks", {
-    description: "List and manage background agents, monitors, and shell tasks",
+    description: "List running subagents, monitors, and shell tasks",
     handler: async (_args, ctx) => {
       await openTasksUi(ctx, deps);
     },
@@ -29,9 +36,22 @@ export function registerTasksCommand(pi: ExtensionAPI, deps: TasksCommandDeps): 
 }
 
 interface TaskOption {
-  key: string; // encoded into the select label
+  key: string;
   label: string;
   stop: () => Promise<void>;
+  view: (ctx: ExtensionContext) => Promise<void>;
+}
+
+/** Running children, plus finished ones whose detail view is still open. */
+export function visibleSubagentChildren(runs: readonly RunRecord[]): RunRecord["children"] {
+  const children: RunRecord["children"] = [];
+  for (const run of runs) {
+    for (const child of run.children) {
+      const active = child.status === "pending" || child.status === "running";
+      if (active || isSubagentPinned(child.childId)) children.push(child);
+    }
+  }
+  return children;
 }
 
 async function openTasksUi(ctx: ExtensionContext, deps: TasksCommandDeps): Promise<void> {
@@ -58,7 +78,12 @@ async function openTasksUi(ctx: ExtensionContext, deps: TasksCommandDeps): Promi
   const item = options.find((o) => o.label === picked);
   if (!item) return;
 
-  const action = await ctx.ui.select(`Manage: ${picked}`, ["Stop / interrupt", "Back"]);
+  const action = await ctx.ui.select(picked, ["View", "Stop / interrupt", "Back"]);
+  if (action === "View") {
+    await item.view(ctx);
+    await openTasksUi(ctx, deps);
+    return;
+  }
   if (action !== "Stop / interrupt") {
     await openTasksUi(ctx, deps);
     return;
@@ -74,43 +99,98 @@ async function openTasksUi(ctx: ExtensionContext, deps: TasksCommandDeps): Promi
 async function collectOptions(deps: TasksCommandDeps): Promise<TaskOption[]> {
   const options: TaskOption[] = [];
   const registry = deps.getRegistry();
-  for (const child of registry?.activeChildren() ?? []) {
+  const client = deps.getClient();
+  const tasks = await listManagerTasks(client);
+
+  for (const child of visibleSubagentChildren(registry?.list() ?? [])) {
     options.push({
       key: child.childId,
-      label: `agent · ${child.name} (${child.agent}) · ${child.status}`,
+      label: `subagent · ${child.name} (${child.agent}) · ${child.status} · ${child.childId}`,
       stop: async () => {
         await registry?.handle(child.childId)?.interrupt();
       },
+      view: (ctx) => viewSubagent(ctx, registry, child.childId, child.name),
     });
   }
+
   for (const mon of deps.getMonitors()?.listActive() ?? []) {
+    const record = tasks.find((t) => t.task_id === mon.taskId);
     options.push({
       key: mon.taskId,
       label: `monitor · ${mon.description} · ${mon.taskId}`,
       stop: async () => {
-        const client = deps.getClient();
         await client?.ensureAvailable();
         await client?.stop(mon.taskId);
       },
+      view: (ctx) => viewTaskLogs(ctx, `monitor ${mon.description}`, record?.output_path ?? ""),
     });
   }
-  const client = deps.getClient();
-  if (client?.isAvailable()) {
-    try {
-      const tasks = await client.list();
-      for (const t of tasks.filter((x) => x.status === "running" && x.kind === "shell")) {
-        options.push({
-          key: t.task_id,
-          label: `shell · ${(t.command.split("\n")[0] ?? "").slice(0, 60)} · ${t.task_id}`,
-          stop: async () => {
-            await client.ensureAvailable();
-            await client.stop(t.task_id);
-          },
-        });
-      }
-    } catch {
-      // ignore
-    }
+
+  for (const t of tasks.filter((x) => x.status === "running" && x.kind === "shell")) {
+    const command = (t.command.split("\n")[0] ?? "").slice(0, 60);
+    options.push({
+      key: t.task_id,
+      label: `worker · ${command} · ${t.task_id}`,
+      stop: async () => {
+        await client?.ensureAvailable();
+        await client?.stop(t.task_id);
+      },
+      view: (ctx) => viewTaskLogs(ctx, `worker ${t.task_id}`, t.output_path),
+    });
   }
   return options;
+}
+
+async function listManagerTasks(client: ManagerClient | null): Promise<TaskRecord[]> {
+  if (!client?.isAvailable()) return [];
+  try {
+    return await client.list();
+  } catch {
+    return [];
+  }
+}
+
+async function viewSubagent(
+  ctx: ExtensionContext,
+  registry: SubagentRegistry | null,
+  childId: string,
+  name: string,
+): Promise<void> {
+  pinSubagent(childId);
+  try {
+    const read = () => formatConversation(registry?.handle(childId)?.conversation() ?? []);
+    if (!ctx.hasUI) return;
+    try {
+      await showScrollDetail(ctx.ui, {
+        title: `subagent ${name}`,
+        content: read,
+        pollMs: 500,
+      });
+    } catch {
+      notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), `subagent ${name}`, read());
+    }
+  } finally {
+    unpinSubagent(childId);
+  }
+}
+
+async function viewTaskLogs(ctx: ExtensionContext, title: string, outputPath: string): Promise<void> {
+  if (!ctx.hasUI) return;
+  const stderrPath = stderrPathFor(outputPath);
+  const read = () => ({
+    output: readTaskFileTail(outputPath),
+    stderr: readTaskFileTail(stderrPath),
+  });
+  try {
+    await showScrollDetail(ctx.ui, {
+      title,
+      tabs: {
+        output: () => read().output,
+        stderr: () => read().stderr,
+      },
+      pollMs: 500,
+    });
+  } catch {
+    notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), title, read().output);
+  }
 }

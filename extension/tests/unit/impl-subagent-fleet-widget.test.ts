@@ -1,10 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  FleetWidget,
-  FLEET_STATUS_KEY,
-  FLEET_WIDGET_KEY,
-  type FleetUi,
-} from "../../src/subagent/fleet-widget";
+import { FleetWidget, FLEET_WIDGET_KEY, type FleetUi } from "../../src/subagent/fleet-widget";
 import { SubagentRegistry } from "../../src/subagent/registry";
 import { InProcessRunner } from "../../src/subagent/runner";
 import type { ChildRunRequest } from "../../src/subagent/types";
@@ -17,15 +12,11 @@ type WidgetCall =
 
 function fakeUi(): FleetUi & {
   widgets: WidgetCall[];
-  statuses: Array<string | undefined>;
   renders: number;
-  editorText: string;
 } {
   const state = {
     widgets: [] as WidgetCall[],
-    statuses: [] as Array<string | undefined>,
     renders: 0,
-    editorText: "",
     tui: { requestRender: () => { state.renders += 1; } },
     theme: {
       fg: (_c: string, t: string) => t,
@@ -33,10 +24,7 @@ function fakeUi(): FleetUi & {
   };
   return {
     get widgets() { return state.widgets; },
-    get statuses() { return state.statuses; },
     get renders() { return state.renders; },
-    get editorText() { return state.editorText; },
-    set editorText(v: string) { state.editorText = v; },
     setWidget(_key, content) {
       if (content === undefined) {
         state.widgets.push({ kind: "clear" });
@@ -49,14 +37,14 @@ function fakeUi(): FleetUi & {
       }
       state.widgets.push({ kind: "lines", lines: content });
     },
-    setStatus(_key, text) {
-      state.statuses.push(text);
-    },
-    getEditorText: () => state.editorText,
   };
 }
 
-function makeStack(ui: FleetUi, monitors: { taskId: string; description: string; startedAt: number }[] = []) {
+function makeStack(
+  ui: FleetUi,
+  monitors: { taskId: string; description: string; startedAt: number }[] = [],
+  shells: { taskId: string; command: string; startedAt: number }[] = [],
+) {
   const registry = new SubagentRegistry();
   const factory = new SessionFactory();
   factory.autoComplete = null;
@@ -70,7 +58,7 @@ function makeStack(ui: FleetUi, monitors: { taskId: string; description: string;
       onTransition: (cb) => registry.onTransition(cb),
       activeChildren: () => registry.activeChildren(),
       listMonitors: () => monitors,
-      listShells: () => [],
+      listShells: () => shells,
     },
     getUi: () => ui,
     refreshMs: 500,
@@ -100,7 +88,7 @@ function lastFactory(ui: ReturnType<typeof fakeUi>): ((w: number) => string[]) |
   return undefined;
 }
 
-describe("FleetWidget (Claude-style status)", () => {
+describe("FleetWidget (passive counts)", () => {
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -108,72 +96,46 @@ describe("FleetWidget (Claude-style status)", () => {
     vi.useRealTimers();
   });
 
-  it("shows a collapsed summary and footer status while agents run", async () => {
+  it("shows worker, subagent, monitor, and total counts under the editor", async () => {
     const ui = fakeUi();
-    const { registry, factory, widget } = makeStack(ui);
+    const monitors = [{ taskId: "mon_1", description: "ticker", startedAt: Date.now() }];
+    const shells = [{ taskId: "sh_1", command: "sleep 9", startedAt: Date.now() }];
+    const { registry, factory, widget } = makeStack(ui, monitors, shells);
     widget.start();
 
     const run = registry.createRun("tasks");
     await registry.startChild(addReq(registry, run.runId, "worker-1"));
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(ui.statuses.at(-1)).toMatch(/1 agent/);
-    const render = lastFactory(ui);
-    expect(render).toBeDefined();
-    const lines = render!(80);
-    expect(lines[0]).toMatch(/1 agent/);
-    expect(lines[0]).toMatch(/↓ to manage/);
+    const lines = lastFactory(ui)!(80);
+    expect(lines[0]).toMatch(/1 worker/);
+    expect(lines[0]).toMatch(/1 subagent/);
+    expect(lines[0]).toMatch(/1 monitor/);
+    expect(lines[0]).toMatch(/3 tasks/);
+    expect(lines[0]).not.toMatch(/↓/);
+
+    factory.sessions[0].complete("done");
+    await vi.advanceTimersByTimeAsync(0);
+    // Shell and monitor remain, so the line stays.
+    const still = lastFactory(ui)!(80);
+    expect(still[0]).toMatch(/1 worker/);
+    expect(still[0]).not.toMatch(/subagent/);
+    expect(still[0]).toMatch(/2 tasks/);
+    widget.dispose();
+  });
+
+  it("clears the line when nothing is running", async () => {
+    const ui = fakeUi();
+    const { registry, factory, widget } = makeStack(ui);
+    widget.start();
+    const run = registry.createRun("tasks");
+    await registry.startChild(addReq(registry, run.runId, "worker-1"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastFactory(ui)).toBeDefined();
 
     factory.sessions[0].complete("done");
     await vi.advanceTimersByTimeAsync(0);
     expect(ui.widgets.at(-1)).toEqual({ kind: "clear" });
-    expect(ui.statuses.at(-1)).toBeUndefined();
-    widget.dispose();
-  });
-
-  it("includes monitors in the collapsed summary", async () => {
-    const ui = fakeUi();
-    const monitors = [{ taskId: "mon_1", description: "ticker", startedAt: Date.now() }];
-    const { widget } = makeStack(ui, monitors);
-    widget.start();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(ui.statuses.at(-1)).toMatch(/1 monitor/);
-    const lines = lastFactory(ui)!(80);
-    expect(lines[0]).toMatch(/monitor/);
-    widget.dispose();
-  });
-
-  it("expands on ↓ when the editor is empty and collapses on esc", async () => {
-    const ui = fakeUi();
-    const handlers: Array<(data: string) => { consume?: boolean } | undefined> = [];
-    ui.onTerminalInput = (h) => {
-      handlers.push(h);
-      return () => {};
-    };
-    const { registry, factory, widget } = makeStack(ui);
-    widget.start();
-    const run = registry.createRun("tasks");
-    await registry.startChild(addReq(registry, run.runId, "alpha"));
-    await registry.startChild(addReq(registry, run.runId, "beta"));
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(handlers.length).toBe(1);
-    const consumed = handlers[0]("\x1b[B"); // down
-    expect(consumed?.consume).toBe(true);
-    await vi.advanceTimersByTimeAsync(0);
-    // Force a render after expand
-    widget.refresh();
-    const expanded = lastFactory(ui)!(80);
-    expect(expanded.some((l) => l.includes("select"))).toBe(true);
-    expect(expanded.some((l) => l.includes("alpha"))).toBe(true);
-
-    handlers[0]("\x1b"); // escape
-    widget.refresh();
-    const collapsed = lastFactory(ui)!(80);
-    expect(collapsed[0]).toMatch(/↓ to manage/);
-
-    factory.sessions[0].complete("a");
-    factory.sessions[1].complete("b");
     widget.dispose();
   });
 
@@ -191,8 +153,7 @@ describe("FleetWidget (Claude-style status)", () => {
     widget.dispose();
   });
 
-  it("exports the contractual widget/status keys", () => {
+  it("exports the widget key", () => {
     expect(FLEET_WIDGET_KEY).toBe("pbs-fleet");
-    expect(FLEET_STATUS_KEY).toBe("pbs-fleet");
   });
 });

@@ -108,14 +108,14 @@ pbs-manager log|tail|output …          # see docs/cli.md
 
 ## TUI (interactive mode)
 
-Copied from Claude Code's background-task UX, adapted to pi's extension APIs:
+Counts sit on one line under the editor. Inspection is `/tasks` (alias `/bashes`), which opens a scrollable full-screen view.
 
 | Surface | Behavior |
 |---------|----------|
-| Collapsed fleet line (below editor) | `2 agents · 1 monitor · ↓ to manage` |
-| Footer status | Same counts via `setStatus` |
-| Expand | `↓` / `←` with an empty editor → selectable roster (agents / monitors / shells) |
-| Inspect / stop | Enter → select action; or `/tasks` (alias `/bashes`) |
+| Fleet line (below editor) | `2 workers · 1 subagent · 1 monitor · 4 tasks` — counts only, no keys |
+| `/tasks` | Running subagents, monitors, and shell workers. View or stop |
+| Subagent view | That child's conversation. Stays listed after it finishes only while the view is open |
+| Monitor / shell view | Two pages: merged output, and stderr. Wheel / PgUp / PgDn scroll; terminal selection copies |
 | Transcript pills | Compact renderers for task / subagent / **monitor** / supervisor notifications |
 | Monitor events | Injected as `Monitor event: "desc"` + `<event>` body (model turn / steer); lifecycle (exit / timeout / rate-limit) also fires a TUI toast |
 | Monitor tool row | `Monitor started · task <id> · timeout 300s` |

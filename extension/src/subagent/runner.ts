@@ -119,6 +119,10 @@ class InProcessChildHandle implements DisposableChildHandle {
     return this.resolvedModel_ ?? this.session?.resolvedModel;
   }
 
+  conversation() {
+    return this.session?.getConversation() ?? [];
+  }
+
   /** Launch generation 1. Resolves once the prompt is issued (not completed). */
   async launch(): Promise<void> {
     await this.beginGeneration(this.req.prompt, true);
