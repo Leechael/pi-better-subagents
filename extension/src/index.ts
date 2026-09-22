@@ -6,6 +6,7 @@
  * M3: subagent tool (InProcessRunner + tasks/chain + budget-to-async) + fleet widget.
  */
 import { applyBehaviorGuidelines } from "./behavior-guidelines";
+import { ExitNotifyGate } from "./exit-notify-gate";
 import { readFileTail } from "./file-tail";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -33,7 +34,6 @@ import { SubagentRegistry } from "./subagent/registry";
 import { InProcessRunner } from "./subagent/runner";
 import { createSubagentTool } from "./subagent/tool";
 import { createTaskListTool, createTaskOutputTool, createTaskStopTool } from "./task-tools";
-import { shouldNotifyTaskExit } from "./task-exit-notify";
 import { registerPbsMessageRenderers } from "./tui/message-renderers";
 import { registerTasksCommand } from "./tui/tasks-command";
 
@@ -75,13 +75,40 @@ export default function (pi: ExtensionAPI): void {
    * is mis-labeled as a parent "Background command" wake (§4.2 / §4.6).
    */
   const notifyOnExit = new Set<string>();
+  const exitGate = new ExitNotifyGate<ManagerEvent>();
   const workIndex = new WorkIndex();
 
   const trackTask = (taskId: string, meta: { kind: string; command: string }) => {
     taskMeta.set(taskId, meta);
   };
+  const deliverExit = (taskId: string, event: ManagerEvent) => {
+    notifyOnExit.delete(taskId);
+    const meta = taskMeta.get(taskId);
+    taskMeta.delete(taskId);
+    workIndex.patch(taskId, {
+      status: toExitStatus(event),
+      endedAt: Date.now(),
+      ...(event.output_path ? { outputPath: event.output_path } : {}),
+    });
+    notifyCenter?.notifyTaskExit({
+      taskId,
+      kind: meta?.kind ?? event.kind ?? "shell",
+      command: meta?.command ?? event.command ?? "",
+      status: toExitStatus(event),
+      exitCode: event.exit_code ?? null,
+      durationMs: event.duration_ms ?? 0,
+      outputPath: event.output_path ?? "",
+      preview: readPreview(event.output_path, 4000),
+    });
+  };
+
   const markNotifyOnExit = (taskId: string) => {
     notifyOnExit.add(taskId);
+    const prior = exitGate.mark(taskId);
+    if (prior) {
+      deliverExit(taskId, prior);
+      return;
+    }
     const meta = taskMeta.get(taskId);
     const item: WorkItem = {
       id: taskId,
@@ -251,31 +278,10 @@ export default function (pi: ExtensionAPI): void {
           endedAt: Date.now(),
           ...(event.output_path ? { outputPath: event.output_path } : {}),
         });
-        // Sync-awaited shells (parent fg within budget, child-bash) already
-        // delivered output via the tool result — do not wake the parent.
-        if (
-          !shouldNotifyTaskExit({
-            taskId: event.task_id,
-            isMonitor: false,
-            notifyOnExit,
-          })
-        ) {
-          taskMeta.delete(event.task_id);
-          return;
-        }
-        notifyOnExit.delete(event.task_id);
-        const meta = taskMeta.get(event.task_id);
-        taskMeta.delete(event.task_id);
-        notifyCenter?.notifyTaskExit({
-          taskId: event.task_id,
-          kind: meta?.kind ?? "shell",
-          command: meta?.command ?? "",
-          status: toExitStatus(event),
-          exitCode: event.exit_code ?? null,
-          durationMs: event.duration_ms ?? 0,
-          outputPath: event.output_path ?? "",
-          preview: readPreview(event.output_path, 4000),
-        });
+        // Exit may share a socket read with wait done:false, before bash marks
+        // the id. Stash and fire on the late mark. Sync waits never mark.
+        if (exitGate.onExit(event.task_id, event, false) !== "notify") return;
+        deliverExit(event.task_id, event);
       }
     });
     client.onReconnect(() => {
