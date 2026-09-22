@@ -1,9 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FleetWidget, FLEET_WIDGET_KEY, type FleetUi } from "../../src/subagent/fleet-widget";
-import { SubagentRegistry } from "../../src/subagent/registry";
-import { InProcessRunner } from "../../src/subagent/runner";
-import type { ChildRunRequest } from "../../src/subagent/types";
-import { SessionFactory, WORKER_AGENT } from "./subagent-fakes";
+import { FleetWidget, FLEET_WIDGET_KEY, summaryLabel, type FleetUi } from "../../src/subagent/fleet-widget";
+import { WorkIndex } from "../../src/work-index";
 
 type WidgetCall =
   | { kind: "clear" }
@@ -40,45 +37,6 @@ function fakeUi(): FleetUi & {
   };
 }
 
-function makeStack(
-  ui: FleetUi,
-  monitors: { taskId: string; description: string; startedAt: number }[] = [],
-  shells: { taskId: string; command: string; startedAt: number }[] = [],
-) {
-  const registry = new SubagentRegistry();
-  const factory = new SessionFactory();
-  factory.autoComplete = null;
-  const runner = new InProcessRunner({
-    createSession: factory.fn,
-    acquire: (req) => registry.admitChild(req.childId),
-  });
-  registry.setRunner(runner);
-  const widget = new FleetWidget({
-    source: {
-      onTransition: (cb) => registry.onTransition(cb),
-      activeChildren: () => registry.activeChildren(),
-      listMonitors: () => monitors,
-      listShells: () => shells,
-    },
-    getUi: () => ui,
-    refreshMs: 500,
-  });
-  return { registry, factory, widget };
-}
-
-function addReq(registry: SubagentRegistry, runId: string, name: string): ChildRunRequest {
-  const childId = registry.addChild(runId, { name, agent: "worker" });
-  return {
-    childId,
-    runId,
-    name,
-    prompt: `do ${name}`,
-    agent: WORKER_AGENT,
-    timeoutMs: 60_000,
-    depth: 1,
-  };
-}
-
 function lastFactory(ui: ReturnType<typeof fakeUi>): ((w: number) => string[]) | undefined {
   for (let i = ui.widgets.length - 1; i >= 0; i--) {
     const c = ui.widgets[i];
@@ -96,60 +54,59 @@ describe("FleetWidget (passive counts)", () => {
     vi.useRealTimers();
   });
 
-  it("shows worker, subagent, monitor, and total counts under the editor", async () => {
+  it("shows workers, subagents, and monitors without a total", () => {
     const ui = fakeUi();
-    const monitors = [{ taskId: "mon_1", description: "ticker", startedAt: Date.now() }];
-    const shells = [{ taskId: "sh_1", command: "sleep 9", startedAt: Date.now() }];
-    const { registry, factory, widget } = makeStack(ui, monitors, shells);
+    const index = new WorkIndex();
+    index.upsert({ id: "sh_1", kind: "shell", status: "running", title: "sleep 9", startedAt: 1, countsAsWorker: true });
+    index.upsert({ id: "mon_1", kind: "monitor", status: "running", title: "ticker", startedAt: 2, countsAsWorker: false });
+    index.upsert({ id: "ch_1", kind: "agent", status: "running", title: "worker-1", startedAt: 3, countsAsWorker: false });
+    const widget = new FleetWidget({ index, getUi: () => ui });
     widget.start();
-
-    const run = registry.createRun("tasks");
-    await registry.startChild(addReq(registry, run.runId, "worker-1"));
-    await vi.advanceTimersByTimeAsync(0);
-
     const lines = lastFactory(ui)!(80);
     expect(lines[0]).toMatch(/1 worker/);
     expect(lines[0]).toMatch(/1 subagent/);
     expect(lines[0]).toMatch(/1 monitor/);
-    expect(lines[0]).toMatch(/3 tasks/);
-    expect(lines[0]).not.toMatch(/↓/);
-
-    factory.sessions[0].complete("done");
-    await vi.advanceTimersByTimeAsync(0);
-    // Shell and monitor remain, so the line stays.
-    const still = lastFactory(ui)!(80);
-    expect(still[0]).toMatch(/1 worker/);
-    expect(still[0]).not.toMatch(/subagent/);
-    expect(still[0]).toMatch(/2 tasks/);
+    expect(lines[0]).not.toMatch(/\d+ tasks/);
+    expect(summaryLabel(1, 1, 1)).toBe("1 worker · 1 subagent · 1 monitor");
     widget.dispose();
   });
 
-  it("clears the line when nothing is running", async () => {
+  it("does not count a sync-waited shell as a worker", () => {
     const ui = fakeUi();
-    const { registry, factory, widget } = makeStack(ui);
+    const index = new WorkIndex();
+    // Sync-waited shells are never inserted. A non-worker shell must not count.
+    index.upsert({ id: "sh_fg", kind: "shell", status: "running", title: "echo hi", startedAt: 1, countsAsWorker: false });
+    const widget = new FleetWidget({ index, getUi: () => ui });
     widget.start();
-    const run = registry.createRun("tasks");
-    await registry.startChild(addReq(registry, run.runId, "worker-1"));
-    await vi.advanceTimersByTimeAsync(0);
-    expect(lastFactory(ui)).toBeDefined();
+    expect(lastFactory(ui)).toBeUndefined();
+    widget.dispose();
+  });
 
-    factory.sessions[0].complete("done");
-    await vi.advanceTimersByTimeAsync(0);
+  it("clears the line when nothing is running", () => {
+    const ui = fakeUi();
+    const index = new WorkIndex();
+    index.upsert({ id: "ch_1", kind: "agent", status: "running", title: "a", startedAt: 1, countsAsWorker: false });
+    const widget = new FleetWidget({ index, getUi: () => ui });
+    widget.start();
+    expect(lastFactory(ui)).toBeDefined();
+    index.patch("ch_1", { status: "completed", endedAt: 2 });
     expect(ui.widgets.at(-1)).toEqual({ kind: "clear" });
     widget.dispose();
   });
 
-  it("re-renders on the 500ms tick while running", async () => {
+  it("re-renders when the index changes, not on a timer", async () => {
     const ui = fakeUi();
-    const { registry, factory, widget } = makeStack(ui);
+    const index = new WorkIndex();
+    const widget = new FleetWidget({ index, getUi: () => ui });
     widget.start();
-    const run = registry.createRun("tasks");
-    await registry.startChild(addReq(registry, run.runId, "worker-1"));
-    await vi.advanceTimersByTimeAsync(0);
     const before = ui.renders;
     await vi.advanceTimersByTimeAsync(500);
-    expect(ui.renders).toBeGreaterThan(before);
-    factory.sessions[0].complete("done");
+    expect(ui.renders).toBe(before);
+    index.upsert({ id: "mon_1", kind: "monitor", status: "running", title: "tick", startedAt: 1, countsAsWorker: false });
+    expect(lastFactory(ui)?.(80).join("\n")).toMatch(/1 monitor/);
+    const afterRegister = ui.renders;
+    index.patch("mon_1", { title: "tick2" });
+    expect(ui.renders).toBeGreaterThan(afterRegister);
     widget.dispose();
   });
 

@@ -26,6 +26,7 @@ import {
   type AgentChildRecord,
 } from "./subagent/agent-records";
 import { FleetWidget } from "./subagent/fleet-widget";
+import { WorkIndex, type WorkItem } from "./work-index";
 import { createPiSessionFn, modelCandidates } from "./subagent/pi-runtime";
 import { SubagentRegistry } from "./subagent/registry";
 import { InProcessRunner } from "./subagent/runner";
@@ -84,12 +85,23 @@ export default function (pi: ExtensionAPI): void {
    * is mis-labeled as a parent "Background command" wake (§4.2 / §4.6).
    */
   const notifyOnExit = new Set<string>();
+  const workIndex = new WorkIndex();
 
   const trackTask = (taskId: string, meta: { kind: string; command: string }) => {
     taskMeta.set(taskId, meta);
   };
   const markNotifyOnExit = (taskId: string) => {
     notifyOnExit.add(taskId);
+    const meta = taskMeta.get(taskId);
+    const item: WorkItem = {
+      id: taskId,
+      kind: "shell",
+      status: "running",
+      title: meta?.command?.replace(/\s+/g, " ").trim() || taskId,
+      startedAt: Date.now(),
+      countsAsWorker: true,
+    };
+    workIndex.upsert(item);
   };
 
   const sessionEnv = (c: ExtensionContext): Record<string, string> => ({
@@ -130,6 +142,20 @@ export default function (pi: ExtensionAPI): void {
     getRegistry: () => subagentRegistry,
     getMonitors: () => monitorRegistry,
     getClient: () => client,
+  });
+  monitorRegistry.onChange(() => {
+    for (const mon of monitorRegistry.listActive()) {
+      const existing = workIndex.get(mon.taskId);
+      workIndex.upsert({
+        id: mon.taskId,
+        kind: "monitor",
+        status: "running",
+        title: mon.description,
+        startedAt: existing?.startedAt ?? mon.startedAt,
+        outputPath: existing?.outputPath,
+        countsAsWorker: false,
+      });
+    }
   });
 
   // M3: subagent tool. The registry/runner are (re)built on every session_start;
@@ -200,6 +226,16 @@ export default function (pi: ExtensionAPI): void {
     client.onEvent((event) => {
       if (event.event === "task_started" && event.task_id) {
         trackTask(event.task_id, { kind: event.kind ?? "shell", command: event.command ?? "" });
+        if (event.kind === "monitor" && !workIndex.get(event.task_id)) {
+          workIndex.upsert({
+            id: event.task_id,
+            kind: "monitor",
+            status: "running",
+            title: event.command || event.task_id,
+            startedAt: Date.now(),
+            countsAsWorker: false,
+          });
+        }
         return;
       }
       if (event.event === "output" && event.task_id && typeof event.chunk === "string") {
@@ -209,8 +245,18 @@ export default function (pi: ExtensionAPI): void {
       if (event.event === "task_exited" && event.task_id) {
         if (monitorRegistry?.has(event.task_id)) {
           monitorRegistry.handleExit(event.task_id, event);
+          workIndex.patch(event.task_id, {
+            status: toExitStatus(event),
+            endedAt: Date.now(),
+            ...(event.output_path ? { outputPath: event.output_path } : {}),
+          });
           return;
         }
+        workIndex.patch(event.task_id, {
+          status: toExitStatus(event),
+          endedAt: Date.now(),
+          ...(event.output_path ? { outputPath: event.output_path } : {}),
+        });
         // Sync-awaited shells (parent fg within budget, child-bash) already
         // delivered output via the tool result — do not wake the parent.
         if (
@@ -316,32 +362,24 @@ export default function (pi: ExtensionAPI): void {
           ...(c.endedAt !== undefined ? { ended_at: c.endedAt } : {}),
         };
         writeAgentChildRecord(home, rec);
+        workIndex.upsert({
+          id: c.childId,
+          kind: "agent",
+          status: c.status,
+          title: `${c.name} (${c.agent})${c.model ? ` ${c.model}` : ""}`,
+          startedAt: c.startedAt,
+          ...(c.endedAt !== undefined ? { endedAt: c.endedAt } : {}),
+          countsAsWorker: false,
+          runId: run.runId,
+          name: c.name,
+          agent: c.agent,
+          ...(c.model !== undefined ? { model: c.model } : {}),
+        });
       }
     });
     if (startCtx.hasUI) {
       fleetWidget = new FleetWidget({
-        source: {
-          onTransition: (cb) => registry.onTransition(cb),
-          activeChildren: () => registry.activeChildren(),
-          listMonitors: () => monitorRegistry?.listActive() ?? [],
-          onMonitorChange: (cb) => monitorRegistry?.onChange(cb) ?? (() => {}),
-          listShells: async () => {
-            const c = client;
-            if (!c?.isAvailable()) return [];
-            try {
-              const tasks = await c.list();
-              return tasks
-                .filter((t) => t.status === "running" && t.kind === "shell")
-                .map((t) => ({
-                  taskId: t.task_id,
-                  command: t.command,
-                  startedAt: t.started_at || Date.now(),
-                }));
-            } catch {
-              return [];
-            }
-          },
-        },
+        index: workIndex,
         getUi: () => (ctx?.hasUI ? (ctx.ui as never) : null),
       });
       fleetWidget.start();
