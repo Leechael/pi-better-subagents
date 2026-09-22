@@ -196,6 +196,7 @@ export default function (pi: ExtensionAPI): void {
       home,
       sessionId: startCtx.sessionManager.getSessionId(),
       managerPath,
+      cwd: startCtx.cwd,
       log: () => {}, // keep quiet; degradation is surfaced via tools
     });
 

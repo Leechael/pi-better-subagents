@@ -123,6 +123,9 @@ pub enum RequestKind {
         session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pi_pid: Option<u32>,
+        /// Session working directory. Optional so older clients still hello.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
     /// §3.3 start — env is the child's *complete* environment.
     Start {
@@ -250,6 +253,9 @@ pub struct SessionInfo {
     pub session_id: String,
     pub pi_pid: u32,
     pub connected: bool,
+    /// Present when the extension sent cwd on hello. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,6 +451,7 @@ mod tests {
                 client_kind: ClientKind::Extension,
                 session_id: Some("sess1".into()),
                 pi_pid: Some(1234),
+                cwd: None,
             },
         };
         let v: serde_json::Value = serde_json::from_slice(&encode(&req)).unwrap();
@@ -463,6 +470,7 @@ mod tests {
                 client_kind: ClientKind::Cli,
                 session_id: None,
                 pi_pid: None,
+                cwd: None,
             },
         };
         let v: serde_json::Value = serde_json::from_slice(&encode(&req)).unwrap();

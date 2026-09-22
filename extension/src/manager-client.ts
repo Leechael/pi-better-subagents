@@ -100,6 +100,8 @@ export interface ManagerClientOptions {
   sessionId: string;
   managerPath: string | null;
   piPid?: number;
+  /** Session working directory, sent on hello (optional; older managers ignore it). */
+  cwd?: string;
   log?: (message: string) => void;
 }
 
@@ -210,6 +212,7 @@ export class ManagerClient {
   private readonly sessionId: string;
   private readonly managerPath: string | null;
   private readonly piPid: number;
+  private readonly cwd: string | undefined;
   private readonly log: (message: string) => void;
 
   private socket: net.Socket | null = null;
@@ -230,6 +233,7 @@ export class ManagerClient {
     this.sessionId = options.sessionId;
     this.managerPath = options.managerPath;
     this.piPid = options.piPid ?? process.pid;
+    this.cwd = options.cwd;
     this.log = options.log ?? (() => {});
   }
 
@@ -527,6 +531,7 @@ export class ManagerClient {
           client_kind: "extension",
           session_id: this.sessionId,
           pi_pid: this.piPid,
+          ...(this.cwd ? { cwd: this.cwd } : {}),
         }),
       );
     });

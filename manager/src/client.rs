@@ -85,11 +85,13 @@ async fn try_connect_and_hello(home: &Path, mode: &HelloMode) -> Result<Conn, St
             client_kind: ClientKind::Cli,
             session_id: None,
             pi_pid: None,
+            cwd: None,
         },
         HelloMode::Extension { session_id } => RequestKind::Hello {
             client_kind: ClientKind::Extension,
             session_id: Some(session_id.clone()),
             pi_pid: Some(std::process::id()),
+            cwd: std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
         },
     };
     let _: HelloOk = conn.roundtrip(hello).await?;
@@ -199,9 +201,10 @@ pub async fn cmd_sessions(home: &Path) -> Result<(), String> {
         println!("no sessions");
         return Ok(());
     }
-    println!("{:<36} {:>8} CONNECTED", "SESSION_ID", "PI_PID");
+    println!("{:<36} {:>8} {:<9} CWD", "SESSION_ID", "PI_PID", "CONNECTED");
     for s in st.sessions {
-        println!("{:<36} {:>8} {}", s.session_id, s.pi_pid, s.connected);
+        let cwd = s.cwd.as_deref().filter(|c| !c.is_empty()).unwrap_or("-");
+        println!("{:<36} {:>8} {:<9} {}", s.session_id, s.pi_pid, s.connected, cwd);
     }
     Ok(())
 }

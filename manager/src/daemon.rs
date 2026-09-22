@@ -49,6 +49,7 @@ pub struct ConnHandle {
 pub struct SessionEntry {
     pub pi_pid: u32,
     pub conn_id: Option<u64>,
+    pub cwd: Option<String>,
 }
 
 pub struct DaemonState {
@@ -251,12 +252,13 @@ async fn handle_conn(state: Shared, stream: Stream) {
             .await;
         return;
     }
-    let (client_kind, session_id, pi_pid) = match hello.kind {
+    let (client_kind, session_id, pi_pid, cwd) = match hello.kind {
         RequestKind::Hello {
             client_kind,
             session_id,
             pi_pid,
-        } => (client_kind, session_id, pi_pid),
+            cwd,
+        } => (client_kind, session_id, pi_pid, cwd),
         _ => {
             let _ = tx
                 .send(encode_error(&hello.id, E_BAD_REQUEST, "first message must be hello"))
@@ -278,7 +280,7 @@ async fn handle_conn(state: Shared, stream: Stream) {
         }
     }
 
-    let conn_id = match register_conn(&state, &tx, &die, client_kind, session_id, pi_pid) {
+    let conn_id = match register_conn(&state, &tx, &die, client_kind, session_id, pi_pid, cwd) {
         Ok(id) => id,
         Err(e) => {
             let _ = tx.send(encode_error(&hello.id, &e.code, &e.message)).await;
@@ -341,6 +343,7 @@ fn register_conn(
     kind: ClientKind,
     session_id: Option<String>,
     pi_pid: Option<u32>,
+    cwd: Option<String>,
 ) -> Result<u64, ProtoError> {
     let mut st = state.lock().unwrap();
     if st.shutdown {
@@ -367,6 +370,7 @@ fn register_conn(
             SessionEntry {
                 pi_pid: pi_pid.unwrap_or(0),
                 conn_id: Some(conn_id),
+                cwd,
             },
         );
     }
@@ -853,7 +857,6 @@ fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessi
 
 fn handle_status(state: &Shared, conn_id: u64) -> Result<StatusOk, ProtoError> {
     let st = state.lock().unwrap();
-    // §3.3 marks status as a cli message.
     if let Some(h) = st.conns.get(&conn_id) {
         if h.kind != ClientKind::Cli {
             return Err(ProtoError::new(E_FORBIDDEN, "status is a cli-only operation"));
@@ -866,6 +869,7 @@ fn handle_status(state: &Shared, conn_id: u64) -> Result<StatusOk, ProtoError> {
             session_id: sid.clone(),
             pi_pid: s.pi_pid,
             connected: s.conn_id.is_some(),
+            cwd: s.cwd.clone(),
         })
         .collect();
     let running = st
