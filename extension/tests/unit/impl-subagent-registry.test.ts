@@ -223,6 +223,20 @@ describe("SubagentRegistry", () => {
     expect(result.status).toBe("interrupted");
   });
 
+  it("emits interrupted before disposeRun drops the children", async () => {
+    const { registry, factory } = makeStack();
+    factory.autoComplete = null;
+    const seen: string[] = [];
+    registry.onTransition((run) => {
+      seen.push(run.children.map((c) => c.status).join(","));
+    });
+    const run = registry.createRun("tasks");
+    const req = addReq(registry, run.runId, "a");
+    await registry.startChild(req);
+    registry.disposeRun(run.runId);
+    expect(seen.at(-1)).toBe("interrupted");
+  });
+
   it("disposeAll disposes every run", async () => {
     const { registry, factory } = makeStack();
     factory.autoComplete = null;

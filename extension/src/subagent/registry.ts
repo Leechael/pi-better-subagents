@@ -248,13 +248,29 @@ export class SubagentRegistry implements RunRegistry {
   disposeRun(runId: string): void {
     const run = this.runs.get(runId);
     if (!run) return;
+    const now = this.now();
+    // Settle while children are still in the map. interrupt() calls settleChild,
+    // which no-ops once the child has been deleted — that used to emit a final
+    // "running" record (ghost agents in ls).
+    for (const child of run.children) {
+      if (child.status === "pending" || child.status === "running") {
+        child.status = "interrupted";
+        child.endedAt = now;
+        child.result = {
+          status: "interrupted",
+          text: child.result?.text ?? "",
+          error: "disposed",
+          durationMs: Math.max(0, now - child.startedAt),
+        };
+      }
+    }
+    this.recomputeRunStatus(run);
+    this.emit(run);
     this.runs.delete(runId);
     for (const child of run.children) {
       this.children.delete(child.childId);
       const handle = child.handle as DisposableChildHandle | undefined;
       if (!handle) continue;
-      // interrupt() settles synchronously; abort floats. dispose() releases
-      // timers and the underlying session.
       void handle.interrupt().catch(() => {});
       try {
         handle.dispose?.();
@@ -262,8 +278,6 @@ export class SubagentRegistry implements RunRegistry {
         // ignore
       }
     }
-    // Fire a final transition so observers (fleet widget) refresh.
-    this.emit(run);
   }
 
   // -------------------------------------------------------------------------
