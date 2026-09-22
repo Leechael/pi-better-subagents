@@ -36,6 +36,7 @@ import { createSubagentTool } from "./subagent/tool";
 import { createTaskListTool, createTaskOutputTool, createTaskStopTool } from "./task-tools";
 import { registerPbsMessageRenderers } from "./tui/message-renderers";
 import { registerTasksCommand } from "./tui/tasks-command";
+import { stderrPathFor } from "./tui/task-output-paths";
 
 /** Read only the tail of a task output file for the notification preview (≤ maxChars). */
 export function readPreview(outputPath: string | undefined, maxChars: number): string {
@@ -88,7 +89,9 @@ export default function (pi: ExtensionAPI): void {
     workIndex.patch(taskId, {
       status: toExitStatus(event),
       endedAt: Date.now(),
-      ...(event.output_path ? { outputPath: event.output_path } : {}),
+      ...(event.output_path
+            ? { outputPath: event.output_path, stderrPath: stderrPathFor(event.output_path) }
+            : {}),
     });
     notifyCenter?.notifyTaskExit({
       taskId,
@@ -151,9 +154,9 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerTool(createBashOverride(deps));
-  pi.registerTool(createTaskListTool(deps));
-  pi.registerTool(createTaskOutputTool(deps));
-  pi.registerTool(createTaskStopTool(deps));
+  pi.registerTool(createTaskListTool({ ...deps, getIndex: () => workIndex }));
+  pi.registerTool(createTaskOutputTool({ ...deps, getIndex: () => workIndex }));
+  pi.registerTool(createTaskStopTool({ ...deps, getIndex: () => workIndex }));
   pi.registerTool(createMonitorTool(monitorRegistry));
   registerTasksCommand(pi, {
     getRegistry: () => subagentRegistry,
@@ -170,6 +173,7 @@ export default function (pi: ExtensionAPI): void {
         title: mon.description,
         startedAt: existing?.startedAt ?? mon.startedAt,
         outputPath: existing?.outputPath,
+        stderrPath: existing?.stderrPath,
         countsAsWorker: false,
       });
     }
@@ -185,7 +189,9 @@ export default function (pi: ExtensionAPI): void {
     getRegistry: () => subagentRegistry,
     getNotifyCenter: () => notifyCenter,
   });
-  const comms: CommsWithOrigin = createComms(commsHost);
+  const comms: CommsWithOrigin = createComms(commsHost, {
+    decisionTimeoutMs: subagentConfig.decisionTimeoutMs,
+  });
   pi.registerTool(
     createSubagentTool({
       getRegistry: () => subagentRegistry,
@@ -269,14 +275,18 @@ export default function (pi: ExtensionAPI): void {
           workIndex.patch(event.task_id, {
             status: toExitStatus(event),
             endedAt: Date.now(),
-            ...(event.output_path ? { outputPath: event.output_path } : {}),
+            ...(event.output_path
+            ? { outputPath: event.output_path, stderrPath: stderrPathFor(event.output_path) }
+            : {}),
           });
           return;
         }
         workIndex.patch(event.task_id, {
           status: toExitStatus(event),
           endedAt: Date.now(),
-          ...(event.output_path ? { outputPath: event.output_path } : {}),
+          ...(event.output_path
+            ? { outputPath: event.output_path, stderrPath: stderrPathFor(event.output_path) }
+            : {}),
         });
         // Exit may share a socket read with wait done:false, before bash marks
         // the id. Stash and fire on the late mark. Sync waits never mark.
@@ -378,6 +388,7 @@ export default function (pi: ExtensionAPI): void {
           name: c.name,
           agent: c.agent,
           ...(c.model !== undefined ? { model: c.model } : {}),
+          ...(c.result?.text ? { text: c.result.text } : {}),
         });
       }
     });

@@ -76,7 +76,7 @@ const subagentParameters = Type.Object({
   ),
   timeout_ms: Type.Optional(
     Type.Number({
-      description: `Hard timeout per subagent in ms (default 600000, max ${MAX_TIMEOUT_MS})`,
+      description: `Hard timeout per subagent in ms (default 1800000, max ${MAX_TIMEOUT_MS})`,
       maximum: MAX_TIMEOUT_MS,
     }),
   ),
