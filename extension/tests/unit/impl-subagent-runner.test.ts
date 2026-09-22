@@ -234,6 +234,41 @@ describe("InProcessRunner", () => {
       expect(factory.sessions[0].aborts).toBe(1);
     });
 
+    it("does not stall while a tool is executing", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500 });
+      const handle = await runner.start(makeReq());
+      const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string }) => void }).emit.bind(
+        factory.sessions[0],
+      );
+      emit({ type: "tool_execution_start" });
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(handle.status()).toBe("running");
+      emit({ type: "tool_execution_end" });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(handle.status()).toBe("failed");
+    });
+
+    it("stalls generation 2 after a timeout that landed mid-tool", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 50 });
+      const handle = await runner.start(makeReq({ timeoutMs: 100 }));
+      const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string }) => void }).emit.bind(
+        factory.sessions[0],
+      );
+      emit({ type: "tool_execution_start" });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(handle.status()).toBe("interrupted");
+      emit({ type: "tool_execution_end" });
+      await handle.resume("again");
+      emit({ type: "tool_execution_end" });
+      await vi.advanceTimersByTimeAsync(50);
+      expect(handle.status()).toBe("failed");
+      expect((await handle.result).error).toBe("stalled");
+    });
+
     it("session events reset the stall watchdog", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;

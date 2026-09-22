@@ -104,10 +104,16 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
       // need_decision: register the per-child waiter BEFORE notifying, so a
       // supervisor that replies synchronously still resolves correctly.
       const wait = mailbox.beginDecision(fromChildId, name, message);
+      const stall = child?.handle as { pauseStall?: () => void; resumeStall?: () => void } | undefined;
+      stall?.pauseStall?.();
       host.notifySupervisor(formatSupervisorRequest({ childId: fromChildId, name }, message));
-      const replyText = await wait;
-      entry.reply = replyText;
-      return replyText;
+      try {
+        const replyText = await wait;
+        entry.reply = replyText;
+        return replyText;
+      } finally {
+        stall?.resumeStall?.();
+      }
     },
 
     reply(toChildId, message, from = "supervisor") {

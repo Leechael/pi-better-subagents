@@ -26,8 +26,10 @@ export interface PbsSubagentConfig {
   budgetMs?: number;
   /** Default per-child hard timeout (ms). */
   timeoutMs?: number;
-  /** Stall watchdog: abort a child with no events for this long (ms). */
+  /** Stall watchdog: abort a child with no events for this long (ms). Paused during tools and need_decision. */
   stallMs?: number;
+  /** need_decision wait for the parent (ms). Independent of stallMs and timeoutMs. */
+  decisionTimeoutMs?: number;
   /** Default per-run worker pool concurrency. */
   concurrency?: number;
   /** Global cap on concurrently running children across all runs. */
@@ -41,6 +43,7 @@ export interface ResolvedSubagentConfig {
   budgetMs: number;
   timeoutMs: number;
   stallMs: number;
+  decisionTimeoutMs: number;
   concurrency: number;
   maxConcurrentChildren: number;
   spawnBudgetPerHour: number;
@@ -48,8 +51,9 @@ export interface ResolvedSubagentConfig {
 
 export const DEFAULT_SUBAGENT_CONFIG: ResolvedSubagentConfig = {
   budgetMs: 45000,
-  timeoutMs: 600000,
-  stallMs: 600000,
+  timeoutMs: 1_800_000,
+  stallMs: 300_000,
+  decisionTimeoutMs: 600_000,
   concurrency: 4,
   maxConcurrentChildren: 8,
   spawnBudgetPerHour: 32,
@@ -63,6 +67,9 @@ export function resolveSubagentConfig(config: PbsConfig): ResolvedSubagentConfig
   if (typeof section.budgetMs === "number" && section.budgetMs > 0) resolved.budgetMs = section.budgetMs;
   if (typeof section.timeoutMs === "number" && section.timeoutMs > 0) resolved.timeoutMs = section.timeoutMs;
   if (typeof section.stallMs === "number" && section.stallMs > 0) resolved.stallMs = section.stallMs;
+  if (typeof section.decisionTimeoutMs === "number" && section.decisionTimeoutMs > 0) {
+    resolved.decisionTimeoutMs = section.decisionTimeoutMs;
+  }
   if (typeof section.concurrency === "number" && section.concurrency >= 1) {
     resolved.concurrency = Math.floor(section.concurrency);
   }
@@ -142,6 +149,9 @@ export function loadConfig(home: string = getPbsHome()): PbsConfig {
     if (typeof section.budgetMs === "number" && section.budgetMs > 0) subagent.budgetMs = section.budgetMs;
     if (typeof section.timeoutMs === "number" && section.timeoutMs > 0) subagent.timeoutMs = section.timeoutMs;
     if (typeof section.stallMs === "number" && section.stallMs > 0) subagent.stallMs = section.stallMs;
+    if (typeof section.decisionTimeoutMs === "number" && section.decisionTimeoutMs > 0) {
+      subagent.decisionTimeoutMs = section.decisionTimeoutMs;
+    }
     if (typeof section.concurrency === "number" && section.concurrency >= 1) {
       subagent.concurrency = section.concurrency;
     }

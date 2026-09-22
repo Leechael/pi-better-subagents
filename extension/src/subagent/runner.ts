@@ -29,7 +29,8 @@ import type {
   DisposableChildHandle,
 } from "./types";
 
-export const DEFAULT_STALL_MS = 10 * 60 * 1000;
+/** Inactivity abort. Paused while a tool is executing or a need_decision is pending. */
+export const DEFAULT_STALL_MS = 5 * 60 * 1000;
 
 export interface InProcessRunnerOptions {
   createSession: CreateSessionFn;
@@ -84,6 +85,10 @@ class InProcessChildHandle implements DisposableChildHandle {
   private stallTimer: NodeJS.Timeout | null = null;
   private releaseSlot: (() => void) | null = null;
   private disposed = false;
+  /** Nested tool_execution_start/end. Stall stays paused while > 0. */
+  private toolDepth = 0;
+  /** contact_supervisor need_decision. Stall stays paused while true. */
+  private decisionPaused = false;
 
   constructor(req: ChildRunRequest, opts: InProcessRunnerOptions) {
     this.req = req;
@@ -117,6 +122,18 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   resolvedModel(): string | undefined {
     return this.resolvedModel_ ?? this.session?.resolvedModel;
+  }
+
+  /** Pause the stall watchdog (need_decision). Nested with tool execution. */
+  pauseStall(): void {
+    this.decisionPaused = true;
+    this.clearStall();
+  }
+
+  resumeStall(): void {
+    this.decisionPaused = false;
+    this.lastEvent = this.now();
+    if (this.status_ === "running" && this.toolDepth === 0) this.armStall(this.generation);
   }
 
   conversation() {
@@ -210,6 +227,10 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.status_ = "pending";
     this.startedAt = this.now();
     this.lastEvent = this.startedAt;
+    // A tool_execution_end from the previous generation may have been dropped
+    // after settle. Don't carry that depth (or a pending decision) into this one.
+    this.toolDepth = 0;
+    this.decisionPaused = false;
 
     if (this.acquire) {
       try {
@@ -248,10 +269,25 @@ class InProcessChildHandle implements DisposableChildHandle {
         this.release();
         return;
       }
-      this.unsubscribe = this.session.subscribe(() => {
+      this.unsubscribe = this.session.subscribe((event) => {
+        // Track depth even after settle. A late tool_execution_end must not
+        // leak into the next resume, and must not rearm a stale generation.
+        if (event.type === "tool_execution_start") {
+          this.toolDepth++;
+          if (this.status_ === "running") this.clearStall();
+          return;
+        }
+        if (event.type === "tool_execution_end") {
+          this.toolDepth = Math.max(0, this.toolDepth - 1);
+          this.lastEvent = this.now();
+          if (this.status_ === "running" && this.toolDepth === 0 && !this.decisionPaused) {
+            this.armStall(this.generation);
+          }
+          return;
+        }
         if (this.status_ !== "running") return;
         this.lastEvent = this.now();
-        this.armStall(gen);
+        if (this.toolDepth === 0 && !this.decisionPaused) this.armStall(this.generation);
       });
     }
 
@@ -386,14 +422,18 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.stallTimer.unref?.();
   }
 
+  private clearStall(): void {
+    if (this.stallTimer !== null) {
+      clearTimeout(this.stallTimer);
+      this.stallTimer = null;
+    }
+  }
+
   private clearTimers(): void {
     if (this.timeoutTimer !== null) {
       clearTimeout(this.timeoutTimer);
       this.timeoutTimer = null;
     }
-    if (this.stallTimer !== null) {
-      clearTimeout(this.stallTimer);
-      this.stallTimer = null;
-    }
+    this.clearStall();
   }
 }
