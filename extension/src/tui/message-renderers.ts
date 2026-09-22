@@ -5,8 +5,8 @@
  * package); otherwise falls back to a plain multi-line text component so
  * print-mode / unit tests still work.
  */
-import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { loadPiTui as loadSharedPiTui } from "./pi-tui-load";
 import { SUPERVISOR_NOTIFICATION_CUSTOM_TYPE } from "../comms/registry-host";
 import { MONITOR_EVENT_CUSTOM_TYPE } from "../monitor";
 import { TASK_NOTIFICATION_CUSTOM_TYPE } from "../notify";
@@ -27,17 +27,7 @@ type PiTui = {
 };
 
 function loadPiTui(): PiTui | null {
-  try {
-    const require = createRequire(import.meta.url);
-    // Prefer the copy nested under pi-coding-agent (always present when pi runs).
-    try {
-      return require("@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui") as PiTui;
-    } catch {
-      return require("@earendil-works/pi-tui") as PiTui;
-    }
-  } catch {
-    return null;
-  }
+  return loadSharedPiTui() as PiTui | null;
 }
 
 function asText(content: string | unknown): string {
