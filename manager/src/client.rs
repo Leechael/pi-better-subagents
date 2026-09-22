@@ -11,6 +11,7 @@ use interprocess::local_socket::tokio::Stream;
 use interprocess::local_socket::{GenericFilePath, ToFsName};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -211,6 +212,13 @@ pub async fn cmd_sessions(home: &Path) -> Result<(), String> {
 
 pub async fn cmd_list(home: &Path, session: Option<String>, include_exited: bool) -> Result<(), String> {
     let mut conn = connect(home, &HelloMode::Cli).await?;
+    let st: StatusOk = conn.roundtrip(RequestKind::Status).await?;
+    let connected: HashSet<String> = st
+        .sessions
+        .iter()
+        .filter(|s| s.connected)
+        .map(|s| s.session_id.clone())
+        .collect();
     // CLI is admin: with no --session filter the daemon returns every session.
     let res: ListOk = conn
         .roundtrip(RequestKind::List {
@@ -218,7 +226,7 @@ pub async fn cmd_list(home: &Path, session: Option<String>, include_exited: bool
             session_id: session.clone(),
         })
         .await?;
-    let agents = load_agent_records(home, session.as_deref());
+    let agents = load_agent_records(home, session.as_deref(), &connected);
     let terminal_shells = res.tasks.iter().filter(|t| t.status.is_terminal()).count();
     let terminal_agents = agents
         .iter()
@@ -246,30 +254,36 @@ pub async fn cmd_list(home: &Path, session: Option<String>, include_exited: bool
         }
         return Ok(());
     }
-    println!(
-        "{:<14} {:<8} {:<10} {:>7} {:>5} {:>9} COMMAND",
-        "TASK_ID", "SESSION", "STATUS", "PID", "EXIT", "SIZE"
-    );
+    println!("{}", ls_header());
     for t in &tasks {
-        let session = truncate(&t.session_id, 8);
+        let kind = serde_json::to_string(&t.kind)
+            .unwrap_or_else(|_| "shell".into())
+            .trim_matches('"')
+            .to_string();
+        let status = serde_json::to_string(&t.status)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string();
         let exit = t
             .exit_code
             .map(|c| c.to_string())
             .or_else(|| t.signal.map(|s| format!("sig{s}")))
             .unwrap_or_else(|| "-".into());
         println!(
-            "{:<14} {:<8} {:<10} {:>7} {:>5} {:>9} {}",
-            t.task_id,
-            session,
-            serde_json::to_string(&t.status).unwrap_or_default().trim_matches('"'),
-            t.pid,
-            exit,
-            t.output_size,
-            truncate_command(&t.command, 60),
+            "{}",
+            format_ls_row(
+                &t.task_id,
+                &kind,
+                &t.session_id,
+                &status,
+                &t.pid.to_string(),
+                &exit,
+                &t.output_size.to_string(),
+                &truncate_command(&t.command, 60),
+            )
         );
     }
     for a in &agents {
-        let session = truncate(&a.session_id, 8);
         let model = a
             .model
             .as_deref()
@@ -277,17 +291,51 @@ pub async fn cmd_list(home: &Path, session: Option<String>, include_exited: bool
             .unwrap_or_default();
         let cmd = format!("agent:{} ({}){model}", a.name, a.agent);
         println!(
-            "{:<14} {:<8} {:<10} {:>7} {:>5} {:>9} {}",
-            a.child_id,
-            session,
-            a.status,
-            "-",
-            "-",
-            "-",
-            truncate_command(&cmd, 60),
+            "{}",
+            format_ls_row(
+                &a.child_id,
+                "agent",
+                &a.session_id,
+                &a.status,
+                "-",
+                "-",
+                "-",
+                &truncate_command(&cmd, 60),
+            )
         );
     }
     Ok(())
+}
+
+/// `TASK_ID KIND SESSION STATUS PID EXIT SIZE COMMAND`
+pub fn ls_header() -> String {
+    format!(
+        "{:<14} {:<8} {:<8} {:<10} {:>7} {:>5} {:>9} COMMAND",
+        "TASK_ID", "KIND", "SESSION", "STATUS", "PID", "EXIT", "SIZE"
+    )
+}
+
+pub fn format_ls_row(
+    task_id: &str,
+    kind: &str,
+    session_id: &str,
+    status: &str,
+    pid: &str,
+    exit: &str,
+    size: &str,
+    command: &str,
+) -> String {
+    format!(
+        "{:<14} {:<8} {:<8} {:<10} {:>7} {:>5} {:>9} {}",
+        task_id,
+        kind,
+        truncate(session_id, 8),
+        status,
+        pid,
+        exit,
+        size,
+        command,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,7 +353,11 @@ fn agent_status_terminal(status: &str) -> bool {
 }
 
 /// Read `<home>/sessions/*/agents/*.json` written by the extension (§4.3).
-fn load_agent_records(home: &Path, session_filter: Option<&str>) -> Vec<AgentRecordFile> {
+fn load_agent_records(
+    home: &Path,
+    session_filter: Option<&str>,
+    connected: &HashSet<String>,
+) -> Vec<AgentRecordFile> {
     let sessions = home.join("sessions");
     let Ok(entries) = std::fs::read_dir(&sessions) else {
         return Vec::new();
@@ -335,9 +387,13 @@ fn load_agent_records(home: &Path, session_filter: Option<&str>) -> Vec<AgentRec
             let Ok(bytes) = std::fs::read(file.path()) else {
                 continue;
             };
-            let Ok(rec) = serde_json::from_slice::<AgentRecordFile>(&bytes) else {
+            let Ok(mut rec) = serde_json::from_slice::<AgentRecordFile>(&bytes) else {
                 continue;
             };
+            // A session that is not connected cannot have a live child.
+            if !connected.contains(&rec.session_id) && !agent_status_terminal(&rec.status) {
+                rec.status = "interrupted".into();
+            }
             out.push(rec);
         }
     }
@@ -729,7 +785,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod resolve_tests {
-    use super::resolve_task_id;
+    use super::{format_ls_row, ls_header, resolve_task_id};
 
     #[test]
     fn exact_and_typo_prefix() {
@@ -745,5 +801,18 @@ mod resolve_tests {
         let err = resolve_task_id("mon_e1351cb2", &known).unwrap_err();
         assert!(err.contains("did you mean"), "{err}");
         assert!(err.contains("mon_e1351cb1"), "{err}");
+    }
+
+    #[test]
+    fn ls_table_has_kind_column() {
+        let header = ls_header();
+        assert!(header.contains("KIND"), "{header}");
+        let mon = format_ls_row("mon_7f409501", "monitor", "repro", "running", "1", "-", "5", "while true");
+        assert!(mon.contains("monitor"), "{mon}");
+        assert!(mon.contains("mon_7f409501"), "{mon}");
+        let agent = format_ls_row("ch_deadbeef", "agent", "sess", "running", "-", "-", "-", "agent:a (worker)");
+        assert!(agent.contains("agent"), "{agent}");
+        let shell = format_ls_row("sh_071f52c1", "shell", "sess", "running", "2", "-", "0", "echo hi");
+        assert!(shell.contains("shell"), "{shell}");
     }
 }

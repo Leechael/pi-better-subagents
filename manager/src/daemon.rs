@@ -855,13 +855,10 @@ fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessi
     })
 }
 
-fn handle_status(state: &Shared, conn_id: u64) -> Result<StatusOk, ProtoError> {
+fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> {
     let st = state.lock().unwrap();
-    if let Some(h) = st.conns.get(&conn_id) {
-        if h.kind != ClientKind::Cli {
-            return Err(ProtoError::new(E_FORBIDDEN, "status is a cli-only operation"));
-        }
-    }
+    // Status is read-only. Extensions need it so task_list can drop ghost
+    // agents whose session is no longer connected. Shutdown stays cli-only.
     let sessions = st
         .sessions
         .iter()

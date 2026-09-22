@@ -61,7 +61,7 @@ function parseRecord(raw: string): AgentChildRecord | null {
 /** Load agent child records from disk (all sessions under home). */
 export function loadAgentChildRecords(
   home: string,
-  opts: { sessionId?: string; includeTerminal?: boolean } = {},
+  opts: { sessionId?: string; includeTerminal?: boolean; connectedSessionIds?: ReadonlySet<string> } = {},
 ): AgentChildRecord[] {
   const sessionsRoot = join(home, "sessions");
   let sessionIds: string[];
@@ -87,10 +87,16 @@ export function loadAgentChildRecords(
       try {
         const rec = parseRecord(readFileSync(join(dir, file), "utf8"));
         if (!rec) continue;
+        const disconnected =
+          opts.connectedSessionIds !== undefined && !opts.connectedSessionIds.has(rec.session_id);
+        const shown: AgentChildRecord =
+          disconnected && (rec.status === "pending" || rec.status === "running")
+            ? { ...rec, status: "interrupted" }
+            : rec;
         const terminal =
-          rec.status === "completed" || rec.status === "failed" || rec.status === "interrupted";
+          shown.status === "completed" || shown.status === "failed" || shown.status === "interrupted";
         if (!opts.includeTerminal && terminal) continue;
-        out.push(rec);
+        out.push(shown);
       } catch {
         // skip bad files
       }

@@ -62,4 +62,23 @@ describe("agent child records", () => {
     expect(loadAgentChildRecords(home)).toHaveLength(0);
     expect(loadAgentChildRecords(home, { includeTerminal: true })).toHaveLength(1);
   });
+
+  it("treats a running record as not running when its session is disconnected", () => {
+    home = mkdtempSync(join(tmpdir(), "pbs-agent-rec-"));
+    writeAgentChildRecord(home, {
+      v: 1,
+      kind: "agent",
+      child_id: "ch_ghost001",
+      run_id: "run_ghost001",
+      session_id: "gone-session",
+      name: "ghost",
+      agent: "worker",
+      status: "running",
+      started_at: 1,
+    });
+    const loaded = loadAgentChildRecords(home, {
+      connectedSessionIds: new Set(["live-session"]),
+    });
+    expect(loaded.map((r) => r.child_id)).not.toContain("ch_ghost001");
+  });
 });
