@@ -7,7 +7,7 @@
  *   interpolation (unknown labels rejected before anything starts);
  * - sync wait bounded by subagentBudgetMs (default 45000, config subagent
  *   section); on expiry the run continues in the background and completion is
- *   delivered via a <subagent-notification> through the NotifyCenter;
+ *   delivered via a <pbs-wake kind="subagent-done"> through the NotifyCenter;
  * - management actions: list / get / status / interrupt / resume / steer.
  *
  * pi-free apart from type-only imports; the registry, runner and session
@@ -16,12 +16,14 @@
 import { Type } from "typebox";
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { formatSubagentHandover, formatSubagentNotification, truncateTail } from "../format";
+
+/** @deprecated emitted type is pbs-wake; kept until the renderer switches. */
+export const SUBAGENT_NOTIFICATION_CUSTOM_TYPE = "pbs-subagent-notification";
 import type { NotifyCenter } from "../notify";
 import { runChain, runTasks, validateChainSteps } from "./pool";
 import type { RunRecord, SubagentRegistry } from "./registry";
 import type { AgentDefinition, ChildHandle, ChildResult, ChildRunRequest } from "./types";
 
-export const SUBAGENT_NOTIFICATION_CUSTOM_TYPE = "pbs-subagent-notification";
 
 /** Overall result text cap (§4.6: truncateTail 512 lines / 48KB). */
 const RESULT_MAX_LINES = 512;
@@ -211,6 +213,7 @@ function toNotificationInfo(record: RunRecord, now: number) {
     status: record.status as "completed" | "partial" | "failed" | "interrupted",
     durationMs: runDurationMs(record, now),
     children: record.children.map((c) => ({
+      childId: c.childId,
       name: c.name,
       status: c.status,
       text: c.result?.text ?? "",
@@ -278,11 +281,7 @@ export function createSubagentTool(
   const notifyRunCompleted = (registry: SubagentRegistry, runId: string): void => {
     const record = registry.get(runId);
     if (!record) return;
-    deps.getNotifyCenter()?.notify({
-      customType: SUBAGENT_NOTIFICATION_CUSTOM_TYPE,
-      content: formatSubagentNotification(toNotificationInfo(record, Date.now())),
-      details: { run_id: runId },
-    });
+    deps.getNotifyCenter()?.notify(formatSubagentNotification(toNotificationInfo(record, Date.now())));
   };
 
   /**
@@ -302,12 +301,11 @@ export function createSubagentTool(
     if (!child || child.status === "pending" || child.status === "running") return false;
     const stillRunning = record.children
       .filter((c) => c.status === "pending" || c.status === "running")
-      .map((c) => `${c.name} (${c.childId})`);
+      .map((c) => ({ id: c.childId, title: c.name }));
     if (stillRunning.length === 0) return false;
     handedOver.add(childId);
-    deps.getNotifyCenter()?.notify({
-      customType: SUBAGENT_NOTIFICATION_CUSTOM_TYPE,
-      content: formatSubagentHandover({
+    deps.getNotifyCenter()?.notify(
+      formatSubagentHandover({
         runId,
         childId: child.childId,
         name: child.name,
@@ -317,8 +315,7 @@ export function createSubagentTool(
         ...(child.result?.error !== undefined ? { error: child.result.error } : {}),
         stillRunning,
       }),
-      details: { run_id: runId, child_id: childId, handover: true },
-    });
+    );
     return true;
   };
 
@@ -424,10 +421,10 @@ export function createSubagentTool(
           type: "text",
           text:
             `Started ${items.length} subagent(s) in run ${run.runId}. ${reason}\n` +
-            `While others are still running, each finished subagent arrives as <subagent-handover> ` +
+            `While others are still running, each finished subagent arrives as <pbs-wake kind="subagent-handover"> ` +
             `with that child's prompt and result. Read it and continue: subagent({action:"resume", run_id, child_id, message}) for that child, ` +
             `or agent_message to steer the ones still running. Do not wait for the whole run. Do not poll. ` +
-            `<subagent-notification> arrives when every subagent in the run has finished. ` +
+            `<pbs-wake kind="subagent-done"> arrives when every subagent in the run has finished. ` +
             `Use subagent({action:"get", run_id:"${run.runId}"}) if you need the full record.`,
         },
       ],
@@ -605,8 +602,8 @@ export function createSubagentTool(
           type: "text",
           text:
             `Resumed subagent ${child.name} (${child.childId}) in run ${record.runId}. ` +
-            "You will be notified via <subagent-handover> if others are still running, " +
-            "otherwise via <subagent-notification> when it completes. Do not poll.",
+            "You will be notified via <pbs-wake kind=\"subagent-handover\"> if others are still running, " +
+            "otherwise via <pbs-wake kind=\"subagent-done\"> when it completes. Do not poll.",
         },
       ],
       details: { run_id: record.runId, child_id: child.childId },
@@ -620,14 +617,14 @@ export function createSubagentTool(
       "Run subagents in parallel (tasks) or sequentially (chain with {previous}/{outputs.<label>} " +
       "interpolation). By default the call waits up to a foreground budget (default 45s); longer runs " +
       "continue in the background. Each child that finishes while others are still running wakes you with " +
-      "<subagent-handover> (its prompt and result). The whole run wakes you with <subagent-notification>. " +
+      "<pbs-wake kind=\"subagent-handover\"> (its prompt and result). The whole run wakes you with <pbs-wake kind=\"subagent-done\">. " +
       "Never poll or sleep to wait. Use action=list/get/status/interrupt/resume/steer to manage existing runs.",
     promptSnippet: "Fan out subagents in parallel or sequence them in a chain",
     promptGuidelines: [
-      'When a <subagent-handover> arrives, read <prompt> and <result> immediately and continue: subagent({action:"resume", run_id, child_id, message}) for that child, or agent_message to steer children that are still running. Do not wait for the rest of the run.',
+      'When a <pbs-wake kind="subagent-handover"> arrives, read <prompt> and <result> immediately and continue: subagent({action:"resume", run_id, child_id, message}) for that child, or agent_message to steer children that are still running. Do not wait for the rest of the run.',
       "Subagent runs that exceed the foreground budget continue in the background; you are notified per finished child and again when the run completes — do not poll.",
       "A failed subagent does not fail the whole run; inspect per-subagent sections in the result.",
-      "<subagent-handover> and <subagent-notification> are system wakes, not user replies.",
+      "<pbs-wake> is a system wake, not a user reply. kind=subagent-handover is one child; kind=subagent-done is the whole run.",
     ],
     parameters: subagentParameters,
     async execute(_toolCallId, rawParams, signal, _onUpdate, _ctx) {

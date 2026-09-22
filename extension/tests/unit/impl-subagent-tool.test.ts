@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SubagentRegistry } from "../../src/subagent/registry";
 import { InProcessRunner } from "../../src/subagent/runner";
-import { createSubagentTool, SUBAGENT_NOTIFICATION_CUSTOM_TYPE } from "../../src/subagent/tool";
+import { createSubagentTool } from "../../src/subagent/tool";
+import { PBS_WAKE_CUSTOM_TYPE } from "../../src/wake";
 import { SessionFactory, tick } from "./subagent-fakes";
 
 function makeStack(opts: { budgetMs?: number; autoComplete?: string | null } = {}) {
@@ -136,12 +137,12 @@ describe("subagent tool — tasks", () => {
     factory.sessions[0].complete("late result");
     await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
     const message = notify.mock.calls[0][0];
-    expect(message.customType).toBe(SUBAGENT_NOTIFICATION_CUSTOM_TYPE);
-    expect(message.content).toContain("<subagent-notification>");
-    expect(message.content).toContain(`<run-id>${runId}</run-id>`);
-    expect(message.content).toContain("<status>completed</status>");
+    expect(message.customType).toBe(PBS_WAKE_CUSTOM_TYPE);
+    expect(message.content).toContain('kind="subagent-done"');
+    expect(message.content).toContain(`run-id="${runId}"`);
+    expect(message.content).toContain('status="completed"');
     expect(message.content).toContain("late result");
-    expect(message.details).toEqual({ run_id: runId });
+    expect(message.details).toMatchObject({ kind: "subagent-done", runId });
   });
 
   it("async: true returns immediately and still notifies on completion", async () => {
@@ -155,7 +156,7 @@ describe("subagent tool — tasks", () => {
     factory.sessions[0].complete("r1");
     await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
     const handover = notify.mock.calls[0][0].content as string;
-    expect(handover).toContain("<subagent-handover>");
+    expect(handover).toContain('kind="subagent-handover"');
     expect(handover).toContain("<prompt>");
     expect(handover).toContain("r1");
     expect(handover).toContain("still running");

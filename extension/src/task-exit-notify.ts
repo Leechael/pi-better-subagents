@@ -1,6 +1,6 @@
 /**
  * Decide whether a manager task_exited should become a parent-session
- * <task-notification> (design doc §4.2 / §4.5 / §4.6).
+ * <pbs-wake kind="task"> (design doc §4.2 / §4.5 / §4.6).
  *
  * - Monitors are handled by MonitorRegistry (not this path).
  * - Parent bash only opts in via markNotifyOnExit when it actually

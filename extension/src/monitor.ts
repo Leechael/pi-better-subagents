@@ -2,19 +2,21 @@
  * monitor tool (design doc §4.4).
  *
  * Starts a long-lived `kind:"monitor"` process via pbs-manager, watches its
- * output stream, and injects line batches as <monitor-event> messages.
+ * output stream, and injects line batches as <pbs-wake kind="monitor"> messages.
  * Batching (LineBatcher) and throttling (RateLimiter) happen extension-side;
  * a monitor that saturates the rate limiter for 30s continuously is stopped.
  */
 import { Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { formatMonitorEvent } from "./format";
+
+/** @deprecated emitted type is pbs-wake; kept until the renderer switches. */
+export const MONITOR_EVENT_CUSTOM_TYPE = "pbs-monitor-event";
 import type { ManagerClient, ManagerEvent } from "./manager-client";
 import { LineBatcher, RateLimiter } from "./monitor-batching";
 import type { NotifyCenter } from "./notify";
 import { statusGlyph, toolComponent } from "./tui/tool-component";
 
-export const MONITOR_EVENT_CUSTOM_TYPE = "pbs-monitor-event";
 
 const DEFAULT_TIMEOUT_MS = 300_000;
 const MIN_TIMEOUT_MS = 1_000;
@@ -148,16 +150,14 @@ export class MonitorRegistry {
     const exitCode = event.exit_code ?? null;
     const duration =
       typeof event.duration_ms === "number" ? `${(event.duration_ms / 1000).toFixed(1)}s` : "unknown duration";
-    this.deps.getNotifyCenter()?.notify({
-      customType: MONITOR_EVENT_CUSTOM_TYPE,
-      content:
-        `<monitor-event description="${escapeAttr(entry.description)}" task_id="${entry.taskId}" status="exited">\n` +
-        `Monitor event: "${entry.description}"\n` +
-        `<event>\nMonitor process exited (exit code ${exitCode === null ? "null" : exitCode}, after ${duration}). ` +
-        "No further events will be delivered.\n</event>\n" +
-        "</monitor-event>",
-      details: { taskId: entry.taskId, description: entry.description, exitCode, status: "exited" },
-    });
+    this.deps.getNotifyCenter()?.notify(
+      formatMonitorEvent(
+        entry.description,
+        entry.taskId,
+        `Monitor process exited (exit code ${exitCode === null ? "null" : exitCode}, after ${duration}). No further events will be delivered.`,
+        "exited",
+      ),
+    );
     this.deps.toast?.(
       `Monitor "${entry.description}" exited (code ${exitCode === null ? "?" : exitCode})`,
       exitCode === 0 || exitCode === null ? "info" : "warning",
@@ -192,11 +192,7 @@ export class MonitorRegistry {
       return;
     }
     entry.saturatedSince = null;
-    this.deps.getNotifyCenter()?.notify({
-      customType: MONITOR_EVENT_CUSTOM_TYPE,
-      content: formatMonitorEvent(entry.description, entry.taskId, text),
-      details: { taskId: entry.taskId, description: entry.description },
-    });
+    this.deps.getNotifyCenter()?.notify(formatMonitorEvent(entry.description, entry.taskId, text));
   }
 
   /** Timeout reached: stop the process and notify (§4.4). */
@@ -205,15 +201,9 @@ export class MonitorRegistry {
     entry.stopped = true;
     const client = this.deps.getClient();
     await client?.stop(entry.taskId).catch(() => {});
-    this.deps.getNotifyCenter()?.notify({
-      customType: MONITOR_EVENT_CUSTOM_TYPE,
-      content:
-        `<monitor-event description="${escapeAttr(entry.description)}" task_id="${entry.taskId}" status="timeout">\n` +
-        `Monitor event: "${entry.description}"\n` +
-        `<event>\n[Monitor timed out — re-arm if needed.]\n</event>\n` +
-        "</monitor-event>",
-      details: { taskId: entry.taskId, description: entry.description, status: "timeout" },
-    });
+    this.deps.getNotifyCenter()?.notify(
+      formatMonitorEvent(entry.description, entry.taskId, "[Monitor timed out — re-arm if needed.]", "timeout"),
+    );
     this.deps.toast?.(`Monitor "${entry.description}" timed out — re-arm if needed.`, "warning");
     this.cleanup(entry);
   }
@@ -224,15 +214,14 @@ export class MonitorRegistry {
     entry.stopped = true;
     const client = this.deps.getClient();
     await client?.stop(entry.taskId).catch(() => {});
-    this.deps.getNotifyCenter()?.notify({
-      customType: MONITOR_EVENT_CUSTOM_TYPE,
-      content:
-        `<monitor-event description="${escapeAttr(entry.description)}" task_id="${entry.taskId}" status="stopped">\n` +
-        `Monitor event: "${entry.description}"\n` +
-        `<event>\n[Monitor stopped: event rate limit saturated for 30s.]\n</event>\n` +
-        "</monitor-event>",
-      details: { taskId: entry.taskId, description: entry.description, status: "stopped" },
-    });
+    this.deps.getNotifyCenter()?.notify(
+      formatMonitorEvent(
+        entry.description,
+        entry.taskId,
+        "[Monitor stopped: event rate limit saturated for 30s.]",
+        "stopped",
+      ),
+    );
     this.deps.toast?.(
       `Monitor "${entry.description}" stopped — too much output (rate limit).`,
       "warning",
@@ -260,14 +249,6 @@ function fullEnv(ctx: ExtensionContext, deps: MonitorDeps): Record<string, strin
   }
   Object.assign(env, deps.sessionEnv(ctx));
   return env;
-}
-
-function escapeAttr(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
 }
 
 const monitorParameters = Type.Object({
@@ -299,15 +280,15 @@ export function createMonitorTool(
     label: "Monitor",
     description:
       "Start a background monitor process whose stdout lines are injected back to you as " +
-      "<monitor-event> messages (batched over 200ms, rate-limited). " +
+      "<pbs-wake kind=\"monitor\"> messages (batched over 200ms, rate-limited). " +
       "The command must be line-buffered: each event must be a single line. " +
       "Silence is not success: write the command so failures also produce lines " +
       "(e.g. grep for both success and error patterns). " +
-      "Events arrive as system wakes (not new user messages). Handle each <monitor-event> before other work. Do not poll.",
+      "Events arrive as system wakes (not new user messages). Handle each <pbs-wake kind=\"monitor\"> before other work. Do not poll.",
     promptSnippet: "Watch a command's line stream and get injected events",
     promptGuidelines: [
       "Use the monitor tool to watch for conditions instead of running sleep/poll loops in bash.",
-      "When woken by a <monitor-event>, handle the event content before doing anything else — it is not a new user request and not user confirmation.",
+      "When woken by a <pbs-wake kind=\"monitor\">, handle the <event> before doing anything else — it is not a new user request and not user confirmation.",
     ],
     parameters: monitorParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

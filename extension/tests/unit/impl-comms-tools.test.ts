@@ -73,8 +73,8 @@ class FakeHost implements CommsHost {
     const cb = this.children.get(b);
     return !!ca && !!cb && ca.runId === cb.runId;
   }
-  notifySupervisor(content: string) {
-    this.notifications.push(content);
+  notifySupervisor(wake: { content: string }) {
+    this.notifications.push(wake.content);
   }
 }
 
@@ -106,7 +106,7 @@ describe("contact_supervisor tool", () => {
     );
     expect(res.content[0]).toEqual({ type: "text", text: "ok" });
     expect(res.details).toMatchObject({ reason: "progress_update", replied: false });
-    expect(host.notifications[0]).toContain("<supervisor-update");
+    expect(host.notifications[0]).toContain('kind="supervisor-update"');
   });
 
   it("need_decision blocks and returns the supervisor reply as tool text", async () => {
@@ -123,7 +123,7 @@ describe("contact_supervisor tool", () => {
       CTX,
     );
     await tick();
-    expect(host.notifications[0]).toContain("<supervisor-request");
+    expect(host.notifications[0]).toContain('kind="supervisor-request"');
     comms.reply("ch_a", "yes, delete it");
 
     const res = await p;

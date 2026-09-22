@@ -72,7 +72,7 @@ export interface BashOverrideDeps {
   /** Register task metadata so exit notifications can describe the task. */
   trackTask: (taskId: string, meta: { kind: string; command: string }) => void;
   /**
-   * Mark a task so its task_exited event becomes a parent <task-notification>.
+   * Mark a task so its task_exited event becomes a parent <pbs-wake kind="task">.
    * Only backgrounded parent bash should call this — sync waits (foreground
    * budget hit, child-bash) must not wake the parent session.
    */

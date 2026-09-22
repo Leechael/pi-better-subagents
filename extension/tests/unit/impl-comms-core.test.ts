@@ -81,8 +81,8 @@ class FakeHost implements CommsHost {
     const cb = this.children.get(b);
     return !!ca && !!cb && ca.runId === cb.runId;
   }
-  notifySupervisor(content: string) {
-    this.notifications.push(content);
+  notifySupervisor(wake: { content: string }) {
+    this.notifications.push(wake.content);
   }
 }
 
@@ -107,10 +107,10 @@ describe("contactSupervisor", () => {
     // parent was notified with a supervisor-request that explains how to reply
     expect(host.notifications).toHaveLength(1);
     const note = host.notifications[0];
-    expect(note).toContain('<supervisor-request from="ch_a" name="explorer">');
-    expect(note).toContain("Which file should I modify?");
+    expect(note).toContain('<pbs-wake kind="supervisor-request" from="ch_a" name="explorer">');
+    expect(note).toContain("<message>Which file should I modify?</message>");
     expect(note).toContain('action: "reply"');
-    expect(note).toContain("</supervisor-request>");
+    expect(note).toContain("</pbs-wake>");
 
     await tick();
     expect(settled).toBe(false); // blocked
@@ -159,7 +159,7 @@ describe("contactSupervisor", () => {
     const r = await comms.contactSupervisor("ch_a", "progress_update", "50% done");
     expect(r).toBe("ok");
     expect(host.notifications).toHaveLength(1);
-    expect(host.notifications[0]).toContain('<supervisor-update from="ch_a" name="explorer">');
+    expect(host.notifications[0]).toContain('<pbs-wake kind="supervisor-update" from="ch_a" name="explorer">');
     expect(host.notifications[0]).toContain("50% done");
     expect(comms.pendingRequests()).toEqual([]);
   });
@@ -336,9 +336,9 @@ describe("XML escaping", () => {
     const xml = formatSupervisorRequest(
       { childId: "ch_a", name: 'evil"<name>&' },
       'use <tag> & "quotes"',
-    );
+    ).content;
     expect(xml).toContain('name="evil&quot;&lt;name&gt;&amp;"');
-    expect(xml).toContain("use &lt;tag&gt; &amp; &quot;quotes&quot;");
+    expect(xml).toContain('use &lt;tag&gt; &amp; "quotes"');
     expect(xml).not.toContain('"<name>');
   });
 
@@ -349,7 +349,7 @@ describe("XML escaping", () => {
 
     await comms.contactSupervisor("ch_a", "progress_update", 'found <script> & "x"');
     const note = host.notifications[0];
-    expect(note).toContain("found &lt;script&gt; &amp; &quot;x&quot;");
+    expect(note).toContain('found &lt;script&gt; &amp; "x"');
     expect(note).not.toContain("<script>");
   });
 });

@@ -10,44 +10,35 @@ import {
   type MailboxOptions,
 } from "./mailbox";
 import type { Comms, CommsHost } from "./types";
+import { formatPbsWake, type FormattedWake } from "../wake";
 
 /** Ring bucket used when the host does not know the child (defensive fallback). */
 export const UNKNOWN_RUN_ID = "unknown";
-
-/** Escape `& < > "` in both attribute values and text content. */
-function escapeXml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
 
 /** Fire-and-forget progress notification shown to the parent agent. */
 export function formatSupervisorUpdate(
   from: { childId: string; name: string },
   message: string,
-): string {
-  return [
-    `<supervisor-update from="${escapeXml(from.childId)}" name="${escapeXml(from.name)}">`,
-    escapeXml(message),
-    "</supervisor-update>",
-  ].join("\n");
+): FormattedWake {
+  return formatPbsWake({
+    kind: "supervisor-update",
+    from: from.childId,
+    name: from.name,
+    message,
+  });
 }
 
-/** Blocking decision request; tells the parent agent exactly how to answer. */
+/** Blocking decision request; the reply recipe is a <reply-with> child, not message text. */
 export function formatSupervisorRequest(
   from: { childId: string; name: string },
   message: string,
-): string {
-  return [
-    `<supervisor-request from="${escapeXml(from.childId)}" name="${escapeXml(from.name)}">`,
-    escapeXml(message),
-    "",
-    "This subagent is blocked waiting for your decision. Reply with the agent_message tool:",
-    `{ action: "reply", to: "${escapeXml(from.childId)}", message: "<your decision>" }`,
-    "</supervisor-request>",
-  ].join("\n");
+): FormattedWake {
+  return formatPbsWake({
+    kind: "supervisor-request",
+    from: from.childId,
+    name: from.name,
+    message,
+  });
 }
 
 /**

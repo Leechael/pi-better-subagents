@@ -31,6 +31,8 @@ export interface ChildHandle {
   resolvedModel?(): string | undefined;
 }
 
+import type { PbsWake } from "../wake";
+
 // ---------- comms contract (appendix B, verbatim) ----------
 
 export interface CommsHost {
@@ -40,7 +42,7 @@ export interface CommsHost {
   ): { handle: ChildHandle; runId: string; name: string; status: ChildStatus } | undefined;
   listChildren(): { childId: string; runId: string; name: string; status: ChildStatus }[];
   sameRun(childIdA: string, childIdB: string): boolean;
-  notifySupervisor(content: string): void; // → NotifyCenter (triggerTurn/steer routing)
+  notifySupervisor(wake: { content: string; details: PbsWake }): void;
 }
 
 export interface MailboxEntry {

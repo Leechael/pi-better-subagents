@@ -5,10 +5,14 @@
  * - idle  -> pi.sendMessage(msg, { triggerTurn: true })
  * - busy  -> pi.sendMessage(msg, { deliverAs: "steer" })
  * - task exit notifications are coalesced over a 200ms window into one
- *   <task-notification> payload, and the same task/event pair is only
+ *   <pbs-wake kind="task"> payload, and the same task/event pair is only
  *   ever delivered once.
  */
 import { formatTaskNotification, type TaskExitInfo } from "./format";
+import { PBS_WAKE_CUSTOM_TYPE, type WakeItem } from "./wake";
+
+/** @deprecated emitted type is pbs-wake; kept until the renderer switches. */
+export const TASK_NOTIFICATION_CUSTOM_TYPE = "pbs-task-notification";
 
 export interface NotifyMessage {
   customType: string;
@@ -28,10 +32,9 @@ export interface NotifyCenterDeps {
    * Background tasks still awaiting their own exit wake.
    * Read at flush time so siblings that exit in the same window are not listed.
    */
-  listStillRunning?: () => string[];
+  listStillRunning?: () => WakeItem[];
 }
 
-export const TASK_NOTIFICATION_CUSTOM_TYPE = "pbs-task-notification";
 
 export class NotifyCenter {
   private readonly deps: NotifyCenterDeps;
@@ -97,10 +100,11 @@ export class NotifyCenter {
     if (this.disposed || this.pendingExits.length === 0) return;
     const events = this.pendingExits;
     this.pendingExits = [];
+    const wake = formatTaskNotification(events, this.deps.listStillRunning?.() ?? []);
     this.deliver({
-      customType: TASK_NOTIFICATION_CUSTOM_TYPE,
-      content: formatTaskNotification(events, this.deps.listStillRunning?.() ?? []),
-      details: { tasks: events.map((e) => e.taskId) },
+      customType: PBS_WAKE_CUSTOM_TYPE,
+      content: wake.content,
+      details: wake.details,
     });
   }
 

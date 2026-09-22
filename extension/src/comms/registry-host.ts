@@ -6,6 +6,10 @@
  * concrete SubagentRegistry.handle() lookup.
  */
 import type { SubagentRegistry } from "../subagent/registry";
+import { PBS_WAKE_CUSTOM_TYPE } from "../wake";
+
+/** @deprecated emitted type is pbs-wake; kept until the renderer switches. */
+export const SUPERVISOR_NOTIFICATION_CUSTOM_TYPE = "pbs-supervisor-message";
 import type { CommsHost } from "./types";
 
 export interface RegistryHostDeps {
@@ -16,7 +20,6 @@ export interface RegistryHostDeps {
   } | null;
 }
 
-export const SUPERVISOR_NOTIFICATION_CUSTOM_TYPE = "pbs-supervisor-message";
 
 export function createRegistryCommsHost(deps: RegistryHostDeps): CommsHost {
   const locate = (childId: string) => {
@@ -61,11 +64,11 @@ export function createRegistryCommsHost(deps: RegistryHostDeps): CommsHost {
       return a !== undefined && b !== undefined && a.run.runId === b.run.runId;
     },
 
-    notifySupervisor(content) {
+    notifySupervisor(wake) {
       deps.getNotifyCenter()?.notify({
-        customType: SUPERVISOR_NOTIFICATION_CUSTOM_TYPE,
-        content,
-        details: {},
+        customType: PBS_WAKE_CUSTOM_TYPE,
+        content: wake.content,
+        details: wake.details,
       });
     },
   };

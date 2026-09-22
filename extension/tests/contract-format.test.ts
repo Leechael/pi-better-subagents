@@ -118,22 +118,23 @@ describe("formatTaskNotification (contract: Appendix A + §4.5 XML template)", (
   };
 
   it("emits <task-notification> XML with every required field (§4.5 template)", () => {
-    const xml = formatTaskNotification([base]);
-    expect(xml).toContain("system wake");
-    expect(xml).toContain("<task-notification>");
-    expect(xml).toContain("</task-notification>");
-    expect(xml).toContain("<task-id>sh_a1b2c3d4</task-id>");
-    expect(xml).toContain("<kind>shell</kind>");
-    expect(xml).toContain("<status>completed</status>");
+    const xml = formatTaskNotification([base]).content;
+    expect(xml).toContain("System wake");
+    expect(xml).toContain('<pbs-wake kind="task">');
+    expect(xml).toContain("</pbs-wake>");
+    expect(xml).toContain('id="sh_a1b2c3d4"');
+    expect(xml).toContain('kind="shell"');
+    expect(xml).toContain('status="completed"');
     expect(xml).toContain("<summary>");
-    expect(xml).toContain("npm run build"); // command interpolated in summary
-    expect(xml).toMatch(/exit code 0/); // per §4.5 summary template
+    expect(xml).toContain("npm run build");
+    expect(xml).toMatch(/exit code 0/);
+    expect(xml).toContain('exit-code="0"');
     expect(xml).toContain(
       "<output-file>/home/u/.pi/agent/pbs/sessions/s/tasks/sh_a1b2c3d4.output</output-file>",
     );
     expect(xml).toContain("<preview>");
     expect(xml).toContain("last lines of output");
-    expect(xml).toContain("<duration-ms>12345</duration-ms>");
+    expect(xml).toContain('duration-ms="12345"');
   });
 
   it("merges multiple events into one message covering every task (§4.5 合批)", () => {
@@ -145,12 +146,12 @@ describe("formatTaskNotification (contract: Appendix A + §4.5 XML template)", (
       status: "failed",
       exitCode: 2,
     };
-    const xml = formatTaskNotification([base, failed]);
-    expect(xml).toContain("<task-notification");
+    const xml = formatTaskNotification([base, failed]).content;
+    expect(xml.match(/<pbs-wake /g)).toHaveLength(1);
     expect(xml).toContain("sh_a1b2c3d4");
     expect(xml).toContain("sh_deadbeef");
-    expect(xml).toContain("<status>completed</status>");
-    expect(xml).toContain("<status>failed</status>");
+    expect(xml).toContain('status="completed"');
+    expect(xml).toContain('status="failed"');
     // AMBIGUITY(design): exact merged structure (repeated blocks vs one block
     // with a list) is unspecified — only coverage of all events is asserted.
   });
@@ -162,9 +163,10 @@ describe("formatTaskNotification (contract: Appendix A + §4.5 XML template)", (
       status: "killed",
       exitCode: null,
     };
-    const xml = formatTaskNotification([killed]);
+    const xml = formatTaskNotification([killed]).content;
     expect(xml).toContain("sh_killed01");
-    expect(xml).toContain("<status>killed</status>");
+    expect(xml).toContain('status="killed"');
+    expect(xml).not.toContain("exit-code");
     // AMBIGUITY(design): summary wording for exitCode:null is unspecified.
   });
 
@@ -174,7 +176,7 @@ describe("formatTaskNotification (contract: Appendix A + §4.5 XML template)", (
       command: 'grep "<tag>" & "quotes"',
       preview: "a < b && c > d",
     };
-    const xml = formatTaskNotification([tricky]);
+    const xml = formatTaskNotification([tricky]).content;
     expect(xml).toContain("sh_a1b2c3d4");
     // DERIVED EXPECTATION (unspecified in design): since the format is XML,
     // metacharacters must be escaped — raw `<tag>` would corrupt the document.
@@ -200,10 +202,9 @@ describe("formatBackgroundNotice (contract: Appendix A + §4.2 template)", () =>
 
 describe("formatMonitorEvent (contract: Appendix A + §4.4)", () => {
   it("wraps the batch in a <monitor-event> element carrying description and task id", () => {
-    const msg = formatMonitorEvent("cargo test failures", "mon_abc123", "test foo failed\n");
-    // §4.4: `<monitor-event description task_id>` + 批文本
-    expect(msg).toContain("<monitor-event");
-    expect(msg).toContain("</monitor-event>");
+    const msg = formatMonitorEvent("cargo test failures", "mon_abc123", "test foo failed\n").content;
+    expect(msg).toContain('<pbs-wake kind="monitor"');
+    expect(msg).toContain("</pbs-wake>");
     expect(msg).toContain("cargo test failures");
     expect(msg).toContain("mon_abc123");
     expect(msg).toContain("test foo failed");
@@ -212,7 +213,7 @@ describe("formatMonitorEvent (contract: Appendix A + §4.4)", () => {
 
   it("keeps multi-line batch text intact inside the element", () => {
     const batch = "line one\nline two\nline three";
-    const msg = formatMonitorEvent("desc", "mon_x", batch);
+    const msg = formatMonitorEvent("desc", "mon_x", batch).content;
     expect(msg).toContain("line one");
     expect(msg).toContain("line two");
     expect(msg).toContain("line three");

@@ -37,6 +37,7 @@ import { createTaskListTool, createTaskOutputTool, createTaskStopTool } from "./
 import { registerPbsMessageRenderers } from "./tui/message-renderers";
 import { registerTasksCommand } from "./tui/tasks-command";
 import { stderrPathFor } from "./tui/task-output-paths";
+import { shellWakeTitle } from "./wake";
 
 /** Read only the tail of a task output file for the notification preview (≤ maxChars). */
 export function readPreview(outputPath: string | undefined, maxChars: number): string {
@@ -70,7 +71,7 @@ export default function (pi: ExtensionAPI): void {
   /** task_id -> metadata, for exit notifications (task_exited carries no command). */
   const taskMeta = new Map<string, { kind: string; command: string }>();
   /**
-   * task_ids whose task_exited should wake the parent via <task-notification>.
+   * task_ids whose task_exited should wake the parent via <pbs-wake kind="task">.
    * Parent bash only adds ids when it actually backgrounded the command.
    * Child-bash (sync wait) must not — otherwise every subagent shell completion
    * is mis-labeled as a parent "Background command" wake (§4.2 / §4.6).
@@ -99,6 +100,7 @@ export default function (pi: ExtensionAPI): void {
       command: meta?.command ?? event.command ?? "",
       status: toExitStatus(event),
       exitCode: event.exit_code ?? null,
+      ...(typeof event.signal === "string" && event.signal ? { signal: event.signal } : {}),
       durationMs: event.duration_ms ?? 0,
       outputPath: event.output_path ?? "",
       preview: readPreview(event.output_path, 4000),
@@ -232,9 +234,9 @@ export default function (pi: ExtensionAPI): void {
       isIdle: () => ctx?.isIdle() ?? true,
       listStillRunning: () =>
         [...notifyOnExit].map((id) => {
-          const command = taskMeta.get(id)?.command?.replace(/\s+/g, " ").trim();
-          const shown = command ? (command.length > 80 ? `${command.slice(0, 79)}…` : command) : id;
-          return `${shown} (${id})`;
+          const command = taskMeta.get(id)?.command;
+          const title = command ? shellWakeTitle(command) || id : id;
+          return { id, title };
         }),
     });
     fleetWidget?.dispose();
