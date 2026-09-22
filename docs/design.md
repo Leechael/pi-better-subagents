@@ -299,7 +299,7 @@ monitor({ command, description, timeout_ms = 300000 (min 1000, max 3600000),
 - 扩展侧行处理(纯函数,便于测试):
   - `LineBatcher`: chunk → `\n` 切分 → 200ms 合批;单行 cap 500 字符,单批 cap 3000 字符
   - `RateLimiter`: token bucket(容量 10,每 2s +1);连续 30s 打满 → 自动 stop + 通知
-- 事件注入: `<monitor-event description task_id>` + 批文本;idle→triggerTurn,busy→steer
+- 事件注入: `<pbs-wake kind="monitor">`(见 §4.5);idle→triggerTurn,busy→steer
 - 进程退出 → 结束通知;timeout 到期 → stop + "[Monitor timed out — re-arm if needed.]"
 - `persistent:true` → 活到 session 结束(无 timeout)
 - prompt 文案(防误用): 命令必须 line-buffered;"silence is not success"(grep 要覆盖失败特征);事件不是用户回复;不要 poll
@@ -314,22 +314,35 @@ notify({ customType, content, details }): void
 // busy → pi.sendMessage(msg, {deliverAs:"steer"})
 ```
 
-- 200ms 合批窗口: 多条 task_exited 合并为一条 `<task-notification>` 列表
+- 200ms 合批窗口: 多条 task_exited 合并为**一个** `<pbs-wake kind="task">`,内含多个 `<task>`
 - 去重: 同一 task 同一事件只发一次
-- 通知格式:
+- 所有异步注入共用一个 `customType`: `pbs-wake`。不再发送 `pbs-task-notification` / `pbs-monitor-event` / `pbs-subagent-notification` / `pbs-supervisor-message`。旧 renderer 已删除;旧 transcript 走 pi 默认 custom message。
+- Lead-in 只有一句,导出为 `PBS_WAKE_LEAD_IN`:
 
-```xml
-<task-notification>
-  <task-id>sh_a1b2c3d4</task-id><kind>shell</kind>
-  <status>completed|failed|killed</status>
-  <summary>Background command "..." completed (exit code 0)</summary>
-  <output-file>~/.pi/agent/pbs/sessions/.../sh_x.output</output-file>
-  <preview>...尾部, cap 4000 字符...</preview>
-  <duration-ms>12345</duration-ms>
-</task-notification>
+```ts
+export const PBS_WAKE_LEAD_IN =
+  "System wake — not a new user message. Handle this <pbs-wake> before other work.";
 ```
 
-- `before_agent_start` 注入行为准则: 不要 poll/不要 sleep 等待/不要伪造结果;通知是 system wake(外表像 user message 但不是新用户请求),收到后**先处理再继续工作**,不要只回复确认就停
+  content = lead-in + 空行 + 一个 `<pbs-wake>`。lead-in 换成 `""` 后仍是可解析的 envelope。Renderer 只读 `details.kind`,不从 XML 猜类型。Pill 的颜色/glyph 用 details 里的 status/exitCode,不用 summary 文本。
+
+### pbs-wake 合同(eval wake adapter 以此为准)
+
+属性 kebab-case,值 XML 转义。子元素文本一律转义(含 monitor `<event>`)。`details` camelCase,按 `kind` 区分。`still-running` 是子元素,不是属性;空则省略。item 文本是显示标题(shell: 命令压成一行并 cap 80;agent: name)。
+
+| kind | 根属性 | 子元素 | details |
+|---|---|---|---|
+| `task` | (无;still-running 不是属性) | `<still-running><item id>` 可选;一个或多个 `<task id kind status duration-ms exit-code? signal?>`,内含 `summary` `command` `output-file` `preview` | `{ kind:"task"; stillRunning: {id,title}[]; tasks: [{ id, taskKind, status, summary, command, outputPath, preview, durationMs, exitCode: number\|null, signal?: string }] }` |
+| `monitor` | `id` `description` `status?` | `<event>` | `{ kind:"monitor"; id; description; status?; event }` |
+| `subagent-handover` | `run-id` `child-id` `name` `status` | `<still-running>` 可选;`summary` `prompt` `result`;`error` 可选 | `{ kind:"subagent-handover"; runId; childId; name; status; stillRunning: {id,title}[]; summary; prompt; result; error? }` |
+| `subagent-done` | `run-id` `status` `duration-ms` | `summary`,然后每个 child 一个 `<child id name status>`,内含 `prompt`(头 cap 2000)、`error` 可选、`result`(尾 cap 2000) | `{ kind:"subagent-done"; runId; status; durationMs; summary; children: [{ childId, name, status, prompt, result, error? }] }` |
+| `supervisor-request` | `from` `name` | `message`,`reply-with` | `{ kind:"supervisor-request"; from; name; message }` |
+| `supervisor-update` | `from` `name` | `message` | `{ kind:"supervisor-update"; from; name; message }` |
+
+- `exit-code` 属性在 `exitCode === null` 时省略;details 里始终是 `number | null`。`signal` 是信号名字符串(`"SIGTERM"` | `"SIGKILL"`),没有则省略,不是数字。
+- `reply-with` 文本是 `agent_message { action: "reply", to: "<childId>", message: "<your decision>" }`,不写进 `message`。
+- subagent-done 的 pill 显示各 status 计数,例如 `3 completed · 1 failed`。
+- 行为准则是持久 section,不是 `before_agent_start` 返回的整段 systemPrompt。收到 `<pbs-wake>` 后先处理再继续,不要 poll/sleep/伪造结果。
 
 ### 4.6 subagent 工具 (M3)
 
@@ -358,7 +371,7 @@ subagent({
 ```
 
 - `tasks` 与 `chain` 互斥,且与 `action` 互斥;三者必须居一
-- 同步路径: 等待至全部完成或 **subagentBudgetMs(默认 45000, config 可配)** 到期 → 转异步,立即返回 `{ run_id, status: "backgrounded" }` + "完成时会通知你,不要 poll" 文案;完成时 NotifyCenter 注入 `<subagent-notification>`
+- 同步路径: 等待至全部完成或 **subagentBudgetMs(默认 45000, config 可配)** 到期 → 转异步,立即返回 `{ run_id, status: "backgrounded" }` + "完成时会通知你,不要 poll" 文案;完成时 NotifyCenter 注入 `<pbs-wake kind="subagent-done">`
 - chain 插值: `{previous}` = 上一节点结果文本, `{outputs.<label>}` = 指定 label 节点结果;未定义 label 引用 → 立即报错不启动
 - 并行: worker pool(concurrency 槽位),结果按 tasks 数组 ordinal 保序返回
 - 单个子代理失败不拖垮整组: 结果数组该项标 `status:"failed", error`;fail_fast=true 时取消未启动项
@@ -379,14 +392,7 @@ subagent({
 
 **通知格式**(NotifyCenter 合批规则与 task_exited 相同):
 
-```xml
-<subagent-notification>
-  <run-id>run_x1y2</run-id>
-  <status>completed|partial|failed|interrupted</status>
-  <summary>3/3 subagents completed in 41234ms</summary>
-  <results>...每个子代理: name + status + 结果文本尾部 2000 字符...</results>
-</subagent-notification>
-```
+完成通知是 `<pbs-wake kind="subagent-done">`,交接是 `<pbs-wake kind="subagent-handover">`。形状见 §4.5,不使用 `<subagent-notification>`。
 
 **fleet widget**(M5 部分提前到 M3,因依赖 registry): `ui.setWidget("pbs-fleet", lines, {placement:"belowEditor"})`,仅 `ctx.hasUI` 时;内容 = 每个活跃子代理一行 `● name (agent) — 12s`,无活跃时 `undefined` 清除;更新时机: registry 任何状态迁移 + 每 5s 计时刷新(活跃时)。
 
@@ -395,8 +401,8 @@ subagent({
 模块: `src/comms/`(mailbox.ts / tools.ts / routing.ts)。**只依赖附录 B 的 `CommsHost` 接口**,不 import subagent 实现(测试用 mock host)。
 
 - `contact_supervisor`(注册在子会话, customTools): `{ reason: "need_decision"|"progress_update", message: string }`
-  - `progress_update`: 即发即返(经 NotifyCenter 注入 `<supervisor-update>` 通知父 agent,不阻塞)
-  - `need_decision`: 阻塞子代理 tool execute,等父 agent 回复;**per-child 独立 waiter**(无全局锁——pi-intercom 教训);10min 超时返回 `"Supervisor did not respond within 10 minutes; decide yourself and continue."`;父侧收到 `<supervisor-request from child_id name>` + message,用 `agent_message reply` 应答
+  - `progress_update`: 即发即返(经 NotifyCenter 注入 `<pbs-wake kind="supervisor-update">` 通知父 agent,不阻塞)
+  - `need_decision`: 阻塞子代理 tool execute,等父 agent 回复;**per-child 独立 waiter**(无全局锁——pi-intercom 教训);10min 超时返回 `"Supervisor did not respond within 10 minutes; decide yourself and continue."`;父侧收到 `<pbs-wake kind="supervisor-request">`(见 §4.5),用 `agent_message reply` 应答
 - `agent_message`(父会话;子会话变体带 `from`): `{ action: "send"|"reply"|"broadcast"|"list", to?: string(child_id|name), message?: string, delivery?: "steer"|"queue"(默认 steer) }`
   - send 到运行中子代理: steer → `session.steer(message)`;queue → `session.followUp(message)`
   - send 到已结束子代理: 即 resume(`session.prompt(message)`),完成时再通知
@@ -475,7 +481,7 @@ M1 后手动: `pi -e ./extension` 跑长命令验证自动后台 + 通知 + `pbs
 - LineBatcher 定时 flush **排空全部缓冲,含未换行残行**("窗口结束不丢数据")。(初版裁决是只发完整行;实现方收敛于 drain-at-end,对 progress bar / 慢速行场景更友好——残行立即可见而非无限持有)
 - `truncateTail` 的 maxBytes 是**硬上限**: 若保留的最后一行单独超限,对该行做 UTF-8 字符边界安全的字节截尾,结果永远 ≤ maxBytes;不产生 U+FFFD 溢出
 - `truncateTail` 的 `totalLines`: 原始文本行数;空串 = 0 行。截断发生时,输出首行为标记行 `… (truncated: showing last K of N lines)`
-- `formatTaskNotification`: 多事件合并为**多个 `<task-notification>` 块纵向拼接**(每块自包含;实现与测试双方收敛于此,而非单根多子元素);`exitCode:null` 的 summary 文案为 `finished (exit code unknown)`;command/preview 内容必须 XML 转义(`& < >`)
+- `formatTaskNotification`: 见 §4.5。多事件合并为一个 `<pbs-wake kind="task">`;command/preview 必须 XML 转义(`& < >`);`exitCode:null` 省略 `exit-code` 属性
 - `formatBackgroundNotice` 文案包含 command 摘要(前 80 字符)
 - **spawn daemon 必须显式传 `--home <resolvedHome>`**(`pbs-manager --home X daemon`),不得依赖 PBS_HOME 环境继承——调用方的 home 可能来自显式覆盖而非环境变量(2026-09-17 端到端联调发现的实际 bug)
 - CLI `status` 输出汇总计数(version/pid/uptime/sessions 数/tasks 数);session 明细用 `sessions` 子命令
@@ -520,9 +526,9 @@ export interface TaskExitInfo {
   exitCode: number | null; durationMs: number;
   outputPath: string; preview: string;  // preview 由调用方先截断到 4000
 }
-export function formatTaskNotification(events: TaskExitInfo[]): string;  // <task-notification> XML, 多条合并
+export function formatTaskNotification(events: TaskExitInfo[], stillRunning?: WakeItem[], leadIn?: string): FormattedWake;  // §4.5
 export function formatBackgroundNotice(taskId: string, command: string, outputPath: string): string;
-export function formatMonitorEvent(description: string, taskId: string, batchText: string): string;
+export function formatMonitorEvent(description: string, taskId: string, batchText: string, status?: string): FormattedWake;  // §4.5
 ```
 
 ## 附录 B: M3-M5 接口签名契约(subagent / comms / agents 三方的共同依据)

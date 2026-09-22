@@ -40,7 +40,7 @@ Degradation when the manager is missing: bash falls back to local execution, tas
 ## Tools
 
 ### bash (overrides the built-in)
-Adds a `run_in_background` parameter. Foreground commands that exceed `foregroundBudgetMs` (default 20s) move to the background automatically; completion arrives as a `<task-notification>`. Bare `sleep` commands are rejected (use monitor or the background flag instead).
+Adds a `run_in_background` parameter. Foreground commands that exceed `foregroundBudgetMs` (default 20s) move to the background automatically; completion arrives as a `<pbs-wake kind="task">`. Bare `sleep` commands are rejected (use monitor or the background flag instead).
 
 ### subagent
 ```
@@ -48,7 +48,7 @@ subagent({ tasks: [{agent?, prompt, name?}], ... })   // parallel, ≤10, concur
 subagent({ chain: [{agent?, prompt, label?}], ... })  // serial, {previous}/{outputs.<label>} interpolation
 subagent({ action: "list|get|status|interrupt|resume|steer|models", run_id?, child_id?, message? })
 ```
-- Synchronous wait up to 45s (`subagent.budgetMs`); on expiry the run continues in the background with a `run_id`, and completion arrives via `<subagent-notification>`. **Never poll.**
+- Synchronous wait up to 45s (`subagent.budgetMs`); on expiry the run continues in the background with a `run_id`, and completion arrives via `<pbs-wake kind="subagent-done">`. **Never poll.**
 - `model` accepts fuzzy specs (`"haiku"`, `"openai/gpt-5.2"`, `"luna:high"`); the candidate set respects pi's whitelist (`enabledModels` / `--models`). Use `action:"models"` to list selectable values before choosing.
 - Subagents run in-process via `createAgentSession`, capped at depth 1 (no nesting), with a no-background bash variant. The stall watchdog is 5 minutes of inactivity, paused while a tool is executing or a `need_decision` is pending. The hard child timeout is 30 minutes. A decision request waits 10 minutes.
 
