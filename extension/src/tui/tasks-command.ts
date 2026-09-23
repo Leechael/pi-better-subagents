@@ -1,18 +1,18 @@
 /**
  * /tasks — one live overlay for shells, monitors, and subagents.
  *
- * ↑↓ select, Enter views, s stops, Esc backs out of a detail or closes the list.
- * Finished items stay viewable while they remain in the work index.
+ * Type to filter, ↑↓ selects, Enter opens, Ctrl+X asks before stopping, Tab
+ * switches between active/recent and the manager's complete task history.
  */
 import { DynamicBorder, keyHint, rawKeyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { realClock, type Clock } from "../clock";
-import type { ManagerClient } from "../manager-client";
+import type { ManagerClient, TaskRecord } from "../manager-client";
 import { formatConversation } from "../subagent/conversation";
 import type { SubagentRegistry } from "../subagent/registry";
 import { formatAge, type WorkIndex, type WorkItem } from "../work-index";
 import { notifyPlainFallback, showScrollDetail } from "./scroll-detail-view";
 import { readTaskFileTailCached, stderrPathFor } from "./task-output-paths";
-import { loadPiTui, truncateToWidth } from "./pi-tui-load";
+import { fitLines, loadPiTui, truncateToWidth } from "./pi-tui-load";
 import { statusGlyph } from "./tool-component";
 
 const AGE_TICK_MS = 1000;
@@ -21,12 +21,11 @@ function isLive(item: WorkItem): boolean {
   return item.status === "pending" || item.status === "running";
 }
 
-/** Selection follows the item id so a reorder (active first) cannot move the cursor. */
+/** Selection follows the item id so a re-sort cannot move the cursor. */
 export function selectedIndex(items: readonly WorkItem[], selectedId: string | undefined): number {
-  if (items.length === 0) return 0;
-  if (!selectedId) return 0;
-  const i = items.findIndex((item) => item.id === selectedId);
-  return i >= 0 ? i : 0;
+  if (items.length === 0 || !selectedId) return 0;
+  const index = items.findIndex((item) => item.id === selectedId);
+  return index >= 0 ? index : 0;
 }
 
 export function moveSelection(
@@ -35,9 +34,8 @@ export function moveSelection(
   dir: -1 | 1,
 ): string | undefined {
   if (items.length === 0) return undefined;
-  const i = selectedIndex(items, selectedId);
-  const next = Math.max(0, Math.min(items.length - 1, i + dir));
-  return items[next]?.id;
+  const index = selectedIndex(items, selectedId);
+  return items[Math.max(0, Math.min(items.length - 1, index + dir))]?.id;
 }
 
 export function stopChoice(
@@ -60,16 +58,73 @@ export interface TasksCommandDeps {
 
 export function registerTasksCommand(pi: ExtensionAPI, deps: TasksCommandDeps): void {
   pi.registerCommand("tasks", {
-    description: "List background shells, monitors, and subagents",
-    handler: async (_args, ctx) => {
-      await openTasksUi(ctx, deps);
-    },
+    description: "List and inspect background work",
+    handler: async (_args, ctx) => openTasksUi(ctx, deps),
   });
   pi.registerCommand("bashes", {
     description: "Alias for /tasks",
-    handler: async (_args, ctx) => {
-      await openTasksUi(ctx, deps);
-    },
+    handler: async (_args, ctx) => openTasksUi(ctx, deps),
+  });
+}
+
+type TaskListRow = { type: "run"; runId: string; count: number } | { type: "task"; item: WorkItem; indent: boolean };
+
+export function groupTaskRows(items: readonly WorkItem[]): TaskListRow[] {
+  const runs = new Map<string, WorkItem[]>();
+  for (const item of items) {
+    if (item.runId) runs.set(item.runId, [...(runs.get(item.runId) ?? []), item]);
+  }
+  const emitted = new Set<string>();
+  const rows: TaskListRow[] = [];
+  for (const item of items) {
+    if (!item.runId) {
+      rows.push({ type: "task", item, indent: false });
+      continue;
+    }
+    if (!emitted.has(item.runId)) {
+      emitted.add(item.runId);
+      rows.push({ type: "run", runId: item.runId, count: runs.get(item.runId)?.length ?? 1 });
+      for (const child of runs.get(item.runId) ?? []) rows.push({ type: "task", item: child, indent: true });
+    }
+  }
+  return rows;
+}
+
+export function filterTaskItems(items: readonly WorkItem[], query: string): WorkItem[] {
+  const needle = query.trim().toLocaleLowerCase();
+  if (!needle) return [...items];
+  return items.filter((item) =>
+    [item.id, item.kind, item.status, item.title, item.runId, item.endReason, item.error]
+      .filter(Boolean)
+      .some((value) => value!.toLocaleLowerCase().includes(needle)),
+  );
+}
+
+function itemFromTask(task: TaskRecord): WorkItem {
+  return {
+    id: task.task_id,
+    kind: task.kind === "monitor" ? "monitor" : "shell",
+    status: task.status,
+    title: task.command.replace(/\s+/g, " ").trim() || task.task_id,
+    startedAt: task.started_at,
+    ...(task.ended_at !== null ? { endedAt: task.ended_at } : {}),
+    exitCode: task.exit_code,
+    ...(task.signal ? { signal: task.signal } : {}),
+    ...(task.end_reason ? { endReason: task.end_reason } : {}),
+    outputPath: task.output_path,
+    stderrPath: stderrPathFor(task.output_path),
+    countsAsWorker: task.kind === "shell" && task.backgrounded_at !== undefined,
+    ...(task.origin?.via === "child-bash" ? { runId: task.origin.run_id } : {}),
+  };
+}
+
+function mergeItems(primary: readonly WorkItem[], extra: readonly WorkItem[]): WorkItem[] {
+  const merged = new Map(extra.map((item) => [item.id, item]));
+  for (const item of primary) merged.set(item.id, item);
+  return [...merged.values()].sort((a, b) => {
+    const aLive = isLive(a);
+    const bLive = isLive(b);
+    return aLive !== bLive ? (aLive ? -1 : 1) : b.startedAt - a.startedAt;
   });
 }
 
@@ -79,17 +134,18 @@ export function formatWorkRows(
   now: number,
   width: number,
 ): string[] {
-  if (items.length === 0) {
-    return [truncateToWidth("No background tasks.", Math.max(1, width), "")];
-  }
+  if (items.length === 0) return [truncateToWidth("No background tasks.", Math.max(1, width), "")];
   const selected = selectedIndex(items, selectedId);
-  return items.map((item, i) => {
-    const mark = i === selected ? "▸" : " ";
+  return items.map((item, index) => {
+    const mark = index === selected ? "▸" : " ";
     const { glyph } = statusGlyph(item.status);
     const age = formatAge(item.startedAt, item.endedAt, now);
+    const terminal = item.exitCode !== undefined && item.exitCode !== null
+      ? ` exit=${item.exitCode}`
+      : item.signal ? ` ${item.signal}` : item.endReason ? ` ${item.endReason}` : "";
     const title = item.error ? `${item.title} · ${item.error}` : item.title;
-    const raw = `${mark} ${glyph} ${item.kind.padEnd(7)} ${item.status.padEnd(11)} ${age.padEnd(6)} ${title}`;
-    return truncateToWidth(raw, Math.max(1, width), "…");
+    const kind = width >= 60 ? `${item.kind.padEnd(7)} ` : "";
+    return truncateToWidth(`${mark} ${glyph} ${kind}${item.status.padEnd(10)} ${age.padEnd(6)}${terminal} ${title}`, Math.max(1, width), "…");
   });
 }
 
@@ -99,13 +155,11 @@ function selectorHint(theme: { fg(color: string, text: string): string }): strin
       keyHint("tui.select.up", ""),
       keyHint("tui.select.down", ""),
       keyHint("tui.select.confirm", "view"),
-      rawKeyHint("s", "stop"),
+      rawKeyHint("ctrl+x", "stop"),
       keyHint("tui.select.cancel", "close"),
     ].join("  ");
   } catch {
-    // keyHint reads the pi theme singleton (globalThis). Unit tests and a
-    // jiti cache that has not called initTheme() throw; the running TUI has it.
-    return theme.fg("dim", "↑↓ select · Enter view · s stop · Esc close");
+    return theme.fg("dim", "↑↓ select · Enter view · Ctrl+X stop · Esc close · type to filter");
   }
 }
 
@@ -117,15 +171,15 @@ export interface TaskListChoice {
 async function openTasksUi(ctx: ExtensionContext, deps: TasksCommandDeps): Promise<void> {
   const index = deps.getIndex();
   const clock = deps.clock ?? realClock;
-  const items = () => index?.list(clock.now()) ?? [];
+  const currentItems = () => index?.list(clock.now()) ?? [];
+  const loadAll = async (): Promise<WorkItem[]> => {
+    const client = deps.getClient();
+    if (!client || !(await client.ensureAvailable())) throw new Error("pbs-manager is unavailable");
+    return (await client.list(true)).map(itemFromTask);
+  };
   if (!ctx.hasUI) {
-    const list = items();
-    ctx.ui.notify(
-      list.length
-        ? formatWorkRows(list, undefined, clock.now(), 100).join("\n")
-        : "No background tasks.",
-      "info",
-    );
+    const list = currentItems();
+    ctx.ui.notify(list.length ? formatWorkRows(list, undefined, clock.now(), 100).join("\n") : "No background tasks.", "info");
     return;
   }
   if (!index) {
@@ -135,26 +189,33 @@ async function openTasksUi(ctx: ExtensionContext, deps: TasksCommandDeps): Promi
 
   let selectedId: string | undefined;
   for (;;) {
-    const choice = await showTaskList(ctx, () => index.list(clock.now()), (cb) => index.onChange(cb), selectedId, clock);
+    const choice = await showTaskList(
+      ctx,
+      currentItems,
+      (cb) => index.onChange(cb),
+      selectedId,
+      clock,
+      loadAll,
+      deps,
+    );
     if (!choice || choice.action === "close") return;
     selectedId = choice.id ?? selectedId;
     if (!choice.id) continue;
     const item = index.get(choice.id);
-    if (!item) continue;
     if (choice.action === "already-finished") {
-      ctx.ui.notify(`${item.id} already finished`, "info");
+      ctx.ui.notify(`${item?.id ?? choice.id} already finished`, "info");
       continue;
     }
     if (choice.action === "stop") {
       try {
-        await stopItem(item, deps);
-        ctx.ui.notify(`Stopped ${item.id}`, "info");
+        if (item) await stopItem(item, deps);
+        ctx.ui.notify(`Stopped ${choice.id}`, "info");
       } catch (err) {
         ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
       }
       continue;
     }
-    await viewItem(ctx, item, deps);
+    if (item) await viewItem(ctx, item, deps);
   }
 }
 
@@ -164,15 +225,13 @@ async function showTaskList(
   subscribe: (cb: () => void) => () => void,
   initialSelectedId: string | undefined,
   clock: Clock,
+  loadAll: () => Promise<WorkItem[]>,
+  deps: TasksCommandDeps,
 ): Promise<TaskListChoice | undefined> {
   const piTui = loadPiTui();
   if (!piTui) {
     const items = getItems();
-    notifyPlainFallback(
-      ctx.ui.notify.bind(ctx.ui),
-      "Background tasks",
-      items.length ? formatWorkRows(items, initialSelectedId, clock.now(), 100).join("\n") : "No background tasks.",
-    );
+    notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), "Background tasks", items.length ? formatWorkRows(items, initialSelectedId, clock.now(), 100).join("\n") : "No background tasks.");
     return { action: "close" };
   }
   const { matchesKey } = piTui;
@@ -180,73 +239,150 @@ async function showTaskList(
   return ctx.ui.custom<TaskListChoice | undefined>(
     (tui, theme, kb, done) => {
       let selectedId = initialSelectedId;
+      let filter = "";
+      let scope: "active-recent" | "all" = "active-recent";
+      let allItems: WorkItem[] = [];
+      let allLoaded = false;
+      let loadingAll = false;
+      let confirmId: string | undefined;
+      let hint = "";
       const unsub = subscribe(() => tui.requestRender());
       const ageTimer = clock.setInterval(() => tui.requestRender(), AGE_TICK_MS);
       clock.unref?.(ageTimer);
       const border = new DynamicBorder((text) => theme.fg("border", text));
-      const matches = (
-        data: string,
-        id: "tui.select.up" | "tui.select.down" | "tui.select.confirm" | "tui.select.cancel",
-      ) => {
-        try {
-          return kb.matches(data, id);
-        } catch {
-          return false;
+      const pageSize = () => Math.max(1, (tui.terminal?.rows ?? 24) - 8);
+      const matches = (data: string, id: "tui.select.up" | "tui.select.down" | "tui.select.confirm" | "tui.select.cancel") => {
+        try { return kb.matches(data, id); } catch { return false; }
+      };
+      const visibleItems = () => filterTaskItems(
+        scope === "all" ? mergeItems(getItems(), allItems) : getItems(),
+        filter,
+      );
+      const choose = (id: string | undefined) => {
+        selectedId = id;
+        hint = "";
+        tui.requestRender();
+      };
+      const requestStop = async () => {
+        const item = visibleItems().find((candidate) => candidate.id === confirmId);
+        if (!item || !isLive(item)) {
+          hint = "Already finished — select another task.";
+          confirmId = undefined;
+          tui.requestRender();
+          return;
         }
+        try {
+          await stopItem(item, deps);
+          hint = `Stop requested for ${item.id}.`;
+        } catch (err) {
+          hint = err instanceof Error ? err.message : String(err);
+        }
+        confirmId = undefined;
+        tui.requestRender();
+      };
+      const startLoadingAll = () => {
+        if (allLoaded || loadingAll) return;
+        loadingAll = true;
+        hint = "Loading manager history…";
+        tui.requestRender();
+        void loadAll().then((items) => {
+          allItems = items;
+          allLoaded = true;
+          hint = "";
+        }).catch((err) => {
+          hint = `Manager unavailable: ${err instanceof Error ? err.message : String(err)}`;
+        }).finally(() => {
+          loadingAll = false;
+          tui.requestRender();
+        });
       };
       return {
         render(width: number) {
-          const items = getItems();
-          selectedId = items[selectedIndex(items, selectedId)]?.id;
+          const items = visibleItems();
+          if (!items.some((item) => item.id === selectedId)) selectedId = items[0]?.id;
+          const rows = groupTaskRows(items);
+          const selectedRow = Math.max(0, rows.findIndex((row) => row.type === "task" && row.item.id === selectedId));
+          const selectedTask = selectedIndex(items, selectedId);
+          const height = pageSize();
+          const start = Math.max(0, Math.min(selectedRow, rows.length - height));
+          const window = rows.slice(start, start + height);
           const inner = Math.max(1, width);
-          const activeCount = items.filter(isLive).length;
-          const titleText = `Background tasks · ${activeCount} active · ${items.length} total`;
+          const active = items.filter(isLive).length;
+          const scopeLabel = scope === "all" ? "All" : "Active + recent";
+          const titleText = `Tasks ${selectedTask + (items.length ? 1 : 0)}/${items.length} · ${active} active · ${scopeLabel}`;
           const title = truncateToWidth(theme.fg("accent", titleText), inner, "…");
-          const hint = truncateToWidth(selectorHint(theme), inner, "…");
-          const rows = formatWorkRows(items, selectedId, clock.now(), inner);
-          return [...border.render(inner), title, hint, ...rows, ...border.render(inner)];
+          const filterLine = truncateToWidth(theme.fg("dim", `Filter: ${filter || "(type to filter)"} · Tab scope`), inner, "…");
+          const hintLine = hint ? truncateToWidth(theme.fg(hint.startsWith("Already") ? "dim" : "warning", hint), inner, "…") : "";
+          const confirmLine = confirmId
+            ? truncateToWidth(theme.fg("error", `Stop ${confirmId}? Enter confirm · Esc cancel`), inner, "…")
+            : "";
+          const body = window.map((row) => {
+            if (row.type === "run") return truncateToWidth(theme.fg("muted", `Run ${row.runId} · ${row.count} child${row.count === 1 ? "" : "ren"}`), inner, "…");
+            const selected = row.item.id === selectedId;
+            const marker = selected ? "▸" : " ";
+            const { color, glyph } = statusGlyph(row.item.status);
+            const age = formatAge(row.item.startedAt, row.item.endedAt, clock.now());
+            const terminal = row.item.exitCode !== undefined && row.item.exitCode !== null
+              ? ` exit=${row.item.exitCode}`
+              : row.item.signal ? ` ${row.item.signal}` : row.item.endReason ? ` ${row.item.endReason}` : "";
+            const kind = width >= 60 ? `${row.item.kind.padEnd(7)} ` : "";
+            const title = row.item.error ? `${row.item.title} · ${row.item.error}` : row.item.title;
+            const prefix = row.indent ? "  " : "";
+            const text = `${prefix}${marker} ${theme.fg(color as never, glyph)} ${kind}${row.item.status.padEnd(10)} ${age.padEnd(6)}${terminal} ${title}`;
+            return fitLines(truncateToWidth(text, inner, "…"), inner);
+          }).flat();
+          const page = theme.fg("dim", `(${items.length ? selectedTask + 1 : 0}/${items.length}) PgUp/PgDn Home/End · Ctrl+X stop · Enter view`);
+          return [...border.render(inner), title, filterLine, ...(confirmLine ? [confirmLine] : []), ...(hintLine ? [hintLine] : []), ...body, page, ...border.render(inner)];
         },
-        invalidate() {
-          border.invalidate();
-        },
+        invalidate() { border.invalidate(); },
         handleInput(data: string) {
-          const items = getItems();
-          if (matches(data, "tui.select.cancel") || matchesKey(data, "escape") || data === "q") {
+          const items = visibleItems();
+          const current = items[selectedIndex(items, selectedId)];
+          if (matchesKey(data, "escape") || data === "\u001b") {
+            if (confirmId) { confirmId = undefined; hint = "Stop cancelled."; tui.requestRender(); return; }
+            if (filter) { filter = ""; hint = ""; tui.requestRender(); return; }
             done({ action: "close", id: selectedId });
             return;
           }
-          if (matches(data, "tui.select.up") || matchesKey(data, "up")) {
-            selectedId = moveSelection(items, selectedId, -1);
+          if (confirmId) {
+            if (matchesKey(data, "tui.select.confirm") || data === "\r" || data === "\n") { void requestStop(); return; }
+            return;
+          }
+          if (matches(data, "tui.select.up")) { choose(moveSelection(items, selectedId, -1) ?? selectedId); return; }
+          if (matches(data, "tui.select.down")) { choose(moveSelection(items, selectedId, 1) ?? selectedId); return; }
+          if (matches(data, "tui.select.confirm") || data === "\r" || data === "\n") {
+            if (current) done({ action: "view", id: current.id });
+            return;
+          }
+          if (matchesKey(data, "ctrl+x") || data === "\u0018") {
+            if (current && !isLive(current)) { hint = "Already finished — select another task."; tui.requestRender(); return; }
+            if (current) { confirmId = current.id; hint = ""; tui.requestRender(); }
+            return;
+          }
+          if (matchesKey(data, "tab") || data === "\t") {
+            scope = scope === "active-recent" ? "all" : "active-recent";
+            if (scope === "all") startLoadingAll();
+            selectedId = visibleItems()[0]?.id;
             tui.requestRender();
             return;
           }
-          if (matches(data, "tui.select.down") || matchesKey(data, "down")) {
-            selectedId = moveSelection(items, selectedId, 1);
+          if (matchesKey(data, "pageUp")) { choose(items[Math.max(0, selectedIndex(items, selectedId) - Math.max(1, pageSize() - 2))]?.id); return; }
+          if (matchesKey(data, "pageDown")) { choose(items[Math.min(items.length - 1, selectedIndex(items, selectedId) + Math.max(1, pageSize() - 2))]?.id); return; }
+          if (matchesKey(data, "home")) { choose(items[0]?.id); return; }
+          if (matchesKey(data, "end")) { choose(items.at(-1)?.id); return; }
+          if (data === "\u007f" || data === "\b") { filter = filter.slice(0, -1); selectedId = visibleItems()[0]?.id; hint = ""; tui.requestRender(); return; }
+          if (data === "\u0015") { filter = ""; selectedId = visibleItems()[0]?.id; hint = ""; tui.requestRender(); return; }
+          if (!data.startsWith("\u001b") && [...data].every((char) => char >= " " && char !== "\u007f")) {
+            filter += data;
+            selectedId = visibleItems()[0]?.id;
+            hint = "";
             tui.requestRender();
-            return;
-          }
-          if (matches(data, "tui.select.confirm") || matchesKey(data, "enter") || data === "\r") {
-            const item = items[selectedIndex(items, selectedId)];
-            if (!item) return;
-            done({ action: "view", id: item.id });
-            return;
-          }
-          if (data === "s") {
-            const choice = stopChoice(items, selectedId);
-            if (choice.action === "none" || !choice.id) return;
-            done({ action: choice.action, id: choice.id });
           }
         },
-        dispose() {
-          clock.clearInterval(ageTimer);
-          unsub();
-        },
+        dispose() { clock.clearInterval(ageTimer); unsub(); },
       };
     },
-    {
-      overlay: true,
-      overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%", row: 0, col: 0, margin: 0 },
-    },
+    { overlay: true, overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%", row: 0, col: 0, margin: 0 } },
   );
 }
 
@@ -258,8 +394,7 @@ async function stopItem(item: WorkItem, deps: TasksCommandDeps): Promise<void> {
     return;
   }
   const client = deps.getClient();
-  if (!client) throw new Error("pbs-manager is not available");
-  await client.ensureAvailable();
+  if (!client || !(await client.ensureAvailable())) throw new Error("pbs-manager is not available");
   await client.stop(item.id, "tui");
 }
 
@@ -295,7 +430,7 @@ async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksComman
       title: `${item.kind} ${item.title}`,
       tabs: {
         output: () => `${taskDetailHeader(item, clock.now())}\n\n${readTaskFileTailCached(outputPath)}`,
-        stderr: () => `${taskDetailHeader(item, clock.now())}\n\n${readTaskFileTailCached(stderrPath)}`
+        stderr: () => `${taskDetailHeader(item, clock.now())}\n\n${readTaskFileTailCached(stderrPath)}`,
       },
       pollMs: 500,
       clock: deps.clock,

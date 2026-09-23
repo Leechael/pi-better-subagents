@@ -18,6 +18,9 @@ export interface WorkItem {
   title: string;
   startedAt: number;
   endedAt?: number;
+  exitCode?: number | null;
+  signal?: string;
+  endReason?: string;
   outputPath?: string;
   stderrPath?: string;
   /** Backgrounded parent shell. Ignored for monitor/agent. */

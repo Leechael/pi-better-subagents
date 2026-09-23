@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ManualClock } from "../../src/clock";
 import { formatConversation, turnsFromMessages } from "../../src/subagent/conversation";
 import { stderrPathFor } from "../../src/tui/task-output-paths";
-import { formatWorkRows, moveSelection, stopChoice, taskDetailHeader } from "../../src/tui/tasks-command";
+import { filterTaskItems, formatWorkRows, groupTaskRows, moveSelection, stopChoice, taskDetailHeader } from "../../src/tui/tasks-command";
 import { wrapLines } from "../../src/tui/scroll-detail-view";
 import { WorkIndex, type WorkItem } from "../../src/work-index";
 
@@ -47,6 +47,31 @@ describe("tasks view", () => {
     expect(rows.join("\n")).toContain("monitor");
     expect(rows.join("\n")).toContain("build watcher");
     expect(rows.join("\n")).toContain("running");
+  });
+
+  it("groups run children and indents the child rows", () => {
+    const a = { ...item("ch_a", "running"), kind: "agent" as const, runId: "run_1" };
+    const b = { ...item("ch_b", "completed"), kind: "agent" as const, runId: "run_1" };
+    expect(groupTaskRows([a, b])).toEqual([
+      { type: "run", runId: "run_1", count: 2 },
+      { type: "task", item: a, indent: true },
+      { type: "task", item: b, indent: true },
+    ]);
+  });
+
+  it("filters by id, status, command, and end reason", () => {
+    const task = { ...item("sh_1", "killed"), title: "compile app", endReason: "timeout" };
+    expect(filterTaskItems([task], "compile")).toEqual([task]);
+    expect(filterTaskItems([task], "timeout")).toEqual([task]);
+    expect(filterTaskItems([task], "missing")).toEqual([]);
+  });
+
+  it("shows colored-status glyph, exit reason, and drops kind under 60 columns", () => {
+    const task = { ...item("sh_1", "failed"), title: "build", exitCode: 3, endReason: "exited" };
+    const narrow = formatWorkRows([task], task.id, 1000, 50)[0];
+    expect(narrow).toContain("✗");
+    expect(narrow).toContain("exit=3");
+    expect(narrow).not.toContain("shell");
   });
 
   it("shows failed agent error inline in the task row", () => {

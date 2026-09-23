@@ -104,6 +104,9 @@ export default function (pi: ExtensionAPI): void {
     workIndex.patch(taskId, {
       status: toExitStatus(event),
       endedAt: clock.now(),
+      exitCode: event.exit_code ?? null,
+      ...(event.signal ? { signal: event.signal } : {}),
+      ...(event.end_reason ? { endReason: event.end_reason } : {}),
       ...(event.output_path
             ? { outputPath: event.output_path, stderrPath: stderrPathFor(event.output_path) }
             : {}),
@@ -318,6 +321,9 @@ export default function (pi: ExtensionAPI): void {
           workIndex.patch(event.task_id, {
             status: toExitStatus(event),
             endedAt: clock.now(),
+            exitCode: event.exit_code ?? null,
+            ...(event.signal ? { signal: event.signal } : {}),
+            ...(event.end_reason ? { endReason: event.end_reason } : {}),
             ...(event.output_path
             ? { outputPath: event.output_path, stderrPath: stderrPathFor(event.output_path) }
             : {}),
@@ -327,6 +333,9 @@ export default function (pi: ExtensionAPI): void {
         workIndex.patch(event.task_id, {
           status: toExitStatus(event),
           endedAt: clock.now(),
+          exitCode: event.exit_code ?? null,
+          ...(event.signal ? { signal: event.signal } : {}),
+          ...(event.end_reason ? { endReason: event.end_reason } : {}),
           ...(event.output_path
             ? { outputPath: event.output_path, stderrPath: stderrPathFor(event.output_path) }
             : {}),
