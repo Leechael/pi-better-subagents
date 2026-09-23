@@ -62,10 +62,6 @@ export function summaryLabel(shells: number, subagents: number, monitors: number
   return parts.join(" · ");
 }
 
-function isFailed(item: WorkItem): boolean {
-  return item.status === "failed" || item.status === "killed" || item.status === "orphaned";
-}
-
 /**
  * Passive fleet status line (below editor). No setStatus, no keyboard capture, no poll.
  */
@@ -96,8 +92,7 @@ export class FleetWidget {
     const items = this.deps.index.list(this.clock.now());
     const counts = this.deps.index.counts();
     const activeAgents = items.filter((item) => item.kind === "agent" && isActive(item));
-    const failed = items.filter(isFailed).length;
-    const total = counts.workers + counts.subagents + counts.monitors + failed;
+    const total = counts.workers + counts.subagents + counts.monitors;
     if (activeAgents.length > 0 && !this.ageTimer) {
       this.ageTimer = this.clock.setInterval(() => this.tui?.requestRender(), 5000);
       this.clock.unref?.(this.ageTimer);
@@ -156,9 +151,9 @@ export class FleetWidget {
   }
 
   /**
-   * One line: `● 2 shells · 1 monitor · alpha 12s · beta 8s · ✗ 1 failed   /tasks`.
-   * Running subagents are named with their age; failures stay listed while the
-   * work index retains them (10 minutes) so a failure is not missed.
+   * One line: `● 2 shells · 1 monitor · alpha 12s · beta 8s   /tasks`.
+   * Live work only: anything that exited, failed, or was killed drops out (its
+   * wake pill and /tasks already report it), and the line clears when idle.
    */
   private renderLine(width: number, theme: FleetTheme): string[] {
     const now = this.clock.now();
@@ -171,13 +166,8 @@ export class FleetWidget {
       const name = item.name ?? item.title;
       parts.push(`${name} ${theme.fg("dim", formatAge(item.startedAt, item.endedAt, now))}`);
     }
-    const failed = items.filter(isFailed).length;
-    if (failed > 0) parts.push(theme.fg("error", `✗ ${failed} failed`));
     if (parts.length === 0) return [];
-    const running = counts.workers + counts.subagents + counts.monitors > 0;
-    // Lead with ● only while something runs; a failures-only row already starts with ✗.
-    const lead = running ? `${theme.fg("accent", "●")} ` : "";
-    const line = `  ${lead}${parts.join(theme.fg("dim", " · "))}   ${theme.fg("dim", "/tasks")}`;
+    const line = `  ${theme.fg("accent", "●")} ${parts.join(theme.fg("dim", " · "))}   ${theme.fg("dim", "/tasks")}`;
     return [truncateToWidth(line, Math.max(1, width), "…")];
   }
 }

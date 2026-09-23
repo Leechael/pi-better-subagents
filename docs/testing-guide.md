@@ -66,8 +66,8 @@ pi -ne -e /path/to/pi-better-subagents/extension
 
 | # | Do | Expect |
 |---|---|---|
-| 5.1 | During F1–F3 | One row: `● 1 shell · 1 monitor · alpha 12s · ✗ 1 failed   /tasks` |
-| 5.2 | After a failure, with nothing running | The row stays with `✗ 1 failed` for up to 10 minutes |
+| 5.1 | During F1–F3 | One row: `● 1 shell · 1 monitor · alpha 12s   /tasks`, counting only what is still running |
+| 5.2 | A task exits, fails or is killed | It drops out of the row at once (the pill and `/tasks` still report it); with nothing running the row disappears |
 | 5.3 | Ctrl+O on any pill | Labelled fields (command, exit, duration, preview…), never raw XML |
 | 5.4 | CJK text in commands/results | Columns stay aligned |
 

@@ -123,7 +123,7 @@ Ids are fuzzy (unique prefix/suffix/near-miss). State directory: `~/.pi/agent/pb
 
 | Surface | Behavior |
 |---------|----------|
-| Fleet line (below editor) | One row: `● 2 shells · 1 monitor · alpha 12s · ✗ 1 failed   /tasks`. Running subagents by name; recent failures stay listed for 10 min |
+| Fleet line (below editor) | One row of live work only: `● 2 shells · 1 monitor · alpha 12s   /tasks`. Running subagents by name; anything that exited, failed or was killed drops out, and the row disappears when nothing runs |
 | `/tasks` (alias `/bashes`) | Live list of shells, monitors and subagents (grouped by run). Type to filter; ↑↓ / PgUp / PgDn / Home / End move; Tab switches active+recent vs all; Enter opens details; `ctrl+x` stops (inline confirm); Esc closes |
 | Finished items | Stay listed for 10 minutes (cap 50). Commands that finished inside the foreground budget are not background work and are not listed |
 | Shell / monitor details | `1` output · `2` stderr · `3` info (status, exit, end reason, times, paths). Tab cycles, `f` toggles follow, arrows / PgUp / PgDn / wheel scroll, Esc back |

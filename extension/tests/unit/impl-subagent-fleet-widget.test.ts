@@ -106,17 +106,21 @@ describe("FleetWidget", () => {
     widget.dispose();
   });
 
-  it("keeps a recent failure visible after everything stops", () => {
+  it("counts only live work: finished or failed items drop out, and the line clears", () => {
     const ui = fakeUi();
     const clock = new ManualClock(1_000);
     const index = new WorkIndex({ clock });
     index.upsert({ id: "sh_1", kind: "shell", status: "running", title: "npm test", startedAt: 0, countsAsWorker: true });
+    index.upsert({ id: "ch_1", kind: "agent", status: "running", title: "alpha (worker)", name: "alpha", startedAt: 0, countsAsWorker: false });
     const widget = new FleetWidget({ index, getUi: () => ui, clock });
     widget.start();
-    index.patch("sh_1", { status: "failed", endedAt: 900 });
+    index.patch("ch_1", { status: "failed", endedAt: 900, error: "boom" });
     const line = lastFactory(ui)?.(80).join("\n") ?? "";
-    expect(line).toContain("✗ 1 failed");
-    expect(line).not.toContain("✗ ✗");
+    expect(line).toContain("1 shell");
+    expect(line).not.toContain("alpha");
+    expect(line).not.toMatch(/failed|✗/);
+    index.patch("sh_1", { status: "killed", endedAt: 950 });
+    expect(ui.widgets.at(-1)).toEqual({ kind: "clear" });
     widget.dispose();
   });
 
