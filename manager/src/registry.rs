@@ -6,15 +6,15 @@
 use crate::proto::{
     ProtoError, TaskKind, TaskRecord, TaskStatus, E_FORBIDDEN, E_NOT_FOUND,
 };
-use crate::task::{OutputChunk, OutputState};
+use crate::task::OutputState;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use crate::task::RunnerProc;
 use tokio::net::unix::pipe;
-use tokio::process::Child;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -36,17 +36,28 @@ pub fn task_output_path(home: &Path, session_id: &str, task_id: &str) -> PathBuf
 // Task entry (runtime state + persisted record)
 // ---------------------------------------------------------------------------
 
+/// Where a running task's exit watch stands. Kept in the entry so an
+/// in-place upgrade can resume the watch where it left off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExitPhase {
+    /// Waiting for the runner's status line, its exit, or the timeout.
+    AwaitReport,
+    /// Finalized from the report; waiting for the runner to exit. With
+    /// `group_lingering` it guards leftovers, otherwise it only needs reaping.
+    AwaitRunnerExit,
+    /// Nothing left to wait for.
+    Done,
+}
+
 pub struct TaskEntry {
     pub record: TaskRecord,
     /// The task's runner (`pbs-manager __run`), taken by the exit watch at
     /// spawn time; None for records loaded from disk.
-    pub child: Option<Child>,
+    pub child: Option<RunnerProc>,
     /// Read end of the runner's status pipe, taken with `child`.
     pub status_rx: Option<pipe::Receiver>,
     pub output: Arc<Mutex<OutputState>>,
-    /// Tee channel receiver; taken by the output fanout task at spawn time.
-    /// Bounded (`task::CHUNK_CHANNEL_CAP`) so a slow watcher cannot grow RAM.
-    pub chunks_rx: Option<mpsc::Receiver<OutputChunk>>,
     /// Status broadcast for `wait` waiters; receives the terminal status once.
     pub status_tx: watch::Sender<TaskStatus>,
     /// Set by stop/timeout/shutdown so the exit path maps to `killed` (§3.4).
@@ -56,7 +67,29 @@ pub struct TaskEntry {
     pub kill_reason: Option<String>,
     /// Connection ids subscribed to output events (§3.3 watch).
     pub watchers: HashSet<u64>,
-    pub timeout_ms: Option<u64>,
+    /// Hard kill ceiling as an absolute wall-clock time (ms since epoch), so
+    /// an in-place upgrade carries it over unchanged.
+    pub timeout_deadline_ms: Option<u64>,
+    /// Where the exit watch stands.
+    pub exit_phase: ExitPhase,
+    /// The hard timeout fired and the group was killed for it.
+    pub timed_out: bool,
+    /// A stop's SIGKILL escalation is due at this wall-clock time.
+    pub kill_grace_until_ms: Option<u64>,
+    /// stdout / stderr pipe read ends while no pump reads them (before the
+    /// tee starts, and while parked). None once that pipe hit EOF.
+    pub stdout_fd: Option<std::os::fd::OwnedFd>,
+    pub stderr_fd: Option<std::os::fd::OwnedFd>,
+    /// The running tee pumps and output fanout, while started.
+    pub tee: Option<crate::task::Tee>,
+    pub fanout: Option<tokio::task::JoinHandle<()>>,
+    /// The running exit watch, while started.
+    pub exit_watch: Option<tokio::task::JoinHandle<()>>,
+    /// A status line the exit watch read only in part (kept across a park).
+    pub status_partial: Vec<u8>,
+    /// Output bytes the fanout has pushed to watchers, as a cursor (an
+    /// incomplete trailing UTF-8 sequence it holds back is not counted).
+    pub delivered_cursor: u64,
     /// The command exited but other members of its process group (children
     /// it backgrounded) are still alive, guarded by the runner. The group is
     /// still ours to kill on stop/shutdown (§3.2: background work must not
@@ -96,47 +129,55 @@ impl TaskEntry {
         }
     }
 
-    pub fn new_running(
-        record: TaskRecord,
-        child: Child,
-        status_rx: pipe::Receiver,
-        output: Arc<Mutex<OutputState>>,
-        chunks_rx: mpsc::Receiver<OutputChunk>,
-        timeout_ms: Option<u64>,
-    ) -> Self {
-        let (status_tx, _) = watch::channel(TaskStatus::Running);
-        TaskEntry {
-            record,
-            child: Some(child),
-            status_rx: Some(status_rx),
-            output,
-            chunks_rx: Some(chunks_rx),
-            status_tx,
-            kill_requested: false,
-            kill_reason: None,
-            watchers: HashSet::new(),
-            timeout_ms,
-            group_lingering: false,
-        }
-    }
-
-    /// A terminal record loaded from disk (kept for list/output visibility).
-    pub fn terminal(record: TaskRecord) -> Self {
-        let total = record.output_size;
+    /// An entry with no runner, pipes or timers attached.
+    pub fn bare(record: TaskRecord, output: Arc<Mutex<OutputState>>) -> Self {
         let (status_tx, _) = watch::channel(record.status);
         TaskEntry {
             record,
             child: None,
             status_rx: None,
-            output: Arc::new(Mutex::new(OutputState::new(None, total))),
-            chunks_rx: None,
+            output,
             status_tx,
             kill_requested: false,
             kill_reason: None,
             watchers: HashSet::new(),
-            timeout_ms: None,
+            timeout_deadline_ms: None,
+            exit_phase: ExitPhase::Done,
+            timed_out: false,
+            kill_grace_until_ms: None,
+            stdout_fd: None,
+            stderr_fd: None,
+            tee: None,
+            fanout: None,
+            exit_watch: None,
+            status_partial: Vec::new(),
+            delivered_cursor: 0,
             group_lingering: false,
         }
+    }
+
+    /// A freshly spawned task: runner, status pipe, and the stdout / stderr
+    /// descriptors its tee will read.
+    pub fn new_running(
+        record: TaskRecord,
+        parts: crate::task::ProcessParts,
+        output: Arc<Mutex<OutputState>>,
+        timeout_ms: Option<u64>,
+    ) -> Self {
+        let mut e = TaskEntry::bare(record, output);
+        e.child = Some(RunnerProc::Child(parts.child));
+        e.status_rx = Some(parts.status);
+        e.stdout_fd = Some(parts.stdout);
+        e.stderr_fd = Some(parts.stderr);
+        e.timeout_deadline_ms = timeout_ms.map(|ms| e.record.started_at + ms);
+        e.exit_phase = ExitPhase::AwaitReport;
+        e
+    }
+
+    /// A terminal record loaded from disk (kept for list/output visibility).
+    pub fn terminal(record: TaskRecord) -> Self {
+        let total = record.output_size;
+        TaskEntry::bare(record, Arc::new(Mutex::new(OutputState::new(None, total))))
     }
 }
 
@@ -376,22 +417,9 @@ mod tests {
         let home = temp_home("acl");
         let mut reg = Registry::new(home.clone());
         let rec = sample_record(&home, "sess-a", "sh_00000001");
-        let (status_tx, _) = watch::channel(TaskStatus::Running);
         reg.tasks.insert(
             "sh_00000001".into(),
-            TaskEntry {
-                record: rec,
-                child: None,
-                status_rx: None,
-                output: Arc::new(Mutex::new(OutputState::new(None, 0))),
-                chunks_rx: None,
-                status_tx,
-                kill_requested: false,
-                kill_reason: None,
-                watchers: HashSet::new(),
-                timeout_ms: None,
-                group_lingering: false,
-            },
+            TaskEntry::bare(rec, Arc::new(Mutex::new(OutputState::new(None, 0)))),
         );
         let own = Access::Extension("sess-a".into());
         let other = Access::Extension("sess-b".into());
