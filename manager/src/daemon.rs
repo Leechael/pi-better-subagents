@@ -1624,10 +1624,22 @@ pub fn start_task_io(state: &Shared, task_id: &str) {
             return;
         }
     }
+    // What reached the file but not the watchers: after a park, the
+    // incomplete UTF-8 tail the fanout held back. It is completed by the
+    // next bytes, so the restarted fanout begins with it.
     let delivered = e.delivered_cursor;
+    let total = e.output.lock().unwrap().total_size;
+    let carry = if total > delivered {
+        let want = (total - delivered).min(MAX_OUTPUT_READ) as usize;
+        task::read_file_range(std::path::Path::new(&e.record.output_path), delivered, want)
+            .map(|(b, _)| b)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let tid = task_id.to_string();
     let state2 = state.clone();
-    e.fanout = Some(tokio::spawn(run_output_fanout(state2, tid, rx, delivered, park)));
+    e.fanout = Some(tokio::spawn(run_output_fanout(state2, tid, rx, delivered, carry, park)));
 }
 
 /// Push a task's output chunks to its watchers as `output` events.
@@ -1643,10 +1655,11 @@ async fn run_output_fanout(
     tid: String,
     mut rx: tokio::sync::mpsc::Receiver<task::OutputChunk>,
     delivered: u64,
+    carry: Vec<u8>,
     park: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut carry: Vec<u8> = Vec::new();
-    let mut last_cursor = delivered;
+    let mut last_cursor = delivered + carry.len() as u64;
+    let mut carry = carry;
     loop {
         let (bytes, next_cursor) = match rx.recv().await {
             Some(c) => {

@@ -355,3 +355,28 @@ fn u9_cli_wait_and_follow_survive_an_upgrade() {
     assert_eq!(assert_sequential(&f.stdout, "f", "output -f across the upgrade"), 60);
     assert_eq!(status(&home)["generation"], 1);
 }
+
+/// A UTF-8 character split across two pipe reads, with an upgrade between
+/// the halves: the fanout's held-back tail survives the park, so the
+/// reconnected watcher gets the whole character, never U+FFFD.
+#[test]
+fn u10_split_utf8_character_across_an_upgrade() {
+    let home = Home::new("u10");
+    let bin = home.install_copy();
+    let _d = home.start_daemon_from(&bin, &[]);
+    let mut c = home.connect();
+    hello(&mut c, "sess-u10");
+    let (t, _) = start(&mut c, "monitor", r"printf 'a\344'; sleep 2; printf '\270\255b\n'", json!({}));
+    c.wait_event(s(3), |e| e["event"] == "output" && e["task_id"] == t).expect("first half");
+    assert!(upgrade(&home).status.success());
+    assert!(c.wait_closed(s(5)), "old connection closed (and read to the end)");
+    let mut c2 = home.connect();
+    hello(&mut c2, "sess-u10");
+    // It may end before or after we are back: `wait` covers both (a
+    // task_exited sent while disconnected is not replayed).
+    c2.request_ok(json!({"type":"wait","task_id":t,"budget_ms":10000}));
+    c2.drain(Duration::from_millis(300));
+    let mut events = c.events.clone();
+    events.extend(c2.events.clone());
+    assert_eq!(event_text(&events, &t), "a中b\n", "{events:?}");
+}
