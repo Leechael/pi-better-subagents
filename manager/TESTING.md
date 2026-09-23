@@ -7,12 +7,13 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 
 | Suite | Kind | What it covers |
 |---|---|---|
-| `src/**` `#[cfg(test)]` | unit | ring buffer, record persistence, state mapping, daemon lock claim, UTF-8 chunk cutting, signal names, id format |
+| `src/**` `#[cfg(test)]` | unit | ring buffer, record persistence, state mapping, daemon lock claim, UTF-8 chunk cutting, signal names, id format, manual clock (`test-clock` only) |
 | `tests/protocol.rs` | black box | message round-trips, basic lifecycle (t01–t13) |
 | `tests/lifecycle_adversarial.rs` | black box | every cell of the lifecycle table below, adversarial conditions |
 | `tests/mutation_gaps.rs` | black box | behaviours found unguarded by cargo-mutants survivors (g1–g13) |
 | `tests/observability.rs` | black box | observability contract: protocol additions, events.jsonl, inspection CLI (p1–p3, e1–e4, c1–c8) |
-| `tests/common/mod.rs` | helpers | wire client, isolated `--home`, process probes, crashable helper client |
+| `tests/timing_canary.rs` | black box, real time | the actual 5s idle grace and 2s kill grace (always on the real clock) |
+| `tests/common/mod.rs` | helpers | wire client, isolated `--home`, process probes, crashable helper client, clock stepping (`Home::advance*`) |
 
 All black-box tests start the compiled binary with an isolated `--home`
 (`$TMPDIR/pbsx-<pid>-<test>`, kept short for the ~104-byte socket path
@@ -22,9 +23,8 @@ are **no new dev-dependencies**.
 
 Determinism rules:
 
-- Every wait is a poll with a deadline (`poll_until`). Fixed sleeps appear
-  only where elapsed time is the thing under test ("nothing may be killed
-  during the 5s grace"), and they sit well inside the tolerance.
+- Every wait is a poll with a deadline (`poll_until`). The daemon's own
+  timers are stepped, not waited for: see [Time in tests](#time-in-tests).
 - A crashing pi is a real separate OS process: the test binary re-executes
   itself as `helper_hold_extension_conn` (an ignored no-op test when run
   normally), which connects, starts tasks, and is then SIGKILLed.
@@ -35,19 +35,90 @@ Determinism rules:
 
 ```bash
 cd manager
-cargo test                                               # everything (~48s wall, warm build)
+cargo test --features test-clock                         # everything, manual clock (~44s wall)
+cargo test                                               # everything, real time (~59s wall)
 cargo test --test lifecycle_adversarial                  # adversarial suite
-scripts/ablate.sh                                        # ablation check (~20 min idle)
+scripts/ablate.sh                                        # ablation check (~8 min, manual clock)
 cargo mutants -j 3 --timeout 150 -f src/lifecycle.rs -f src/task.rs -f src/registry.rs \
-  -f src/daemon.rs -f src/sys.rs -f src/proto.rs          # mutation score (~55 min)
+  -f src/daemon.rs -f src/sys.rs -f src/proto.rs          # mutation score (manual clock via .cargo/mutants.toml)
 ```
 
-Measured on an M-series Mac with a warm build: `cargo test` takes 48s wall
-for 125 passing tests: unit 0.2s (42), `lifecycle_adversarial` 19s (42),
-`mutation_gaps` 14s (13), `observability` 5s (15), `protocol` 8s (13). Binaries run one after
-another; tests inside a binary run in parallel. The suite is stable across
-repeated runs and with 3 concurrent copies of the integration suites. Most
-of the time goes to the contract's own timers (5s grace, 2s kill grace).
+Measured on an M-series Mac with a warm build (129 passing tests with the
+feature, 127 without; the difference is the two `clock` unit tests):
+
+| | `cargo test` wall | per-test time, summed serially | `cargo mutants -f src/lifecycle.rs` (42 mutants, -j 3) |
+|---|---|---|---|
+| before (real time only) | 48s (50s re-measured) | 182s | 324s |
+| `--features test-clock` | 44s | 77s | 226s (−30%) |
+| plain, after | 59s (+2 canaries, 8s) | — | — |
+
+Per binary with the feature: unit 0.2s, `lifecycle_adversarial` 18s,
+`mutation_gaps` 2.6s (was 14s), `observability` 2.3s (was 5s), `protocol`
+7.6s, `timing_canary` 7.7s. Binaries run one after another; tests inside a
+binary run in parallel. The wall time is now bounded by tests that are not
+about the timers: `c6` (256 MiB through a stuck watcher, ~15s), the real-time
+`protocol::t09`, and the canaries. The timer-bound tests dropped from 5–12s
+each to about 1s (`d5` 1.1s, `d6` 1.0s, `d4` 0.8s). `d3` no longer sleeps a
+fixed 1.5s per round (15.8s → 1.5s). Both modes are stable with 3–4
+concurrent copies of the integration suites.
+
+## Time in tests
+
+The daemon's own timers are the 5s idle grace, the 2s kill grace (stop
+reaper and graceful shutdown), the 1s re-adopt poll and the 500ms
+leftover-group poll. They go through `src/clock.rs`. In a normal build that
+is `tokio::time::sleep`. With the `test-clock` cargo feature **and**
+`PBS_TEST_CLOCK=manual` in the daemon's environment, they run on a manual
+clock instead:
+
+- Virtual time starts at 0 and moves only on `clock_advance {ms}`.
+  `clock_status` lists the pending timers by label (`idle`, `kill-grace`,
+  `shutdown-grace`, `adopt-poll`, `group-poll`) and time left.
+- Both requests exist only under the feature. They are sent as the first
+  frame of a fresh connection, without hello, so they never count as an
+  active connection and never cancel the idle timer.
+- Everything else stays on real time: child processes, `timeout_ms`, the
+  hello timeout, record timestamps.
+- The daemon keeps accepting during graceful shutdown (see D8/D8b). That is
+  also what lets a test step the 2s grace that holds a shutdown open.
+
+`tests/common` drives it:
+
+- `Home::advance(label, ms)` waits until a timer with that label is armed,
+  then advances. A step can never race ahead of the daemon scheduling the
+  timer.
+- `advance_almost(label, total)` stops 1 ms short and asserts that the timer
+  is still pending with exactly 1 ms left. A shorter or longer constant
+  fails there, deterministically.
+- `advance_past()` takes the last millisecond.
+- `advance_now(ms)` shows that a cancelled countdown does not fire.
+
+Without the feature, every step is a real sleep: `advance_almost` sleeps
+60% of the timer, and `advance_past` does nothing. So plain `cargo test`
+still runs every test against real time, with margins.
+
+`tests/timing_canary.rs` always uses the real clock (`Home::new_real`) and
+pins the actual values:
+
+- the idle grace: a task is SIGTERMed 4.9–6.5s after the last client leaves;
+- the kill grace: a TERM-ignoring task is SIGKILLed 1.9–3.5s after `stop`.
+
+`protocol::t09` also still runs on real time. Shortening either constant
+turns both canaries red. So does the manual-clock suite: 6 lifecycle tests,
+including `d7` through the `advance_almost` pending check.
+
+Why not an existing tool:
+
+| Option | Why not |
+|---|---|
+| tokio `test-util` (`time::pause` / `advance`) | Controls only the runtime of the process under test, and only a current-thread runtime. These tests are black box: the daemon is a separate binary with a multi-thread runtime, and the test cannot reach its runtime. Paused time also auto-advances whenever the runtime is idle. The daemon is idle exactly while it waits on real children, so the 2s kill grace would fire at once, before a TERM-ignoring child could be observed alive. |
+| turmoil | Simulates hosts and TCP/UDP inside one process. There are no unix sockets, no `fork`/`exec`, and no signals or process groups. Those are what the lifecycle is made of. |
+| madsim | Deterministic simulation, but it replaces tokio and std at build time for the whole crate, and it cannot run real child processes. The kill-grace and group tests need real processes that ignore SIGTERM. |
+| Env var that shortens the constants | Faster, but it changes the values under test and still races on the wall clock. A manual clock keeps 5000/2000 exact and makes the ordering deterministic. |
+
+The feature is off by default and adds no dependency. Release builds do not
+contain the debug requests (`#[cfg(feature = "test-clock")]` on the protocol
+variants). `PBS_TEST_CLOCK` alone does nothing without the feature.
 
 ## Lifecycle state-transition table
 
@@ -124,7 +195,8 @@ States: `absent` → `starting` (claim) → `serving` (≥1 active conn) ⇄ `id
 | D5 | serving | last client process SIGKILLed | idle → shutting_down after 5s → exited | nothing touched during the grace; then SIGTERM → 2s → SIGKILL (grandchildren too), records `killed`, socket + pid removed, exit 0 | `t09` (in-process close) | `d5` |
 | D6 | idle | hello within 5s | serving | countdown cancelled; restarts from zero when that client leaves | no | `d6`, `d6b` |
 | D7 | idle | only a silent (no hello) connection | exited | — | no | `d7` |
-| D8 | shutting_down | hello | shutting_down | refused; shutdown completes | no | `d8` |
+| D8 | shutting_down | hello (connection accepted before or during shutdown) | shutting_down | refused at once (`manager is shutting down`); shutdown completes | no | **FIXED** `d8` |
+| D8b | shutting_down | CLI command | serving (successor) | the CLI waits for the old manager to exit, then spawns a successor; no stall, no error | no | **FIXED** `d8b` |
 | D9 | serving | cli `shutdown` | exited | kills tasks even with an extension still connected; files removed; ext sees EOF | no | `d9` |
 | D10 | starting | stale pid (dead) + socket | serving | client path recovers with a new pid | unit, `t12` | `d10` |
 | D11 | starting | socket without pid file / corrupt pid file | serving | cleaned by the lock holder | unit | `d11`, `d11b` |
@@ -137,12 +209,12 @@ States: `absent` → `starting` (claim) → `serving` (≥1 active conn) ⇄ `id
 | D17 | any | `doctor` | unchanged | no daemon → removes stale files while holding the lock; live daemon → touches nothing, hello ok | no | `g13` |
 | D18 | serving | all watched tasks finished | serving | idle: no busy loop | no | `g10` |
 
-**Coverage:** 55 cells (C 10, S 6, T 20, D 19).
+**Coverage:** 56 cells (C 10, S 6, T 20, D 20).
 
 | | Covered | Partial | Uncovered | Violated by the code |
 |---|---|---|---|---|
 | Before (original code, original tests) | 7 | 10 (unit-level, status-only, or in-process close) | 38 | 8 (C10, T6b, T6c, T15, T16, D2, D3, D13) |
-| After (fixed code) | 55 | 0 | 0 | 0 |
+| After (fixed code) | 56 | 0 | 0 | 0 |
 
 ## Bugs found (all fixed)
 
@@ -159,6 +231,8 @@ added while fixing and were also run against the pre-fix code: all red.
 | `d12` | Identity was `kill(pid,0)` on manager.pid; a reused pid blocked startup forever. | Same lock: identity is the lock, the pid file is informational. `doctor` also uses the lock and cleans only while holding it. | `d12`, `g13` |
 | `o3` | Reads were capped at 1 MiB of raw bytes, but control bytes JSON-escape to 6 bytes: the >4 MiB response made `write_frame` fail and the writer task exit, and the connection went mute. | `utf8_chunk_len` cuts each chunk so its escaped size fits `CHUNK_JSON_BUDGET` (4 MiB − 64 KiB). `respond` turns any other oversized response into `E_INTERNAL`; the writer drops an unsendable frame instead of exiting. | `o3`, `o3b`, `o3c`, `g9` |
 | `o4` | Chunks were lossy-decoded per read; a `max_bytes` or pipe boundary inside a multi-byte char produced U+FFFD while `next_cursor` skipped the bytes. | Reads fetch `cap + 3` bytes and cut at the last char boundary (a first char wider than `max_bytes` is sent whole, so reads always progress). A truncated tail is held back while the task runs. Watch events carry an incomplete tail over to the next pipe read and flush it at EOF. | `o4`, `o4b`, `o4c`, `g12`, unit `chunk_len_*` |
+| `d8b` | Once shutdown began, the accept loop was gone but the socket stayed bound: a client connecting in that window waited for its 30s response timeout, then failed (was deferred in part A). | The daemon keeps accepting during shutdown and refuses hello at once; a client refused with `manager is shutting down` waits (≤ 5s) for that manager's pid to exit, then spawns a successor. | `d8` (fresh connection), `d8b` |
+| `t13` flake | `finalize_exit` persisted `output_size` at child exit, before the tee had drained the pipe. After a restart the loaded record reported too few bytes (0 under load; seen once in a stress run as `t13` `total_size` 0 vs 13893). | `scan_tasks` takes `max(record, file length)` for every loaded record, not only re-adopted ones: the file is append-only and can no longer grow. | unit `scan_recovers_output_size_of_terminal_records_from_the_file` |
 | `t5b` | `signal` was an integer on the wire and on disk; §3.3 and the extension type say `"SIGTERM"`/`"SIGKILL"`. | `signal` is a name (`proto::signal_name`) in `task_exited`, `TaskRecord` and the CLI `EXIT` column (widened to 7). Legacy numeric records still load (converted). The extension only tests truthiness / displays it; verified with `tsc`, its unit tests, and its real-binary integration tests. | `t5b`, `t2`, unit `signal_names_on_wire_and_legacy_numbers_load` |
 
 ## Observability contract (manager + CLI side)
@@ -262,14 +336,17 @@ dead or unneeded code:
 
 ## Ablation
 
-`ablation.toml` lists 42 load-bearing mechanisms (29 lifecycle, 13
+`ablation.toml` lists 44 load-bearing mechanisms (31 lifecycle, 13
 observability), each with a literal
 find/replace and the tests that must go red. `scripts/ablate.sh` applies
 each one to a scratch copy (sharing one build cache), first checks that
 every listed test passes on the pristine copy (a test that is already red
 proves nothing), then runs them one by one and compares the result with
 `expect`. Per-test logs go to `$ABLATE_WORK/logs/`. Needs `cargo`,
-`python3` ≥ 3.11 (tomllib), `perl`, `rsync`.
+`python3` ≥ 3.11 (tomllib), `perl`, `rsync`. The runner builds and
+tests with `--features test-clock` unless `ABLATE_FEATURES` is set (empty =
+real time). The full run takes 476s with the manual clock, against about
+20 minutes on real time.
 
 **Runner bug found and fixed (`fix(ablate)` commit).** `fresh_copy` used
 `rsync -a`, which restores a file changed by an earlier ablation with the
@@ -281,8 +358,10 @@ during part A (the previous run ended on a bounded-queue ablation), which
 had been filed as a possible flake. Restores now rewrite differing files
 with a new mtime.
 
-Final pass on the fixed code: **29/29 entries behave as declared** (28 red,
-1 green), with no baseline flakes and exit status 0.
+Final pass (manual clock, after the test-clock work): **44/44 entries
+behave as declared** (43 red, 1 green), with no baseline flakes. The first
+run reported `refuse-hello-while-shutting-down` as a stale manifest (see
+below); after that fix it was re-run and is red.
 
 | Ablation (mechanism removed) | Tests red |
 |---|---|
@@ -315,6 +394,8 @@ Final pass on the fixed code: **29/29 entries behave as declared** (28 red,
 | frame-size-limit | 1/1: f1 |
 | timeout-hard-kill | 1/1: t3 |
 | daemon-detach-setsid (auto-spawned daemon) | 1/1: g2 |
+| accept-during-shutdown (accept loop stops at shutdown, as before) | 2/2: d8, d8b |
+| client-waits-out-shutdown | 1/1: d8b |
 
 Changes from the first manifest:
 
@@ -330,6 +411,13 @@ Changes from the first manifest:
 - **refuse-hello-while-shutting-down** first stayed green: once shutdown
   starts, the accept loop has exited, so only a connection accepted
   *before* shutdown can race it. `d8` now opens its connection first.
+- **refuse-hello-while-shutting-down** now finds `SHUTTING_DOWN` (the
+  message became a shared constant, so the client can recognise it).
+- Under the manual clock, **idle-grace-5s** and **sigkill-grace-2s** go red
+  through the clock helpers, not by timing: `advance_almost` finds no
+  pending timer 1 ms short of 5000 (`d5`), or the timer never shows up as
+  armed (`d6b`; `t5` with a zero grace). `protocol::t09` still catches the
+  idle case on real time. The canaries pin the real values.
 - **bounded-tee-channel** was first declared `green` ("fanout never
   blocks"), which was wrong: the fanout lags the tee at high output rates,
   and without the bound RSS grew ~190 MiB for 256 MiB of output.
@@ -350,5 +438,6 @@ No removal turned a test red.
 
 - deferred: HELLO_TIMEOUT (10s) close of a silent connection is not asserted, only that it does not keep the daemon alive | impact: a silent peer holds one fd for 10s; not customer-visible | trigger: if connection limits are added
 - deferred: Windows named-pipe path (design §3.1) has no tests; `sys.rs` is unix-only | impact: none until Windows ships | trigger: first Windows build
-- deferred: a client that connects while the daemon is in graceful shutdown (accept loop gone, listener still bound) waits for its 30s hello timeout instead of failing fast and spawning a successor | impact: rare 30s stall right after an idle shutdown | trigger: any report of a slow first command after idle
+- deferred: the extension's own connect path (TypeScript) is not changed to wait out a shutting-down manager the way the Rust client now does | impact: an extension connecting in the ≤ 2s shutdown window gets `manager is shutting down` at once instead of a successor | trigger: extension side of this branch's merge
+- deferred: `task_exited.output_size` (live event) is the size at child exit and can be short by what was still in the pipe; the in-memory record catches up and a restart recovers it from the file | impact: the extension's byte count hint can be low for a fast-exiting, high-output task; reads still return every byte | trigger: any consumer that uses `output_size` as a read bound
 - deferred: re-adopted tasks are identified by pid liveness only (`kill(pid,0)`); a task pid reused while no manager ran would be re-adopted, and signalled on stop/shutdown | impact: wrong process signalled after a crash plus a long gap | trigger: persisting process start time in TaskRecord (a contract change)
