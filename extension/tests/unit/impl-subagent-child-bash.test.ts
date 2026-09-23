@@ -29,6 +29,8 @@ function makeDeps(client: ManagerClient | null, clock?: ManualClock): ChildBashD
     sessionId: () => "parent-session",
     sessionEnv: () => ({ PI_SESSION_ID: "parent-session" }),
     trackTask: vi.fn(),
+    childId: "ch_test",
+    runId: "run_test",
     clock,
   };
 }
@@ -57,6 +59,7 @@ describe("child bash (no-background variant)", () => {
         command: "echo hello",
         run_in_background: false,
         timeout_ms: null,
+        origin: { via: "child-bash", child_id: "ch_test", run_id: "run_test" },
       }),
     );
     expect(deps.trackTask).toHaveBeenCalledWith("sh_test1234", {
@@ -104,7 +107,7 @@ describe("child bash (no-background variant)", () => {
     const pending = tool.execute("tc", { command: "long" }, controller.signal, undefined, ctx);
     controller.abort();
     await expect(pending).rejects.toThrow(/aborted/);
-    expect(client.stop).toHaveBeenCalledWith("sh_test1234");
+    expect(client.stop).toHaveBeenCalledWith("sh_test1234", "tool");
   });
 
   describe("timeout (ManualClock)", () => {
@@ -121,7 +124,7 @@ describe("child bash (no-background variant)", () => {
       await expect(
         tool.execute("tc", { command: "slow", timeout: 5 }, undefined, undefined, ctx),
       ).rejects.toThrow(/timed out after 5 seconds and was killed/);
-      expect(client.stop).toHaveBeenCalledWith("sh_test1234");
+      expect(client.stop).toHaveBeenCalledWith("sh_test1234", "timeout");
     });
   });
 });

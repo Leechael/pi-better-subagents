@@ -111,6 +111,7 @@ export class MonitorRegistry {
       env: fullEnv(ctx, this.deps),
       run_in_background: true,
       timeout_ms: null, // timeout is enforced extension-side to control the notice
+      origin: { via: "monitor" },
     });
     await client.watch(task_id);
     this.deps.trackTask(task_id, { kind: "monitor", command: params.command });
@@ -213,12 +214,13 @@ export class MonitorRegistry {
     if (entry.stopped) return;
     entry.stopped = true;
     const client = this.deps.getClient();
-    await client?.stop(entry.taskId).catch(() => {});
+    await client?.stop(entry.taskId, "timeout").catch(() => {});
     this.deps.getNotifyCenter()?.notify(
       formatMonitorEvent(
         entry.description,
         entry.taskId,
         "[Monitor timed out — re-arm if needed.]",
+
         "timeout",
         { droppedLines: entry.droppedLinesPending },
       ),
@@ -232,12 +234,13 @@ export class MonitorRegistry {
     if (entry.stopped) return;
     entry.stopped = true;
     const client = this.deps.getClient();
-    await client?.stop(entry.taskId).catch(() => {});
+    await client?.stop(entry.taskId, "rate-limit").catch(() => {});
     this.deps.getNotifyCenter()?.notify(
       formatMonitorEvent(
         entry.description,
         entry.taskId,
         "[Monitor stopped: at least half of output batches were dropped in the last 30s.]",
+
         "stopped",
         { droppedLines: entry.droppedLinesPending },
       ),

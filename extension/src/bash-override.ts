@@ -253,6 +253,7 @@ export function createBashOverride(
           env: fullEnv(ctx, deps),
           run_in_background: input.run_in_background === true,
           timeout_ms: timeoutMs,
+          origin: { via: input.run_in_background === true ? "bash-bg" : "bash-fg" },
         });
       } catch {
         // Manager request failed mid-session; degrade to local execution.
@@ -275,7 +276,7 @@ export function createBashOverride(
       let waitResult;
       try {
         waitResult = await withAbort(client.wait(start.task_id, deps.config.foregroundBudgetMs), signal, () => {
-          client.stop(start.task_id).catch(() => {});
+          client.stop(start.task_id, "tool").catch(() => {});
         });
       } catch (err) {
         if ((err as Error).message === "aborted") {

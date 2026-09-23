@@ -256,7 +256,7 @@ async function stopItem(item: WorkItem, deps: TasksCommandDeps): Promise<void> {
   const client = deps.getClient();
   if (!client) throw new Error("pbs-manager is not available");
   await client.ensureAvailable();
-  await client.stop(item.id);
+  await client.stop(item.id, "tui");
 }
 
 async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksCommandDeps): Promise<void> {

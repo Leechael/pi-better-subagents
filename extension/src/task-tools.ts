@@ -282,7 +282,7 @@ export function createTaskStopTool(
         };
       }
       const client = await requireClient(deps);
-      await client.stop(params.task_id);
+      await client.stop(params.task_id, "tool");
       return {
         content: [
           {

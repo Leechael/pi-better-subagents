@@ -16,6 +16,8 @@ import { pbsPaths } from "./config";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
+const EXTENSION_VERSION = "0.1.0";
+const OBSERVABILITY_PROTOCOL = 2;
 const HELLO_TIMEOUT_MS = 5000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const SOCKET_READY_TIMEOUT_MS = 2000;
@@ -29,6 +31,12 @@ const MANAGER_SHUTTING_DOWN = "manager is shutting down";
 // Protocol types (field names are contractual, see design doc §3.3)
 // ---------------------------------------------------------------------------
 
+export type TaskOrigin =
+  | { via: "bash-fg" | "bash-bg" | "monitor" }
+  | { via: "child-bash"; child_id: string; run_id: string };
+
+export type StopReason = "tui" | "cli" | "tool" | "timeout" | "rate-limit" | "session-end";
+
 export interface StartRequest {
   kind: "shell" | "monitor";
   command: string;
@@ -36,6 +44,7 @@ export interface StartRequest {
   env: Record<string, string>;
   run_in_background?: boolean;
   timeout_ms?: number | null;
+  origin?: TaskOrigin;
 }
 
 export interface StartResponse {
@@ -70,6 +79,9 @@ export interface TaskRecord {
   ended_at: number | null;
   output_path: string;
   output_size: number;
+  origin?: TaskOrigin;
+  backgrounded_at?: number;
+  end_reason?: string;
 }
 
 /** Server-pushed event (§3.3). Fields beyond `event` depend on the event kind. */
@@ -86,6 +98,7 @@ export interface ManagerEvent {
   duration_ms?: number;
   output_path?: string;
   output_size?: number;
+  end_reason?: string;
   ts?: number;
 }
 
@@ -114,6 +127,8 @@ export interface SessionInfo {
   pi_pid: number;
   connected: boolean;
   cwd?: string;
+  extension_version?: string;
+  protocol?: number;
 }
 
 type ClientState = "disconnected" | "connected" | "unavailable";
@@ -354,8 +369,12 @@ export class ManagerClient {
     };
   }
 
-  async stop(taskId: string): Promise<void> {
-    await this.request({ type: "stop", task_id: taskId });
+  async markBackground(taskId: string): Promise<void> {
+    await this.request({ type: "mark_background", task_id: taskId });
+  }
+
+  async stop(taskId: string, reason: StopReason = "tool"): Promise<void> {
+    await this.request({ type: "stop", task_id: taskId, reason });
   }
 
   async list(all = false): Promise<TaskRecord[]> {
@@ -603,6 +622,8 @@ export class ManagerClient {
           session_id: this.sessionId,
           pi_pid: this.piPid,
           ...(this.cwd ? { cwd: this.cwd } : {}),
+          extension_version: EXTENSION_VERSION,
+          protocol: OBSERVABILITY_PROTOCOL,
         }),
       );
     });

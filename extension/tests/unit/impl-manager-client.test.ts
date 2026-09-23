@@ -83,6 +83,7 @@ async function startFakeManager(home: string): Promise<FakeManager> {
           total_size: 13,
         };
       case "stop":
+      case "mark_background":
         return { v: 1, id: msg.id, ok: true };
       case "list":
         return { v: 1, id: msg.id, ok: true, tasks: [] };
@@ -165,6 +166,8 @@ describe("ManagerClient (integration, fake manager)", () => {
       client_kind: "extension",
       session_id: "sess-1",
       pi_pid: process.pid,
+      extension_version: "0.1.0",
+      protocol: 2,
     });
   });
 
@@ -187,8 +190,16 @@ describe("ManagerClient (integration, fake manager)", () => {
       env: {},
       run_in_background: false,
       timeout_ms: null,
+      origin: { via: "bash-fg" },
     });
     expect(start).toEqual({ task_id: "sh_a1b2c3d4", pid: 5678 });
+    expect(fake.received.find((message) => message.type === "start")).toMatchObject({
+      origin: { via: "bash-fg" },
+    });
+    await client.markBackground("sh_a1b2c3d4");
+    expect(fake.received.find((message) => message.type === "mark_background")).toMatchObject({
+      task_id: "sh_a1b2c3d4",
+    });
 
     const waitRes = await client.wait("sh_a1b2c3d4", 20000);
     expect(waitRes).toEqual({ done: true, exit_code: 0 });
@@ -201,7 +212,8 @@ describe("ManagerClient (integration, fake manager)", () => {
     expect(out.next_cursor).toBe(13);
     expect(out.total_size).toBe(13);
 
-    await expect(client.stop("sh_a1b2c3d4")).resolves.toBeUndefined();
+    await expect(client.stop("sh_a1b2c3d4", "tui")).resolves.toBeUndefined();
+    expect(fake.received.find((message) => message.type === "stop")).toMatchObject({ reason: "tui" });
     await expect(client.list()).resolves.toEqual([]);
     await expect(client.shutdownSession()).resolves.toEqual(["sh_a1b2c3d4"]);
   });

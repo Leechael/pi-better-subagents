@@ -122,6 +122,7 @@ export default function (pi: ExtensionAPI): void {
 
   const markNotifyOnExit = (taskId: string) => {
     notifyOnExit.add(taskId);
+    void client?.markBackground(taskId).catch(() => {});
     const prior = exitGate.mark(taskId);
     if (prior) {
       deliverExit(taskId, prior);
@@ -385,6 +386,8 @@ export default function (pi: ExtensionAPI): void {
               sessionId: () => ctx?.sessionManager.getSessionId() ?? "",
               sessionEnv: () => (ctx ? sessionEnv(ctx) : {}),
               trackTask,
+              childId: req.childId,
+              runId: req.runId,
               clock,
             }),
           );

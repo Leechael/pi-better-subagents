@@ -61,6 +61,8 @@ export interface ChildBashDeps {
   /** Precomputed PI_* env injection (from the parent session). */
   sessionEnv: () => Record<string, string>;
   trackTask: (taskId: string, meta: { kind: string; command: string }) => void;
+  childId?: string;
+  runId?: string;
   clock?: Clock;
 }
 
@@ -120,6 +122,9 @@ export function createChildBashTool(
         env: fullEnv(deps),
         run_in_background: false,
         timeout_ms: timeoutMs,
+        ...(deps.childId && deps.runId
+          ? { origin: { via: "child-bash" as const, child_id: deps.childId, run_id: deps.runId } }
+          : {}),
       });
       deps.trackTask(start.task_id, { kind: "shell", command: input.command });
       const outputPath = taskOutputPath(deps.home, deps.sessionId(), start.task_id);
@@ -134,7 +139,7 @@ export function createChildBashTool(
             : Math.min(WAIT_SLICE_MS, Math.max(1, deadline - clock.now()));
         try {
           waitResult = await withAbort(client.wait(start.task_id, budget), signal, () => {
-            client.stop(start.task_id).catch(() => {});
+            client.stop(start.task_id, "tool").catch(() => {});
           });
         } catch (err) {
           if ((err as Error).message === "aborted") {
@@ -147,7 +152,7 @@ export function createChildBashTool(
         }
         if (waitResult.done) break;
         if (deadline !== null && clock.now() >= deadline) {
-          await client.stop(start.task_id).catch(() => {});
+          await client.stop(start.task_id, "timeout").catch(() => {});
           const collected = await collectOutput(client, start.task_id).catch(() => null);
           const text = collected ? formatFinishedOutput(collected, outputPath).text : "";
           throw new Error(
