@@ -186,6 +186,12 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     let scan = lifecycle::scan_tasks(&home, &mut registry);
     let state: Shared = Arc::new(Mutex::new(DaemonState::new(home.clone(), registry, foreground)));
 
+    // The pid file first: whoever can connect may read it at once (identity
+    // is the lock, the pid file is informational).
+    if let Err(e) = lifecycle::write_pid_file(&home, std::process::id()) {
+        eprintln!("pbs-manager: cannot write pid file: {e}");
+        return 1;
+    }
     // Bind the well-known socket (§3.1). A plain tokio UnixListener: the
     // daemon owns its descriptor, which an in-place upgrade hands over.
     let sock = lifecycle::socket_path(&home);
@@ -196,10 +202,6 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
             return 1;
         }
     };
-    if let Err(e) = lifecycle::write_pid_file(&home, std::process::id()) {
-        eprintln!("pbs-manager: cannot write pid file: {e}");
-        return 1;
-    }
     lifecycle::log_line(
         &home,
         &format!(
