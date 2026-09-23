@@ -57,6 +57,50 @@ describe("MonitorRegistry saturation", () => {
   });
 });
 
+describe("MonitorRegistry reconnect output recovery", () => {
+  it("fetches the gap before queued events and dedupes overlapping cursors", async () => {
+    const clock = new ManualClock();
+    const sent: { details?: unknown; content?: string }[] = [];
+    let watchCount = 0;
+    const manager = {
+      ensureAvailable: async () => true,
+      isAvailable: () => true,
+      start: async () => ({ task_id: "mon_gap", pid: 12 }),
+      watch: async () => {
+        watchCount++;
+        if (watchCount === 2) registry.handleOutput("mon_gap", "new\n", 12);
+      },
+      output: async (_id: string, cursor: number) => {
+        if (cursor === 4) {
+          // Simulate a delayed overlapping output event racing the gap read.
+          registry.handleOutput("mon_gap", "gap\n", 8);
+          return { chunk: "gap\n", next_cursor: 8, status: "running", exit_code: null, total_size: 12 };
+        }
+        return { chunk: "", next_cursor: cursor, status: "running", exit_code: null, total_size: 12 };
+      },
+      stop: async () => {},
+    } as unknown as ManagerClient;
+    const center = new NotifyCenter({ sendMessage: (m) => sent.push(m), isIdle: () => true, clock });
+    const registry = new MonitorRegistry({
+      getClient: () => manager,
+      sessionEnv: () => ({}),
+      getNotifyCenter: () => center,
+      trackTask: () => {},
+      clock,
+    });
+    await registry.start({ command: "ticker", description: "ticker", persistent: true }, { cwd: "/tmp" } as ExtensionContext);
+    // The event stream skips the gap line, then overlaps it and continues.
+    registry.handleOutput("mon_gap", "old\n", 4);
+    await registry.rewatchAll();
+    clock.advanceBy(200);
+    const wake = sent.map((m) => m.details as PbsWake | undefined).find((d) => d?.kind === "monitor");
+    expect(wake).toMatchObject({ kind: "monitor", event: "old\ngap\nnew" });
+    expect(sent[0]?.content).not.toContain("gap\ngap");
+    center.dispose();
+    registry.disposeAll();
+  });
+});
+
 describe("MonitorRegistry early exit (manual testing, 2026-09-24)", () => {
   function setup(opts: { list?: () => unknown[] } = {}) {
     const clock = new ManualClock();

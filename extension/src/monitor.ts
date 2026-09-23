@@ -62,6 +62,9 @@ interface MonitorEntry {
   droppedLinesPending: number;
   timeoutTimer: ClockTimer | null;
   stopped: boolean;
+  cursor: number;
+  recovering: boolean;
+  queuedOutput: { chunk: string; cursor?: number }[];
 }
 
 export class MonitorRegistry {
@@ -69,7 +72,7 @@ export class MonitorRegistry {
   private readonly clock: Clock;
   private readonly entries = new Map<string, MonitorEntry>();
   private readonly changeListeners = new Set<() => void>();
-  private readonly early = new Map<string, { chunks: string[]; chars: number; exit?: ManagerEvent }>();
+  private readonly early = new Map<string, { chunks: { chunk: string; cursor?: number }[]; chars: number; exit?: ManagerEvent }>();
 
   constructor(deps: MonitorDeps) {
     this.deps = deps;
@@ -146,6 +149,9 @@ export class MonitorRegistry {
       droppedLinesPending: 0,
       timeoutTimer: null,
       stopped: false,
+      cursor: 0,
+      recovering: false,
+      queuedOutput: [],
     };
     entry.batcher = new LineBatcher({
       onFlush: (text) => this.onBatch(entry, text),
@@ -162,7 +168,7 @@ export class MonitorRegistry {
     // Replay what arrived before we knew the id: lines first, then the exit.
     const early = this.early.get(task_id);
     this.early.delete(task_id);
-    for (const chunk of early?.chunks ?? []) entry.batcher.push(chunk);
+    for (const output of early?.chunks ?? []) this.acceptOutput(entry, output.chunk, output.cursor);
     if (early?.exit) this.handleExit(task_id, early.exit);
     // Older managers only stream after an explicit watch; newer ones already do.
     else await client.watch(task_id).catch(() => {});
@@ -170,16 +176,27 @@ export class MonitorRegistry {
   }
 
   /** Handle a watched output event from the manager. */
-  handleOutput(taskId: string, chunk: string): void {
+  handleOutput(taskId: string, chunk: string, nextCursor?: number): void {
     const entry = this.entries.get(taskId);
     if (entry) {
-      entry.batcher.push(chunk);
+      if (entry.recovering) entry.queuedOutput.push({ chunk, cursor: nextCursor });
+      else this.acceptOutput(entry, chunk, nextCursor);
       return;
     }
     const early = this.earlyFor(taskId);
     if (early.chars + chunk.length > EARLY_MAX_CHARS) return;
-    early.chunks.push(chunk);
+    early.chunks.push({ chunk, cursor: nextCursor });
     early.chars += chunk.length;
+  }
+
+  private acceptOutput(entry: MonitorEntry, chunk: string, nextCursor?: number): void {
+    if (typeof nextCursor === "number") {
+      if (nextCursor <= entry.cursor) return;
+      entry.cursor = nextCursor;
+    } else {
+      entry.cursor += Buffer.byteLength(chunk, "utf8");
+    }
+    entry.batcher.push(chunk);
   }
 
   /**
@@ -234,7 +251,7 @@ export class MonitorRegistry {
     return closed;
   }
 
-  private earlyFor(taskId: string): { chunks: string[]; chars: number; exit?: ManagerEvent } {
+  private earlyFor(taskId: string): { chunks: { chunk: string; cursor?: number }[]; chars: number; exit?: ManagerEvent } {
     let early = this.early.get(taskId);
     if (!early) {
       early = { chunks: [], chars: 0 };
@@ -249,7 +266,20 @@ export class MonitorRegistry {
     const client = this.deps.getClient();
     if (!client || !client.isAvailable()) return;
     for (const entry of this.entries.values()) {
+      entry.recovering = true;
       await client.watch(entry.taskId).catch(() => {});
+      let cursor = entry.cursor;
+      // Output events are not replayed by the manager. Read the durable log gap
+      // before delivering events queued while watch/output catch-up was active.
+      for (;;) {
+        const gap = await client.output(entry.taskId, cursor, 64 * 1024).catch(() => null);
+        if (!gap || !gap.chunk || gap.next_cursor <= cursor) break;
+        this.acceptOutput(entry, gap.chunk, gap.next_cursor);
+        cursor = gap.next_cursor;
+      }
+      entry.recovering = false;
+      const queued = entry.queuedOutput.splice(0).sort((a, b) => (a.cursor ?? 0) - (b.cursor ?? 0));
+      for (const output of queued) this.acceptOutput(entry, output.chunk, output.cursor);
     }
   }
 

@@ -4,7 +4,7 @@
  * - Implements the §3.1 startup flow: connect -> spawn via lock -> zombie cleanup.
  * - Request/response multiplexing over a single long-lived connection.
  * - Server events dispatched to registered handlers.
- * - On unexpected disconnect: exponential backoff reconnect (0.5s/1s/2s, 3 attempts),
+ * - On unexpected disconnect: immediate then short-backoff reconnect (0/100/250ms, 3 attempts),
  *   re-hello after reconnect. If all attempts fail the client is marked unavailable
  *   and callers are expected to degrade (bash falls back to local execution).
  */
@@ -615,7 +615,10 @@ export class ManagerClient {
       };
       const timer = this.clock.setTimeout(() => done(new Error("hello timed out")), HELLO_TIMEOUT_MS);
       this.helloWaiter = { resolve: () => done(), reject: (err) => done(err) };
-      this.pending.set(id, { resolve: () => done(), reject: (err) => done(err), timer });
+      this.pending.set(id, {
+        resolve: () => done(), reject: (err) => done(err), timer,
+        message: { type: "hello" }, timeoutMs: HELLO_TIMEOUT_MS, retryable: false,
+      });
       socket.write(
         encodeFrame({
           v: 1,
@@ -745,7 +748,11 @@ export class ManagerClient {
     }
     this.state = "disconnected";
     if (wasConnected) {
-      this.reconnecting = this.reconnectLoop();
+      let run!: Promise<void>;
+      run = this.reconnectLoop().finally(() => {
+        if (this.reconnecting === run) this.reconnecting = null;
+      });
+      this.reconnecting = run;
     }
   }
 
@@ -773,6 +780,7 @@ export class ManagerClient {
     this.state = "unavailable";
     this.lastFailureAt = this.now();
     this.lastFailureMessage = "reconnect exhausted";
+    this.failAllPending(new Error("pbs-manager reconnect exhausted"));
     this.log("giving up on pbs-manager; bash falls back to local execution");
   }
 

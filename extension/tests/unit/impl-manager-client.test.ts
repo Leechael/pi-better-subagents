@@ -22,6 +22,7 @@ interface FakeManager {
   rejectFirstHelloOnce(): void;
   dropNext(type: string): void;
   startCount(): number;
+  setTasks(tasks: Record<string, unknown>[]): void;
   close(): Promise<void>;
 }
 
@@ -40,6 +41,7 @@ async function startFakeManager(home: string): Promise<FakeManager> {
   let rejectNextHelloForShutdown = false;
   const dropTypes = new Set<string>();
   const startsByKey = new Map<string, { task_id: string; pid: number }>();
+  let tasks: Record<string, unknown>[] = [];
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -102,7 +104,7 @@ async function startFakeManager(home: string): Promise<FakeManager> {
       case "mark_background":
         return { v: 1, id: msg.id, ok: true };
       case "list":
-        return { v: 1, id: msg.id, ok: true, tasks: [] };
+        return { v: 1, id: msg.id, ok: true, tasks };
       case "shutdown_session":
         return { v: 1, id: msg.id, ok: true, stopped: ["sh_a1b2c3d4"] };
       case "watch":
@@ -141,6 +143,7 @@ async function startFakeManager(home: string): Promise<FakeManager> {
     rejectFirstHelloOnce: () => { rejectNextHelloForShutdown = true; },
     dropNext: (type) => { dropTypes.add(type); },
     startCount: () => startsByKey.size,
+    setTasks: (value) => { tasks = value; },
     close: () =>
       new Promise<void>((resolve) => {
         for (const s of sockets) s.destroy();
@@ -281,6 +284,31 @@ describe("ManagerClient (integration, fake manager)", () => {
     expect(requests[1].key).toBe(requests[0].key);
     expect(fake.startCount()).toBe(1);
     expect(result.task_id).toBe("sh_a1b2c3d4");
+  });
+
+  it("reconciles an exit missed during disconnect and delivers exactly one wake", async () => {
+    await client.connect();
+    const taskId = "sh_missed";
+    const notifyOnExit = new Set([taskId]);
+    let wakes = 0;
+    const syncDone = new Promise<void>((resolve) => {
+      client.onReconnect(() => {
+        void client.list(true).then((tasks) => {
+          const ended = tasks.find((task) => task.task_id === taskId && task.status !== "running");
+          if (ended && notifyOnExit.delete(taskId)) wakes++;
+          resolve();
+        });
+      });
+    });
+    fake.setTasks([{
+      task_id: taskId, session_id: "sess-1", kind: "shell", command: "sleep 1", cwd: "/tmp",
+      pid: 99, status: "completed", exit_code: 0, signal: null, started_at: 1, ended_at: 2,
+      output_path: "/tmp/task.output", output_size: 0,
+    }]);
+    for (const socket of fake.sockets) socket.destroy();
+    await syncDone;
+    expect(wakes).toBe(1);
+    expect(notifyOnExit.has(taskId)).toBe(false);
   });
 
   it("reconnects with re-hello after an unexpected disconnect", async () => {
