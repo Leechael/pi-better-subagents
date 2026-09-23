@@ -30,9 +30,10 @@ function toolOf(role: string): { tool: string; isError: boolean } | undefined {
 
 export function transcriptLine(turn: ConversationTurn, ts: number): string {
   const tool = toolOf(turn.role);
+  const modelError = turn.role === "assistant error";
   const line = tool
     ? { ts, role: "tool", tool: tool.tool, text: capText(turn.text), ...(tool.isError ? { isError: true } : {}) }
-    : { ts, role: turn.role, text: capText(turn.text) };
+    : { ts, role: modelError ? "assistant" : turn.role, text: capText(turn.text), ...(modelError ? { isError: true } : {}) };
   return `${JSON.stringify(line)}\n`;
 }
 

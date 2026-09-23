@@ -110,3 +110,17 @@ describe.skipIf(!existsSync(managerBin))("CLI reads extension-written agent file
     expect(agent).toContain("There are 42 files.");
   });
 });
+
+describe("model errors in the conversation", () => {
+  it("keeps a failed model call visible even when it produced no text", async () => {
+    const { turnsFromMessages } = await import("../../src/subagent/conversation");
+    const turns = turnsFromMessages([
+      { role: "user", content: "do something" },
+      { role: "assistant", content: [], stopReason: "error", errorMessage: "529 overloaded_error" },
+    ]);
+    expect(turns.at(-1)).toEqual({ role: "assistant error", text: "529 overloaded_error" });
+    const home = tempHome();
+    const path = new TranscriptWriter(home, new ManualClock(0)).sync("s", "ch_e", turns);
+    expect(lines(path).at(-1)).toMatchObject({ role: "assistant", isError: true, text: "529 overloaded_error" });
+  });
+});

@@ -16,6 +16,8 @@ interface LooseMessage {
   content?: unknown;
   toolName?: string;
   isError?: boolean;
+  stopReason?: string;
+  errorMessage?: string;
 }
 
 function blockText(block: LooseBlock): string {
@@ -51,6 +53,12 @@ export function turnsFromMessages(messages: readonly LooseMessage[]): Conversati
     const rawText = contentText(message.content);
     const text = message.role === "user" && firstUserTurn ? visibleUserText(rawText) : rawText;
     if (message.role === "user") firstUserTurn = false;
+    if (message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) {
+      // A failed model call often has no text; its error is the only record of what happened.
+      if (text) turns.push({ role: "assistant", text });
+      turns.push({ role: "assistant error", text: message.errorMessage?.trim() || `model stopped: ${message.stopReason}` });
+      continue;
+    }
     if (!text) continue;
     if (message.role === "toolResult") {
       const name = message.toolName ?? "tool";
