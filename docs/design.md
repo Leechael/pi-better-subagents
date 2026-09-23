@@ -302,6 +302,7 @@ monitor({ command, description, timeout_ms = 300000 (min 1000, max 3600000),
 - 事件注入: `<pbs-wake kind="monitor">`(见 §4.5);idle→triggerTurn,busy→steer
 - 进程退出 → 结束通知;timeout 到期 → stop + "[Monitor timed out — re-arm if needed.]"
 - `persistent:true` → 活到 session 结束(无 timeout)
+- 所有时间源与定时器由 extension scope 注入的 `Clock` 驱动,包括批处理、限速与 timeout;测试用 `ManualClock`,不替换全局 fake timers
 - prompt 文案(防误用): 命令必须 line-buffered;"silence is not success"(grep 要覆盖失败特征);事件不是用户回复;不要 poll
 
 ### 4.5 NotifyCenter (`src/notify.ts`)
@@ -378,6 +379,7 @@ subagent({
 - 结果文本: 每个子代理取 `session.getLastAssistantText()`;空 → "(no output)"
 - 深度: 扩展记录自身 depth(主=0);子会话工具集中**不含 subagent**(depth 1 硬上限,v1 不开放更深)
 - **child session isolation**: `createPiSessionFn` 显式传入 `DefaultResourceLoader({ cwd, agentDir, noExtensions:true, noSkills:true, noPromptTemplates:true, noThemes:true, noContextFiles:true })`;不加载 user/project extensions、skills、prompt templates、themes 或 context files。特别是不能加载父 extension,否则它的 session_start / before_agent_start 会把 parent wake guidelines 注入 child prompt。child 仍单独注入 `CHILD_BEHAVIOR_GUIDELINES`;没有配置开关。
+- **统一时钟与 generation timer ownership**: 扩展创建一个 `Clock` 并通过依赖注入传给时间相关服务。`ManualClock` 确定性地按 deadline、再按插入顺序执行同刻 timer;`advance()` 中新产生且已到期的 timer 也会运行, callback 内清除 timer 会阻止后续执行,大跨度 interval 每个到期点只触发一次。每个 child generation 有自己的 `TimerScope`; settle、interrupt、resume 或 dispose 时清除该 scope 的所有 timeout,避免过期 generation 影响后续状态。无需 Effect-TS;试点被拒绝的原因和数据见 `docs/decisions/effect-child-runner-pilot.md`。
 - 子代理 bash: `child-bash.ts` 禁后台变体——schema 无 `run_in_background`;execute 走 manager start + wait(timeout_ms 全程),到期 SIGKILL 并返回超时错误(不转后台);裸 sleep 拦截规则与主 bash 相同
 - 限制: 全局并发 8(跨 run);stall watchdog——子代理 10min 无任何事件 → abort 标记 `failed (stalled)`;session 级 spawn 预算 32 个子代理/小时,超限报错
 - 管理 action: `list`(本 session 全部 run + 状态), `get`(run_id → 完整结果), `status`(run_id → 每子代理状态/耗时/最后事件), `interrupt`(abort 子代理或整 run), `steer`(运行中子代理 → `session.steer(message)`), `resume`(已结束子代理 → `session.prompt(message)` 续跑, 结果完成时再通知), **`models`(列出可指定的模型, 供调用前自查)**
