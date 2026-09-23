@@ -267,6 +267,15 @@ async fn pump_async<R: AsyncReadExt + Unpin>(
 /// recognised (UTF-8 sequences are at most 4 bytes).
 pub const UTF8_LOOKAHEAD: usize = 3;
 
+/// Bytes `c` occupies inside a JSON string as serde_json writes it.
+fn json_escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+        c if (c as u32) < 0x20 => 6, // \u00XX
+        c => c.len_utf8(),
+    }
+}
+
 /// How many leading bytes of `buf` to send as one chunk (§3.3 output).
 ///
 /// - Never cuts inside a valid UTF-8 sequence: the cut backs off to the
@@ -274,22 +283,26 @@ pub const UTF8_LOOKAHEAD: usize = 3;
 ///   valid text and `next_cursor` never skips bytes.
 /// - An incomplete sequence at the very end of `buf` is held back while
 ///   `more_may_follow` (the rest has not been read or written yet).
+/// - The JSON-escaped size of the decoded chunk stays within `budget`, so the
+///   response frame cannot exceed the 4 MiB cap (control bytes escape to 6).
 /// - Progress: if the first character alone exceeds `max`, it is still sent
 ///   whole (a chunk may exceed `max` by up to 3 bytes). `max == 0` returns 0.
 ///
 /// `buf` may hold up to `max + UTF8_LOOKAHEAD` bytes.
-pub fn utf8_chunk_len(buf: &[u8], max: usize, more_may_follow: bool) -> usize {
+pub fn utf8_chunk_len(buf: &[u8], max: usize, budget: usize, more_may_follow: bool) -> usize {
     if max == 0 {
         return 0;
     }
     let mut pos = 0usize;
+    let mut cost = 0usize;
     for chunk in buf.utf8_chunks() {
         for c in chunk.valid().chars() {
-            let len = c.len_utf8();
-            if pos + len > max {
+            let (len, esc) = (c.len_utf8(), json_escaped_len(c));
+            if pos + len > max || cost + esc > budget {
                 return if pos == 0 { len } else { pos };
             }
             pos += len;
+            cost += esc;
         }
         let bad = chunk.invalid();
         if bad.is_empty() {
@@ -304,12 +317,12 @@ pub fn utf8_chunk_len(buf: &[u8], max: usize, more_may_follow: bool) -> usize {
         if at_end && truncated && more_may_follow {
             return pos;
         }
-        // Malformed bytes decode to one U+FFFD per invalid run; never split
-        // a run across chunks.
-        if pos + bad.len() > max {
+        // Malformed bytes decode to one U+FFFD (3 bytes) per invalid run.
+        if pos + bad.len() > max || cost + 3 > budget {
             return if pos == 0 { bad.len() } else { pos };
         }
         pos += bad.len();
+        cost += 3;
     }
     pos
 }
@@ -413,40 +426,58 @@ mod tests {
     #[test]
     fn chunk_len_backs_off_to_char_boundary() {
         let text = "a中文".as_bytes(); // 1 + 3 + 3 bytes
-        assert_eq!(utf8_chunk_len(text, 1, true), 1);
-        assert_eq!(utf8_chunk_len(text, 2, true), 1); // not inside 中
-        assert_eq!(utf8_chunk_len(text, 3, true), 1);
-        assert_eq!(utf8_chunk_len(text, 4, true), 4);
-        assert_eq!(utf8_chunk_len(text, 6, true), 4);
-        assert_eq!(utf8_chunk_len(text, 7, true), 7);
+        let big = usize::MAX;
+        assert_eq!(utf8_chunk_len(text, 1, big, true), 1);
+        assert_eq!(utf8_chunk_len(text, 2, big, true), 1); // not inside 中
+        assert_eq!(utf8_chunk_len(text, 3, big, true), 1);
+        assert_eq!(utf8_chunk_len(text, 4, big, true), 4);
+        assert_eq!(utf8_chunk_len(text, 6, big, true), 4);
+        assert_eq!(utf8_chunk_len(text, 7, big, true), 7);
         // Progress: a first char wider than max is sent whole.
-        assert_eq!(utf8_chunk_len(&text[1..], 1, true), 3);
-        assert_eq!(utf8_chunk_len(text, 0, true), 0);
+        assert_eq!(utf8_chunk_len(&text[1..], 1, big, true), 3);
+        assert_eq!(utf8_chunk_len(text, 0, big, true), 0);
         // Truncated tail: held back while more may follow, sent at EOF.
         let cut = &text[..5]; // "a中" + first byte of 文
-        assert_eq!(utf8_chunk_len(cut, 100, true), 4);
-        assert_eq!(utf8_chunk_len(cut, 100, false), 5);
-        assert_eq!(utf8_chunk_len(&cut[4..], 100, true), 0);
+        assert_eq!(utf8_chunk_len(cut, 100, big, true), 4);
+        assert_eq!(utf8_chunk_len(cut, 100, big, false), 5);
+        assert_eq!(utf8_chunk_len(&cut[4..], 100, big, true), 0);
         // Malformed bytes are not held back, even when more may follow.
-        assert_eq!(utf8_chunk_len(b"ok\xff\xfeend", 100, true), 7);
-        assert_eq!(utf8_chunk_len(b"ok\xff", 100, true), 3);
+        assert_eq!(utf8_chunk_len(b"ok\xff\xfeend", 100, big, true), 7);
+        assert_eq!(utf8_chunk_len(b"ok\xff", 100, big, true), 3);
         // A malformed run that ends exactly at max is included; one that
         // would cross max is not split.
-        assert_eq!(utf8_chunk_len(b"abcd\xe4\xb8A", 6, false), 6);
-        assert_eq!(utf8_chunk_len(b"abcd\xe4\xb8A", 5, false), 4);
+        assert_eq!(utf8_chunk_len(b"abcd\xe4\xb8A", 6, big, false), 6);
+        assert_eq!(utf8_chunk_len(b"abcd\xe4\xb8A", 5, big, false), 4);
         // Concatenating chunks cut at every max reproduces the text exactly.
         let s = "中文\n".repeat(50);
         for max in 1..12 {
             let (mut pos, mut out) = (0usize, String::new());
             while pos < s.len() {
                 let end = (pos + max + UTF8_LOOKAHEAD).min(s.len());
-                let n = utf8_chunk_len(&s.as_bytes()[pos..end], max, end < s.len());
+                let n = utf8_chunk_len(&s.as_bytes()[pos..end], max, big, end < s.len());
                 assert!(n > 0, "no progress at {pos} max {max}");
                 out.push_str(std::str::from_utf8(&s.as_bytes()[pos..pos + n]).unwrap());
                 pos += n;
             }
             assert_eq!(out, s, "max {max}");
         }
+    }
+
+    #[test]
+    fn chunk_len_respects_escaped_budget() {
+        let ctl = vec![1u8; 1000]; // each escapes to \u0001 (6 bytes)
+        assert_eq!(utf8_chunk_len(&ctl, 1000, 600, false), 100);
+        let quotes = vec![b'"'; 1000]; // \" (2 bytes)
+        assert_eq!(utf8_chunk_len(&quotes, 1000, 600, false), 300);
+        let bad = vec![0xffu8; 1000]; // each -> U+FFFD (3 bytes)
+        assert_eq!(utf8_chunk_len(&bad, 1000, 600, false), 200);
+        let enc = serde_json::to_string(&String::from_utf8_lossy(&ctl[..100])).unwrap();
+        assert_eq!(enc.len() - 2, 600, "cost model matches serde_json");
+        // Plain text costs its byte length: space (0x20) is not escaped.
+        assert_eq!(utf8_chunk_len(&[b' '; 1000], 1000, 1000, false), 1000);
+        assert_eq!(utf8_chunk_len(&[0x1f; 10], 10, 60, false), 10);
+        // A budget smaller than one char still makes progress.
+        assert_eq!(utf8_chunk_len(&ctl, 1000, 1, false), 1);
     }
 
     #[test]

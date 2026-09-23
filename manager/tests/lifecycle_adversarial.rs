@@ -5,9 +5,9 @@
 //! asserts the customer-visible invariant: which processes are alive, which
 //! files exist, what the wire says. No crate internals are used.
 //!
-//! Tests marked `#[ignore = "bug: ..."]` reproduce real defects found while
-//! writing this suite; they are expected to FAIL until the bug is fixed.
-//! Run them with `cargo test --test lifecycle_adversarial -- --ignored`.
+//! Tests d2, d3, d12, t5b, t6b, t6c, o3, o4 began as `#[ignore = "bug: …"]`
+//! reproducers that failed against the original code. Each bug is fixed and
+//! the test now guards the fix; see manager/TESTING.md "Bugs found".
 
 mod common;
 
@@ -925,7 +925,6 @@ fn o2_invalid_utf8_is_lossy_with_byte_cursors() {
 /// max-size read must still produce a response instead of silently killing
 /// the connection's writer.
 #[test]
-#[ignore = "bug: a 1 MiB read of control-byte output serializes to >4 MiB; write_frame fails, the writer task exits and the client never gets a response (connection goes mute)"]
 fn o3_control_byte_output_large_read_still_answers() {
     let home = Home::new("o3");
     let _d = home.start_daemon();
@@ -934,9 +933,39 @@ fn o3_control_byte_output_large_read_still_answers() {
     let (id, _) = c.start("head -c 1048576 /dev/zero | tr '\\0' '\\001'");
     c.request_ok(json!({"type":"wait","task_id":id,"budget_ms":10000}));
     let r = c.try_request(json!({"type":"output","task_id":id,"cursor":0,"max_bytes":1048576}), S(5));
-    assert!(r.is_some(), "no response to a 1 MiB output read of control bytes");
+    let r = r.expect("no response to a 1 MiB output read of control bytes");
+    // The read succeeds with a shorter chunk (bounded by its escaped size)
+    // instead of failing: the client can page through everything.
+    assert_eq!(r["ok"], true, "{}", r["error"]);
+    let first = r["chunk"].as_str().unwrap().len() as u64;
+    assert!(first > 0 && r["next_cursor"] == first, "cursor must match chunk bytes");
+    let (text, cursor, _) = c.read_all_output(&id, 1048576);
+    assert_eq!(cursor, 1048576);
+    assert_eq!(text.len(), 1048576);
+    assert!(text.bytes().all(|b| b == 1));
     let l = c.try_request(json!({"type":"list"}), S(5));
     assert!(l.is_some(), "connection went mute after an oversized response");
+}
+
+/// O3c: even the error substituted for an oversized response can be too big
+/// (the id alone nearly fills a frame). That reply is dropped, but the
+/// connection must keep serving later requests.
+#[test]
+fn o3c_unanswerable_request_does_not_mute_connection() {
+    let home = Home::new("o3c");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_cli();
+    let mut req = json!({"v":1,"id":"","type":"stop","task_id":"x"});
+    let base = serde_json::to_vec(&req).unwrap().len();
+    req["id"] = json!("i".repeat(MAX_FRAME - base));
+    c.send(&req);
+    // Requests are dispatched concurrently; let the doomed reply be attempted
+    // before probing, or the probe could be answered first and prove nothing.
+    std::thread::sleep(MS(500));
+    let r = c.try_request(json!({"type":"list"}), S(5));
+    assert!(r.is_some(), "connection went mute after an unanswerable request");
+    assert_eq!(r.unwrap()["ok"], true);
 }
 
 /// O4: valid multi-byte UTF-8 (CJK) must survive chunking: concatenating
@@ -1050,6 +1079,32 @@ fn o4c_partial_character_at_live_end_and_eof() {
         raw += chunk.len() as u64;
         assert_eq!(e["next_cursor"], raw, "cursor must follow the bytes sent: {outs:?}");
     }
+}
+
+/// O3b: a response that cannot fit a frame (the request id is echoed, so a
+/// near-4 MiB id does it) must not silence the connection: later requests
+/// on the same connection are still answered.
+#[test]
+fn o3b_oversized_response_does_not_mute_connection() {
+    let home = Home::new("o3b");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_cli();
+    // The E_NOT_FOUND error echoes both the id and the task id plus a longer
+    // envelope, so a request of exactly 4 MiB yields a response over 4 MiB.
+    let task = "t".repeat(2 << 20);
+    let mut req = json!({"v":1,"id":"","type":"stop","task_id":task});
+    let base = serde_json::to_vec(&req).unwrap().len();
+    let id = format!("big{}", "i".repeat(MAX_FRAME - base - 3));
+    req["id"] = json!(id);
+    assert_eq!(serde_json::to_vec(&req).unwrap().len(), MAX_FRAME);
+    c.send(&req);
+    let r = c.wait_id(&id, S(5)).expect("oversized response must become an error, not silence");
+    assert_eq!(r["ok"], false);
+    assert_eq!(r["error"]["code"], "E_INTERNAL", "{}", r["error"]);
+    let r = c.try_request(json!({"type":"list"}), S(5));
+    assert!(r.is_some(), "connection went mute after an oversized response");
+    assert_eq!(r.unwrap()["ok"], true);
 }
 
 /// F1/F2/F3: a frame over 4 MiB closes that connection (before or after

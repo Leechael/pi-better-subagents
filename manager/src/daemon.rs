@@ -25,9 +25,11 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Hygiene: a connection must complete hello within this window (it does not
 /// count as an active connection until then).
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-/// Server-side cap for one output read (keeps frames well under the 4 MiB
-/// frame limit even after UTF-8-lossy expansion).
+/// Server-side cap on raw bytes for one output read.
 const MAX_OUTPUT_READ: u64 = 1024 * 1024;
+/// Cap on a chunk's JSON-escaped size (control bytes escape to 6 bytes each),
+/// leaving room for the response envelope inside the 4 MiB frame.
+const CHUNK_JSON_BUDGET: usize = MAX_FRAME_SIZE as usize - 64 * 1024;
 /// §3.4: re-adopted tasks are polled with kill(pid, 0) every second.
 const ADOPT_POLL: Duration = Duration::from_secs(1);
 /// Poll interval for a process group that outlived its leader.
@@ -228,6 +230,13 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin>(
     mut rx: mpsc::Receiver<Arc<Vec<u8>>>,
 ) {
     while let Some(payload) = rx.recv().await {
+        // An oversized frame is dropped, not written: write_frame would
+        // refuse it, and ending the writer here would leave the connection
+        // mute for every later response. `respond` already substitutes an
+        // error for oversized responses, so this is a last line of defence.
+        if payload.len() > MAX_FRAME_SIZE as usize {
+            continue;
+        }
         if write_frame(&mut w, &payload).await.is_err() {
             break;
         }
@@ -481,10 +490,15 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
 }
 
 async fn respond<T: Serialize>(tx: &OutTx, id: &str, result: Result<T, ProtoError>) {
-    let frame = match result {
+    let mut frame = match result {
         Ok(body) => encode_ok(id, &body),
         Err(e) => encode_error(id, &e.code, &e.message),
     };
+    // Every request gets an answer: a response that does not fit a frame
+    // becomes an error instead of silently disappearing.
+    if frame.len() > MAX_FRAME_SIZE as usize {
+        frame = encode_error(id, E_INTERNAL, "response exceeds the 4 MiB frame limit");
+    }
     let _ = tx.send(frame).await;
 }
 
@@ -737,11 +751,11 @@ fn handle_output(
                 .0
         }
     };
-    // §3.3: cut at a UTF-8 boundary. A truncated sequence at the end of the
-    // data is held back while the task can still write the rest. (One
-    // straddling the cap never looks truncated: the lookahead always holds
-    // the whole character.)
-    let n = task::utf8_chunk_len(&bytes, cap, status == TaskStatus::Running);
+    // §3.3: cut at a UTF-8 boundary, within the frame budget after escaping.
+    // A truncated sequence at the end of the data is held back while the task
+    // can still write the rest. (One straddling the cap never looks truncated:
+    // the lookahead always holds the whole character.)
+    let n = task::utf8_chunk_len(&bytes, cap, CHUNK_JSON_BUDGET, status == TaskStatus::Running);
     bytes.truncate(n);
     let next_cursor = cursor + bytes.len() as u64;
     Ok(OutputOk {
@@ -982,7 +996,7 @@ fn spawn_output_fanout(state: &Shared, task_id: &str) {
                     last_cursor = c.next_cursor;
                     let mut data = std::mem::take(&mut carry);
                     data.extend_from_slice(&c.bytes);
-                    let n = task::utf8_chunk_len(&data, usize::MAX, true);
+                    let n = task::utf8_chunk_len(&data, usize::MAX, CHUNK_JSON_BUDGET, true);
                     carry = data.split_off(n);
                     (data, c.next_cursor - carry.len() as u64)
                 }
