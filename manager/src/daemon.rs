@@ -540,7 +540,6 @@ fn maybe_arm_idle_timer(state: &Shared) {
 // ---------------------------------------------------------------------------
 
 async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
-    touch_session(&state, conn_id);
     let id = req.id;
     match req.kind {
         RequestKind::Hello { .. } => {
@@ -616,15 +615,6 @@ fn handle_clock(state: &Shared, req: &RequestKind) -> Result<crate::clock::Clock
         RequestKind::ClockAdvance { ms } => m.advance(*ms),
         _ => m.status(),
     })
-}
-
-/// Record activity for the connection's session (`sessions` LAST_SEEN).
-fn touch_session(state: &Shared, conn_id: u64) {
-    let mut st = state.lock().unwrap();
-    let sid = st.conns.get(&conn_id).and_then(|h| h.session_id.clone());
-    if let Some(s) = sid.and_then(|sid| st.sessions.get_mut(&sid)) {
-        s.last_seen = now_ms();
-    }
 }
 
 async fn respond<T: Serialize>(tx: &OutTx, id: &str, result: Result<T, ProtoError>) {

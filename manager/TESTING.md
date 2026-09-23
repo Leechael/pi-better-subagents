@@ -10,7 +10,7 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 | `src/**` `#[cfg(test)]` | unit | ring buffer, record persistence, state mapping, daemon lock claim, UTF-8 chunk cutting, signal names, id format, manual clock (`test-clock` only) |
 | `tests/protocol.rs` | black box | message round-trips, basic lifecycle (t01–t13) |
 | `tests/lifecycle_adversarial.rs` | black box | every cell of the lifecycle table below, adversarial conditions |
-| `tests/mutation_gaps.rs` | black box | behaviours found unguarded by cargo-mutants survivors (g1–g13) |
+| `tests/mutation_gaps.rs` | black box | behaviours found unguarded by cargo-mutants survivors (g1–g14) |
 | `tests/observability.rs` | black box | observability contract: protocol additions, events.jsonl, inspection CLI (p1–p3, e1–e4, c1–c8) |
 | `tests/timing_canary.rs` | black box, real time | the actual 5s idle grace and 2s kill grace (always on the real clock) |
 | `tests/common/mod.rs` | helpers | wire client, isolated `--home`, process probes, crashable helper client, clock stepping (`Home::advance*`) |
@@ -320,6 +320,45 @@ dead or unneeded code:
 | client.rs:161:20, 167:20 delete `!` in `connect` | b | Only changes which error text is kept; a successful spawn is still found on the retry. |
 | client.rs:239:40 ×2, 242:28 ×2 in `cmd_list` | a (not this work) | The "N terminal hidden, use -a" hint arithmetic from the KIND/agent-records change. Untested, but not code touched here. |
 
+### Observability and test-clock code (parts B and C)
+
+`cargo mutants --features test-clock --in-diff` over every `src` change
+since the part-A docs commit (`6ec4135..`): 493 mutants, 35 unviable,
+**458 viable, 330 caught + 12 timeouts = 74.7%**. The run took 68 min at
+`-j 4`. `clock.rs`: all 15 viable mutants killed.
+
+The two manager survivors were followed up:
+
+- `daemon.rs` `touch_session` → `()`: **dead code, removed**. `status`
+  reports `now` as `last_seen` for a connected session, and disconnect
+  sets `last_seen` itself, so the per-request update could never be seen.
+- `daemon.rs` `delete !` in `spawn_adopted_poller`: **missing test**. The
+  poller then stops sleeping after its first tick and spins. `g14` (daemon
+  CPU with one re-adopted task) now kills it. It first survived `g14`
+  because the manual clock never passed the first `adopt-poll` tick; the
+  test now advances it.
+
+After those: 343 / 457 = **75.1%**. The other 114 survivors are all in the
+CLI presentation code. Classes: (a) missing test, (b) equivalent or not
+observable in tests, (c) dead.
+
+| Area | Survivors | Class | What |
+|---|---|---|---|
+| `fmt.rs` `char_width` ranges | 11 | a | Only a few CJK and emoji ranges are exercised. `\|\|`→`&&` on the others goes unseen. |
+| `fmt.rs` `human_duration`, `datetime`, `short_time`, `local` | 10 | a / b | Boundary values (exactly 60s, 60m, 24h) are untested (a). Human timestamps are only checked for shape, not value (a). The tz offset arithmetic is equivalent on a UTC-offset-0 check (b). |
+| `events.rs` `encode_line`, `shrink_longest_string` | 18 | a | Truncation arithmetic at the edges of the 4 KiB cap. The tests assert that every line is under the cap and still valid JSON, not the exact size removed. Some `<`/`<=` swaps sit exactly on the cap (b). |
+| `sys.rs` `stdout_tty_columns`, `inspect.rs` `term_width` | 12 | b | The tests never run on a TTY, so terminal width is always unknown. |
+| `inspect.rs` `cmd_ls`, `render_ls`, `session_views` | 16 | a | The "N hidden, use -a" hint counts, session sort order for equal timestamps, and the COMMAND width arithmetic. |
+| `inspect.rs` transcripts, `wake_summary`, `cmd_show`, `render_event`, `cmd_events`, `cmd_sessions`, `cmd_status`, `wait_agent` | 19 | a | Rendering details (preamble detection edges, tail windows, `-f` poll bookkeeping), and the `wait` budget arithmetic for agents. |
+| `client.rs` `cmd_doctor`, `dir_size`, `Report::warn` | 16 | a | The doctor's disk-usage line and warnings are printed but not asserted. The protocol-match branch is only tested as a mismatch. |
+| `client.rs` `resolve_task_id` closest match | 6 | a | The distance thresholds of the "did you mean" hint. |
+| `client.rs` `cmd_kill_session`, `cmd_start` → `Ok(())` | 2 | a | Convenience commands without black-box tests. |
+| `client.rs` `wait_for_manager_exit` | 2 | b | `&&`→`\|\|` always waits the full 5s and `<`→`<=` changes nothing. Only latency differs, and `d8b` still passes. |
+| `client.rs` `cmd_output` | 1 | a | The `--max-bytes` read-size clamp. |
+| `out.rs` `bytes` | 1 | b | The EPIPE check vs. other write errors; both end the command. |
+
+deferred: tests for the (a) rows above | impact: CLI rendering regressions (widths, hints, doctor text) would not be caught; no effect on the lifecycle or wire contract | trigger: the first user-visible CLI rendering bug, or before the CLI output is declared stable for scripts
+
 ## Changed code for the fixes
 
 | File | Change |
@@ -431,6 +470,7 @@ Changes from the first manifest:
 | Hand-rolled read loop + `Interrupted` arm in `read_file_range` | Replaced by `take(max).read_to_end`, which retries EINTR itself | `read_file_range_offsets`, `g1`, `g8`, `o1`, `t13` green |
 | Client-side zombie cleanup in `connect` (§3.1 step 5) | Redundant with the daemon's cleanup, and the cause of bug d2 | `d2`, `d10`, `d11`, `d11b` green; ablation `clients-never-clean` |
 | `claim_pid` (pid-liveness identity) | Replaced by the lifetime lock | `t10`, `d3`, `d12` |
+| `touch_session` (per-request `last_seen` update, part B) | Unobservable: `status` reports `now` for connected sessions and disconnect sets `last_seen` | `p3`, `c5` green; found as a mutation survivor |
 
 No removal turned a test red.
 

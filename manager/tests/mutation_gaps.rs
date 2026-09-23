@@ -418,3 +418,31 @@ fn g6_readopted_task_output_is_caught_up() {
     assert_eq!(r["total_size"], 13);
     assert_eq!(r["status"], "running");
 }
+
+/// Kills: daemon.rs spawn_adopted_poller's first-iteration guard (without it
+/// the poller never sleeps after the first check: a busy loop per re-adopted
+/// task). A daemon that re-adopted a live task must be idle.
+#[test]
+fn g14_readopted_task_poller_does_not_spin() {
+    let home = Home::new("g14");
+    let mut d1 = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, _) = c.start("sleep 300");
+    drop(c);
+    d1.kill().unwrap();
+    d1.wait().unwrap();
+    let d2 = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    assert_eq!(c.status_of(&id).as_deref(), Some("running"), "re-adopted");
+    // Let the poller get past its first tick and check a few times.
+    for _ in 0..3 {
+        home.advance("adopt-poll", 1000);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let before = cpu_ms(d2.id());
+    std::thread::sleep(Duration::from_millis(1500));
+    let used = cpu_ms(d2.id()) - before;
+    assert!(used < 300, "daemon with one re-adopted task used {used}ms CPU in 1.5s");
+}
