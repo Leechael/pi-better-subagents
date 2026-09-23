@@ -1415,9 +1415,32 @@ fn log_task_exit(home: &std::path::Path, sid: &str, ev: &EventKind) {
 // Graceful shutdown (§3.2)
 // ---------------------------------------------------------------------------
 
+/// Re-probe every leftover group (`TaskEntry::refresh_lingering`). Returns
+/// whether any still lingers.
+fn refresh_lingering_groups(state: &Shared) -> bool {
+    let mut st = state.lock().unwrap();
+    let mut any = false;
+    for e in st.registry.tasks.values_mut() {
+        any |= e.refresh_lingering();
+    }
+    any
+}
+
 async fn graceful_shutdown(state: &Shared) {
     let home = state.lock().unwrap().home.clone();
     lifecycle::log_line(&home, "graceful shutdown: terminating running tasks");
+
+    // 0) Look at leftover groups as they are now, not as the last group
+    //    poll saw them: a group that has emptied needs no SIGTERM and must
+    //    not hold shutdown in the grace (under the manual test clock the
+    //    poll never runs unstepped, so a stale flag would hold it forever).
+    //    Right after its leader is reaped, `kill(-pgid, 0)` can answer EPERM
+    //    for a moment (macOS, seen under load), so a group that still looks
+    //    alive gets a second probe after a short real-time pause.
+    if refresh_lingering_groups(state) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        refresh_lingering_groups(state);
+    }
 
     // 1) SIGTERM every process group that may have members: running tasks,
     //    and finished tasks whose leader left descendants behind (§3.2).
@@ -1447,6 +1470,8 @@ async fn graceful_shutdown(state: &Shared) {
         //    even if its leader already died (SIGTERM-ignoring descendants).
         let clock = state.lock().unwrap().clock.clone();
         clock.sleep("shutdown-grace", KILL_GRACE).await;
+        // A group that emptied during the grace is no longer ours to signal.
+        refresh_lingering_groups(state);
         let survivors: Vec<u32> = {
             state
                 .lock()

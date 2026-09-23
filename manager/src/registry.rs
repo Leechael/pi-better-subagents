@@ -67,6 +67,17 @@ impl TaskEntry {
         self.record.status == TaskStatus::Running || self.group_lingering
     }
 
+    /// Re-probe a leftover group now and clear `group_lingering` once it has
+    /// emptied. The flag is otherwise refreshed only by the group poll, which
+    /// can be a tick behind (or, on the manual test clock, never run).
+    /// Returns whether the group still lingers.
+    pub fn refresh_lingering(&mut self) -> bool {
+        if self.group_lingering && !crate::sys::group_alive(self.record.pid) {
+            self.group_lingering = false;
+        }
+        self.group_lingering
+    }
+
     /// Mark a running task as killed by us, for `end_reason` (first reason
     /// wins: a stop followed by a shutdown stays "stopped:…").
     pub fn request_kill(&mut self, end_reason: &str) {
