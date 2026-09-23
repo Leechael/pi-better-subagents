@@ -53,12 +53,17 @@ function countLabel(n: number, singular: string, plural?: string): string {
   return `${n} ${n === 1 ? singular : (plural ?? `${singular}s`)}`;
 }
 
-export function summaryLabel(workers: number, subagents: number, monitors: number): string {
+/** Counts part of the fleet line. "shell" = a backgrounded bash command. */
+export function summaryLabel(shells: number, subagents: number, monitors: number): string {
   const parts: string[] = [];
-  if (workers > 0) parts.push(countLabel(workers, "worker"));
+  if (shells > 0) parts.push(countLabel(shells, "shell"));
   if (subagents > 0) parts.push(countLabel(subagents, "subagent"));
   if (monitors > 0) parts.push(countLabel(monitors, "monitor"));
   return parts.join(" · ");
+}
+
+function isFailed(item: WorkItem): boolean {
+  return item.status === "failed" || item.status === "killed" || item.status === "orphaned";
 }
 
 /**
@@ -91,7 +96,8 @@ export class FleetWidget {
     const items = this.deps.index.list(this.clock.now());
     const counts = this.deps.index.counts();
     const activeAgents = items.filter((item) => item.kind === "agent" && isActive(item));
-    const total = counts.workers + counts.subagents + counts.monitors;
+    const failed = items.filter(isFailed).length;
+    const total = counts.workers + counts.subagents + counts.monitors + failed;
     if (activeAgents.length > 0 && !this.ageTimer) {
       this.ageTimer = this.clock.setInterval(() => this.tui?.requestRender(), 5000);
       this.clock.unref?.(this.ageTimer);
@@ -149,16 +155,29 @@ export class FleetWidget {
     }
   }
 
+  /**
+   * One line: `● 2 shells · 1 monitor · alpha 12s · beta 8s · ✗ 1 failed   /tasks`.
+   * Running subagents are named with their age; failures stay listed while the
+   * work index retains them (10 minutes) so a failure is not missed.
+   */
   private renderLine(width: number, theme: FleetTheme): string[] {
     const now = this.clock.now();
+    const items = this.deps.index.list(now);
     const counts = this.deps.index.counts();
+    const parts: string[] = [];
     const summary = summaryLabel(counts.workers, 0, counts.monitors);
-    const lines = summary ? [`  ${theme.fg("muted", summary)}`] : [];
-    const agents = this.deps.index.list(now).filter((item) => item.kind === "agent" && isActive(item));
-    for (const item of agents) {
-      lines.push(`  ${theme.fg("accent", "●")} ${item.title} — ${formatAge(item.startedAt, item.endedAt, now)}`);
+    if (summary) parts.push(theme.fg("muted", summary));
+    for (const item of items.filter((i) => i.kind === "agent" && isActive(i))) {
+      const name = item.name ?? item.title;
+      parts.push(`${name} ${theme.fg("dim", formatAge(item.startedAt, item.endedAt, now))}`);
     }
-    return lines.map((line) => truncateToWidth(line, Math.max(20, width), "…"));
+    const failed = items.filter(isFailed).length;
+    if (failed > 0) parts.push(theme.fg("error", `✗ ${failed} failed`));
+    if (parts.length === 0) return [];
+    const running = counts.workers + counts.subagents + counts.monitors > 0;
+    const glyph = running ? theme.fg("accent", "●") : theme.fg("error", "✗");
+    const line = `  ${glyph} ${parts.join(theme.fg("dim", " · "))}   ${theme.fg("dim", "/tasks")}`;
+    return [truncateToWidth(line, Math.max(1, width), "…")];
   }
 }
 
