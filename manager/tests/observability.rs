@@ -878,3 +878,62 @@ fn c8_doctor_checks_and_exit_status() {
     assert!(out.stdout.contains("FAIL  socket path:"), "{}", out.stdout);
 }
 
+/// Gone-session retention: a disconnected session's files are deleted once
+/// `goneSessionRetention` passes, unless it still runs something; connected
+/// sessions are never touched. `0s` makes the next sweep (1 s cadence) act.
+#[test]
+fn g1_gone_sessions_are_swept_after_retention() {
+    let home = Home::new("g1");
+    std::fs::create_dir_all(&home.path).unwrap();
+    std::fs::write(home.path.join("config.json"), r#"{"goneSessionRetention":"0s"}"#).unwrap();
+    let _d = home.start_daemon();
+
+    let mut live = home.connect();
+    hello_v2(&mut live, "sess-g-live", "/tmp");
+    let (live_task, _) = start(&mut live, "true", json!({}));
+    live.wait_terminal(&live_task, S(3)).unwrap();
+
+    let mut done = home.connect();
+    hello_v2(&mut done, "sess-g-done", "/tmp");
+    let (done_task, _) = start(&mut done, "true", json!({}));
+    done.wait_terminal(&done_task, S(3)).unwrap();
+
+    let mut busy = home.connect();
+    hello_v2(&mut busy, "sess-g-busy", "/tmp");
+    let (busy_task, busy_pid) = start(&mut busy, "sleep 300", json!({}));
+
+    drop(done);
+    drop(busy);
+    let sessions = home.path.join("sessions");
+    let swept = poll_true(S(10), || {
+        home.advance("gc", 1_000);
+        !sessions.join("sess-g-done").exists()
+    });
+    assert!(swept, "gone, finished session not swept");
+    assert!(sessions.join("sess-g-live").exists(), "connected session kept");
+    assert!(sessions.join("sess-g-busy").exists(), "gone session with a running task kept");
+    assert!(pid_alive(busy_pid), "sweeping never touches live processes");
+
+    // Forgotten everywhere: listings and by-id lookups.
+    assert!(!home.cli(&["show", &done_task], S(5)).status.success(), "swept task is gone from show");
+    let ls = cli_ok(&home, &["ls"]).stdout;
+    assert!(ls.contains(&busy_task), "running work of a gone session stays listed: {ls}");
+    assert!(ls.contains(&live_task), "connected session's finished work is listed: {ls}");
+    assert!(!ls.contains(&done_task), "{ls}");
+    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
+    assert!(log.contains("gc: removed 1 gone session(s): sess-g-done"), "{log}");
+    kill_group(busy_pid, 9);
+}
+
+#[test]
+fn g2_doctor_flags_a_bad_retention() {
+    let home = Home::new("g2");
+    std::fs::create_dir_all(&home.path).unwrap();
+    std::fs::write(home.path.join("config.json"), r#"{"goneSessionRetention":"soon"}"#).unwrap();
+    let out = home.cli(&["doctor"], S(10));
+    assert_eq!(out.status.code(), Some(1), "{}", out.stdout);
+    assert!(out.stdout.contains("session retention") && out.stdout.contains("soon"), "{}", out.stdout);
+    std::fs::write(home.path.join("config.json"), r#"{"goneSessionRetention":"2h"}"#).unwrap();
+    let out = home.cli(&["doctor"], S(10));
+    assert!(out.stdout.contains("gone sessions kept 2h"), "{}", out.stdout);
+}

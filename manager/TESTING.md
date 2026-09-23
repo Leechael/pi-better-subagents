@@ -264,7 +264,9 @@ fixtures in the contract's format, because the extension side may land later.
 | `show` for sh_/ch_/run_ (header, origin, backgrounded, wake emitted→delivered, last 10 lines; agent error/tool calls/shells/prompt/result tail 20), fuzzy + `--json`, one-line not-found with closest match | `c2` |
 | `agent` (preamble hidden, `--full`), `log`/`tail -f` on ch_ ids, `output`/`wait` on ch_, `stop` on an agent refused with the contract message | `c3` |
 | `stop` → `stopped:cli`; "already finished (<reason>)" | `c4` |
-| `sessions` / `-a` (gone sessions from events.jsonl, counts, `--json`), no spawn | `c5` |
+| `sessions`: connected only, gone sessions hidden but `show`/`events` still reach them, counts, `--json`, no spawn | `c5` |
+| gone-session retention: swept after `goneSessionRetention`; connected and still-running sessions kept; swept tasks leave `show`/`ls` | `g1` (red with the sweep disabled) |
+| `doctor` flags an invalid `goneSessionRetention` | `g2` |
 | `status`: human uptime, counts incl. agents, protocol, `--json`; not running → exit 1, no spawn | `c6` |
 | `output --max-bytes` is a total cap (UTF-8 safe); SIGPIPE → exit 0, silent (output, ls, events, log); human timestamps in `log` | `c7` |
 | `doctor`: home missing (not created), config.json, managerPath, stale agent records, orphan pids, socket path length, exit status; protocol per session | `c8`, `protocol::t11`, `mutation_gaps::g13` |

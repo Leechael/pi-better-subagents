@@ -9,6 +9,7 @@ mod clock;
 mod daemon;
 mod events;
 mod fmt;
+mod gc;
 mod inspect;
 mod lifecycle;
 mod proto;

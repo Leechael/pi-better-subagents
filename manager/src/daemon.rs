@@ -11,7 +11,7 @@ use interprocess::local_socket::tokio::prelude::*; // traits for accept()/connec
 use interprocess::local_socket::tokio::Stream;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -176,6 +176,9 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
     for (task_id, pid) in scan.readopted {
         spawn_adopted_poller(&state, &task_id, pid);
     }
+
+    // §3.2: forget gone sessions past their retention, now and periodically.
+    spawn_session_gc(&state);
 
     // §3.2: the idle rule applies from boot (clients connect within 2s of
     // spawn per §3.1, so this never fires for a healthy startup).
@@ -507,6 +510,69 @@ fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
             t.watchers.remove(&conn_id);
         }
     }
+}
+
+/// §3.2: sweep gone sessions at startup and then every
+/// `gc::interval_ms(retention)`. The retention is read once per daemon.
+fn spawn_session_gc(state: &Shared) {
+    let (home, clock) = {
+        let st = state.lock().unwrap();
+        (st.home.clone(), st.clock.clone())
+    };
+    let retention = match crate::gc::retention_ms(&home) {
+        Ok(ms) => ms,
+        Err(e) => {
+            lifecycle::log_line(&home, &format!("config: {e}; using the default 24h"));
+            crate::gc::DEFAULT_RETENTION_MS
+        }
+    };
+    run_session_gc(state, retention);
+    let state2 = state.clone();
+    tokio::spawn(async move {
+        let every = Duration::from_millis(crate::gc::interval_ms(retention));
+        loop {
+            clock.sleep("gc", every).await;
+            if state2.lock().unwrap().shutdown {
+                break;
+            }
+            run_session_gc(&state2, retention);
+        }
+    });
+}
+
+fn run_session_gc(state: &Shared, retention_ms: u64) {
+    let mut st = state.lock().unwrap();
+    // Never sweep a session that is connected or still owns live processes.
+    let mut keep: HashSet<String> = st
+        .sessions
+        .iter()
+        .filter(|(_, s)| s.conn_id.is_some())
+        .map(|(sid, _)| sid.clone())
+        .collect();
+    for e in st.registry.tasks.values() {
+        if e.record.status == TaskStatus::Running || e.owns_live_group() {
+            keep.insert(e.record.session_id.clone());
+        }
+    }
+    let home = st.home.clone();
+    let removed = crate::gc::sweep(&home, &keep, retention_ms);
+    if removed.is_empty() {
+        return;
+    }
+    let gone: HashSet<&String> = removed.iter().collect();
+    st.registry.tasks.retain(|_, e| !gone.contains(&e.record.session_id));
+    st.sessions.retain(|sid, _| !gone.contains(sid));
+    lifecycle::log_line(
+        &home,
+        &format!("gc: removed {} gone session(s): {}", removed.len(), removed.join(" ")),
+    );
+    crate::events::emit(
+        &home,
+        None,
+        "session.gc",
+        None,
+        serde_json::json!({ "removed": removed, "retention_ms": retention_ms }),
+    );
 }
 
 /// §3.2: arm the 5s idle timer when the last active connection went away.
