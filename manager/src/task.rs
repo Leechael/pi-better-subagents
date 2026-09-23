@@ -237,7 +237,8 @@ pub fn spawn_process(command: &str, cwd: &str, env: &HashMap<String, String>) ->
     let lifeline = lifeline()?;
     let (status_read, status_write) = crate::sys::pipe_cloexec()?;
     let status_write = crate::sys::dup_cloexec_high(&status_write)?;
-    let mut cmd = Command::new(runner_exe()?);
+    let runner = runner_exe()?;
+    let mut cmd = Command::new(&runner);
     cmd.arg("__run").arg(command);
     cmd.current_dir(cwd);
     // §3.3: env is the complete environment; the client builds it.
@@ -247,7 +248,9 @@ pub fn spawn_process(command: &str, cwd: &str, env: &HashMap<String, String>) ->
     cmd.stderr(Stdio::piped());
     crate::sys::apply_runner_setup_tokio(&mut cmd, lifeline.read.as_raw_fd(), status_write.as_raw_fd());
 
-    let mut child = cmd.spawn()?;
+    let mut child = cmd.spawn().map_err(|e| {
+        io::Error::new(e.kind(), format!("cannot spawn runner {}: {e}", runner.display()))
+    })?;
     drop(status_write); // the runner has its copy at fd 4
     let status = pipe::Receiver::from_owned_fd(status_read)?;
     let stdout = child
@@ -675,7 +678,7 @@ mod tests {
         let _ = &dir;
 
         let (status, collected) = wait_and_drain(&mut t).await;
-        assert_eq!(status.code(), Some(0));
+        assert_eq!(status.code(), Some(0), "runner signal: {:?}", status.signal());
         wait_tee_idle(&t.tee_remaining).await;
 
         let text = String::from_utf8_lossy(&collected);

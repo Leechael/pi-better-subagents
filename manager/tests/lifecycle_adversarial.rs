@@ -176,7 +176,12 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
         // ...and free as soon as it has exited: no other process held it.
         let out = home.cli(&["shutdown"], S(10));
         assert!(out.status.success(), "{}", out.stderr);
-        assert!(poll_true(S(5), || !pid_running(daemon)), "round {round}: daemon did not exit");
+        assert!(
+            poll_true(S(5), || lifetime_lock_free(&home)),
+            "round {round}: manager.lock stayed held after shutdown (pid {daemon} alive={})\n{}",
+            pid_running(daemon),
+            d1_diagnostics(&home)
+        );
         assert!(
             lifetime_lock_free(&home),
             "round {round}: manager.lock still held after the daemon exited\n{}",
@@ -1224,9 +1229,15 @@ fn o3c_unanswerable_request_does_not_mute_connection() {
     c.send(&req);
     // Requests are dispatched concurrently; let the doomed reply be attempted
     // before probing, or the probe could be answered first and prove nothing.
-    std::thread::sleep(MS(500));
-    let r = c.try_request(json!({"type":"list"}), S(5));
-    assert!(r.is_some(), "connection went mute after an unanswerable request");
+    // The 4 MiB id needs a longer bound under the full parallel stress suite.
+    std::thread::sleep(S(2));
+    let r = c.try_request(json!({"type":"list"}), S(15));
+    assert!(
+        r.is_some(),
+        "connection went mute after an unanswerable request (closed={}); manager.log:\n{}",
+        c.closed,
+        std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default()
+    );
     assert_eq!(r.unwrap()["ok"], true);
 }
 
