@@ -138,10 +138,32 @@ export function formatTaskNotification(
 /** Tool-result text returned when a foreground command is moved to the background (§4.2). */
 export function formatBackgroundNotice(
   taskId: string,
-  _command: string,
-  _outputPath: string,
+  command: string,
+  outputPath: string,
 ): string {
-  return `⏵ ${taskId} running in background · /tasks`;
+  // Model-facing. The transcript row is drawn by the bash tool's renderResult.
+  return [
+    `Command "${displayCommand(command)}" moved to background (task_id: ${taskId}). Output: ${outputPath}.`,
+    'You will be notified when it completes, even if other commands are still running. Do not poll or sleep — end your turn and continue from the <pbs-wake kind="task"> when it arrives.',
+  ].join("\n");
+}
+
+/** Transcript row for a backgrounded command (UI only; never sent to the model). */
+export function backgroundRowText(
+  taskId: string,
+  item: { status: string; exitCode?: number | null; startedAt: number; endedAt?: number } | undefined,
+  now: number,
+): { glyph: string; color: string; text: string } {
+  if (!item || item.status === "running" || item.status === "pending") {
+    return { glyph: "⏵", color: "accent", text: `${taskId} running in background · /tasks` };
+  }
+  const secs = ((item.endedAt ?? now) - item.startedAt) / 1000;
+  const dur = secs < 60 ? `${secs.toFixed(1)}s` : `${Math.floor(secs / 60)}m${Math.round(secs % 60)}s`;
+  const exit = item.exitCode === null || item.exitCode === undefined ? "" : ` · exit ${item.exitCode}`;
+  const ok = item.status === "completed" && (item.exitCode === 0 || item.exitCode === null || item.exitCode === undefined);
+  return ok
+    ? { glyph: "✓", color: "success", text: `${taskId} finished${exit} · ${dur}` }
+    : { glyph: "✗", color: "error", text: `${taskId} ${item.status}${exit} · ${dur} · /tasks` };
 }
 
 /** Injected payload for a batch of monitor output lines (§4.4 / §4.5). */

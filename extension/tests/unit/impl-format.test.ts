@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  backgroundRowText,
   formatBackgroundNotice,
   formatMonitorEvent,
   formatTaskNotification,
@@ -132,11 +133,25 @@ describe("formatTaskNotification", () => {
 });
 
 describe("formatBackgroundNotice", () => {
-  it("keeps background notices to one concise task row", () => {
+  it("keeps the model-facing notice actionable", () => {
     const text = formatBackgroundNotice("sh_a1b2c3d4", "npm run build", "/tmp/out.log");
-    expect(text).toBe("⏵ sh_a1b2c3d4 running in background · /tasks");
-    expect(text).not.toContain("/tmp/out.log");
-    expect(text).not.toContain("Do not poll");
+    expect(text).toContain("task_id: sh_a1b2c3d4");
+    expect(text).toContain("Output: /tmp/out.log");
+    expect(text).toContain("Do not poll");
+  });
+
+  it("draws the transcript row from live task state, not from the model text", () => {
+    expect(backgroundRowText("sh_1", undefined, 0)).toMatchObject({ glyph: "⏵", text: "sh_1 running in background · /tasks" });
+    expect(backgroundRowText("sh_1", { status: "running", startedAt: 0 }, 5_000).glyph).toBe("⏵");
+    expect(backgroundRowText("sh_1", { status: "completed", exitCode: 0, startedAt: 0, endedAt: 14_000 }, 20_000)).toEqual({
+      glyph: "✓",
+      color: "success",
+      text: "sh_1 finished · exit 0 · 14.0s",
+    });
+    expect(backgroundRowText("sh_1", { status: "failed", exitCode: 3, startedAt: 0, endedAt: 12_000 }, 20_000)).toMatchObject({
+      glyph: "✗",
+      text: "sh_1 failed · exit 3 · 12.0s · /tasks",
+    });
   });
 });
 

@@ -26,7 +26,9 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { taskOutputPath, type PbsConfig } from "./config";
 import { realClock, type Clock, type ClockTimer } from "./clock";
-import { formatBackgroundNotice, truncateTail } from "./format";
+import { backgroundRowText, formatBackgroundNotice, truncateTail } from "./format";
+import { toolComponent } from "./tui/tool-component";
+import type { WorkIndex } from "./work-index";
 import type { ManagerClient } from "./manager-client";
 import {
   appendStatus,
@@ -79,6 +81,15 @@ export interface BashOverrideDeps {
    */
   markNotifyOnExit: (taskId: string) => void;
   clock?: Clock;
+  /** Live background work, so a backgrounded row can show its final status. */
+  getIndex?: () => WorkIndex | null;
+}
+
+/** Same collapsed preview as pi's default tool-result view. */
+const PREVIEW_LINES = 10;
+
+function isActiveStatus(status: string | undefined): boolean {
+  return status === undefined || status === "running" || status === "pending";
 }
 
 const BARE_SLEEP_GUIDANCE =
@@ -230,6 +241,38 @@ export function createBashOverride(
       "Long-running bash commands are moved to the background automatically; do not poll or sleep to wait for them. End your turn and resume from the task wake when it arrives.",
     ],
     parameters: bashParameters,
+    renderResult(result, { expanded }, theme, context) {
+      const details = result.details as PbsBashDetails | undefined;
+      if (details?.backgrounded && details.task_id) {
+        const taskId = details.task_id;
+        const index = deps.getIndex?.() ?? null;
+        const state = context.state as { unsubscribe?: () => void };
+        const item = index?.get(taskId);
+        if (index && !state.unsubscribe && isActiveStatus(item?.status)) {
+          // Redraw this row when the task finishes, then stop listening.
+          state.unsubscribe = index.onChange(() => {
+            if (!isActiveStatus(index.get(taskId)?.status)) {
+              state.unsubscribe?.();
+              state.unsubscribe = () => {};
+            }
+            context.invalidate();
+          });
+        }
+        const row = backgroundRowText(taskId, item, (deps.clock ?? realClock).now());
+        return toolComponent([`${theme.fg(row.color as never, row.glyph)} ${theme.fg("muted", row.text)}`]) as never;
+      }
+      const text = result.content
+        .filter((c): c is { type: "text"; text: string } => c.type === "text")
+        .map((c) => c.text)
+        .join("\n");
+      const lines = text.split("\n");
+      const shown = expanded ? lines : lines.slice(0, PREVIEW_LINES);
+      const out = shown.map((l) => theme.fg("toolOutput", l));
+      if (shown.length < lines.length) {
+        out.push(theme.fg("muted", `... (${lines.length - shown.length} more lines, ctrl+o to expand)`));
+      }
+      return toolComponent(out) as never;
+    },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const input = params as BashParams;
 

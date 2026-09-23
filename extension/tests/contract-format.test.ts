@@ -186,11 +186,14 @@ describe("formatTaskNotification (contract: Appendix A + §4.5 XML template)", (
 });
 
 describe("formatBackgroundNotice (contract: Appendix A + §4.2 template)", () => {
-  it("returns the concise user-facing task row", () => {
+  it("tells the model the task id, output path, and to end its turn", () => {
+    // Model-facing tool result. The one-line transcript row is a renderer concern.
     const msg = formatBackgroundNotice("sh_a1b2c3d4", "npm run build", "/tmp/x.output");
-    expect(msg).toBe("⏵ sh_a1b2c3d4 running in background · /tasks");
-    expect(msg).not.toContain("/tmp/x.output");
-    expect(msg).not.toMatch(/do not poll/i);
+    expect(msg).toContain("sh_a1b2c3d4");
+    expect(msg).toContain("/tmp/x.output");
+    expect(msg).toContain("npm run build");
+    expect(msg).toMatch(/do not poll/i);
+    expect(msg).toContain('<pbs-wake kind="task">');
   });
 });
 

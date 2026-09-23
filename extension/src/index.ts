@@ -177,6 +177,7 @@ export default function (pi: ExtensionAPI): void {
     markNotifyOnExit,
     clock,
     getRegistry: () => subagentRegistry,
+    getIndex: () => workIndex,
   };
 
   monitorRegistry = new MonitorRegistry({
