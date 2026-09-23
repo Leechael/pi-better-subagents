@@ -94,6 +94,7 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 - shutdown 期间 manager 仍接受新连接,但立即拒绝其 `hello`(`E_INTERNAL` "manager is shutting down");客户端按 §3.1 第 6 步等该 manager 退出后 spawn 继任者,而不是卡到响应超时
 - 后台任务不允许比最后一个 pi 活得久。`pi --resume` 的 reattach 只在"还有其他 pi 活着"时成立
 - manager **永不自我复活**;只有客户端(扩展/CLI)在需要时 spawn
+- **已断开 session 的保留期**:session 断开后立即从 `ls` / `sessions` 消失;`sessions/<sid>/` 在最后一次写入后保留 `goneSessionRetention`(config.json,默认 24h),期间 `show` / `agent` / `events` 仍可查(事后排查、`pi --resume`),到期由 daemon 删除目录并从内存移除其任务。启动时与每 `min(保留期, 1h)` 清扫一次;已连接、或仍有 running 任务/存活进程组的 session 永不清扫
 
 ### 3.3 传输与协议
 
@@ -260,8 +261,8 @@ running ──exit 0──► completed
 ```
 pbs-manager daemon [--foreground]        # 前台运行(被 spawn 时用)
 pbs-manager status [--json]              # 版本/协议/uptime/sessions/任务与 agent 计数;不启动 daemon
-pbs-manager sessions [-a] [--json]       # 会话;-a 含已断开的(读磁盘)
-pbs-manager ls [-a] [--session P] [--cwd D] [--since DUR] [--json]
+pbs-manager sessions [--json]            # 已连接的会话(断开但仍有运行中任务的也列出)
+pbs-manager ls [--session P] [--cwd D] [--since DUR] [--json]   # 已连接会话的全部工作 + 任何仍在运行的
 pbs-manager show <id> [--json]           # sh_/mon_/ch_/run_ 任意 id,模糊匹配
 pbs-manager agent <ch_id> [--full] [-f]  # 渲染 agent transcript
 pbs-manager events [-f] [--session P] [--id X] [--since DUR] [--json]
@@ -493,7 +494,7 @@ You are an explorer agent. ... (body = system prompt 追加段)
 `~/.pi/agent/pbs/config.json`(扩展读):
 
 ```json
-{ "foregroundBudgetMs": 20000, "subagentBudgetMs": 45000, "managerPath": null, "logLevel": "info" }
+{ "foregroundBudgetMs": 20000, "subagentBudgetMs": 45000, "managerPath": null, "logLevel": "info", "goneSessionRetention": "24h" }
 ```
 
 ## 5. 测试策略

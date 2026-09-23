@@ -51,8 +51,8 @@ sessions/<session_id>/agents/<child_id>.{json,jsonl}   # written by the extensio
 
 ```bash
 pbs-manager status [--json]
-pbs-manager sessions [-a] [--json]
-pbs-manager ls [-a] [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # alias of list
+pbs-manager sessions [--json]
+pbs-manager ls [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # alias of list
 pbs-manager show <id> [--json]
 pbs-manager agent <ch_id> [--full] [-f]
 pbs-manager events [-f] [--session PREFIX] [--id ID] [--since DUR] [--json]
@@ -105,7 +105,7 @@ SESSION   PI_PID STATE     CWD         SINCE    LAST_SEEN RUNNING TASKS AGENTS
 0199aaaa  81234  connected ~/src/app   14:02:11 now       2       7     1
 ```
 
-Connected sessions by default; `-a` adds sessions that are gone (read from disk: pid, cwd and times come from their `events.jsonl`). `SESSION` is the shortest unique prefix, at least 8 characters. `RUNNING` counts running tasks and agents; a record that says an agent is running while its session is gone is not counted (it cannot be alive).
+Connected sessions only (a gone session is listed while it still runs something). When a pi session exits, it leaves the listings at once; its files stay on disk for `goneSessionRetention` (see below) so `show`, `agent` and `events --session` still reach it, and are then deleted. `SESSION` is the shortest unique prefix, at least 8 characters. `RUNNING` counts running tasks and agents; a record that says an agent is running while its session is gone is not counted (it cannot be alive).
 
 ### `ls` / `list`
 
@@ -116,7 +116,7 @@ mon_e1351cb1 monitor 0199aaaa  ~/src/app  killed    14:01:10 30s    SIGTERM stop
 ch_7d0e22a1  agent   0199aaaa  ~/src/app  failed    14:00:05 12s    -       model-error  broken (worker) m1
 ```
 
-Running tasks and agents by default; `-a` includes finished ones. Filters: `--session PREFIX` (session id prefix), `--cwd DIR` (that directory or below; agents use their session's cwd), `--since DUR` (started within). `--json` prints an array of row objects (`id`, `kind`, `session_id`, `cwd`, `status`, `started_at`, `ended_at`, `duration_ms`, `exit_code`, `signal`, `end_reason`, `title`, plus `pid`/`origin`/`backgrounded_at`/`run_id`/`error` when known).
+Work of connected sessions, running and finished, plus anything still running in a gone session (a live process is never hidden). There is no `--all`: a gone session's finished work is reached by id (`show`) until its retention ends. Filters: `--session PREFIX` (session id prefix), `--cwd DIR` (that directory or below; agents use their session's cwd), `--since DUR` (started within). `--json` prints an array of row objects (`id`, `kind`, `session_id`, `cwd`, `status`, `started_at`, `ended_at`, `duration_ms`, `exit_code`, `signal`, `end_reason`, `title`, plus `pid`/`origin`/`backgrounded_at`/`run_id`/`error` when known).
 
 - `EXIT` is the exit code, a signal name (`SIGTERM`, `SIGKILL`, …), or `-`.
 - `REASON` is the task's `end_reason` (see below), or an agent record's `end_reason`.
@@ -191,6 +191,7 @@ Health checks, one line each (`ok`, `fixed`, `warn`, `FAIL`), then `ok` or `N pr
 - protocol: every connected session announced the manager's protocol
 - stale agent records: an agent says running but its session is gone
 - orphan pids: a task still running with no manager to own it
+- session retention: `goneSessionRetention` in `config.json` is a valid duration
 - sessions dir size (warn above 100 MiB; events.jsonl has no rotation yet)
 
 ---
@@ -271,16 +272,26 @@ After a crash, the next daemon re-adopts tasks whose pid is alive (output contin
 | `0` | Success, including `wait` budget expiry, `stop` on a finished task, `shutdown` with no daemon, and a reader closing the pipe |
 | `1` | Error (`pbs-manager: …` on stderr), `status` with no daemon, a `doctor` check failed |
 
+## Retention of gone sessions
+
+A session is *gone* once its pi process disconnects. Gone sessions leave `ls` and `sessions` immediately. Their directory `sessions/<sid>/` (task records and output, agent records and transcripts, `events.jsonl`) is kept for `goneSessionRetention` after its last write, then the daemon deletes it and forgets its tasks. The daemon sweeps at startup and every `min(retention, 1h)` (at least every second). A session that is connected, or still owns a running task or a live process group, is never swept.
+
+```json
+{ "goneSessionRetention": "24h" }
+```
+
+in `<home>/config.json`; any duration (`30m`, `7d`, `0s` = at the next sweep). Default `24h`. An invalid value makes `doctor` fail and the daemon use the default.
+
 ## Typical workflows
 
 ```bash
 # What is running, where, and why did the last thing stop?
 pbs-manager ls
-pbs-manager ls -a --since 10m
+pbs-manager ls --since 10m
 pbs-manager show e1351cb1
 
 # What did a subagent do?
-pbs-manager ls -a | grep agent
+pbs-manager ls | grep agent
 pbs-manager show ch_7d0e22a1
 pbs-manager agent ch_7d0e22a1
 

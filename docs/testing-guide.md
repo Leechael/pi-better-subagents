@@ -89,8 +89,8 @@ pbs-manager events -f
 | # | Do | Expect |
 |---|---|---|
 | 6.1 | `pbs-manager status` · `pbs-manager doctor` | Version/protocol/uptime; doctor all OK, exit 0 |
-| 6.2 | `pbs-manager sessions` / `sessions -a` | Your pi session with PID and CWD; `-a` also shows gone sessions |
-| 6.3 | `pbs-manager ls` / `ls -a` | KIND (shell/monitor/agent), SESSION prefix, CWD, STATUS, DUR, EXIT, REASON |
+| 6.2 | `pbs-manager sessions` | Only connected pi sessions, with PID and CWD (never blank) |
+| 6.3 | `pbs-manager ls` | Running and finished work of connected sessions: KIND (shell/monitor/agent), SESSION prefix, CWD, STATUS, DUR, EXIT, REASON. No `-a` |
 | 6.4 | `pbs-manager show <id>` for a shell, a monitor, a `ch_…`, a `run_…` (fuzzy ids ok) | Everything about it; for an agent: model, error, reason, tool calls, result tail |
 | 6.5 | `pbs-manager agent ch_… -f` while a child runs | Live transcript; `--full` also shows the preamble |
 | 6.6 | `pbs-manager events -f` while running F1 | `task.start`, `task.background`, `task.exit`, `wake.emit`, `wake.deliver mode=…` |
@@ -102,8 +102,9 @@ pbs-manager events -f
 | # | Do | Expect |
 |---|---|---|
 | 7.1 | Start a background `sleep 300`, quit pi | Within ~7 s `pbs-manager status` says not running (exit 1) and the sleep is gone (`pgrep -f 'sleep 300'` empty) |
-| 7.2 | Two pi sessions at once, then quit one | Daemon stays; `sessions` shows one connected, one gone |
-| 7.3 | `kill -9` the daemon while a background task runs, then run any bash in pi | The extension reconnects/respawns; `ls -a` shows the task re-adopted or `orphaned` |
+| 7.2 | Two pi sessions at once, then quit one | Daemon stays; `sessions` and `ls` show only the remaining session at once; `show <id>` of the quit session's task still works |
+| 7.2b | Put `{"goneSessionRetention":"1m"}` in `~/.pi/agent/pbs-test/config.json`, restart the daemon (`pbs-manager shutdown` with no pi open), repeat 7.2 | About a minute after quitting, `sessions/<sid>/` of the quit session is deleted and `show <id>` says not found; `manager.log` has `gc: removed` |
+| 7.3 | `kill -9` the daemon while a background task runs, then run any bash in pi | The extension reconnects/respawns; `ls` shows the task re-adopted or `orphaned` |
 | 7.4 | Background a command that spawns `sleep 300 &` and exits; quit pi | The grandchild `sleep 300` is gone too |
 | 7.5 | Move the manager binary away, start pi | Warning lists the paths tried and says children lose bash; bash still runs locally; monitor/`task_*` report disabled (red); `/tasks` says the manager is unavailable |
 
