@@ -107,6 +107,11 @@ fn g3_manager_log_records_shutdown_reason() {
         "{}",
         out.stdout
     );
+    assert!(
+        !out.stdout.contains("leftover process group"),
+        "no leftover groups existed: {}",
+        out.stdout
+    );
     // The `log` subcommand must not have resurrected the manager.
     assert!(!home.sock().exists());
 }
@@ -214,6 +219,161 @@ fn g8_unreadable_output_is_an_error_not_empty() {
     }
     assert_eq!(r["ok"], false, "unreadable output reported as success: {r}");
     assert_eq!(r["error"]["code"], "E_INTERNAL");
+}
+
+/// Kills: daemon.rs respond / writer_task frame-size boundary (`>` vs `>=`).
+/// A response of exactly 4 MiB is legal (§3.3 "max frame 4 MiB") and must
+/// arrive intact, not be replaced by an error or dropped.
+#[test]
+fn g9_response_of_exactly_max_frame_is_delivered() {
+    let home = Home::new("g9");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_cli();
+    // Response size = fixed envelope + |id| + |task_id| (both echoed once).
+    let probe = c.request(json!({"type":"stop","task_id":"t"}));
+    assert_eq!(probe["error"]["code"], "E_NOT_FOUND");
+    let probe_len = serde_json::to_vec(&probe).unwrap().len();
+    let probe_id_len = probe["id"].as_str().unwrap().len();
+    let envelope = probe_len - probe_id_len - 1;
+    let task = "t".repeat(1 << 20);
+    let id = format!("g9-{}", "i".repeat(MAX_FRAME - envelope - task.len() - 3));
+    let req = json!({"v":1,"id":id,"type":"stop","task_id":task});
+    assert!(serde_json::to_vec(&req).unwrap().len() <= MAX_FRAME);
+    c.send(&req);
+    let r = c.wait_id(&id, S(10)).expect("exactly-4MiB response was dropped");
+    assert_eq!(serde_json::to_vec(&r).unwrap().len(), MAX_FRAME, "test arithmetic");
+    assert_eq!(r["error"]["code"], "E_NOT_FOUND", "4 MiB response was replaced");
+}
+
+/// CPU time used by `pid` so far, in milliseconds (`ps -o time=`).
+fn cpu_ms(pid: u32) -> u64 {
+    let o = std::process::Command::new("ps")
+        .args(["-o", "time=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    // [[dd-]hh:]mm:ss[.cc]
+    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    let (rest, frac) = s.split_once('.').unwrap_or((s.as_str(), "0"));
+    let secs = rest
+        .split(':')
+        .fold(0u64, |acc, p| acc * 60 + p.trim_start_matches('-').parse::<u64>().unwrap_or(0));
+    let frac_ms = format!("{frac:0<3}")[..3].parse::<u64>().unwrap_or(0);
+    secs * 1000 + frac_ms
+}
+
+/// Kills: daemon.rs spawn_output_fanout EOF handling (a busy loop after the
+/// tee channel closes). A daemon whose tasks have all finished must be idle.
+#[test]
+fn g10_daemon_is_idle_after_watched_tasks_finish() {
+    let home = Home::new("g10");
+    let d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    for _ in 0..3 {
+        let (id, _) = c.start("sleep 0.2; echo done");
+        c.request_ok(json!({"type":"watch","task_id":id}));
+        c.wait_terminal(&id, S(5)).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let before = cpu_ms(d.id());
+    std::thread::sleep(Duration::from_millis(1500));
+    let used = cpu_ms(d.id()) - before;
+    assert!(used < 300, "idle daemon used {used}ms CPU in 1.5s");
+}
+
+/// Kills: daemon.rs spawn_group_watcher. A leftover process group stops
+/// being tracked once it empties, so shutdown only reports (and signals)
+/// groups that still have members; a pgid that died is never signalled.
+#[test]
+fn g11_shutdown_counts_only_live_leftover_groups() {
+    let home = Home::new("g11");
+    let mut d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (gone, _) = c.start("sleep 0.3 >/dev/null 2>&1 &");
+    let (live, _) = c.start("sleep 300 >/dev/null 2>&1 & echo $!");
+    c.wait_terminal(&gone, S(3)).unwrap();
+    c.wait_terminal(&live, S(3)).unwrap();
+    let gc = wait_for_pids(&mut c, &live, 1)[0];
+    std::thread::sleep(Duration::from_millis(1500)); // first group has emptied
+    drop(c);
+    assert!(home.cli(&["shutdown"], S(10)).status.success());
+    assert!(wait_child(&mut d, S(10)).is_some());
+    assert!(poll_true(S(2), || !pid_running(gc)), "live leftover survived");
+    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap();
+    assert!(
+        log.contains("killed 1 leftover process group(s) of finished tasks"),
+        "{log}"
+    );
+    assert!(!log.contains("killed 0 task(s)"), "no task was running: {log}");
+}
+
+/// Kills: lifecycle.rs clean_if_no_daemon (doctor). With no daemon, doctor
+/// removes stale socket/pid files; with a live daemon (whatever manager.pid
+/// says) it touches nothing and reports the socket healthy.
+#[test]
+fn g13_doctor_cleans_only_without_a_daemon() {
+    let home = Home::new("g13");
+    // Nothing at all: healthy, nothing to do.
+    let out = home.cli(&["doctor"], S(5));
+    assert!(out.stdout.contains("no stale files"), "{}", out.stdout);
+    assert!(out.stdout.trim_end().ends_with("ok"), "{}", out.stdout);
+
+    drop(std::os::unix::net::UnixListener::bind(home.sock()).unwrap());
+    std::fs::write(home.pidfile(), br#"{"pid":1,"version":"0","started_at":0}"#).unwrap();
+    let out = home.cli(&["doctor"], S(5));
+    assert!(out.status.success());
+    assert!(out.stdout.contains("not running"), "{}", out.stdout);
+    assert!(out.stdout.lines().any(|l| l == "1 problem(s) found"), "{}", out.stdout);
+    assert!(!home.sock().exists() && !home.pidfile().exists(), "stale files kept");
+
+    let _d = home.start_daemon();
+    let pid = home.pidfile_pid().unwrap();
+    let out = home.cli(&["doctor"], S(5));
+    assert!(out.stdout.contains("hello ok"), "{}", out.stdout);
+    assert!(home.sock().exists() && home.pidfile_pid() == Some(pid), "doctor touched a live daemon");
+    assert!(out.stdout.trim_end().ends_with("ok"), "{}", out.stdout);
+
+    // Lock held but the socket is gone: a problem, and nothing is cleaned.
+    std::fs::remove_file(home.sock()).unwrap();
+    let out = home.cli(&["doctor"], S(5));
+    assert!(out.stdout.contains("NOT responding"), "{}", out.stdout);
+    assert!(out.stdout.lines().any(|l| l == "1 problem(s) found"), "{}", out.stdout);
+    assert!(home.pidfile_pid() == Some(pid), "doctor cleaned under a live daemon");
+
+    // The lock itself cannot be checked: reported as a problem.
+    if unsafe { libc::geteuid() } != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        let home2 = Home::new("g13b");
+        let lock = home2.path.join("manager.lock");
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let out = home2.cli(&["doctor"], S(5));
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(out.stdout.contains("daemon lock check failed"), "{}", out.stdout);
+        assert!(out.stdout.lines().any(|l| l == "1 problem(s) found"), "{}", out.stdout);
+    }
+}
+
+/// Kills: daemon.rs handle_output lookahead. Tiny max_bytes over 4-byte
+/// characters still makes progress and never corrupts them.
+#[test]
+fn g12_tiny_max_bytes_over_wide_chars() {
+    let home = Home::new("g12");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, _) = c.start("printf 'a\\360\\237\\230\\200\\344\\270\\255b'"); // a😀中b
+    c.wait_terminal(&id, S(3)).unwrap();
+    for max in 1..=5u64 {
+        let (text, cursor, _) = c.read_all_output(&id, max);
+        assert_eq!(text, "a😀中b", "max_bytes={max}");
+        assert_eq!(cursor, 9);
+    }
+    // One read with max_bytes 1 at the emoji returns the whole emoji.
+    let r = c.request_ok(json!({"type":"output","task_id":id,"cursor":1,"max_bytes":1}));
+    assert_eq!((r["chunk"].as_str(), r["next_cursor"].as_u64()), (Some("😀"), Some(5)));
 }
 
 /// Kills: daemon.rs spawn_adopted_poller output catch-up. Output written

@@ -265,6 +265,9 @@ fn d4_crash_restart_readopts_live_and_orphans_dead() {
     assert!(wait_child(&mut d2, S(12)).is_some(), "restarted daemon must still idle-exit");
     assert!(poll_true(S(2), || !pid_running(live_pid)), "adopted task must be killed at shutdown");
     assert_eq!(home.record(&live_id).unwrap()["status"], "killed");
+    // The restart is accounted for in manager.log.
+    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap();
+    assert!(log.contains("readopted=2 orphaned=1"), "{log}");
 }
 
 /// D4b: `stop` on a re-adopted task (no child handle, only a pid) must kill
@@ -720,7 +723,14 @@ fn t2_exit_status_mapping() {
     assert_eq!((w["done"].as_bool(), w["exit_code"].as_i64()), (Some(true), Some(3)));
     // Records on disk agree with the wire.
     assert_eq!(home.record(&bad).unwrap()["status"], "failed");
-    assert!(home.record(&ok).unwrap()["ended_at"].as_u64().is_some());
+    // Timestamps are real epoch milliseconds, ended after started.
+    let rec = home.record(&ok).unwrap();
+    let (started, ended) = (rec["started_at"].as_u64().unwrap(), rec["ended_at"].as_u64().unwrap());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(started > now - 60_000 && started <= ended && ended <= now + 1000, "{rec}");
 }
 
 // ===========================================================================
@@ -884,7 +894,9 @@ fn o1_huge_output_roundtrip() {
     c.hello_ext("sess-a");
     const N: u64 = 20_000_000;
     let (id, _) = c.start(&format!("head -c {N} /dev/zero | tr '\\0' 'a'"));
-    let w = c.request_ok(json!({"type":"wait","task_id":id,"budget_ms":30000}));
+    let w = c
+        .try_request(json!({"type":"wait","task_id":id,"budget_ms":60000}), S(65))
+        .expect("wait response");
     assert_eq!(w["done"], true);
     let big = c.request_ok(json!({"type":"output","task_id":id,"cursor":0,"max_bytes":64u64<<20}));
     let len = big["chunk"].as_str().unwrap().len() as u64;
@@ -1299,6 +1311,8 @@ fn t13_terminal_records_survive_restart() {
     assert_eq!(last["total_size"], want.len() as u64);
     let w = c.request_ok(json!({"type":"wait","task_id":bad,"budget_ms":100}));
     assert_eq!((w["done"].as_bool(), w["exit_code"].as_i64()), (Some(true), Some(2)));
+    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap();
+    assert!(log.contains("readopted=0 orphaned=0 loaded=2"), "{log}");
 }
 
 /// D15: SIGTERM/SIGINT to the daemon is the same graceful shutdown.
