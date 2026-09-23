@@ -10,7 +10,7 @@ mod common;
 
 use common::*;
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn s(secs: u64) -> Duration {
     Duration::from_secs(secs)
@@ -273,6 +273,31 @@ fn u6_failed_restore_cleans_up_like_a_crash() {
     let mut d = d;
     assert!(wait_child(&mut d, s(5)).is_some(), "daemon exited");
     assert!(poll_true(s(5), || members.iter().all(|p| !pid_running(*p))), "left alive: {:?}", group(pid));
+}
+
+/// Replacing the binary file is enough: the daemon notices and upgrades.
+#[test]
+fn u7_replacing_the_binary_upgrades_by_itself() {
+    let home = Home::new("u7");
+    let bin = home.install_copy();
+    let _d = home.start_daemon_from(&bin, &[]);
+    let mut c = home.connect();
+    hello(&mut c, "sess-u7");
+    let (_t, pid) = start(&mut c, "shell", "sleep 300", json!({}));
+    let before = status(&home);
+    replace_binary(&bin, std::path::Path::new(BIN));
+    let deadline = Instant::now() + s(15);
+    let after = loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let st = status(&home);
+        if st["generation"] == 1 {
+            break st;
+        }
+        assert!(Instant::now() < deadline, "no automatic upgrade: {st}");
+    };
+    assert_eq!(after["pid"], before["pid"]);
+    assert_eq!(after["last_upgrade"]["trigger"], "binary-changed");
+    assert!(pid_alive(pid));
 }
 
 /// A stop's kill grace pending across the upgrade still ends in SIGKILL for
