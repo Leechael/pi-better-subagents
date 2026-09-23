@@ -563,6 +563,28 @@ fn t07_watch_streams_output_events() {
     );
 }
 
+/// A monitor streams to the connection that started it from spawn on. With a
+/// separate `watch` round trip, a fast command (`echo noop`) printed and
+/// exited before the watch landed: its lines were lost and the extension
+/// never saw the monitor end (manual testing, 2026-09-24).
+#[test]
+fn t07b_monitor_streams_from_spawn_without_watch() {
+    let d = Daemon::start("monitor-autowatch");
+    let mut c = d.connect();
+    hello_ext(&mut c, "sess-mon");
+
+    let req = start_req("r7b-start", "echo early-line", true).replace(r#""kind":"shell""#, r#""kind":"monitor""#);
+    let resp = c.request(&req, "r7b-start");
+    let task_id = extract_str(&resp, "task_id").expect("task_id").to_string();
+
+    let ev = c
+        .read_until_event("output", EVENT_TIMEOUT)
+        .expect("output event without a watch request");
+    assert!(ev.contains(&task_id) && ev.contains("early-line"), "first line reaches the starter: {ev}");
+    let exit = c.read_until_event("task_exited", EVENT_TIMEOUT).expect("task_exited");
+    assert!(exit.contains(&task_id), "exit event: {exit}");
+}
+
 /// §3.4 state machine: running --stop--> killed (terminal).
 /// NOTE: whether the stop response is acked before/after the state flips is
 /// unspecified — we poll list until the terminal state is observable.

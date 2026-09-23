@@ -789,10 +789,13 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
                 "pid": pid,
             }),
         );
-        st.registry.tasks.insert(
-            task_id.clone(),
-            TaskEntry::new_running(record, child, output, chunks, timeout_ms),
-        );
+        let mut entry = TaskEntry::new_running(record, child, output, chunks, timeout_ms);
+        // A monitor exists to stream: its starter watches from spawn on, so a
+        // command that prints and exits at once loses nothing to a late watch.
+        if kind == TaskKind::Monitor {
+            entry.watchers.insert(conn_id);
+        }
+        st.registry.tasks.insert(task_id.clone(), entry);
     }
     spawn_output_fanout(state, &task_id);
     spawn_exit_watch(state, &task_id, pid);
