@@ -136,8 +136,9 @@ fn spawn_daemon(home: &Path) -> Result<(), String> {
 }
 
 /// §3.1 client startup flow: connect; on failure take the spawn lock and
-/// spawn (or wait for the in-progress spawn); on zombie socket, clean and
-/// retry once.
+/// spawn (or wait for the in-progress spawn), then retry once. A zombie
+/// socket is handled the same way: the spawned daemon, holding manager.lock,
+/// removes it.
 pub async fn connect(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
     let mut last_err = String::new();
     for attempt in 0..2 {
@@ -148,16 +149,9 @@ pub async fn connect(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
         if attempt > 0 {
             break;
         }
-        // Step 5: zombie socket — if the recorded pid is dead, clean up.
-        match lifecycle::read_pid_file(home) {
-            Some(pf) if !task::pid_alive(pf.pid) => {
-                let _ = lifecycle::cleanup_stale_files(home);
-            }
-            None => {
-                let _ = std::fs::remove_file(lifecycle::socket_path(home));
-            }
-            _ => {}
-        }
+        // Clients never delete socket/pid files: only the daemon holding
+        // manager.lock may (§3.1). A client cleaning up here could unlink the
+        // socket of a daemon another client just spawned.
         // Steps 2–4: spawn lock; winner spawns, losers wait for the socket.
         match lifecycle::try_acquire_spawn_lock(home) {
             Ok(Some(guard)) => {

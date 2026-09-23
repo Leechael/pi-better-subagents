@@ -40,7 +40,8 @@ fn wait_output_contains(c: &mut Conn, task_id: &str, needle: &str) {
 // ===========================================================================
 
 /// D1: N clients race to auto-spawn the daemon on an empty home. Invariant:
-/// every client succeeds and they all talk to the same daemon.
+/// every client succeeds, they all talk to the same daemon, and exactly one
+/// daemon process exists afterwards.
 #[test]
 fn d1_concurrent_clients_spawn_exactly_one_daemon() {
     let home = Home::new("d1");
@@ -75,9 +76,22 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
             pids.insert(pid);
         }
         assert_eq!(pids.len(), 1, "round {round}: clients reached different daemons: {pids:?}");
-        // Not asserted: "exactly one daemon *process*". Under heavy load an
-        // extra unreachable daemon was once observed (root cause = bug d3,
-        // whose reproducer fails reliably); asserting it here would flake.
+        let live = daemon_pids_for(&home.path);
+        if live.len() != 1 {
+            let ps = std::process::Command::new("ps").args(["-axww", "-o", "pid=,stat=,command="]).output().unwrap();
+            let home_s = home.path.to_string_lossy().to_string();
+            let lines: Vec<String> = String::from_utf8_lossy(&ps.stdout)
+                .lines()
+                .filter(|l| l.contains(&home_s))
+                .map(|l| l.to_string())
+                .collect();
+            let pf = home.pidfile_pid();
+            panic!(
+                "round {round}: expected one daemon process, found {live:?}; served by {pids:?}; \
+                 pidfile={pf:?} running={:?}; ps lines for home: {lines:#?}",
+                pf.map(pid_running)
+            );
+        }
         // Tear down so the next round races a cold start again.
         let out = home.cli(&["shutdown"], S(10));
         assert!(out.status.success());
@@ -92,7 +106,7 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
 struct Burners(Vec<std::process::Child>);
 impl Burners {
     fn start() -> Burners {
-        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) * 2;
+        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         Burners(
             (0..n)
                 .map(|_| {
@@ -115,11 +129,11 @@ impl Drop for Burners {
 }
 
 /// D2: the same race, but starting from stale socket/pid files left by a
-/// SIGKILLed daemon. Every racing client runs the zombie-cleanup step, so a
-/// slow cleaner can unlink the socket of the daemon a faster client just
-/// spawned. Invariant: still exactly one reachable daemon.
+/// SIGKILLed daemon. Regression guard: clients used to delete "zombie" files
+/// themselves, and a slow one could unlink the socket of the daemon a faster
+/// client had just spawned. Invariant: every client succeeds, and exactly one
+/// reachable daemon remains.
 #[test]
-#[ignore = "bug (intermittent race; reproduces within 30 rounds under CPU pressure): client zombie-cleanup races a just-spawned daemon; read_pid_file sees the old dead pid, then cleanup_stale_files unlinks the NEW socket + pid file, every client fails with cannot reach pbs-manager and an unreachable daemon lingers"]
 fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
     let home = Home::new("d2");
     // Scheduler pressure widens the microsecond race window the way a busy
