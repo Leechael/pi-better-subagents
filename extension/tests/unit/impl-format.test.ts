@@ -132,14 +132,11 @@ describe("formatTaskNotification", () => {
 });
 
 describe("formatBackgroundNotice", () => {
-  it("contains task id, output path and the no-poll instruction", () => {
+  it("keeps background notices to one concise task row", () => {
     const text = formatBackgroundNotice("sh_a1b2c3d4", "npm run build", "/tmp/out.log");
-    expect(text).toContain("task_id: sh_a1b2c3d4");
-    expect(text).toContain("Output: /tmp/out.log");
-    expect(text).toContain("even if other commands are still running");
-    expect(text).toContain("Do not poll or sleep");
-    expect(text).toContain('<pbs-wake kind="task">');
-    expect(text).toContain('"npm run build"');
+    expect(text).toBe("⏵ sh_a1b2c3d4 running in background · /tasks");
+    expect(text).not.toContain("/tmp/out.log");
+    expect(text).not.toContain("Do not poll");
   });
 });
 

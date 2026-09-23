@@ -272,10 +272,9 @@ execute:
   run_in_background → 立即返回后台通知
   否则 wait(foregroundBudgetMs, 默认 20000, config 可配):
     done → output 全量读 → 尾部截断(2000 行 / 50KB,同内置) → {content, details:{truncation, fullOutputPath}}
-    超时 → 返回后台通知:
-      "Command moved to background (task_id: sh_x). Output: <path>.
-       You will be notified when it completes. Do not poll or sleep."
-      details: {backgrounded:true, task_id, fullOutputPath}
+    超时 → 返回一行后台状态: `⏵ sh_x running in background · /tasks`
+      (no instructions or duplicate output path in transcript)
+      details: {backgrounded:true, task_id, fullOutputPath}; no-poll/end-turn guidance stays model-facing in tool guidelines
 ```
 
 - `details` 保持 `BashToolDetails` 兼容(truncation/fullOutputPath),扩展字段加在 details 上
@@ -485,7 +484,7 @@ M1 后手动: `pi -e ./extension` 跑长命令验证自动后台 + 通知 + `pbs
 - `truncateTail` 的 maxBytes 是**硬上限**: 若保留的最后一行单独超限,对该行做 UTF-8 字符边界安全的字节截尾,结果永远 ≤ maxBytes;不产生 U+FFFD 溢出
 - `truncateTail` 的 `totalLines`: 原始文本行数;空串 = 0 行。截断发生时,输出首行为标记行 `… (truncated: showing last K of N lines)`
 - `formatTaskNotification`: 见 §4.5。多事件合并为一个 `<pbs-wake kind="task">`;command/preview 必须 XML 转义(`& < >`);`exitCode:null` 省略 `exit-code` 属性
-- `formatBackgroundNotice` 文案包含 command 摘要(前 80 字符)
+- `formatBackgroundNotice` 是一行任务状态 (`⏵ sh_x running in background · /tasks`); no-poll/end-turn 指引仅进入 model-facing tool guidelines
 - **spawn daemon 必须显式传 `--home <resolvedHome>`**(`pbs-manager --home X daemon`),不得依赖 PBS_HOME 环境继承——调用方的 home 可能来自显式覆盖而非环境变量(2026-09-17 端到端联调发现的实际 bug)
 - CLI `status` 输出汇总计数(version/pid/uptime/sessions 数/tasks 数);session 明细用 `sessions` 子命令
 - monitor 的 `timeout_ms` 由**扩展侧**强制执行(传 manager `timeout_ms:null`):若由 manager 硬杀,超时通知会退化为普通 task_exited,无法产出 "[Monitor timed out — re-arm if needed.]" 文案;扩展死亡时由 manager 连接归零清算兜底

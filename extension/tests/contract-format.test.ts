@@ -186,17 +186,11 @@ describe("formatTaskNotification (contract: Appendix A + §4.5 XML template)", (
 });
 
 describe("formatBackgroundNotice (contract: Appendix A + §4.2 template)", () => {
-  it("carries task id, output path, and the no-polling guidance", () => {
+  it("returns the concise user-facing task row", () => {
     const msg = formatBackgroundNotice("sh_a1b2c3d4", "npm run build", "/tmp/x.output");
-    // §4.2: "Command moved to background (task_id: sh_x). Output: <path>.
-    //        You will be notified when it completes. Do not poll or sleep."
-    expect(msg).toContain("sh_a1b2c3d4");
-    expect(msg).toContain("/tmp/x.output");
-    expect(msg).toMatch(/background/i);
-    expect(msg).toMatch(/notified/i);
-    expect(msg).toMatch(/do not poll/i);
-    // AMBIGUITY(design): whether the command text itself is interpolated is
-    // unspecified (the §4.2 template omits it despite the parameter existing).
+    expect(msg).toBe("⏵ sh_a1b2c3d4 running in background · /tasks");
+    expect(msg).not.toContain("/tmp/x.output");
+    expect(msg).not.toMatch(/do not poll/i);
   });
 });
 

@@ -138,13 +138,10 @@ export function formatTaskNotification(
 /** Tool-result text returned when a foreground command is moved to the background (§4.2). */
 export function formatBackgroundNotice(
   taskId: string,
-  command: string,
-  outputPath: string,
+  _command: string,
+  _outputPath: string,
 ): string {
-  return [
-    `Command "${displayCommand(command)}" moved to background (task_id: ${taskId}). Output: ${outputPath}.`,
-    "You will be notified when it completes, even if other commands are still running. Do not poll or sleep — end your turn and continue from the <pbs-wake kind=\"task\"> when it arrives.",
-  ].join("\n");
+  return `⏵ ${taskId} running in background · /tasks`;
 }
 
 /** Injected payload for a batch of monitor output lines (§4.4 / §4.5). */
