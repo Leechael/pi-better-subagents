@@ -934,3 +934,17 @@ fn g2_doctor_flags_a_bad_retention() {
     let out = home.cli(&["doctor"], S(10));
     assert!(out.stdout.contains("gone sessions kept 2h"), "{}", out.stdout);
 }
+
+/// Between a daemon crash and the next daemon start, the disk still says
+/// "running". Every task dies with its manager (lifeline), so a CLI that finds
+/// no daemon must not report it as running (found in acceptance of PR #2).
+#[test]
+fn g3_no_daemon_means_nothing_is_running() {
+    let home = Home::new("g3");
+    record_fixture(&home, "sess-g3", "sh_0000d301", now_ms() - 5_000,
+        json!({"status":"running","exit_code":null,"ended_at":null,"end_reason":null}));
+    let out = cli_ok(&home, &["show", "sh_0000d301"]);
+    assert!(!out.stdout.contains("running"), "{}", out.stdout);
+    assert!(out.stdout.contains("orphaned") && out.stdout.contains("manager-crash"), "{}", out.stdout);
+    assert!(!home.sock().exists(), "show must not start the daemon");
+}

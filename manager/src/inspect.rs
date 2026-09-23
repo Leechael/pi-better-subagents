@@ -169,7 +169,16 @@ pub async fn snapshot(home: &Path, live: Live) -> Result<Snapshot, String> {
                 .await?;
             (Some(st), list.tasks)
         }
-        None => (None, registry::load_all_records(home)),
+        // No daemon: every task died with it (lifeline, §3.2), so a record
+        // still saying "running" is what the next daemon start marks orphaned.
+        None => {
+            let mut tasks = registry::load_all_records(home);
+            for t in tasks.iter_mut().filter(|t| t.status == TaskStatus::Running) {
+                t.status = TaskStatus::Orphaned;
+                t.end_reason = Some(crate::proto::end_reason::MANAGER_CRASH.to_string());
+            }
+            (None, tasks)
+        }
     };
     // A gone session's tasks may have left the daemon's memory while their
     // records are still retained on disk (§3.2): `show` must still find them.
