@@ -105,35 +105,40 @@ Timeouts are staggered so they do not fire together:
 
 ## Manager CLI
 
-Operations manual (install, every subcommand, fuzzy ids, workflows): **[docs/cli.md](docs/cli.md)**.
+Operations manual (every subcommand, fuzzy ids, output formats): **[docs/cli.md](docs/cli.md)**. Everything the TUI shows can also be answered from the CLI:
 
-```bash
-pbs-manager status|sessions|list|ls|doctor|shutdown
-pbs-manager start '<cmd>' | wait <id> | stop <id> | kill-session <sid>
-pbs-manager log|tail|output …          # see docs/cli.md
-```
+| Question | Command |
+|---|---|
+| Is the daemon healthy? | `pbs-manager doctor` (non-zero exit on any failure), `pbs-manager status` |
+| What is each pi session doing, and where? | `pbs-manager sessions [-a]` (PID, state, CWD, running/tasks/agents) |
+| What is running / just finished? | `pbs-manager ls [-a] [--session P] [--cwd DIR] [--since 10m] [--json]` (KIND, CWD, STATUS, DUR, EXIT, REASON) |
+| Why did this end? What did it print? | `pbs-manager show <id>` (shell, monitor, `ch_…` agent or `run_…`) |
+| What did this subagent do? | `pbs-manager agent <ch_id> [-f] [--full]` (live transcript) |
+| Why didn't a notification arrive? | `pbs-manager events [-f] [--id X]` (task lifecycle + wake emit/deliver/dedupe/drop) |
+| Follow output | `pbs-manager tail <id>`, `pbs-manager log -f <id> [--stderr]` |
 
-`list` / `ls` show running tasks by default; `-a` / `--all` includes exited. State directory: `~/.pi/agent/pbs/` (`PBS_HOME` / `--home`).
+Ids are fuzzy (unique prefix/suffix/near-miss). State directory: `~/.pi/agent/pbs/` (`PBS_HOME` / `--home`).
 
 ## TUI (interactive mode)
 
-Counts sit on one line under the editor. Inspection is `/tasks` (alias `/bashes`), which opens a scrollable full-screen view.
-
 | Surface | Behavior |
 |---------|----------|
-| Fleet line (below editor) | `2 workers · 1 subagent · 1 monitor` — counts only, no total, no poll |
-| `/tasks` | Live list of shells, monitors, and subagents. Filter by typing; ↑↓ select, Tab switches active/recent vs all, PgUp/PgDn page, Enter view, `s` stop (with confirmation), Esc close |
-| Finished items | Stay viewable for 10 minutes (cap 50). Sync-waited shells are not workers |
-| Shell / monitor details | Output, stderr, and info panes; `1`/`2`/`3` select and Tab cycles. `f` toggles follow; wheel / arrows / PgUp / PgDn scroll |
-| Subagent details | Conversation, result, and info panes; prompts and preambles are labelled separately |
-| Transcript pills | Compact, labelled renderers for task / subagent / **monitor** / supervisor notifications. Ctrl+O expands details without exposing the XML envelope |
-| Monitor events | Injected as `Monitor event: "desc"` + `<event>` body (model turn / steer); lifecycle (exit / timeout / rate-limit) also fires a TUI toast |
-| Monitor tool row | `Monitor started · task <id> · timeout 300s` |
+| Fleet line (below editor) | One row: `● 2 shells · 1 monitor · alpha 12s · ✗ 1 failed   /tasks`. Running subagents by name; recent failures stay listed for 10 min |
+| `/tasks` (alias `/bashes`) | Live list of shells, monitors and subagents (grouped by run). Type to filter; ↑↓ / PgUp / PgDn / Home / End move; Tab switches active+recent vs all; Enter opens details; `ctrl+x` stops (inline confirm); Esc closes |
+| Finished items | Stay listed for 10 minutes (cap 50). Commands that finished inside the foreground budget are not background work and are not listed |
+| Shell / monitor details | `1` output · `2` stderr · `3` info (status, exit, end reason, times, paths). Tab cycles, `f` toggles follow, arrows / PgUp / PgDn / wheel scroll, Esc back |
+| Subagent details | Conversation (agent preamble hidden), result, info |
+| `/reply <child> <text>` | Answer a subagent's decision request without going through the model |
+| Transcript rows | A backgrounded bash call is one row that updates when the command finishes |
+| Notification pills | One line per wake (✓ done, ✗ failed, › monitor event, ? decision request). Ctrl+O expands labelled fields; the XML envelope is model-facing only |
 
 Print mode (`pi -p`) skips widgets; notifications still inject as before.
 
 ```bash
-cd manager && cargo test                             # Rust: 31 unit + 13 protocol (1 RSS test ignored)
-cd extension && npx tsc --noEmit && npx vitest run   # TS: 289 passed, 9 skipped
-PBS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts  # TS↔real daemon e2e (9)
+cd manager && cargo test                        # Rust: unit + adversarial + protocol + observability
+cd manager && cargo test --features test-clock  # same suites on a manual clock (fast)
+cd extension && npx tsc --noEmit && npx vitest run
+PBS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts  # TS ↔ real daemon
 ```
+
+Manual acceptance checklist: [docs/testing-guide.md](docs/testing-guide.md).
