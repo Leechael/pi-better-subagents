@@ -72,7 +72,7 @@ export default function (pi: ExtensionAPI): void {
   let fleetWidget: FleetWidget | null = null;
   let agentLoader: AgentLoader | null = null;
   /** task_id -> metadata, for notifications and the original manager task start time. */
-  const taskMeta = new Map<string, { kind: string; command: string; startedAt?: number }>();
+  const taskMeta = new Map<string, { kind: string; command: string; cwd?: string; startedAt?: number }>();
   /**
    * task_ids whose task_exited should wake the parent via <pbs-wake kind="task">.
    * Parent bash only adds ids when it actually backgrounded the command.
@@ -83,7 +83,7 @@ export default function (pi: ExtensionAPI): void {
   const exitGate = new ExitNotifyGate<ManagerEvent>({ clock });
   const workIndex = new WorkIndex({ clock });
 
-  const trackTask = (taskId: string, meta: { kind: string; command: string }) => {
+  const trackTask = (taskId: string, meta: { kind: string; command: string; cwd?: string }) => {
     taskMeta.set(taskId, { ...meta, startedAt: taskMeta.get(taskId)?.startedAt });
   };
   const upsertBackgroundTask = (taskId: string, startedAt: number) => {
@@ -93,6 +93,8 @@ export default function (pi: ExtensionAPI): void {
       kind: "shell",
       status: "running",
       title: meta?.command?.replace(/\s+/g, " ").trim() || taskId,
+      command: meta?.command,
+      cwd: meta?.cwd,
       startedAt,
       countsAsWorker: true,
     });
@@ -190,6 +192,8 @@ export default function (pi: ExtensionAPI): void {
     getRegistry: () => subagentRegistry,
     getIndex: () => workIndex,
     getClient: () => client,
+    home,
+    sessionId: () => ctx?.sessionManager.getSessionId() ?? "",
     clock,
   });
   monitorRegistry.onChange(() => {
@@ -200,6 +204,8 @@ export default function (pi: ExtensionAPI): void {
         kind: "monitor",
         status: "running",
         title: mon.description,
+        command: taskMeta.get(mon.taskId)?.command,
+        cwd: taskMeta.get(mon.taskId)?.cwd,
         startedAt: existing?.startedAt ?? mon.startedAt,
         outputPath: existing?.outputPath,
         stderrPath: existing?.stderrPath,
@@ -305,6 +311,8 @@ export default function (pi: ExtensionAPI): void {
             kind: "monitor",
             status: "running",
             title: event.command || event.task_id,
+            command: event.command,
+            cwd: taskMeta.get(event.task_id)?.cwd,
             startedAt: clock.now(),
             countsAsWorker: false,
           });
@@ -446,6 +454,7 @@ export default function (pi: ExtensionAPI): void {
           name: c.name,
           agent: c.agent,
           ...(c.model !== undefined ? { model: c.model } : {}),
+          cwd: startCtx.cwd,
           ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
           ...(c.result?.text ? { text: c.result.text } : {}),
           ...(c.result?.error ? { error: c.result.error } : {}),

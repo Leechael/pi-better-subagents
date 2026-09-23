@@ -7,6 +7,7 @@
 import { DynamicBorder, keyHint, rawKeyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { realClock, type Clock } from "../clock";
 import type { ManagerClient, TaskRecord } from "../manager-client";
+import { taskOutputPath } from "../config";
 import { formatConversation } from "../subagent/conversation";
 import type { SubagentRegistry } from "../subagent/registry";
 import { formatAge, type WorkIndex, type WorkItem } from "../work-index";
@@ -53,6 +54,8 @@ export interface TasksCommandDeps {
   getRegistry: () => SubagentRegistry | null;
   getIndex: () => WorkIndex | null;
   getClient: () => ManagerClient | null;
+  home?: string;
+  sessionId?: () => string;
   clock?: Clock;
 }
 
@@ -106,6 +109,8 @@ function itemFromTask(task: TaskRecord): WorkItem {
     kind: task.kind === "monitor" ? "monitor" : "shell",
     status: task.status,
     title: task.command.replace(/\s+/g, " ").trim() || task.task_id,
+    command: task.command,
+    cwd: task.cwd,
     startedAt: task.started_at,
     ...(task.ended_at !== null ? { endedAt: task.ended_at } : {}),
     exitCode: task.exit_code,
@@ -399,8 +404,24 @@ async function stopItem(item: WorkItem, deps: TasksCommandDeps): Promise<void> {
 }
 
 export function taskDetailHeader(item: WorkItem, now: number): string {
-  const lines = [`${item.kind} · ${item.status} · ${formatAge(item.startedAt, item.endedAt, now)}`];
+  const outcome = item.exitCode !== undefined && item.exitCode !== null
+    ? `exit ${item.exitCode}`
+    : item.signal ?? item.endReason ?? item.status;
+  return `${item.id} · ${item.kind} · ${outcome} · ${formatAge(item.startedAt, item.endedAt, now)} · ${item.cwd ?? "cwd unavailable"}\n$ ${item.command ?? item.title}`;
+}
+
+export function resolveTaskOutputPath(item: WorkItem, home: string | undefined, sessionId: string | undefined): string {
+  return item.outputPath || (home && sessionId ? taskOutputPath(home, sessionId, item.id) : "");
+}
+
+export function taskDetailInfo(item: WorkItem, now: number): string {
+  const lines = [taskDetailHeader(item, now)];
   if (item.outputPath) lines.push(`Output: ${item.outputPath}`);
+  if (item.stderrPath) lines.push(`Stderr: ${item.stderrPath}`);
+  if (item.runId) lines.push(`Run: ${item.runId}`);
+  if (item.agent) lines.push(`Agent: ${item.agent}`);
+  if (item.model) lines.push(`Model: ${item.model}`);
+  if (item.prompt) lines.push(`Task prompt:\n${item.prompt}`);
   if (item.error) lines.push(`Error: ${item.error}`);
   return lines.join("\n");
 }
@@ -409,33 +430,48 @@ async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksComman
   if (!ctx.hasUI) return;
   const clock = deps.clock ?? realClock;
   if (item.kind === "agent") {
-    const read = () => {
-      const conversation = deps.getRegistry()?.handle(item.id)?.conversation() ?? [];
-      const body = conversation.length > 0
-        ? formatConversation(conversation)
-        : item.text || (item.prompt ? `Task prompt:\n${item.prompt}` : "(no output)");
-      return `${taskDetailHeader(item, clock.now())}\n\n${body}`;
+    const handle = () => deps.getRegistry()?.handle(item.id);
+    const conversation = () => handle()?.conversation() ?? [];
+    const conversationText = () => {
+      const turns = conversation();
+      return turns.length > 0 ? formatConversation(turns) : item.prompt ? `Task prompt:\n${item.prompt}` : "(no conversation yet)";
     };
+    const resultText = () => {
+      const latest = [...conversation()].reverse().find((turn) => turn.role === "assistant")?.text;
+      return latest ?? item.text ?? "(no result yet)";
+    };
+    const infoText = () => taskDetailInfo(item, clock.now());
     try {
-      await showScrollDetail(ctx.ui, { title: `subagent ${item.title}`, content: read, pollMs: 500, clock: deps.clock });
+      await showScrollDetail(ctx.ui, {
+        title: `subagent ${item.title}`,
+        tabs: {
+          conversation: conversationText,
+          result: resultText,
+          info: infoText,
+        },
+        pollMs: 500,
+        clock: deps.clock,
+      });
     } catch {
-      notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), item.title, read());
+      notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), item.title, `${infoText()}\n\n${conversationText()}`);
     }
     return;
   }
-  const outputPath = item.outputPath ?? "";
+  const outputPath = resolveTaskOutputPath(item, deps.home, deps.sessionId?.());
   const stderrPath = item.stderrPath || stderrPathFor(outputPath);
+  const infoText = () => taskDetailInfo({ ...item, outputPath, stderrPath }, clock.now());
   try {
     await showScrollDetail(ctx.ui, {
       title: `${item.kind} ${item.title}`,
       tabs: {
         output: () => `${taskDetailHeader(item, clock.now())}\n\n${readTaskFileTailCached(outputPath)}`,
         stderr: () => `${taskDetailHeader(item, clock.now())}\n\n${readTaskFileTailCached(stderrPath)}`,
+        info: infoText,
       },
       pollMs: 500,
       clock: deps.clock,
     });
   } catch {
-    notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), item.title, readTaskFileTailCached(outputPath));
+    notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), item.title, `${infoText()}\n\n${readTaskFileTailCached(outputPath)}`);
   }
 }

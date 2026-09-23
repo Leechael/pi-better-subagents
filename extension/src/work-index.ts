@@ -16,6 +16,8 @@ export interface WorkItem {
   kind: WorkKind;
   status: string;
   title: string;
+  command?: string;
+  cwd?: string;
   startedAt: number;
   endedAt?: number;
   exitCode?: number | null;

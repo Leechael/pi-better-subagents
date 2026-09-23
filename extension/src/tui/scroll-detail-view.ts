@@ -10,12 +10,21 @@ import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { fitLines, loadPiTui, truncateToWidth } from "./pi-tui-load";
 import { realClock, type Clock, type ClockTimer } from "../clock";
 
-export type TaskLogTab = "output" | "stderr";
+export type TaskDetailTab = "output" | "stderr" | "info" | "conversation" | "result";
+
+const TAB_ORDER: TaskDetailTab[] = ["output", "stderr", "info", "conversation", "result"];
+const TAB_LABEL: Record<TaskDetailTab, string> = {
+  output: "output",
+  stderr: "stderr",
+  info: "info",
+  conversation: "conversation",
+  result: "result",
+};
 
 export interface ScrollDetailOptions {
   title: string;
-  /** When set, Tab / 1 / 2 switch between merged output and stderr-only file. */
-  tabs?: { output: () => string; stderr: () => string };
+  /** Named panes; shortcuts 1/2/3 and Tab cycle through the provided panes. */
+  tabs?: Partial<Record<TaskDetailTab, () => string>>;
   /** Single-pane content (subagent conversation). */
   content?: () => string;
   /** Poll for live updates while the task is running. */
@@ -29,6 +38,11 @@ export function wrapLines(text: string, width: number): string[] {
   return fitLines(text, Math.max(1, width));
 }
 
+export function visibleDetailTabs(tabs: ScrollDetailOptions["tabs"]): TaskDetailTab[] {
+  const order = tabs?.conversation ? ["conversation", "result", "info"] as const : TAB_ORDER;
+  return order.filter((key) => Boolean(tabs?.[key]));
+}
+
 export function fitTitle(title: string, width: number): string {
   return truncateToWidth(title, Math.max(1, width), "…");
 }
@@ -37,11 +51,11 @@ export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDe
   const piTui = loadPiTui();
   if (!piTui) throw new Error("pi-tui is not available");
   const { matchesKey } = piTui;
-  const follow = options.followEnd !== false;
-
   await ui.custom<void>(
     (tui, theme, _kb, done) => {
-      let tab: TaskLogTab = "output";
+      const tabKeys = () => visibleDetailTabs(options.tabs);
+      let tab: TaskDetailTab = tabKeys()[0] ?? "output";
+      let follow = options.followEnd !== false;
       let scroll = 0;
       let stuckToEnd = follow;
       let timer: ClockTimer | null = null;
@@ -50,8 +64,7 @@ export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDe
       let lastLineCount = 0;
 
       function source(): string {
-        if (options.tabs) return tab === "stderr" ? options.tabs.stderr() : options.tabs.output();
-        return options.content?.() ?? "";
+        return options.tabs?.[tab]?.() ?? options.content?.() ?? "";
       }
 
       function bodyHeight(width: number): { lines: string[]; height: number } {
@@ -84,16 +97,15 @@ export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDe
           const dim = (s: string) => theme.fg("dim", s);
           const accent = (s: string) => theme.fg("accent", s);
           const head = accent(fitTitle(options.title, Math.max(1, width - 2)));
-          const tabLine = options.tabs
-            ? `${tab === "output" ? accent("▸ output") : dim("  output")}    ${
-                tab === "stderr" ? accent("▸ stderr") : dim("  stderr")
-              }  ${dim("· Tab or 1/2")}`
+          const keys = tabKeys();
+          const tabLine = keys.length > 0
+            ? `${keys.map((key, index) => tab === key ? accent(`▸ ${index + 1} ${TAB_LABEL[key]}`) : dim(`  ${index + 1} ${TAB_LABEL[key]}`)).join("    ")}  ${dim("· Tab cycle · f follow")}`
             : "";
           const visible = lines.slice(scroll, scroll + height);
           while (visible.length < height) visible.push("");
           const place =
             lines.length <= height ? "" : `  ${scroll + 1}–${Math.min(lines.length, scroll + height)}/${lines.length}`;
-          const foot = dim(`↑↓ PgUp PgDn scroll · select to copy · Esc close${place}`);
+          const foot = dim(`↑↓ PgUp PgDn scroll · f follow ${follow ? "on" : "off"} · Esc close${place}`);
           return [head, ...(tabLine ? [tabLine] : []), ...visible, foot];
         },
         invalidate() {},
@@ -110,16 +122,26 @@ export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDe
             done();
             return;
           }
-          if (options.tabs && (matchesKey(data, "tab") || data === "2")) {
-            tab = tab === "output" ? "stderr" : "output";
+          const keys = tabKeys();
+          const shortcut = /^[123]$/.test(data) ? Number(data) - 1 : -1;
+          if (keys.length > 0 && (matchesKey(data, "tab") || data === "\t")) {
+            const current = keys.indexOf(tab);
+            tab = keys[(current + 1) % keys.length];
             scroll = 0;
             stuckToEnd = follow;
             tui.requestRender();
             return;
           }
-          if (options.tabs && data === "1") {
-            tab = "output";
+          if (shortcut >= 0 && shortcut < keys.length) {
+            tab = keys[shortcut];
             scroll = 0;
+            stuckToEnd = follow;
+            tui.requestRender();
+            return;
+          }
+          if (data === "f" || data === "F") {
+            follow = !follow;
+            if (follow) scroll = Math.max(0, bodyHeight(width).lines.length - bodyHeight(width).height);
             stuckToEnd = follow;
             tui.requestRender();
             return;

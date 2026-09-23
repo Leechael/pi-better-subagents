@@ -65,6 +65,7 @@ describe("child bash (no-background variant)", () => {
     expect(deps.trackTask).toHaveBeenCalledWith("sh_test1234", {
       kind: "shell",
       command: "echo hello",
+      cwd: "/tmp",
     });
     // Child-bash must not opt into parent <task-notification> wakes — it has no
     // markNotifyOnExit hook (sync wait already returns the output to the child).

@@ -60,7 +60,7 @@ export interface ChildBashDeps {
   sessionId: () => string;
   /** Precomputed PI_* env injection (from the parent session). */
   sessionEnv: () => Record<string, string>;
-  trackTask: (taskId: string, meta: { kind: string; command: string }) => void;
+  trackTask: (taskId: string, meta: { kind: string; command: string; cwd?: string }) => void;
   childId?: string;
   runId?: string;
   clock?: Clock;
@@ -126,7 +126,7 @@ export function createChildBashTool(
           ? { origin: { via: "child-bash" as const, child_id: deps.childId, run_id: deps.runId } }
           : {}),
       });
-      deps.trackTask(start.task_id, { kind: "shell", command: input.command });
+      deps.trackTask(start.task_id, { kind: "shell", command: input.command, cwd: ctx.cwd });
       const outputPath = taskOutputPath(deps.home, deps.sessionId(), start.task_id);
 
       const clock = deps.clock ?? realClock;

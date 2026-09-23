@@ -71,7 +71,7 @@ export interface BashOverrideDeps {
   /** Extra environment injected into managed child processes (PI_* vars). */
   sessionEnv: (ctx: ExtensionContext) => Record<string, string>;
   /** Register task metadata so exit notifications can describe the task. */
-  trackTask: (taskId: string, meta: { kind: string; command: string }) => void;
+  trackTask: (taskId: string, meta: { kind: string; command: string; cwd?: string }) => void;
   /**
    * Mark a task so its task_exited event becomes a parent <pbs-wake kind="task">.
    * Only backgrounded parent bash should call this — sync waits (foreground
@@ -259,7 +259,7 @@ export function createBashOverride(
         // Manager request failed mid-session; degrade to local execution.
         return executeLocal(input, signal, ctx, deps.clock ?? realClock);
       }
-      deps.trackTask(start.task_id, { kind: "shell", command: input.command });
+      deps.trackTask(start.task_id, { kind: "shell", command: input.command, cwd: ctx.cwd });
       const outputPath = taskOutputPath(deps.home, deps.sessionId(), start.task_id);
 
       if (input.run_in_background === true) {

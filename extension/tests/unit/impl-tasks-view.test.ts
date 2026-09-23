@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { ManualClock } from "../../src/clock";
 import { formatConversation, turnsFromMessages } from "../../src/subagent/conversation";
 import { stderrPathFor } from "../../src/tui/task-output-paths";
-import { filterTaskItems, formatWorkRows, groupTaskRows, moveSelection, stopChoice, taskDetailHeader } from "../../src/tui/tasks-command";
-import { wrapLines } from "../../src/tui/scroll-detail-view";
+import { filterTaskItems, formatWorkRows, groupTaskRows, moveSelection, stopChoice, taskDetailHeader, taskDetailInfo, resolveTaskOutputPath } from "../../src/tui/tasks-command";
+import { visibleDetailTabs, wrapLines } from "../../src/tui/scroll-detail-view";
 import { WorkIndex, type WorkItem } from "../../src/work-index";
 
 function item(id: string, status: string): WorkItem {
@@ -79,9 +79,30 @@ describe("tasks view", () => {
     expect(formatWorkRows([failed], failed.id, 1000, 100)[0]).toContain("529 overloaded_error");
   });
 
-  it("puts task state and output location at the top of details", () => {
-    const task = { ...item("sh_1", "failed"), outputPath: "/tmp/sh_1.output", error: "exit 3" };
-    expect(taskDetailHeader(task, 5_001)).toBe("shell · failed · 5s\nOutput: /tmp/sh_1.output\nError: exit 3");
+  it("keeps detail tabs in keyboard shortcut order", () => {
+    expect(visibleDetailTabs({ output: () => "", stderr: () => "", info: () => "" }))
+      .toEqual(["output", "stderr", "info"]);
+    expect(visibleDetailTabs({ conversation: () => "", result: () => "", info: () => "" }))
+      .toEqual(["conversation", "result", "info"]);
+  });
+
+  it("uses the manager task output path for a live monitor before exit", () => {
+    expect(resolveTaskOutputPath(item("mon_1", "running"), "/home/pbs", "sess-a"))
+      .toBe("/home/pbs/sessions/sess-a/tasks/mon_1.output");
+  });
+
+  it("puts task identity, outcome, duration, cwd, command, and info in the detail panes", () => {
+    const task = {
+      ...item("sh_1", "failed"),
+      command: "make build",
+      cwd: "/tmp/project",
+      exitCode: 3,
+      outputPath: "/tmp/sh_1.output",
+      error: "exit 3",
+    };
+    expect(taskDetailHeader(task, 5_001)).toBe("sh_1 · shell · exit 3 · 5s · /tmp/project\n$ make build");
+    expect(taskDetailInfo(task, 5_001)).toContain("Output: /tmp/sh_1.output");
+    expect(taskDetailInfo(task, 5_001)).toContain("Error: exit 3");
   });
 
   it("shows elapsed time from the task start, not when it was backgrounded", () => {

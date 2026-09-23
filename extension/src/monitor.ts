@@ -30,7 +30,7 @@ export interface MonitorDeps {
   getClient: () => ManagerClient | null;
   sessionEnv: (ctx: ExtensionContext) => Record<string, string>;
   getNotifyCenter: () => NotifyCenter | null;
-  trackTask: (taskId: string, meta: { kind: string; command: string }) => void;
+  trackTask: (taskId: string, meta: { kind: string; command: string; cwd?: string }) => void;
   /** Optional TUI toast for lifecycle notices (exit / timeout / rate-limit). */
   toast?: (message: string, type?: "info" | "warning" | "error") => void;
   clock?: Clock;
@@ -114,7 +114,7 @@ export class MonitorRegistry {
       origin: { via: "monitor" },
     });
     await client.watch(task_id);
-    this.deps.trackTask(task_id, { kind: "monitor", command: params.command });
+    this.deps.trackTask(task_id, { kind: "monitor", command: params.command, cwd: ctx.cwd });
 
     const entry: MonitorEntry = {
       taskId: task_id,
