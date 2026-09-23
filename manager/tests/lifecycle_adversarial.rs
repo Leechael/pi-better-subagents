@@ -942,7 +942,6 @@ fn o3_control_byte_output_large_read_still_answers() {
 /// O4: valid multi-byte UTF-8 (CJK) must survive chunking: concatenating
 /// cursor reads with the CLI's default max_bytes must give back the text.
 #[test]
-#[ignore = "bug: chunks are lossy-decoded per read; a max_bytes/pipe boundary inside a multi-byte char yields U+FFFD while next_cursor skips the bytes (CJK output corrupted every 64 KiB)"]
 fn o4_multibyte_utf8_survives_chunk_boundaries() {
     let home = Home::new("o4");
     let _d = home.start_daemon();
@@ -953,6 +952,104 @@ fn o4_multibyte_utf8_survives_chunk_boundaries() {
     let (text, _, _) = c.read_all_output(&id, 65536);
     assert!(!text.contains('\u{FFFD}'), "replacement chars in valid UTF-8 output");
     assert_eq!(text, "中文\n".repeat(20000));
+}
+
+/// O4b: watch events carry the same guarantee: pipe reads split multi-byte
+/// characters, but concatenated `output` events reproduce the text exactly
+/// and the last event's next_cursor is the total size.
+#[test]
+fn o4b_watch_events_never_split_utf8() {
+    let home = Home::new("o4b");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    // `cat` of a prepared file makes large block writes, so the daemon's
+    // 8 KiB pipe reads (not a multiple of the 7-byte line) land mid-character.
+    let (id, _) = c.start(
+        "f=$(mktemp); yes 中文 | head -n 30000 > \"$f\"; sleep 0.3; cat \"$f\"; rm -f \"$f\"",
+    );
+    c.request_ok(json!({"type":"watch","task_id":id}));
+    let want = "中文\n".repeat(30000);
+    assert!(
+        c.wait_event(S(20), |e| e["event"] == "task_exited" && e["task_id"] == json!(id)).is_some(),
+        "task did not finish"
+    );
+    // The final event may trail task_exited; wait until the cursor catches up.
+    let total = want.len() as u64;
+    let caught_up = poll_true(S(5), || {
+        let _ = c.wait_event(MS(100), |_| false);
+        c.events
+            .iter()
+            .filter(|e| e["event"] == "output")
+            .any(|e| e["next_cursor"] == total)
+    });
+    let got: String = c
+        .events
+        .iter()
+        .filter(|e| e["event"] == "output" && e["task_id"] == json!(id))
+        .map(|e| e["chunk"].as_str().unwrap().to_string())
+        .collect();
+    let sizes: Vec<usize> = c
+        .events
+        .iter()
+        .filter(|e| e["event"] == "output")
+        .map(|e| e["chunk"].as_str().unwrap().len())
+        .collect();
+    eprintln!("o4b: {} output events, sizes {:?}", sizes.len(), &sizes[..sizes.len().min(12)]);
+    assert!(!got.contains('\u{FFFD}'), "replacement chars in watch events");
+    assert!(caught_up, "no event reached next_cursor {total}");
+    assert_eq!(got.len(), want.len());
+    assert_eq!(got, want);
+}
+
+/// O4c: the live end of the stream. A partial character the task has not
+/// finished writing is held back (not turned into U+FFFD) while it runs;
+/// once the task exits, a truncated character at EOF is delivered as one
+/// U+FFFD so the cursor reaches the end. Watch events obey the same rules,
+/// carry consistent cursors, and are never empty.
+#[test]
+fn o4c_partial_character_at_live_end_and_eof() {
+    let home = Home::new("o4c");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    // a + first byte of 中; then its second byte alone (a read holding only
+    // part of a character); then its last byte + b; then c and a dangling
+    // first byte of 中 at EOF. 1+3+1+1+1 = 7 bytes in total.
+    let (id, _) = c.start(
+        "sleep 0.3; printf 'a\\344'; sleep 0.8; printf '\\270'; sleep 0.6; printf '\\255b'; \
+         sleep 0.3; printf 'c\\344'",
+    );
+    c.request_ok(json!({"type":"watch","task_id":id}));
+    assert!(
+        poll_true(S(3), || c.task(&id).unwrap()["output_size"] == 2),
+        "first write not seen"
+    );
+    let r = c.request_ok(json!({"type":"output","task_id":id,"cursor":0,"max_bytes":100}));
+    assert_eq!(r["status"], "running");
+    assert_eq!(r["chunk"], "a", "partial char must be held back while running");
+    assert_eq!(r["next_cursor"], 1);
+
+    c.wait_terminal(&id, S(5)).expect("task ends");
+    let r = c.request_ok(json!({"type":"output","task_id":id,"cursor":0,"max_bytes":100}));
+    assert_eq!(r["chunk"], "a中bc\u{FFFD}", "truncated char at EOF is delivered");
+    assert_eq!(r["next_cursor"], 7);
+
+    let caught_up = poll_true(S(3), || {
+        let _ = c.wait_event(MS(50), |_| false);
+        c.events.iter().any(|e| e["event"] == "output" && e["next_cursor"] == 7)
+    });
+    let outs: Vec<_> = c.events.iter().filter(|e| e["event"] == "output").cloned().collect();
+    assert!(caught_up, "EOF remainder never flushed to watchers: {outs:?}");
+    let got: String = outs.iter().map(|e| e["chunk"].as_str().unwrap()).collect();
+    assert_eq!(got, "a中bc\u{FFFD}", "{outs:?}");
+    let mut raw = 0u64;
+    for e in &outs[..outs.len() - 1] {
+        let chunk = e["chunk"].as_str().unwrap();
+        assert!(!chunk.is_empty(), "empty output event: {outs:?}");
+        raw += chunk.len() as u64;
+        assert_eq!(e["next_cursor"], raw, "cursor must follow the bytes sent: {outs:?}");
+    }
 }
 
 /// F1/F2/F3: a frame over 4 MiB closes that connection (before or after

@@ -705,6 +705,8 @@ fn handle_output(
     max_bytes: u64,
 ) -> Result<OutputOk, ProtoError> {
     let cap = max_bytes.min(MAX_OUTPUT_READ) as usize;
+    // Read a little past the cap so a character straddling it is visible.
+    let want = cap + task::UTF8_LOOKAHEAD;
     enum Src {
         Ring(Vec<u8>),
         Disk(String),
@@ -721,20 +723,26 @@ fn handle_output(
         let src = if cursor >= ring_start && cursor < total {
             let skip = (cursor - ring_start) as usize;
             let avail = out.ring.len() - skip;
-            Src::Ring(out.ring.slice(skip, avail.min(cap)))
+            Src::Ring(out.ring.slice(skip, avail.min(want)))
         } else {
             Src::Disk(e.record.output_path.clone())
         };
         (src, e.record.status, e.record.exit_code, total)
     };
-    let bytes = match src {
+    let mut bytes = match src {
         Src::Ring(b) => b,
         Src::Disk(path) => {
-            task::read_file_range(std::path::Path::new(&path), cursor, cap)
+            task::read_file_range(std::path::Path::new(&path), cursor, want)
                 .map_err(|e| ProtoError::new(E_INTERNAL, format!("read output: {e}")))?
                 .0
         }
     };
+    // §3.3: cut at a UTF-8 boundary. A truncated sequence at the end of the
+    // data is held back while the task can still write the rest. (One
+    // straddling the cap never looks truncated: the lookahead always holds
+    // the whole character.)
+    let n = task::utf8_chunk_len(&bytes, cap, status == TaskStatus::Running);
+    bytes.truncate(n);
     let next_cursor = cursor + bytes.len() as u64;
     Ok(OutputOk {
         chunk: String::from_utf8_lossy(&bytes).into_owned(), // §3.3: UTF-8 lossy
@@ -962,12 +970,31 @@ fn spawn_output_fanout(state: &Shared, task_id: &str) {
     let state2 = state.clone();
     let tid = task_id.to_string();
     tokio::spawn(async move {
-        while let Some(chunk) = rx.recv().await {
+        // Pipe reads split UTF-8 sequences arbitrarily. Hold an incomplete
+        // trailing sequence back and prepend it to the next read, so events
+        // never carry U+FFFD for valid text; `next_cursor` points at the
+        // first byte not yet sent. The remainder is flushed at EOF.
+        let mut carry: Vec<u8> = Vec::new();
+        let mut last_cursor = 0u64;
+        loop {
+            let (bytes, next_cursor) = match rx.recv().await {
+                Some(c) => {
+                    last_cursor = c.next_cursor;
+                    let mut data = std::mem::take(&mut carry);
+                    data.extend_from_slice(&c.bytes);
+                    let n = task::utf8_chunk_len(&data, usize::MAX, true);
+                    carry = data.split_off(n);
+                    (data, c.next_cursor - carry.len() as u64)
+                }
+                None if !carry.is_empty() => (std::mem::take(&mut carry), last_cursor),
+                None => break,
+            };
+            let chunk = task::OutputChunk { bytes, next_cursor };
             let targets: Vec<OutTx> = {
                 let mut st = state2.lock().unwrap();
                 let watcher_ids: Vec<u64> = match st.registry.tasks.get_mut(&tid) {
                     Some(e) => {
-                        e.record.output_size = chunk.next_cursor; // monotonic (§3.4)
+                        e.record.output_size = last_cursor; // monotonic (§3.4)
                         e.watchers.iter().copied().collect()
                     }
                     None => break,
@@ -977,7 +1004,7 @@ fn spawn_output_fanout(state: &Shared, task_id: &str) {
                     .filter_map(|cid| st.conns.get(cid).map(|h| h.tx.clone()))
                     .collect()
             };
-            if !targets.is_empty() {
+            if !targets.is_empty() && !chunk.bytes.is_empty() {
                 let ev = encode_event(&EventKind::Output {
                     task_id: tid.clone(),
                     chunk: String::from_utf8_lossy(&chunk.bytes).into_owned(),
