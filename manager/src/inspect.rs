@@ -140,6 +140,8 @@ pub struct Snapshot {
     pub tasks: Vec<TaskRecord>,
     pub agents: Vec<AgentRecord>,
     pub sessions: BTreeMap<String, SessionView>,
+    /// Sessions the daemon reports as connected (empty without a daemon).
+    pub connected: HashSet<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -169,6 +171,13 @@ pub async fn snapshot(home: &Path, live: Live) -> Result<Snapshot, String> {
         }
         None => (None, registry::load_all_records(home)),
     };
+    // A gone session's tasks may have left the daemon's memory while their
+    // records are still retained on disk (§3.2): `show` must still find them.
+    let mut tasks = tasks;
+    if daemon.is_some() {
+        let known: HashSet<String> = tasks.iter().map(|t| t.task_id.clone()).collect();
+        tasks.extend(registry::load_all_records(home).into_iter().filter(|t| !known.contains(&t.task_id)));
+    }
     let connected: HashSet<String> = daemon
         .as_ref()
         .map(|d| {
@@ -181,7 +190,6 @@ pub async fn snapshot(home: &Path, live: Live) -> Result<Snapshot, String> {
         .unwrap_or_default();
     let agents = load_agent_records(home, &connected);
     let sessions = session_views(home, daemon.as_ref());
-    let mut tasks = tasks;
     tasks.sort_by_key(|t| t.started_at);
     Ok(Snapshot {
         now,
@@ -189,7 +197,23 @@ pub async fn snapshot(home: &Path, live: Live) -> Result<Snapshot, String> {
         tasks,
         agents,
         sessions,
+        connected,
     })
+}
+
+/// A CLI newer than the running daemon reads what the old daemon reports:
+/// columns it never recorded (a session's CWD, SINCE) stay empty.
+fn warn_if_older_daemon(snap: &Snapshot) {
+    if let Some(d) = &snap.daemon {
+        if d.protocol < crate::proto::PROTOCOL {
+            eprintln!(
+                "note: the running pbs-manager is older (protocol {}, this CLI {}); some columns stay empty until it restarts. \
+                 Run `pbs-manager shutdown` once no pi session needs it.",
+                d.protocol,
+                crate::proto::PROTOCOL
+            );
+        }
+    }
 }
 
 /// Live sessions from the daemon plus every session directory on disk; gone
@@ -395,7 +419,6 @@ fn exit_col(r: &Row) -> String {
 // ---------------------------------------------------------------------------
 
 pub struct LsOpts {
-    pub all: bool,
     pub session: Option<String>,
     pub cwd: Option<String>,
     pub since: Option<String>,
@@ -423,7 +446,11 @@ fn under_dir(cwd: &str, dir: &str) -> bool {
     c == dir || c.starts_with(&format!("{dir}/"))
 }
 
-pub fn filter_rows(rows: Vec<Row>, o: &LsOpts, now: u64) -> Result<Vec<Row>, String> {
+/// `ls` rows: work of connected sessions (running and finished) plus anything
+/// still running anywhere, so a live process is never hidden. A gone
+/// session's finished work stays inspectable by id (`show`) until its
+/// retention expires, but is no longer listed.
+pub fn filter_rows(rows: Vec<Row>, o: &LsOpts, now: u64, connected: &HashSet<String>) -> Result<Vec<Row>, String> {
     let since = match &o.since {
         Some(s) => Some(now.saturating_sub(fmt::parse_duration(s)?)),
         None => None,
@@ -431,7 +458,7 @@ pub fn filter_rows(rows: Vec<Row>, o: &LsOpts, now: u64) -> Result<Vec<Row>, Str
     let dir = o.cwd.as_deref().map(normalize_dir);
     Ok(rows
         .into_iter()
-        .filter(|r| o.all || r.running)
+        .filter(|r| r.running || connected.contains(&r.session_id))
         .filter(|r| o.session.as_ref().map_or(true, |p| r.session_id.starts_with(p.as_str())))
         .filter(|r| match (&dir, &r.cwd) {
             (None, _) => true,
@@ -497,20 +524,17 @@ pub fn render_ls(rows: &[Row], prefixes: &HashMap<String, String>, now: u64, wid
 
 pub async fn cmd_ls(home: &Path, o: LsOpts) -> Result<(), String> {
     let snap = snapshot(home, Live::Spawn).await?;
-    let rows = all_rows(&snap);
-    let total_terminal = rows.iter().filter(|r| !r.running).count();
-    let rows = filter_rows(rows, &o, snap.now)?;
+    warn_if_older_daemon(&snap);
+    let rows = filter_rows(all_rows(&snap), &o, snap.now, &snap.connected)?;
     if o.json {
         outln!("{}", serde_json::to_string_pretty(&rows).unwrap());
         return Ok(());
     }
     if rows.is_empty() {
-        if o.all || o.session.is_some() || o.cwd.is_some() || o.since.is_some() {
+        if o.session.is_some() || o.cwd.is_some() || o.since.is_some() {
             outln!("no tasks");
-        } else if total_terminal > 0 {
-            outln!("no running tasks ({total_terminal} finished; use -a / --all to include them)");
         } else {
-            outln!("no running tasks");
+            outln!("no tasks in connected sessions");
         }
         return Ok(());
     }
@@ -1037,12 +1061,13 @@ struct SessionRow<'a> {
     agents: usize,
 }
 
-pub async fn cmd_sessions(home: &Path, all: bool, json_out: bool) -> Result<(), String> {
+/// Connected sessions, plus a gone one only while it still runs something.
+pub async fn cmd_sessions(home: &Path, json_out: bool) -> Result<(), String> {
     let snap = snapshot(home, Live::IfRunning).await?;
+    warn_if_older_daemon(&snap);
     let rows: Vec<SessionRow> = snap
         .sessions
         .values()
-        .filter(|v| all || v.state == "connected")
         .map(|v| {
             let tasks: Vec<&TaskRecord> = snap.tasks.iter().filter(|t| t.session_id == v.session_id).collect();
             let agents: Vec<&AgentRecord> = snap.agents.iter().filter(|a| a.session_id == v.session_id).collect();
@@ -1054,16 +1079,16 @@ pub async fn cmd_sessions(home: &Path, all: bool, json_out: bool) -> Result<(), 
                 agents: agents.len(),
             }
         })
+        .filter(|r| r.view.state == "connected" || r.running > 0)
         .collect();
     if json_out {
         outln!("{}", serde_json::to_string_pretty(&rows).unwrap());
         return Ok(());
     }
     if rows.is_empty() {
-        match (&snap.daemon, all) {
-            (None, false) => outln!("no connected sessions (pbs-manager is not running; -a lists past sessions)"),
-            (_, false) => outln!("no connected sessions (-a lists past sessions)"),
-            (_, true) => outln!("no sessions"),
+        match &snap.daemon {
+            None => outln!("no connected sessions (pbs-manager is not running)"),
+            Some(_) => outln!("no connected sessions"),
         }
         return Ok(());
     }

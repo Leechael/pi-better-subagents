@@ -700,7 +700,7 @@ fn t11_cli_smoke() {
         &["status"][..],
         &["sessions"][..],
         &["list"][..],
-        &["list", "--all"][..],
+        &["ls", "--json"][..],
     ] {
         let (status, text) = run_cli(&d.home, args, Duration::from_secs(5));
         assert!(

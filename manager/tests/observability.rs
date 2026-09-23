@@ -515,15 +515,15 @@ fn c1_ls_columns_filters_json_and_cjk() {
     let lines: Vec<&str> = out.stdout.lines().collect();
     let header: Vec<&str> = lines[0].split_whitespace().collect();
     assert_eq!(header, ["ID", "KIND", "SESSION", "CWD", "STATUS", "STARTED", "DUR", "EXIT", "REASON", "TITLE"]);
-    assert_eq!(lines.len(), 2, "default is running only: {}", out.stdout);
-    assert!(lines[1].starts_with(&b) && lines[1].contains("0199aaaa-2 ") && lines[1].ends_with("sleep 300"), "{}", out.stdout);
-
-    let out = cli_ok(&home, &["ls", "-a"]);
-    let lines: Vec<&str> = out.stdout.lines().collect();
     let rows: Vec<&str> = lines[1..].to_vec();
-    assert_eq!(rows.len(), 4, "{}", out.stdout);
+    // The connected session's work, running and finished. 0199aaaa-1111 never
+    // connected, so its finished task is not listed (still reachable via show).
+    assert_eq!(rows.len(), 3, "{}", out.stdout);
+    assert!(!out.stdout.contains("sh_0000a001"), "{}", out.stdout);
+    assert!(cli_ok(&home, &["show", "sh_0000a001"]).stdout.contains("sh_0000a001"), "gone work stays inspectable");
+    let running = rows.iter().find(|r| r.starts_with(&b)).expect("running task listed");
     // SESSION: shortest unique prefix, at least 8 chars
-    assert!(rows.iter().any(|r| r.starts_with("sh_0000a001") && r.contains(" 0199aaaa-1 ")), "{}", out.stdout);
+    assert!(running.contains("0199aaaa-2 ") && running.ends_with("sleep 300"), "{}", out.stdout);
     let agent = rows.iter().find(|r| r.starts_with("ch_0000b001")).expect("agents are listed");
     assert!(agent.contains(" agent ") && agent.contains("alpha (worker) m1") && agent.contains("completed"), "{agent}");
     // CJK: TITLE truncated by display width, all rows the same width budget
@@ -540,19 +540,20 @@ fn c1_ls_columns_filters_json_and_cjk() {
         let v: Value = serde_json::from_str(&out.stdout).unwrap();
         v.as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect()
     };
-    let mut all = ids(&["ls", "-a", "--json"]);
+    let mut all = ids(&["ls", "--json"]);
     all.sort();
-    let mut want = vec![a.clone(), b.clone(), "ch_0000b001".into(), "sh_0000a001".into()];
+    let mut want = vec![a.clone(), b.clone(), "ch_0000b001".into()];
     want.sort();
     assert_eq!(all, want);
-    assert_eq!(ids(&["ls", "-a", "--json", "--session", "0199aaaa-1"]), ["sh_0000a001"]);
-    assert_eq!(ids(&["ls", "-a", "--json", "--since", "1h"]).len(), 3);
-    let mut in_cwd = ids(&["ls", "-a", "--json", "--cwd", cwd.to_str().unwrap()]);
+    assert_eq!(ids(&["ls", "--json", "--session", "0199aaaa-2"]).len(), 3);
+    assert!(ids(&["ls", "--json", "--session", "0199aaaa-1"]).is_empty());
+    assert_eq!(ids(&["ls", "--json", "--since", "1h"]).len(), 3);
+    let mut in_cwd = ids(&["ls", "--json", "--cwd", cwd.to_str().unwrap()]);
     in_cwd.sort();
     let mut want_cwd = vec![a.clone(), b.clone(), "ch_0000b001".into()];
     want_cwd.sort();
     assert_eq!(in_cwd, want_cwd, "agents inherit their session's cwd");
-    let out = cli_ok(&home, &["ls", "-a", "--json"]);
+    let out = cli_ok(&home, &["ls", "--json"]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     let row = v.as_array().unwrap().iter().find(|r| r["id"] == b).unwrap();
     assert_eq!((row["kind"].as_str(), row["status"].as_str(), row["title"].as_str()), (Some("shell"), Some("running"), Some("sleep 300")));
@@ -725,7 +726,7 @@ fn c5_sessions_connected_and_gone() {
     record_fixture(&home, "sess-gone-1", "sh_0000c501", old, json!({}));
     agent_fixture(&home, "sess-gone-1", json!({"child_id":"ch_0000c501","session_id":"sess-gone-1","name":"x",
         "agent":"worker","status":"running","started_at":old}));
-    // Without a daemon: nothing connected, -a still lists history.
+    // Without a daemon: nothing connected.
     let out = cli_ok(&home, &["sessions"]);
     assert!(out.stdout.contains("not running"), "{}", out.stdout);
     assert!(!home.sock().exists(), "sessions must not start the daemon");
@@ -746,17 +747,16 @@ fn c5_sessions_connected_and_gone() {
     assert_eq!((live[1], live[2], live[3]), (std::process::id().to_string().as_str(), "connected", "/tmp/live"));
     assert_eq!(&live[live.len() - 3..], ["1", "1", "0"]);
 
-    let out = cli_ok(&home, &["sessions", "-a"]);
-    let gone = out.stdout.lines().find(|l| l.starts_with("sess-gon")).expect("gone session listed");
-    let g: Vec<&str> = gone.split_whitespace().collect();
-    assert_eq!((g[1], g[2], g[3]), ("4242", "gone", "/tmp/gone"), "{gone}");
-    assert!(gone.contains(" ago "), "LAST_SEEN is an age: {gone}");
-    assert_eq!(&g[g.len() - 3..], ["0", "1", "1"], "stale running agent is not counted as running: {gone}");
-    let out = cli_ok(&home, &["sessions", "-a", "--json"]);
+    // A gone session is not listed (its stale "running" agent does not count
+    // as running work), but its records stay inspectable until retention ends.
+    assert!(!out.stdout.contains("sess-gon"), "{}", out.stdout);
+    let out = cli_ok(&home, &["sessions", "--json"]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
-    let gj = v.as_array().unwrap().iter().find(|s| s["session_id"] == "sess-gone-1").unwrap();
-    assert_eq!((gj["state"].as_str(), gj["pi_pid"].as_u64(), gj["since"].as_u64()), (Some("gone"), Some(4242), Some(old)));
-    assert_eq!(gj["last_seen"].as_u64(), Some(old + 60_000));
+    let ids: Vec<&str> = v.as_array().unwrap().iter().map(|s| s["session_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["sess-live-1"]);
+    assert!(cli_ok(&home, &["show", "sh_0000c501"]).stdout.contains("sh_0000c501"));
+    assert!(cli_ok(&home, &["events", "--session", "sess-gone"]).stdout.contains("session.connect"));
+    assert!(home.cli(&["sessions", "-a"], S(5)).status.code() == Some(2), "-a is gone");
 }
 
 #[test]
@@ -815,7 +815,7 @@ fn c7_output_max_bytes_sigpipe_and_log_timestamps() {
     assert_eq!(out.stdout.len(), 3_000_000, "no cap without --max-bytes");
 
     // SIGPIPE: a closed reader ends the CLI quietly with status 0.
-    for args in [format!("output {big}"), "ls -a".into(), "events".into(), format!("log {big}")] {
+    for args in [format!("output {big}"), "ls".into(), "events".into(), format!("log {big}")] {
         let script = format!(
             "set -o pipefail; '{BIN}' --home '{}' {args} | head -c 1 >/dev/null",
             home.path.display()
@@ -877,3 +877,4 @@ fn c8_doctor_checks_and_exit_status() {
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.contains("FAIL  socket path:"), "{}", out.stdout);
 }
+

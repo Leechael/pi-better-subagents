@@ -47,15 +47,15 @@ enum Sub {
         #[arg(long)]
         json: bool,
     },
-    /// pi sessions: connected ones, or with -a also past (gone) sessions.
+    /// Connected pi sessions (a gone session only while it still runs
+    /// something). Gone sessions' records are kept for `goneSessionRetention`
+    /// (config.json, default 24h) and stay reachable via show/agent/events.
     Sessions {
-        /// Include sessions that are no longer connected (from disk).
-        #[arg(short = 'a', long)]
-        all: bool,
         #[arg(long)]
         json: bool,
     },
-    /// List tasks and agents (running only by default). Alias: `ls`.
+    /// Tasks and agents of connected sessions, running and finished, plus
+    /// anything still running elsewhere. Alias: `ls`.
     #[command(visible_alias = "ls")]
     List {
         /// Only sessions whose id starts with this prefix.
@@ -67,9 +67,6 @@ enum Sub {
         /// Only work started within this long (e.g. 30s, 10m, 2h, 1d).
         #[arg(long)]
         since: Option<String>,
-        /// Include finished tasks and agents (default: running only).
-        #[arg(short = 'a', long)]
-        all: bool,
         #[arg(long)]
         json: bool,
     },
@@ -191,16 +188,14 @@ async fn main() {
     let code = match cli.cmd {
         Sub::Daemon { foreground } => daemon::run(home, foreground).await,
         Sub::Status { json } => run_client(inspect::cmd_status(&home, json)).await,
-        Sub::Sessions { all, json } => run_client(inspect::cmd_sessions(&home, all, json)).await,
+        Sub::Sessions { json } => run_client(inspect::cmd_sessions(&home, json)).await,
         Sub::List {
             session,
             cwd,
             since,
-            all,
             json,
         } => {
             let opts = inspect::LsOpts {
-                all,
                 session,
                 cwd,
                 since,
