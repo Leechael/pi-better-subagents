@@ -11,17 +11,25 @@ PBS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts
 cd eval && npm run test:e2e && npm run test:unit      # faux-model end-to-end, no model cost
 ```
 
-## 0. Install
+## 0. Install into an isolated home
+
+Plain `pi` talks to whatever daemon already runs at `~/.pi/agent/pbs`, possibly an older binary with other sessions attached. Test against a separate home instead:
 
 ```bash
 cd manager && cargo build --release
-mkdir -p ~/.pi/agent/pbs/bin
-install -m 755 target/release/pbs-manager ~/.pi/agent/pbs/bin/pbs-manager   # atomic replace (macOS code signing)
-pbs-manager shutdown 2>/dev/null   # make sure no older daemon keeps running
-pi -ne -e /path/to/pi-better-subagents/extension
+mkdir -p ~/.pi/agent/pbs-test/bin
+install -m 755 target/release/pbs-manager ~/.pi/agent/pbs-test/bin/pbs-manager   # atomic replace (macOS code signing)
+
+# terminal A, from a scratch directory (worker subagents edit files)
+PBS_HOME=~/.pi/agent/pbs-test pi -ne -e /path/to/pi-better-subagents/extension
+
+# terminal B
+export PBS_HOME=~/.pi/agent/pbs-test
+alias pbs-manager=~/.pi/agent/pbs-test/bin/pbs-manager
+pbs-manager events -f
 ```
 
-`-ne` keeps other extensions (e.g. an installed `pi-subagents`) out of the way. Keep a second terminal open for the CLI steps.
+`-ne` keeps other extensions (e.g. an installed `pi-subagents`) out of the way. There must be no "pbs-manager unavailable" warning at startup, and `pbs-manager status` should report the version you just built.
 
 ## F1. Bash auto-background
 
@@ -40,6 +48,8 @@ pi -ne -e /path/to/pi-better-subagents/extension
 | 2.1 | Ask for a monitor on `while true; do date; sleep 2; done`, timeout 20s | `› monitor …` pills while events flow (merged while the agent is busy), then a timeout notice. The tool row shows the monitor as a failure if the manager is missing (F7.5) |
 | 2.2 | Ask for a monitor on `yes \| head -c 100000000` | Drops are reported (`dropped-lines`), and after sustained saturation the monitor stops itself with a rate-limit notice; it does not wake the model every 2 s until timeout |
 | 2.3 | `/tasks` during 2.1 | The monitor is listed; Enter → output tab shows its lines |
+| 2.4 | Ask for a monitor on `echo noop` | One event pill with `noop`, then an exit notice right away (not a timeout later). `/tasks` shows it finished; the fleet line never keeps counting it |
+| 2.5 | Ask the agent to stop a running monitor | It ends as killed in `/tasks` and drops out of the fleet line at once |
 
 ## F3. Subagents
 
@@ -50,12 +60,15 @@ pi -ne -e /path/to/pi-better-subagents/extension
 | 3.3 | `/tasks` → select a child → Enter | Conversation (no agent preamble), result, info tabs |
 | 3.4 | Use a model that fails (e.g. a provider without credits) for a subagent | Child is `✗ failed` with the provider error, in the pill, `/tasks`, and `pbs-manager show ch_…` (`reason model-error`) |
 | 3.5 | Ask for a subagent that must ask you a question (it uses `contact_supervisor`) | `? decision for <name>` pill; answer with `/reply <child> <text>`; the child continues |
+| 3.6 | Ask a subagent to start another subagent, or a monitor | It reports the tool is unavailable (depth cap 1; children have no `monitor` / `task_*`) |
+| 3.7 | Ask a subagent to run a 30 s command | It blocks and returns the output; nothing is backgrounded. The command shows under its run in `/tasks` and in `pbs-manager ls` |
+| 3.8 | Start background work in a second pi session (same home), then ask the first agent "what tasks, monitors and subagents are running?" (also "including finished ones") | Only the first session's own work is listed; nothing from the other session |
 
 ## F4. `/tasks`
 
 | # | Do | Expect |
 |---|---|---|
-| 4.1 | Open with several items | Grouped list (subagents under their run), coloured glyphs, exit/reason inline, `(i/n)` when it scrolls |
+| 4.1 | Open with several items | A bottom sheet over the editor (not at the top of the screen). Grouped list (subagents under their run), coloured glyphs, exit/reason inline, `(i/n)` when it scrolls |
 | 4.2 | Type letters | Filters the list (typing never triggers an action) |
 | 4.3 | `ctrl+x` on a running item | Inline red confirm; Enter stops it, Esc cancels. On a finished item: a muted "already finished" hint, nothing written to the transcript |
 | 4.4 | Tab | Switches active+recent ↔ all |
