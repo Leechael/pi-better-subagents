@@ -82,10 +82,12 @@ pub struct Resilient {
 
 impl Resilient {
     pub async fn connect(home: &Path) -> Result<Resilient, String> {
-        Ok(Resilient {
-            home: home.to_path_buf(),
-            conn: connect(home, &HelloMode::Cli).await?,
-        })
+        let conn = match connect(home, &HelloMode::Cli).await {
+            // Closed during the hello: an upgrade is under way.
+            Err(e) if is_disconnect(&e) => reconnect(home).await?,
+            r => r?,
+        };
+        Ok(Resilient { home: home.to_path_buf(), conn })
     }
 
     pub async fn call<T: DeserializeOwned>(&mut self, kind: RequestKind) -> Result<T, String> {
@@ -95,6 +97,20 @@ impl Resilient {
                 self.conn.roundtrip(kind).await
             }
             r => r,
+        }
+    }
+}
+
+/// `inspect::snapshot`, taken again if an in-place upgrade closed the
+/// connection under it.
+async fn snapshot_resilient(home: &Path) -> Result<inspect::Snapshot, String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match inspect::snapshot(home, Live::Spawn).await {
+            Err(e) if is_disconnect(&e) && std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            r => return r,
         }
     }
 }
@@ -255,7 +271,7 @@ pub async fn connect(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
 /// total printed (never more; a character that would cross it is left out).
 /// For an agent id, prints the agent's result tail.
 pub async fn cmd_output(home: &Path, typed: &str, follow: bool, max_bytes: Option<u64>) -> Result<(), String> {
-    let snap = inspect::snapshot(home, Live::Spawn).await?;
+    let snap = snapshot_resilient(home).await?;
     let task_id = match inspect::resolve(&snap, typed)? {
         Target::Task(t) => t.task_id,
         Target::Agent(a) => {
@@ -495,7 +511,7 @@ pub async fn cmd_start(
 
 /// Extra CLI convenience (not in §3.5): budget-wait on a task or an agent.
 pub async fn cmd_wait(home: &Path, typed: &str, budget_ms: u64) -> Result<(), String> {
-    let snap = inspect::snapshot(home, Live::Spawn).await?;
+    let snap = snapshot_resilient(home).await?;
     let task_id = match inspect::resolve(&snap, typed)? {
         Target::Task(t) => t.task_id,
         Target::Agent(a) => return inspect::wait_agent(home, &a.child_id, budget_ms).await,
