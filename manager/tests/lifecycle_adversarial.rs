@@ -598,7 +598,6 @@ fn t6_stop_kills_grandchildren() {
 /// T6b: leader dies on SIGTERM but a grandchild ignores it. The group must
 /// still be SIGKILLed after the grace.
 #[test]
-#[ignore = "bug: kill escalation only targets tasks whose leader is still running; a SIGTERM-ignoring grandchild outlives stop and manager shutdown"]
 fn t6b_stop_kills_term_ignoring_grandchild_after_leader_exits() {
     let home = Home::new("t6b");
     let _d = home.start_daemon();
@@ -617,7 +616,6 @@ fn t6b_stop_kills_term_ignoring_grandchild_after_leader_exits() {
 /// T6c: a task that backgrounds a child and exits. §3.2: background work must
 /// not outlive the last pi, so manager shutdown must reach the leftover group.
 #[test]
-#[ignore = "bug: shutdown only signals groups of tasks still marked running; children left behind by an exited task leader survive the manager"]
 fn t6c_shutdown_kills_leftover_group_of_exited_task() {
     let home = Home::new("t6c");
     let mut daemon = home.start_daemon();
@@ -632,6 +630,40 @@ fn t6c_shutdown_kills_leftover_group_of_exited_task() {
     let dead = poll_true(S(2), || !pid_running(gc));
     kill_pid(gc, libc::SIGKILL);
     assert!(dead, "grandchild {gc} outlived the manager");
+}
+
+/// T6d: `stop` on a task that already completed but left a background child
+/// kills the leftover group (TERM, then KILL after the grace for a child
+/// that ignores TERM); the task's recorded status stays `completed`.
+/// shutdown_session reaches leftover groups too, without reporting them.
+#[test]
+fn t6d_stop_and_shutdown_session_reach_leftover_group() {
+    let home = Home::new("t6d");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (a, _) = c.start("sh -c \"trap '' TERM; exec sleep 300\" >/dev/null 2>&1 & echo $!");
+    let (b, _) = c.start("sleep 300 >/dev/null 2>&1 & echo $!");
+    let ga = wait_for_pids(&mut c, &a, 1)[0];
+    let gb = wait_for_pids(&mut c, &b, 1)[0];
+    assert_eq!(c.wait_terminal(&a, S(3)).unwrap()["status"], "completed");
+    assert_eq!(c.wait_terminal(&b, S(3)).unwrap()["status"], "completed");
+    assert!(pid_running(ga) && pid_running(gb));
+
+    c.request_ok(json!({"type":"stop","task_id":a}));
+    std::thread::sleep(S(1));
+    assert!(pid_running(ga), "TERM-ignoring leftover killed before the grace");
+    let dead = poll_true(S(4), || !pid_running(ga));
+    kill_pid(ga, libc::SIGKILL);
+    assert!(dead, "leftover child {ga} survived stop");
+    assert_eq!(c.status_of(&a).as_deref(), Some("completed"), "status must not change");
+
+    let r = c.request_ok(json!({"type":"shutdown_session"}));
+    assert_eq!(r["stopped"], json!([]), "only running tasks are reported: {r}");
+    let dead = poll_true(S(3), || !pid_running(gb));
+    kill_pid(gb, libc::SIGKILL);
+    assert!(dead, "leftover child {gb} survived shutdown_session");
+    assert_eq!(c.status_of(&b).as_deref(), Some("completed"));
 }
 
 /// T3: timeout_ms is a hard ceiling -> killed; a task finishing before its

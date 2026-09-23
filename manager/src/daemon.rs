@@ -30,6 +30,8 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_OUTPUT_READ: u64 = 1024 * 1024;
 /// §3.4: re-adopted tasks are polled with kill(pid, 0) every second.
 const ADOPT_POLL: Duration = Duration::from_secs(1);
+/// Poll interval for a process group that outlived its leader.
+const GROUP_POLL: Duration = Duration::from_millis(500);
 
 type OutTx = mpsc::Sender<Arc<Vec<u8>>>;
 pub type Shared = Arc<Mutex<DaemonState>>;
@@ -744,10 +746,14 @@ fn handle_stop(state: &Shared, conn_id: u64, task_id: &str) -> Result<UnitOk, Pr
         let mut st = state.lock().unwrap();
         let acc = access_for(&st, conn_id);
         let e = st.registry.visible_mut(task_id, &acc)?;
-        if e.record.status.is_terminal() {
-            return Ok(UnitOk {}); // idempotent
+        if !e.owns_live_group() {
+            return Ok(UnitOk {}); // idempotent: terminal and nothing left
         }
-        e.kill_requested = true; // exit path maps this to `killed` (§3.4)
+        if e.record.status == TaskStatus::Running {
+            e.kill_requested = true; // exit path maps this to `killed` (§3.4)
+        }
+        // A terminal task with a lingering group keeps its status; stop
+        // still takes down what it left behind.
         e.record.pid
     };
     // §3.3 stop: SIGTERM the process group, 2s grace, then SIGKILL.
@@ -756,23 +762,45 @@ fn handle_stop(state: &Shared, conn_id: u64, task_id: &str) -> Result<UnitOk, Pr
     Ok(UnitOk {})
 }
 
+/// After the grace, SIGKILL the *group* if anything in it may survive: the
+/// leader, or descendants that ignored SIGTERM after the leader died.
 fn spawn_kill_reaper(state: &Shared, task_id: &str, pid: u32) {
     let state2 = state.clone();
     let tid = task_id.to_string();
     tokio::spawn(async move {
         tokio::time::sleep(KILL_GRACE).await;
-        let still_running = {
+        let group_live = {
             state2
                 .lock()
                 .unwrap()
                 .registry
                 .tasks
                 .get(&tid)
-                .map(|e| e.record.status == TaskStatus::Running)
+                .map(|e| e.owns_live_group())
                 .unwrap_or(false)
         };
-        if still_running {
+        if group_live {
             let _ = task::signal_group(pid, task::SIGKILL);
+        }
+    });
+}
+
+/// Track a process group whose leader exited while members remain, until the
+/// group empties. Polling keeps the pgid ours: POSIX does not reuse a pid
+/// while a group with that id exists.
+fn spawn_group_watcher(state: &Shared, task_id: &str, pgid: u32) {
+    let state2 = state.clone();
+    let tid = task_id.to_string();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(GROUP_POLL).await;
+            if task::group_alive(pgid) {
+                continue;
+            }
+            if let Some(e) = state2.lock().unwrap().registry.tasks.get_mut(&tid) {
+                e.group_lingering = false;
+            }
+            break;
         }
     });
 }
@@ -837,21 +865,30 @@ fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessi
                 ))
             }
         };
+        // (task_id, pgid, was_running): lingering groups of finished tasks are
+        // killed too, but only running tasks are reported as stopped.
         let mut v = Vec::new();
         for e in st.registry.tasks.values_mut() {
-            if e.record.session_id == sid && e.record.status == TaskStatus::Running {
-                e.kill_requested = true;
-                v.push((e.record.task_id.clone(), e.record.pid));
+            if e.record.session_id == sid && e.owns_live_group() {
+                let running = e.record.status == TaskStatus::Running;
+                if running {
+                    e.kill_requested = true;
+                }
+                v.push((e.record.task_id.clone(), e.record.pid, running));
             }
         }
         v
     };
-    for (tid, pid) in &victims {
+    for (tid, pid, _) in &victims {
         let _ = task::signal_group(*pid, task::SIGTERM);
         spawn_kill_reaper(state, tid, *pid);
     }
     Ok(ShutdownSessionOk {
-        stopped: victims.into_iter().map(|(t, _)| t).collect(),
+        stopped: victims
+            .into_iter()
+            .filter(|(_, _, running)| *running)
+            .map(|(t, _, _)| t)
+            .collect(),
     })
 }
 
@@ -1051,6 +1088,7 @@ fn spawn_adopted_poller(state: &Shared, task_id: &str, pid: u32) {
 /// Map an observed exit to a terminal status, persist the record, wake
 /// `wait`ers, and push `task_exited` to the owning session (§3.3/§3.4).
 fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::ExitStatus>) {
+    let mut lingering = None;
     let (sid, event) = {
         let mut st = state.lock().unwrap();
         let home = st.home.clone();
@@ -1072,6 +1110,12 @@ fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::Exi
             lifecycle::log_line(&home, &format!("persist {} failed: {e}", entry.record.task_id));
         }
         let _ = entry.status_tx.send(entry.record.status);
+        // The leader is gone; descendants it backgrounded may not be.
+        let pgid = entry.record.pid;
+        if task::group_alive(pgid) {
+            entry.group_lingering = true;
+            lingering = Some(pgid);
+        }
         let event = EventKind::TaskExited {
             task_id: task_id.to_string(),
             exit_code: code,
@@ -1083,6 +1127,9 @@ fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::Exi
         };
         (entry.record.session_id.clone(), event)
     };
+    if let Some(pgid) = lingering {
+        spawn_group_watcher(state, task_id, pgid);
+    }
     send_event_to_session(state, &sid, event);
 }
 
@@ -1094,24 +1141,32 @@ async fn graceful_shutdown(state: &Shared) {
     let home = state.lock().unwrap().home.clone();
     lifecycle::log_line(&home, "graceful shutdown: terminating running tasks");
 
-    // 1) SIGTERM every running process group.
-    let pids: Vec<u32> = {
+    // 1) SIGTERM every process group that may have members: running tasks,
+    //    and finished tasks whose leader left descendants behind (§3.2).
+    let (pids, running): (Vec<u32>, usize) = {
         let mut st = state.lock().unwrap();
-        st.registry
+        let mut running = 0;
+        let pids = st
+            .registry
             .tasks
             .values_mut()
-            .filter(|e| e.record.status == TaskStatus::Running)
+            .filter(|e| e.owns_live_group())
             .map(|e| {
-                e.kill_requested = true; // disk state must say `killed` (§3.2)
+                if e.record.status == TaskStatus::Running {
+                    e.kill_requested = true; // disk state must say `killed` (§3.2)
+                    running += 1;
+                }
                 e.record.pid
             })
-            .collect()
+            .collect();
+        (pids, running)
     };
     for pid in &pids {
         let _ = task::signal_group(*pid, task::SIGTERM);
     }
     if !pids.is_empty() {
-        // 2) 2s grace, then SIGKILL the survivors.
+        // 2) 2s grace, then SIGKILL every group that may still have members,
+        //    even if its leader already died (SIGTERM-ignoring descendants).
         tokio::time::sleep(KILL_GRACE).await;
         let survivors: Vec<u32> = {
             state
@@ -1120,7 +1175,7 @@ async fn graceful_shutdown(state: &Shared) {
                 .registry
                 .tasks
                 .values()
-                .filter(|e| e.record.status == TaskStatus::Running)
+                .filter(|e| e.owns_live_group())
                 .map(|e| e.record.pid)
                 .collect()
         };
@@ -1152,10 +1207,19 @@ async fn graceful_shutdown(state: &Shared) {
             }
         }
     }
-    if !pids.is_empty() {
+    if running > 0 {
         lifecycle::log_line(
             &home,
-            &format!("killed {} task(s) (reason: manager_shutdown)", pids.len()),
+            &format!("killed {running} task(s) (reason: manager_shutdown)"),
+        );
+    }
+    if pids.len() > running {
+        lifecycle::log_line(
+            &home,
+            &format!(
+                "killed {} leftover process group(s) of finished tasks (reason: manager_shutdown)",
+                pids.len() - running
+            ),
         );
     }
     // Let pending responses (e.g. the shutdown ack) flush to clients.

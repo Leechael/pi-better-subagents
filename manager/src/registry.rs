@@ -51,9 +51,19 @@ pub struct TaskEntry {
     /// Connection ids subscribed to output events (§3.3 watch).
     pub watchers: HashSet<u64>,
     pub timeout_ms: Option<u64>,
+    /// The leader exited but other members of its process group (children
+    /// it backgrounded) are still alive. The group is still ours to kill on
+    /// stop/shutdown (§3.2: background work must not outlive the manager).
+    pub group_lingering: bool,
 }
 
 impl TaskEntry {
+    /// The task's process group may still have members: the leader runs, or
+    /// it exited leaving descendants behind.
+    pub fn owns_live_group(&self) -> bool {
+        self.record.status == TaskStatus::Running || self.group_lingering
+    }
+
     pub fn new_running(
         record: TaskRecord,
         child: Child,
@@ -71,6 +81,7 @@ impl TaskEntry {
             kill_requested: false,
             watchers: HashSet::new(),
             timeout_ms,
+            group_lingering: false,
         }
     }
 
@@ -88,6 +99,7 @@ impl TaskEntry {
             kill_requested: false,
             watchers: HashSet::new(),
             timeout_ms: None, // original timeout is not persisted; not re-armed
+            group_lingering: false,
         }
     }
 
@@ -104,6 +116,7 @@ impl TaskEntry {
             kill_requested: false,
             watchers: HashSet::new(),
             timeout_ms: None,
+            group_lingering: false,
         }
     }
 }
@@ -353,6 +366,7 @@ mod tests {
                 kill_requested: false,
                 watchers: HashSet::new(),
                 timeout_ms: None,
+                group_lingering: false,
             },
         );
         let own = Access::Extension("sess-a".into());

@@ -66,6 +66,18 @@ pub fn signal_group(pid: u32, sig: i32) -> io::Result<()> {
     }
 }
 
+/// `kill(-pgid, 0)`: does any process remain in the group led by `pgid`?
+/// POSIX does not reuse a pid while a process group with that id exists, so
+/// a group we have watched continuously is still ours while this is true.
+pub fn group_alive(pgid: u32) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+    // SAFETY: signal 0 to a negative pid is a pure existence check.
+    let rc = unsafe { libc::kill(-(pgid as i32), 0) };
+    rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// `kill(pid, 0)` liveness probe. `EPERM` counts as alive (process exists
 /// but we lack permission to signal it).
 pub fn pid_alive(pid: u32) -> bool {
