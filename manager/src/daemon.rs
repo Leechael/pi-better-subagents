@@ -1801,6 +1801,17 @@ impl Outcome {
     }
 }
 
+fn normalize_killed_outcome(kill_requested: bool, outcome: Outcome) -> Outcome {
+    if !kill_requested || outcome.signal.is_some() {
+        return outcome;
+    }
+    match outcome.code {
+        Some(code) if code == 128 + task::SIGTERM => Outcome { code: None, signal: Some(task::SIGTERM) },
+        Some(code) if code == 128 + task::SIGKILL => Outcome { code: None, signal: Some(task::SIGKILL) },
+        _ => outcome,
+    }
+}
+
 /// What may be left of the task's process group once its command ended.
 enum Leftover {
     /// Nothing: the runner saw an empty group.
@@ -2018,7 +2029,7 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         if entry.record.status.is_terminal() {
             return; // already finalized (e.g. shutdown force-pass)
         }
-        let Outcome { code, signal } = outcome;
+        let Outcome { code, signal } = normalize_killed_outcome(entry.kill_requested, outcome);
         let now = now_ms();
         entry.record.exit_code = code;
         entry.record.signal = signal.map(signal_name);
@@ -2257,5 +2268,12 @@ mod tests {
         assert!(!valid_session_id("a/b"));
         assert!(!valid_session_id("a b"));
         assert!(!valid_session_id(&"x".repeat(200)));
+    }
+
+    #[test]
+    fn killed_shell_exit_code_143_is_reported_as_sigterm() {
+        let outcome = normalize_killed_outcome(true, Outcome { code: Some(143), signal: None });
+        assert_eq!(outcome.code, None);
+        assert_eq!(outcome.signal, Some(task::SIGTERM));
     }
 }
