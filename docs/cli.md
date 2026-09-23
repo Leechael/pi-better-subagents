@@ -20,6 +20,8 @@ export PATH="$HOME/.pi/agent/pbs/bin:$PATH"
 
 If you already hit `killed` after a reinstall, fix with another atomic replace (same `install` line above), or `cp …/pbs-manager …/pbs-manager.new && mv …/pbs-manager.new …/pbs-manager`.
 
+**Upgrading while pi sessions run work:** just `install` the new binary. A running daemon notices within a few seconds and upgrades itself in place (see [`upgrade`](#upgrade)); `pbs-manager upgrade` does it now and reports the result. Nothing running is interrupted and no pi session needs a restart; reload or reopen pi sessions only when you also want the new extension code.
+
 The extension discovers the same path, or an override via `PBS_MANAGER_PATH` / `managerPath` in config.
 
 ## Global options
@@ -258,6 +260,20 @@ Prints `task_id=sh_… pid=12345`.
 ### `daemon`
 
 Runs the manager in the foreground (what auto-spawn uses); `--foreground` also logs to stderr. One daemon per home: the daemon holds `manager.lock` for its lifetime; a second one prints "already running" and exits 0.
+
+### `upgrade`
+
+Replaces the running daemon, in place, with the binary now installed at its path: same pid, every task keeps running (and later reports its real exit code), clients reconnect by themselves within tens of milliseconds. Requests in flight during the switch are resent by the clients; a `start` is never run twice.
+
+```text
+upgraded in place: 0.1.0 -> 0.1.1 (pid 4321, generation 1, 3 running task(s) kept)
+```
+
+- The new binary is checked first (`__handover-check`). A missing, broken or incompatible binary stops the upgrade before anything is touched: `upgrade not done, still running 0.1.0: …` (exit 1).
+- If the switch itself cannot finish (quiesce over 5s, exec failure), the daemon keeps running the old binary and says why.
+- If the new binary cannot restore, it exits and every task is cleaned up, as in a crash (no crash recovery); `upgrade` reports `the manager (pid N) exited during the upgrade`.
+- With no daemon running: `pbs-manager is not running; the next client starts the installed binary` (exit 0).
+- The daemon does the same by itself when the file at its path changes and settles (checked every 2s); `status --json` shows `generation` and `last_upgrade` (`trigger: "cli"` or `"binary-changed"`).
 
 ### `shutdown`
 
