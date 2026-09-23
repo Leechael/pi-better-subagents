@@ -324,11 +324,8 @@ expect = "red"
 id = "lifeline-teardown"
 mechanism = "a runner whose lifeline breaks (the daemon died by any means) takes its process group down (§3.2)"
 file = "src/runner.rs"
-find = """
-    let _ = sys::signal_group(me, sys::SIGTERM);
-    std::thread::sleep(LIFELINE_GRACE);
-    let _ = sys::signal_group(me, sys::SIGKILL);"""
-replace = ""
+find = "    // The daemon is gone: take the group down. SIGTERM reaches everyone"
+replace = "    std::process::exit(0);\n    // The daemon is gone: take the group down. SIGTERM reaches everyone"
 tests = [
   "lifecycle_adversarial::d4_daemon_kill9_takes_every_task_down",
   "protocol::t12_restart_after_crash_orphans_the_task",
@@ -338,13 +335,13 @@ expect = "red"
 
 [[ablation]]
 id = "lifeline-sigkill-after-grace"
-mechanism = "after the lifeline grace the runner SIGKILLs its group, reaching SIGTERM-ignoring members"
+mechanism = "after the lifeline grace the runner SIGKILLs the rest of its group, reaching SIGTERM-ignoring members"
 file = "src/runner.rs"
 find = """
-    std::thread::sleep(LIFELINE_GRACE);
-    let _ = sys::signal_group(me, sys::SIGKILL);"""
-replace = """
-    std::thread::sleep(LIFELINE_GRACE);"""
+        for p in others {
+            let _ = sys::kill_pid(p, sys::SIGKILL);
+        }"""
+replace = ""
 tests = ["lifecycle_adversarial::d4_daemon_kill9_takes_every_task_down"]
 expect = "red"
 

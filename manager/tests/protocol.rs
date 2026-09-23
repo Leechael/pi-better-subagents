@@ -738,16 +738,31 @@ fn t12_restart_after_crash_orphans_the_task() {
 
     let mut c1 = connect(&home, CONNECT_TIMEOUT);
     hello_ext(&mut c1, "sess-crash");
-    let resp = c1.request(&start_req("r12-start", "sleep 30", true), "r12-start");
+    // The command reports its own pid: the task's pid is its runner's, and
+    // the command must die too, not just the runner.
+    let resp = c1.request(&start_req("r12-start", "echo $$; exec sleep 30", true), "r12-start");
     let task_id = extract_str(&resp, "task_id").expect("task_id").to_string();
     let task_pid = extract_num(&resp, "pid").expect("pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut i = 0;
+    let cmd_pid: u64 = loop {
+        i += 1;
+        let id = format!("r12-out-{i:04}"); // fixed width: no id is a prefix of another
+        let out = c1.request(&output_req(&id, &task_id, 0), &id);
+        let digits: String = extract_str(&out, "chunk").unwrap_or("").chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(p) = digits.parse() {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "command did not print its pid: {out}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
     drop(c1);
 
     d1.kill().expect("SIGKILL daemon");
     d1.wait().expect("reap daemon");
     let deadline = Instant::now() + Duration::from_secs(4);
-    while pid_alive(task_pid) {
-        assert!(Instant::now() < deadline, "task {task_pid} survived the daemon's SIGKILL");
+    while pid_alive(task_pid) || pid_alive(cmd_pid) {
+        assert!(Instant::now() < deadline, "task (runner {task_pid}, command {cmd_pid}) survived the daemon's SIGKILL");
         std::thread::sleep(Duration::from_millis(50));
     }
 

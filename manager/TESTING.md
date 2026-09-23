@@ -568,7 +568,7 @@ behave as declared (red).
 
 | Ablation | Tests red |
 |---|---|
-| lifeline-teardown | 3/3: d4, t12, p2 |
+| lifeline-teardown | 3/3: d4, t12, p2 (after t12/p2 learned to check the command's own pid, see below) |
 | lifeline-sigkill-after-grace | 1/1: d4 |
 | lifeline-read-end-to-runner | 1/1: d4 |
 | runner-reports-status | 1/1: r1 |
@@ -580,4 +580,10 @@ behave as declared (red).
 | lingering-group-tracking (now the `Guarded` arm) | 3/3: t6b, t6c, t6d |
 | setsid-process-group (now in `child_setup`) | 4/4: t6, t5, d5, d4 |
 | timeout-hard-kill (new exit-watch select) | 1/1: t3 |
+
+After the teardown rewrite (fork-race fix), `lifeline-teardown` first came
+back **1/3 red**: `t12` and `p2` only watched the task's pid, which is now
+the runner's, and a runner that simply exits on EOF passed them while
+`sh` kept running. Both now make the command print its own pid (`echo $$;
+exec sleep …`) and require it gone too; the entry is 3/3 red again.
 

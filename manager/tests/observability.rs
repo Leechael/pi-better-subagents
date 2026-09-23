@@ -190,11 +190,15 @@ fn p2_end_reasons_across_manager_lifecycle() {
     let mut d1 = home.start_daemon();
     let mut c = home.connect();
     hello_v2(&mut c, "sess-p2", "/tmp");
-    let (crashed, crashed_pid) = start(&mut c, "sleep 300", json!({}));
+    let (crashed, runner_pid) = start(&mut c, "echo $$; exec sleep 300", json!({}));
+    let cmd_pid = wait_for_pids(&mut c, &crashed, 1)[0];
     drop(c);
     d1.kill().unwrap();
     d1.wait().unwrap();
-    assert!(poll_true(S(4), || !pid_running(crashed_pid)), "the lifeline takes the task down");
+    assert!(
+        poll_true(S(4), || !pid_running(runner_pid) && !pid_running(cmd_pid)),
+        "the lifeline takes the task down, command included"
+    );
 
     let mut d2 = home.start_daemon();
     let mut c = home.connect();
