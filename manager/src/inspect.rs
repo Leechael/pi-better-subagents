@@ -887,9 +887,17 @@ pub struct EventsOpts {
 }
 
 /// Read every events file; returns (events, malformed line count).
-fn read_all_events(home: &Path, session_prefix: Option<&str>) -> (Vec<EventLine>, usize) {
+/// Every event line so far, time-ordered, plus the malformed-line count and,
+/// per file, the offset just past the last complete line read. `-f`
+/// continues from exactly those offsets, so a line written while history is
+/// printed is neither lost nor shown twice.
+fn read_all_events(
+    home: &Path,
+    session_prefix: Option<&str>,
+) -> (Vec<EventLine>, usize, HashMap<PathBuf, u64>) {
     let mut out = Vec::new();
     let mut bad = 0;
+    let mut offsets = HashMap::new();
     for (path, sid) in events::all_event_files(home) {
         if let Some(p) = session_prefix {
             if !sid.as_deref().is_some_and(|s| s.starts_with(p)) {
@@ -897,13 +905,15 @@ fn read_all_events(home: &Path, session_prefix: Option<&str>) -> (Vec<EventLine>
             }
         }
         let Ok(bytes) = std::fs::read(&path) else { continue };
-        let evs = events::parse_bytes(&bytes, sid.as_deref());
-        let lines = bytes.iter().filter(|b| **b == b'\n').count();
+        let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        let evs = events::parse_bytes(&bytes[..complete], sid.as_deref());
+        let lines = bytes[..complete].iter().filter(|b| **b == b'\n').count();
         bad += lines.saturating_sub(evs.len());
         out.extend(evs);
+        offsets.insert(path, complete as u64);
     }
     out.sort_by_key(|e| e.ts);
-    (out, bad)
+    (out, bad, offsets)
 }
 
 fn render_event(e: &EventLine, prefixes: &HashMap<String, String>) -> String {
@@ -955,7 +965,7 @@ pub async fn cmd_events(home: &Path, o: EventsOpts) -> Result<(), String> {
     let keep = |e: &EventLine| -> bool {
         since.map_or(true, |s| e.ts >= s) && o.id.as_deref().map_or(true, |id| event_mentions(e, id))
     };
-    let (evs, bad) = read_all_events(home, o.session.as_deref());
+    let (evs, bad, mut offsets) = read_all_events(home, o.session.as_deref());
     if bad > 0 {
         eprintln!("note: skipped {bad} malformed event line(s)");
     }
@@ -971,12 +981,8 @@ pub async fn cmd_events(home: &Path, o: EventsOpts) -> Result<(), String> {
     if !o.follow {
         return Ok(());
     }
-    // Follow: poll every file for growth (new session dirs included).
-    let mut offsets: HashMap<PathBuf, u64> = HashMap::new();
-    for (p, _) in events::all_event_files(home) {
-        let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-        offsets.insert(p, len);
-    }
+    // Follow: poll every file for growth from where history stopped; a file
+    // history did not see (a new session) is read from its start.
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let mut batch = Vec::new();

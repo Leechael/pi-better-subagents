@@ -774,7 +774,21 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
     }
 
     {
+        // `task.start` is written before the task becomes visible, and so
+        // before its exit can be watched and logged (see finalize_exit).
         let mut st = state.lock().unwrap();
+        crate::events::emit(
+            &home,
+            Some(&session_id),
+            "task.start",
+            Some(&task_id),
+            serde_json::json!({
+                "kind": kind,
+                "command": crate::events::clip_chars(&command, crate::events::COMMAND_CHARS),
+                "origin": origin,
+                "pid": pid,
+            }),
+        );
         st.registry.tasks.insert(
             task_id.clone(),
             TaskEntry::new_running(record, child, output, chunks, timeout_ms),
@@ -782,18 +796,6 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
     }
     spawn_output_fanout(state, &task_id);
     spawn_exit_watch(state, &task_id, pid);
-    crate::events::emit(
-        &home,
-        Some(&session_id),
-        "task.start",
-        Some(&task_id),
-        serde_json::json!({
-            "kind": kind,
-            "command": crate::events::clip_chars(&command, crate::events::COMMAND_CHARS),
-            "origin": origin,
-            "pid": pid,
-        }),
-    );
     // §3.3: task_started is always pushed to the owning session.
     send_event_to_session(
         state,
@@ -971,18 +973,21 @@ fn handle_mark_background(state: &Shared, conn_id: u64, task_id: &str) -> Result
             return Ok(UnitOk {});
         }
         e.record.backgrounded_at = Some(now_ms());
-        (home, e.record.clone())
+        let rec = e.record.clone();
+        // Under the lock, like task.exit: the line cannot fall after a
+        // concurrent exit's, nor after anyone sees `backgrounded_at`.
+        crate::events::emit(
+            &home,
+            Some(&rec.session_id),
+            "task.background",
+            Some(task_id),
+            serde_json::json!({ "after_ms": rec.backgrounded_at.unwrap_or(0).saturating_sub(rec.started_at) }),
+        );
+        (home, rec)
     };
     if let Err(e) = registry::persist_record(&home, &rec) {
         lifecycle::log_line(&home, &format!("persist {} failed: {e}", rec.task_id));
     }
-    crate::events::emit(
-        &home,
-        Some(&rec.session_id),
-        "task.background",
-        Some(task_id),
-        serde_json::json!({ "after_ms": rec.backgrounded_at.unwrap_or(0).saturating_sub(rec.started_at) }),
-    );
     Ok(UnitOk {})
 }
 
@@ -1323,7 +1328,7 @@ fn spawn_adopted_poller(state: &Shared, task_id: &str, pid: u32) {
 /// `wait`ers, and push `task_exited` to the owning session (§3.3/§3.4).
 fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::ExitStatus>) {
     let mut lingering = None;
-    let (sid, event, home) = {
+    let (sid, event) = {
         let mut st = state.lock().unwrap();
         let home = st.home.clone();
         let Some(entry) = st.registry.tasks.get_mut(task_id) else {
@@ -1350,7 +1355,6 @@ fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::Exi
         if let Err(e) = registry::persist_record(&home, &entry.record) {
             lifecycle::log_line(&home, &format!("persist {} failed: {e}", entry.record.task_id));
         }
-        let _ = entry.status_tx.send(entry.record.status);
         // The leader is gone; descendants it backgrounded may not be.
         let pgid = entry.record.pid;
         if task::group_alive(pgid) {
@@ -1367,12 +1371,17 @@ fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::Exi
             ts: now,
             end_reason: entry.record.end_reason.clone(),
         };
-        (entry.record.session_id.clone(), event, home)
+        // The events.jsonl line goes first, still under the state lock: once
+        // anyone can see the task as finished (`wait`, `list`), `task.exit`
+        // is on disk, ahead of whatever that observer does next.
+        let sid = entry.record.session_id.clone();
+        log_task_exit(&home, &sid, &event);
+        let _ = entry.status_tx.send(entry.record.status);
+        (sid, event)
     };
     if let Some(pgid) = lingering {
         spawn_group_watcher(state, task_id, pgid);
     }
-    log_task_exit(&home, &sid, &event);
     send_event_to_session(state, &sid, event);
 }
 
@@ -1477,7 +1486,6 @@ async fn graceful_shutdown(state: &Shared) {
                         &format!("persist {} failed: {err}", e.record.task_id),
                     );
                 }
-                let _ = e.status_tx.send(TaskStatus::Killed);
                 let ev = EventKind::TaskExited {
                     task_id: e.record.task_id.clone(),
                     exit_code: None,
@@ -1489,6 +1497,7 @@ async fn graceful_shutdown(state: &Shared) {
                     end_reason: e.record.end_reason.clone(),
                 };
                 log_task_exit(&home, &e.record.session_id, &ev);
+                let _ = e.status_tx.send(TaskStatus::Killed);
             }
         }
     }
