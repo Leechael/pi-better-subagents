@@ -190,13 +190,18 @@ export class MonitorRegistry {
   }
 
   private acceptOutput(entry: MonitorEntry, chunk: string, nextCursor?: number): void {
+    let deliver = Buffer.from(chunk, "utf8");
     if (typeof nextCursor === "number") {
       if (nextCursor <= entry.cursor) return;
+      const startCursor = nextCursor - deliver.byteLength;
+      if (startCursor < entry.cursor) {
+        deliver = deliver.subarray(entry.cursor - startCursor);
+      }
       entry.cursor = nextCursor;
     } else {
-      entry.cursor += Buffer.byteLength(chunk, "utf8");
+      entry.cursor += deliver.byteLength;
     }
-    entry.batcher.push(chunk);
+    if (deliver.byteLength > 0) entry.batcher.push(deliver.toString("utf8"));
   }
 
   /**
@@ -269,8 +274,9 @@ export class MonitorRegistry {
       entry.recovering = true;
       await client.watch(entry.taskId).catch(() => {});
       let cursor = entry.cursor;
-      // Output events are not replayed by the manager. Read the durable log gap
-      // before delivering events queued while watch/output catch-up was active.
+      // Read the durable log gap before delivering events queued while
+      // watch/output catch-up was active. A handover may replay overlapping
+      // event ranges; acceptOutput trims them to the first unseen byte cursor.
       for (;;) {
         const gap = await client.output(entry.taskId, cursor, 64 * 1024).catch(() => null);
         if (!gap || !gap.chunk || gap.next_cursor <= cursor) break;
