@@ -22,6 +22,8 @@ const SOCKET_READY_TIMEOUT_MS = 2000;
 const SOCKET_READY_POLL_MS = 50;
 const RECONNECT_DELAYS_MS = [500, 1000, 2000];
 const RETRY_COOLDOWN_MS = 30000;
+const MANAGER_SHUTDOWN_WAIT_MS = 5000;
+const MANAGER_SHUTTING_DOWN = "manager is shutting down";
 
 // ---------------------------------------------------------------------------
 // Protocol types (field names are contractual, see design doc §3.3)
@@ -400,6 +402,16 @@ export class ManagerClient {
       return;
     } catch (err) {
       if (err instanceof HelloError) {
+        if (err.message.includes(MANAGER_SHUTTING_DOWN)) {
+          // A shutdown manager refuses hello while it completes its bounded
+          // kill grace. Wait for its pid to exit before retrying/spawning.
+          await this.waitForManagerExit(paths.pidFile);
+          if (allowZombieRetry) {
+            await this.connectFlow(false);
+            return;
+          }
+          throw err;
+        }
         // Socket exists but hello failed: possible zombie socket (§3.1 step 5).
         this.handleZombie(paths.socket, paths.pidFile);
         if (allowZombieRetry) {
@@ -426,6 +438,21 @@ export class ManagerClient {
       await this.waitForSocket(paths.socket, SOCKET_READY_TIMEOUT_MS);
     }
     await this.connectAndHello(paths.socket);
+  }
+
+  private async waitForManagerExit(pidFile: string): Promise<void> {
+    let pid: number;
+    try {
+      const info = JSON.parse(readFileSync(pidFile, "utf8")) as { pid?: number };
+      if (typeof info.pid !== "number") return;
+      pid = info.pid;
+    } catch {
+      return;
+    }
+    const deadline = this.now() + MANAGER_SHUTDOWN_WAIT_MS;
+    while (pidAlive(pid) && this.now() < deadline) {
+      await this.clock.sleep(SOCKET_READY_POLL_MS);
+    }
   }
 
   private handleZombie(socketPath: string, pidFile: string): void {

@@ -2,7 +2,7 @@
  * Integration test for ManagerClient against an in-process fake pbs-manager
  * speaking the real §3.3 wire protocol (u32 BE length + JSON frames).
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +19,7 @@ interface FakeManager {
   socketPath: string;
   received: Record<string, unknown>[];
   sockets: Set<net.Socket>;
+  rejectFirstHelloOnce(): void;
   close(): Promise<void>;
 }
 
@@ -34,6 +35,7 @@ async function startFakeManager(home: string): Promise<FakeManager> {
   const socketPath = join(home, "manager.sock");
   const received: Record<string, unknown>[] = [];
   const sockets = new Set<net.Socket>();
+  let rejectNextHelloForShutdown = false;
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -60,6 +62,10 @@ async function startFakeManager(home: string): Promise<FakeManager> {
   ): Record<string, unknown> | null {
     switch (msg.type) {
       case "hello":
+        if (rejectNextHelloForShutdown) {
+          rejectNextHelloForShutdown = false;
+          return { v: 1, id: msg.id, ok: false, error: { code: "E_INTERNAL", message: "manager is shutting down" } };
+        }
         return { v: 1, id: msg.id, ok: true, version: "0.1.0", pid: 4321, started_at: 1 };
       case "start":
         return { v: 1, id: msg.id, ok: true, task_id: "sh_a1b2c3d4", pid: 5678 };
@@ -115,6 +121,7 @@ async function startFakeManager(home: string): Promise<FakeManager> {
     socketPath,
     received,
     sockets,
+    rejectFirstHelloOnce: () => { rejectNextHelloForShutdown = true; },
     close: () =>
       new Promise<void>((resolve) => {
         for (const s of sockets) s.destroy();
@@ -159,6 +166,16 @@ describe("ManagerClient (integration, fake manager)", () => {
       session_id: "sess-1",
       pi_pid: process.pid,
     });
+  });
+
+  it("waits out a shutting-down hello without deleting manager files", async () => {
+    fake.rejectFirstHelloOnce();
+    writeFileSync(join(home, "manager.pid"), JSON.stringify({ pid: 2_000_000_000 }));
+
+    expect(await client.connect()).toBe(true);
+    expect(fake.received.filter((message) => message.type === "hello")).toHaveLength(2);
+    expect(existsSync(fake.socketPath)).toBe(true);
+    expect(existsSync(join(home, "manager.pid"))).toBe(true);
   });
 
   it("multiplexes request/response for start/wait/output/stop/list", async () => {
