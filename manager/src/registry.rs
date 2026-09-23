@@ -48,12 +48,37 @@ pub struct TaskEntry {
     pub status_tx: watch::Sender<TaskStatus>,
     /// Set by stop/timeout/shutdown so the exit path maps to `killed` (§3.4).
     pub kill_requested: bool,
+    /// end_reason for a kill we initiated (stop/timeout/shutdown); the first
+    /// reason wins. None + a natural exit = "exited".
+    pub kill_reason: Option<String>,
     /// Connection ids subscribed to output events (§3.3 watch).
     pub watchers: HashSet<u64>,
     pub timeout_ms: Option<u64>,
+    /// The leader exited but other members of its process group (children
+    /// it backgrounded) are still alive. The group is still ours to kill on
+    /// stop/shutdown (§3.2: background work must not outlive the manager).
+    pub group_lingering: bool,
 }
 
 impl TaskEntry {
+    /// The task's process group may still have members: the leader runs, or
+    /// it exited leaving descendants behind.
+    pub fn owns_live_group(&self) -> bool {
+        self.record.status == TaskStatus::Running || self.group_lingering
+    }
+
+    /// Mark a running task as killed by us, for `end_reason` (first reason
+    /// wins: a stop followed by a shutdown stays "stopped:…").
+    pub fn request_kill(&mut self, end_reason: &str) {
+        if self.record.status != TaskStatus::Running {
+            return;
+        }
+        self.kill_requested = true; // exit path maps this to `killed` (§3.4)
+        if self.kill_reason.is_none() {
+            self.kill_reason = Some(end_reason.to_string());
+        }
+    }
+
     pub fn new_running(
         record: TaskRecord,
         child: Child,
@@ -69,8 +94,10 @@ impl TaskEntry {
             chunks_rx: Some(chunks_rx),
             status_tx,
             kill_requested: false,
+            kill_reason: None,
             watchers: HashSet::new(),
             timeout_ms,
+            group_lingering: false,
         }
     }
 
@@ -86,8 +113,10 @@ impl TaskEntry {
             chunks_rx: None,
             status_tx,
             kill_requested: false,
+            kill_reason: None,
             watchers: HashSet::new(),
             timeout_ms: None, // original timeout is not persisted; not re-armed
+            group_lingering: false,
         }
     }
 
@@ -102,8 +131,10 @@ impl TaskEntry {
             chunks_rx: None,
             status_tx,
             kill_requested: false,
+            kill_reason: None,
             watchers: HashSet::new(),
             timeout_ms: None,
+            group_lingering: false,
         }
     }
 }
@@ -291,6 +322,9 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             output_size: 0,
+            origin: None,
+            backgrounded_at: None,
+            end_reason: None,
         }
     }
 
@@ -351,8 +385,10 @@ mod tests {
                 chunks_rx: None,
                 status_tx,
                 kill_requested: false,
+                kill_reason: None,
                 watchers: HashSet::new(),
                 timeout_ms: None,
+                group_lingering: false,
             },
         );
         let own = Access::Extension("sess-a".into());

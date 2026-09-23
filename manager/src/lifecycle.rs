@@ -41,6 +41,11 @@ pub fn lock_path(home: &Path) -> PathBuf {
     home.join("manager.spawn.lock")
 }
 
+/// Held by the running daemon for its whole lifetime (singleton identity).
+pub fn daemon_lock_path(home: &Path) -> PathBuf {
+    home.join("manager.lock")
+}
+
 pub fn log_path(home: &Path) -> PathBuf {
     home.join("manager.log")
 }
@@ -93,23 +98,85 @@ pub fn cleanup_stale_files(home: &Path) -> io::Result<()> {
 }
 
 pub enum Claim {
-    Acquired,
-    AlreadyRunning { pid: u32 },
+    /// This process is the daemon for `home`. Keep the guard alive for the
+    /// daemon's whole lifetime; the OS releases the lock when it exits, even
+    /// on SIGKILL.
+    Acquired(DaemonLockGuard),
+    /// Another live daemon holds the lock. `pid` comes from manager.pid and
+    /// may be absent while that daemon is still starting.
+    AlreadyRunning { pid: Option<u32> },
 }
 
-/// §3.1: daemon startup checks the pid file first — a live pid refuses the
-/// start ("already running", exit 0); a dead pid is cleaned up and taken over.
-pub fn claim_pid(home: &Path) -> io::Result<Claim> {
-    if let Some(pf) = read_pid_file(home) {
-        if task::pid_alive(pf.pid) {
-            return Ok(Claim::AlreadyRunning { pid: pf.pid });
+/// Exclusive lock on manager.lock, held by the daemon for its lifetime.
+pub struct DaemonLockGuard {
+    _guard: fd_lock::RwLockWriteGuard<'static, std::fs::File>,
+}
+
+fn open_daemon_lock(home: &Path) -> io::Result<fd_lock::RwLock<std::fs::File>> {
+    // std opens files with O_CLOEXEC, so task processes never inherit the
+    // lock: after a daemon crash, live tasks cannot keep a new daemon out.
+    let f = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(daemon_lock_path(home))?;
+    Ok(fd_lock::RwLock::new(f))
+}
+
+/// §3.1 singleton claim. Identity is the lifetime lock on manager.lock, not
+/// pid liveness: the pid in manager.pid can belong to an unrelated process
+/// after a crash or reboot. Only the lock holder touches socket/pid files, so
+/// whatever it finds is stale and is removed before binding.
+pub fn claim_daemon(home: &Path) -> io::Result<Claim> {
+    let lock: &'static mut fd_lock::RwLock<std::fs::File> =
+        Box::leak(Box::new(open_daemon_lock(home)?));
+    match lock.try_write() {
+        Ok(guard) => {
+            cleanup_stale_files(home)?;
+            Ok(Claim::Acquired(DaemonLockGuard { _guard: guard }))
         }
-        cleanup_stale_files(home)?;
-    } else if socket_path(home).exists() {
-        // Socket without a pid file is a zombie; remove it.
-        cleanup_stale_files(home)?;
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Claim::AlreadyRunning {
+            pid: read_pid_file(home).map(|p| p.pid),
+        }),
+        Err(e) => Err(e),
     }
-    Ok(Claim::Acquired)
+}
+
+/// True when a daemon currently holds manager.lock. Takes and releases the
+/// lock when it is free, so call it only from short-lived tools (doctor).
+#[cfg(test)]
+pub fn daemon_running(home: &Path) -> io::Result<bool> {
+    Ok(clean_if_no_daemon_with(home, |_| Ok(()))?.is_none())
+}
+
+/// Doctor: when no daemon holds manager.lock, remove stale socket/pid files
+/// while holding the lock (so a daemon cannot start mid-cleanup). Returns
+/// `None` when a daemon is running (nothing touched), otherwise the list of
+/// files that were removed.
+pub fn clean_if_no_daemon(home: &Path) -> io::Result<Option<Vec<PathBuf>>> {
+    clean_if_no_daemon_with(home, |home| {
+        let mut removed = Vec::new();
+        for p in [socket_path(home), pid_path(home)] {
+            if p.exists() {
+                fs::remove_file(&p)?;
+                removed.push(p);
+            }
+        }
+        Ok(removed)
+    })
+}
+
+fn clean_if_no_daemon_with<T>(
+    home: &Path,
+    f: impl FnOnce(&Path) -> io::Result<T>,
+) -> io::Result<Option<T>> {
+    let mut lock = open_daemon_lock(home)?;
+    let res = match lock.try_write() {
+        Ok(_guard) => Some(f(home)?),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => None,
+        Err(e) => return Err(e),
+    };
+    Ok(res)
 }
 
 // ---------------------------------------------------------------------------
@@ -158,16 +225,37 @@ pub fn scan_tasks(home: &Path, registry: &mut Registry) -> ScanResult {
         loaded: 0,
     };
     for mut rec in registry::load_all_records(home) {
+        // The persisted output_size lags the output file: a running task's
+        // is only written at exit, and the exit snapshot can precede the tee
+        // draining the pipe. The file is append-only and can no longer grow
+        // (the stdout pipe died with the old manager), so it is the truth.
+        if let Ok(m) = fs::metadata(&rec.output_path) {
+            rec.output_size = rec.output_size.max(m.len());
+        }
         if rec.status == TaskStatus::Running {
             if task::pid_alive(rec.pid) {
-                // §3.4: pid alive -> re-adopt; output file keeps being tailed.
+                // §3.4: pid alive -> re-adopt.
                 result.readopted.push((rec.task_id.clone(), rec.pid));
                 registry.tasks.insert(rec.task_id.clone(), TaskEntry::adopted(rec));
             } else {
                 // §3.4: pid dead -> orphaned.
                 rec.status = TaskStatus::Orphaned;
-                rec.ended_at = Some(now_ms());
+                rec.end_reason = Some(crate::proto::end_reason::ORPHANED.to_string());
+                let now = now_ms();
+                rec.ended_at = Some(now);
                 let _ = registry::persist_record(home, &rec);
+                crate::events::emit(
+                    home,
+                    Some(&rec.session_id),
+                    "task.exit",
+                    Some(&rec.task_id),
+                    serde_json::json!({
+                        "exit_code": null,
+                        "signal": null,
+                        "end_reason": crate::proto::end_reason::ORPHANED,
+                        "duration_ms": now.saturating_sub(rec.started_at),
+                    }),
+                );
                 registry.tasks.insert(rec.task_id.clone(), TaskEntry::terminal(rec));
                 result.orphaned += 1;
             }
@@ -212,30 +300,33 @@ mod tests {
     }
 
     #[test]
-    fn claim_refuses_live_pid_and_takes_over_dead() {
+    fn claim_is_exclusive_and_ignores_pid_liveness() {
         let home = temp_home("claim");
-        // Live pid (ourselves) -> already running.
+        // A live but unrelated pid in manager.pid (pid reuse) does not block.
         write_pid_file(&home, std::process::id()).unwrap();
-        match claim_pid(&home).unwrap() {
-            Claim::AlreadyRunning { pid } => assert_eq!(pid, std::process::id()),
-            Claim::Acquired => panic!("should have refused"),
-        }
-        // Dead pid -> cleaned up and acquired.
-        write_pid_file(&home, 99_999_999).unwrap();
         fs::write(socket_path(&home), b"").unwrap();
-        match claim_pid(&home).unwrap() {
-            Claim::Acquired => {}
-            Claim::AlreadyRunning { .. } => panic!("should have taken over"),
-        }
+        let first = match claim_daemon(&home).unwrap() {
+            Claim::Acquired(g) => g,
+            Claim::AlreadyRunning { .. } => panic!("a reused pid must not block the claim"),
+        };
+        // The lock holder removed the stale files.
         assert!(!pid_path(&home).exists());
         assert!(!socket_path(&home).exists());
-        // Zombie socket without pid file -> cleaned.
-        fs::write(socket_path(&home), b"").unwrap();
-        match claim_pid(&home).unwrap() {
-            Claim::Acquired => {}
-            Claim::AlreadyRunning { .. } => panic!("should have taken over"),
+        assert!(daemon_running(&home).unwrap());
+        // A second claim while the first is held is refused and leaves the
+        // owner's files alone.
+        write_pid_file(&home, 4242).unwrap();
+        match claim_daemon(&home).unwrap() {
+            Claim::AlreadyRunning { pid } => assert_eq!(pid, Some(4242)),
+            Claim::Acquired(_) => panic!("second claim must be refused"),
         }
-        assert!(!socket_path(&home).exists());
+        assert!(pid_path(&home).exists());
+        drop(first);
+        assert!(!daemon_running(&home).unwrap());
+        match claim_daemon(&home).unwrap() {
+            Claim::Acquired(_) => {}
+            Claim::AlreadyRunning { .. } => panic!("a released lock must be claimable"),
+        }
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -258,6 +349,9 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             output_size: 3,
+            origin: None,
+            backgrounded_at: None,
+            end_reason: None,
         };
         registry::persist_record(&home, &rec).unwrap();
         let mut reg = Registry::new(home.clone());
@@ -270,6 +364,42 @@ mod tests {
         // Persisted too.
         let loaded = registry::load_all_records(&home);
         assert_eq!(loaded[0].status, TaskStatus::Orphaned);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The exit path persists `output_size` when the child exits, which can
+    /// be before the tee has drained the pipe. The output file is the truth:
+    /// a loaded terminal record must report its full size.
+    #[test]
+    fn scan_recovers_output_size_of_terminal_records_from_the_file() {
+        let home = temp_home("scan-size");
+        let out = registry::task_output_path(&home, "s1", "sh_0000000b");
+        let rec = crate::proto::TaskRecord {
+            task_id: "sh_0000000b".into(),
+            session_id: "s1".into(),
+            kind: crate::proto::TaskKind::Shell,
+            command: "seq 1 3".into(),
+            cwd: "/tmp".into(),
+            pid: 99_999_999,
+            status: TaskStatus::Completed,
+            exit_code: Some(0),
+            signal: None,
+            started_at: now_ms(),
+            ended_at: Some(now_ms()),
+            output_path: out.to_string_lossy().into_owned(),
+            output_size: 0, // snapshot taken before the pipe was drained
+            origin: None,
+            backgrounded_at: None,
+            end_reason: None,
+        };
+        registry::persist_record(&home, &rec).unwrap();
+        fs::write(&out, b"1\n2\n3\n").unwrap();
+        let mut reg = Registry::new(home.clone());
+        let res = scan_tasks(&home, &mut reg);
+        assert_eq!(res.loaded, 1);
+        let e = &reg.tasks["sh_0000000b"];
+        assert_eq!(e.record.output_size, 6);
+        assert_eq!(e.output.lock().unwrap().total_size, 6);
         std::fs::remove_dir_all(&home).ok();
     }
 }

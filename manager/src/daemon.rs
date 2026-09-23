@@ -25,11 +25,15 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Hygiene: a connection must complete hello within this window (it does not
 /// count as an active connection until then).
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-/// Server-side cap for one output read (keeps frames well under the 4 MiB
-/// frame limit even after UTF-8-lossy expansion).
+/// Server-side cap on raw bytes for one output read.
 const MAX_OUTPUT_READ: u64 = 1024 * 1024;
+/// Cap on a chunk's JSON-escaped size (control bytes escape to 6 bytes each),
+/// leaving room for the response envelope inside the 4 MiB frame.
+const CHUNK_JSON_BUDGET: usize = MAX_FRAME_SIZE as usize - 64 * 1024;
 /// §3.4: re-adopted tasks are polled with kill(pid, 0) every second.
 const ADOPT_POLL: Duration = Duration::from_secs(1);
+/// Poll interval for a process group that outlived its leader.
+const GROUP_POLL: Duration = Duration::from_millis(500);
 
 type OutTx = mpsc::Sender<Arc<Vec<u8>>>;
 pub type Shared = Arc<Mutex<DaemonState>>;
@@ -50,6 +54,10 @@ pub struct SessionEntry {
     pub pi_pid: u32,
     pub conn_id: Option<u64>,
     pub cwd: Option<String>,
+    pub extension_version: Option<String>,
+    pub protocol: Option<u32>,
+    pub connected_at: u64,
+    pub last_seen: u64,
 }
 
 pub struct DaemonState {
@@ -64,6 +72,8 @@ pub struct DaemonState {
     pub idle_timer: Option<tokio::task::JoinHandle<()>>,
     pub shutdown: bool,
     pub shutdown_notify: Arc<Notify>,
+    /// Time source for the daemon's own timers (see `clock.rs`).
+    pub clock: crate::clock::Clock,
 }
 
 // ---------------------------------------------------------------------------
@@ -75,18 +85,22 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
         eprintln!("pbs-manager: cannot create {}: {e}", home.display());
         return 1;
     }
-    // §3.1: refuse to start over a live manager; take over from a dead one.
-    match lifecycle::claim_pid(&home) {
-        Ok(Claim::Acquired) => {}
+    // §3.1: the lifetime lock on manager.lock decides who the daemon is; the
+    // holder removes stale socket/pid files before binding. Held until exit.
+    let _daemon_lock = match lifecycle::claim_daemon(&home) {
+        Ok(Claim::Acquired(guard)) => guard,
         Ok(Claim::AlreadyRunning { pid }) => {
-            println!("pbs-manager already running (pid {pid})");
+            match pid {
+                Some(pid) => println!("pbs-manager already running (pid {pid})"),
+                None => println!("pbs-manager already running (starting up)"),
+            }
             return 0;
         }
         Err(e) => {
-            eprintln!("pbs-manager: pid claim failed: {e}");
+            eprintln!("pbs-manager: daemon lock failed: {e}");
             return 1;
         }
-    }
+    };
 
     let mut registry = Registry::new(home.clone());
     let scan = lifecycle::scan_tasks(&home, &mut registry);
@@ -101,6 +115,7 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
         idle_timer: None,
         shutdown: false,
         shutdown_notify: Arc::new(Notify::new()),
+        clock: crate::clock::Clock::from_env(),
     }));
 
     // Bind the well-known socket (§3.1).
@@ -134,6 +149,20 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
             scan.loaded
         ),
     );
+    crate::events::emit(
+        &home,
+        None,
+        "daemon.start",
+        None,
+        serde_json::json!({
+            "pid": std::process::id(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "protocol": PROTOCOL,
+            "readopted": scan.readopted.len(),
+            "orphaned": scan.orphaned,
+            "loaded": scan.loaded,
+        }),
+    );
     if foreground {
         eprintln!(
             "pbs-manager {} listening on {} (pid {})",
@@ -143,7 +172,7 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
         );
     }
 
-    // §3.4: re-adopted tasks get a kill(pid,0) poller + output tailer.
+    // §3.4: re-adopted tasks get a kill(pid,0) exit poller.
     for (task_id, pid) in scan.readopted {
         spawn_adopted_poller(&state, &task_id, pid);
     }
@@ -156,6 +185,10 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
 
+    // Keep accepting while shutting down: a new client then gets a prompt
+    // "manager is shutting down" instead of hanging until its hello timeout
+    // (and, under `test-clock`, can still step the manual clock).
+    let mut shutdown_task: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         tokio::select! {
             res = listener.accept() => match res {
@@ -168,30 +201,44 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             },
-            _ = shutdown_notify.notified() => break,
+            _ = shutdown_notify.notified(), if shutdown_task.is_none() => {
+                shutdown_task = Some(begin_shutdown(&state));
+            }
             _ = async {
                 match sigterm.as_mut() {
                     Some(s) => { s.recv().await; }
                     None => std::future::pending::<()>().await,
                 }
-            } => {
+            }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, "received SIGTERM");
-                break;
+                shutdown_task = Some(begin_shutdown(&state));
             }
             _ = async {
                 match sigint.as_mut() {
                     Some(s) => { s.recv().await; }
                     None => std::future::pending::<()>().await,
                 }
-            } => {
+            }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, "received SIGINT");
-                break;
+                shutdown_task = Some(begin_shutdown(&state));
             }
+            _ = async {
+                match shutdown_task.as_mut() {
+                    Some(t) => { let _ = t.await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => break,
         }
     }
-
-    graceful_shutdown(&state).await;
     0
+}
+
+/// Mark the manager as shutting down (new hellos are refused) and run the
+/// graceful shutdown as its own task.
+fn begin_shutdown(state: &Shared) -> tokio::task::JoinHandle<()> {
+    state.lock().unwrap().shutdown = true;
+    let s = state.clone();
+    tokio::spawn(async move { graceful_shutdown(&s).await })
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +269,13 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin>(
     mut rx: mpsc::Receiver<Arc<Vec<u8>>>,
 ) {
     while let Some(payload) = rx.recv().await {
+        // An oversized frame is dropped, not written: write_frame would
+        // refuse it, and ending the writer here would leave the connection
+        // mute for every later response. `respond` already substitutes an
+        // error for oversized responses, so this is a last line of defence.
+        if payload.len() > MAX_FRAME_SIZE as usize {
+            continue;
+        }
         if write_frame(&mut w, &payload).await.is_err() {
             break;
         }
@@ -246,19 +300,37 @@ async fn handle_conn(state: Shared, stream: Stream) {
             return;
         }
     };
+    // Test-only manual-clock requests: answered before (instead of) hello,
+    // so they never count as an active connection or cancel the idle timer.
+    #[cfg(feature = "test-clock")]
+    if matches!(hello.kind, RequestKind::ClockStatus | RequestKind::ClockAdvance { .. }) {
+        respond(&tx, &hello.id, handle_clock(&state, &hello.kind)).await;
+        return;
+    }
     if matches!(hello.v, Some(v) if v != PROTO_VERSION) {
         let _ = tx
             .send(encode_error(&hello.id, E_VERSION, "unsupported protocol version"))
             .await;
         return;
     }
-    let (client_kind, session_id, pi_pid, cwd) = match hello.kind {
+    let (client_kind, session_id, pi_pid, info) = match hello.kind {
         RequestKind::Hello {
             client_kind,
             session_id,
             pi_pid,
             cwd,
-        } => (client_kind, session_id, pi_pid, cwd),
+            extension_version,
+            protocol,
+        } => (
+            client_kind,
+            session_id,
+            pi_pid,
+            HelloInfo {
+                cwd,
+                extension_version,
+                protocol,
+            },
+        ),
         _ => {
             let _ = tx
                 .send(encode_error(&hello.id, E_BAD_REQUEST, "first message must be hello"))
@@ -280,7 +352,7 @@ async fn handle_conn(state: Shared, stream: Stream) {
         }
     }
 
-    let conn_id = match register_conn(&state, &tx, &die, client_kind, session_id, pi_pid, cwd) {
+    let conn_id = match register_conn(&state, &tx, &die, client_kind, session_id, pi_pid, info) {
         Ok(id) => id,
         Err(e) => {
             let _ = tx.send(encode_error(&hello.id, &e.code, &e.message)).await;
@@ -329,9 +401,16 @@ async fn handle_conn(state: Shared, stream: Stream) {
     // ---- disconnect (§3.2: socket close marks the session disconnected) ----
     {
         let mut st = state.lock().unwrap();
-        remove_conn(&mut st, conn_id);
+        remove_conn(&mut st, conn_id, "closed");
     }
     maybe_arm_idle_timer(&state);
+}
+
+/// Optional hello fields stored per session.
+pub struct HelloInfo {
+    pub cwd: Option<String>,
+    pub extension_version: Option<String>,
+    pub protocol: Option<u32>,
 }
 
 /// Register a hello'd connection. Same-session rebind: the new connection
@@ -343,11 +422,11 @@ fn register_conn(
     kind: ClientKind,
     session_id: Option<String>,
     pi_pid: Option<u32>,
-    cwd: Option<String>,
+    info: HelloInfo,
 ) -> Result<u64, ProtoError> {
     let mut st = state.lock().unwrap();
     if st.shutdown {
-        return Err(ProtoError::new(E_INTERNAL, "manager is shutting down"));
+        return Err(ProtoError::new(E_INTERNAL, SHUTTING_DOWN));
     }
     // A fresh active connection cancels any pending idle shutdown (§3.2).
     if let Some(t) = st.idle_timer.take() {
@@ -363,14 +442,34 @@ fn register_conn(
                 let _ = old_h.tx.try_send(encode_event(&EventKind::SessionRebound {}));
                 old_h.die.notify_one();
             }
-            remove_conn(&mut st, old_id);
+            remove_conn(&mut st, old_id, "rebound");
         }
+        let now = now_ms();
+        // `connected_at` is the first hello this manager saw for the session;
+        // a reconnect (pi --resume, rebind) keeps it.
+        let connected_at = st.sessions.get(&sid).map(|s| s.connected_at).unwrap_or(now);
+        crate::events::emit(
+            &st.home,
+            Some(&sid),
+            "session.connect",
+            None,
+            serde_json::json!({
+                "pi_pid": pi_pid.unwrap_or(0),
+                "cwd": info.cwd,
+                "extension_version": info.extension_version,
+                "protocol": info.protocol,
+            }),
+        );
         st.sessions.insert(
             sid,
             SessionEntry {
                 pi_pid: pi_pid.unwrap_or(0),
                 conn_id: Some(conn_id),
-                cwd,
+                cwd: info.cwd,
+                extension_version: info.extension_version,
+                protocol: info.protocol,
+                connected_at,
+                last_seen: now,
             },
         );
     }
@@ -386,12 +485,21 @@ fn register_conn(
     Ok(conn_id)
 }
 
-fn remove_conn(st: &mut DaemonState, conn_id: u64) {
+fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
     if let Some(h) = st.conns.remove(&conn_id) {
         if let Some(sid) = &h.session_id {
+            let home = st.home.clone();
             if let Some(s) = st.sessions.get_mut(sid) {
                 if s.conn_id == Some(conn_id) {
                     s.conn_id = None; // session now disconnected (§3.2)
+                    s.last_seen = now_ms();
+                    crate::events::emit(
+                        &home,
+                        Some(sid),
+                        "session.disconnect",
+                        None,
+                        serde_json::json!({ "reason": why }),
+                    );
                 }
             }
         }
@@ -408,8 +516,9 @@ fn maybe_arm_idle_timer(state: &Shared) {
         return;
     }
     let state2 = state.clone();
+    let clock = st.clock.clone();
     st.idle_timer = Some(tokio::spawn(async move {
-        tokio::time::sleep(IDLE_SHUTDOWN).await;
+        clock.sleep("idle", IDLE_SHUTDOWN).await;
         let fired = {
             let mut st = state2.lock().unwrap();
             if st.conns.is_empty() && !st.shutdown {
@@ -431,6 +540,7 @@ fn maybe_arm_idle_timer(state: &Shared) {
 // ---------------------------------------------------------------------------
 
 async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
+    touch_session(&state, conn_id);
     let id = req.id;
     match req.kind {
         RequestKind::Hello { .. } => {
@@ -444,8 +554,22 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             cwd,
             env,
             timeout_ms,
+            origin,
             ..
-        } => respond(&tx, &id, handle_start(&state, conn_id, kind, command, cwd, env, timeout_ms)).await,
+        } => {
+            let spec = StartSpec {
+                kind,
+                command,
+                cwd,
+                env,
+                timeout_ms,
+                origin,
+            };
+            respond(&tx, &id, handle_start(&state, conn_id, spec)).await
+        }
+        RequestKind::MarkBackground { task_id } => {
+            respond(&tx, &id, handle_mark_background(&state, conn_id, &task_id)).await
+        }
         RequestKind::Wait { task_id, budget_ms } => {
             respond(&tx, &id, handle_wait(&state, conn_id, &task_id, budget_ms).await).await
         }
@@ -454,8 +578,8 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             cursor,
             max_bytes,
         } => respond(&tx, &id, handle_output(&state, conn_id, &task_id, cursor, max_bytes)).await,
-        RequestKind::Stop { task_id } => {
-            respond(&tx, &id, handle_stop(&state, conn_id, &task_id)).await
+        RequestKind::Stop { task_id, reason } => {
+            respond(&tx, &id, handle_stop(&state, conn_id, &task_id, reason.as_deref())).await
         }
         RequestKind::List { all, session_id } => {
             respond(&tx, &id, handle_list(&state, conn_id, all, session_id)).await
@@ -471,14 +595,48 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         }
         RequestKind::Status => respond(&tx, &id, handle_status(&state, conn_id)).await,
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
+        #[cfg(feature = "test-clock")]
+        ref k @ (RequestKind::ClockStatus | RequestKind::ClockAdvance { .. }) => {
+            respond(&tx, &id, handle_clock(&state, k)).await
+        }
+    }
+}
+
+/// Test-only: inspect or advance the manual clock (`test-clock` feature).
+#[cfg(feature = "test-clock")]
+fn handle_clock(state: &Shared, req: &RequestKind) -> Result<crate::clock::ClockStatus, ProtoError> {
+    let clock = state.lock().unwrap().clock.clone();
+    let Some(m) = clock.manual() else {
+        return Err(ProtoError::new(
+            E_BAD_REQUEST,
+            "manual clock not enabled (start the daemon with PBS_TEST_CLOCK=manual)",
+        ));
+    };
+    Ok(match req {
+        RequestKind::ClockAdvance { ms } => m.advance(*ms),
+        _ => m.status(),
+    })
+}
+
+/// Record activity for the connection's session (`sessions` LAST_SEEN).
+fn touch_session(state: &Shared, conn_id: u64) {
+    let mut st = state.lock().unwrap();
+    let sid = st.conns.get(&conn_id).and_then(|h| h.session_id.clone());
+    if let Some(s) = sid.and_then(|sid| st.sessions.get_mut(&sid)) {
+        s.last_seen = now_ms();
     }
 }
 
 async fn respond<T: Serialize>(tx: &OutTx, id: &str, result: Result<T, ProtoError>) {
-    let frame = match result {
+    let mut frame = match result {
         Ok(body) => encode_ok(id, &body),
         Err(e) => encode_error(id, &e.code, &e.message),
     };
+    // Every request gets an answer: a response that does not fit a frame
+    // becomes an error instead of silently disappearing.
+    if frame.len() > MAX_FRAME_SIZE as usize {
+        frame = encode_error(id, E_INTERNAL, "response exceeds the 4 MiB frame limit");
+    }
     let _ = tx.send(frame).await;
 }
 
@@ -534,19 +692,28 @@ fn send_event_to_session(state: &Shared, session_id: &str, kind: EventKind) {
 // Message handlers
 // ---------------------------------------------------------------------------
 
-fn handle_start(
-    state: &Shared,
-    conn_id: u64,
-    kind: TaskKind,
-    command: String,
-    cwd: Option<String>,
-    env: HashMap<String, String>,
-    timeout_ms: Option<u64>,
-) -> Result<StartOk, ProtoError> {
+pub struct StartSpec {
+    pub kind: TaskKind,
+    pub command: String,
+    pub cwd: Option<String>,
+    pub env: HashMap<String, String>,
+    pub timeout_ms: Option<u64>,
+    pub origin: Option<Origin>,
+}
+
+fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk, ProtoError> {
+    let StartSpec {
+        kind,
+        command,
+        cwd,
+        env,
+        timeout_ms,
+        origin,
+    } = spec;
     let (session_id, home) = {
         let st = state.lock().unwrap();
         if st.shutdown {
-            return Err(ProtoError::new(E_INTERNAL, "manager is shutting down"));
+            return Err(ProtoError::new(E_INTERNAL, SHUTTING_DOWN));
         }
         let h = st
             .conns
@@ -607,6 +774,9 @@ fn handle_start(
         ended_at: None,
         output_path: out_path.to_string_lossy().into_owned(),
         output_size: 0,
+        origin: origin.clone(),
+        backgrounded_at: None,
+        end_reason: None,
     };
     if let Err(e) = registry::persist_record(&home, &record) {
         let _ = task::signal_group(pid, task::SIGKILL); // don't leak the child
@@ -622,6 +792,18 @@ fn handle_start(
     }
     spawn_output_fanout(state, &task_id);
     spawn_exit_watch(state, &task_id, pid);
+    crate::events::emit(
+        &home,
+        Some(&session_id),
+        "task.start",
+        Some(&task_id),
+        serde_json::json!({
+            "kind": kind,
+            "command": crate::events::clip_chars(&command, crate::events::COMMAND_CHARS),
+            "origin": origin,
+            "pid": pid,
+        }),
+    );
     // §3.3: task_started is always pushed to the owning session.
     send_event_to_session(
         state,
@@ -699,6 +881,8 @@ fn handle_output(
     max_bytes: u64,
 ) -> Result<OutputOk, ProtoError> {
     let cap = max_bytes.min(MAX_OUTPUT_READ) as usize;
+    // Read a little past the cap so a character straddling it is visible.
+    let want = cap + task::UTF8_LOOKAHEAD;
     enum Src {
         Ring(Vec<u8>),
         Disk(String),
@@ -715,20 +899,26 @@ fn handle_output(
         let src = if cursor >= ring_start && cursor < total {
             let skip = (cursor - ring_start) as usize;
             let avail = out.ring.len() - skip;
-            Src::Ring(out.ring.slice(skip, avail.min(cap)))
+            Src::Ring(out.ring.slice(skip, avail.min(want)))
         } else {
             Src::Disk(e.record.output_path.clone())
         };
         (src, e.record.status, e.record.exit_code, total)
     };
-    let bytes = match src {
+    let mut bytes = match src {
         Src::Ring(b) => b,
         Src::Disk(path) => {
-            task::read_file_range(std::path::Path::new(&path), cursor, cap)
+            task::read_file_range(std::path::Path::new(&path), cursor, want)
                 .map_err(|e| ProtoError::new(E_INTERNAL, format!("read output: {e}")))?
                 .0
         }
     };
+    // §3.3: cut at a UTF-8 boundary, within the frame budget after escaping.
+    // A truncated sequence at the end of the data is held back while the task
+    // can still write the rest. (One straddling the cap never looks truncated:
+    // the lookahead always holds the whole character.)
+    let n = task::utf8_chunk_len(&bytes, cap, CHUNK_JSON_BUDGET, status == TaskStatus::Running);
+    bytes.truncate(n);
     let next_cursor = cursor + bytes.len() as u64;
     Ok(OutputOk {
         chunk: String::from_utf8_lossy(&bytes).into_owned(), // §3.3: UTF-8 lossy
@@ -739,40 +929,114 @@ fn handle_output(
     })
 }
 
-fn handle_stop(state: &Shared, conn_id: u64, task_id: &str) -> Result<UnitOk, ProtoError> {
-    let pid = {
+fn handle_stop(
+    state: &Shared,
+    conn_id: u64,
+    task_id: &str,
+    reason: Option<&str>,
+) -> Result<UnitOk, ProtoError> {
+    if let Some(r) = reason {
+        if !STOP_REASONS.contains(&r) {
+            return Err(ProtoError::new(
+                E_BAD_REQUEST,
+                format!("unknown stop reason {r:?} (expected one of {})", STOP_REASONS.join(", ")),
+            ));
+        }
+    }
+    let (pid, home, sid) = {
         let mut st = state.lock().unwrap();
+        let home = st.home.clone();
         let acc = access_for(&st, conn_id);
         let e = st.registry.visible_mut(task_id, &acc)?;
-        if e.record.status.is_terminal() {
-            return Ok(UnitOk {}); // idempotent
+        if !e.owns_live_group() {
+            return Ok(UnitOk {}); // idempotent: terminal and nothing left
         }
-        e.kill_requested = true; // exit path maps this to `killed` (§3.4)
-        e.record.pid
+        // A terminal task with a lingering group keeps its status; stop
+        // still takes down what it left behind.
+        e.request_kill(&end_reason_for_stop(reason));
+        (e.record.pid, home, e.record.session_id.clone())
     };
+    crate::events::emit(
+        &home,
+        Some(&sid),
+        "task.stop",
+        Some(task_id),
+        serde_json::json!({ "reason": reason.unwrap_or("tool") }),
+    );
     // §3.3 stop: SIGTERM the process group, 2s grace, then SIGKILL.
     let _ = task::signal_group(pid, task::SIGTERM);
     spawn_kill_reaper(state, task_id, pid);
     Ok(UnitOk {})
 }
 
+/// Observability: record that the extension moved a task to the background.
+/// Idempotent (the first time is kept); a no-op on a finished task.
+fn handle_mark_background(state: &Shared, conn_id: u64, task_id: &str) -> Result<UnitOk, ProtoError> {
+    let (home, rec) = {
+        let mut st = state.lock().unwrap();
+        let home = st.home.clone();
+        let acc = access_for(&st, conn_id);
+        let e = st.registry.visible_mut(task_id, &acc)?;
+        if e.record.status != TaskStatus::Running || e.record.backgrounded_at.is_some() {
+            return Ok(UnitOk {});
+        }
+        e.record.backgrounded_at = Some(now_ms());
+        (home, e.record.clone())
+    };
+    if let Err(e) = registry::persist_record(&home, &rec) {
+        lifecycle::log_line(&home, &format!("persist {} failed: {e}", rec.task_id));
+    }
+    crate::events::emit(
+        &home,
+        Some(&rec.session_id),
+        "task.background",
+        Some(task_id),
+        serde_json::json!({ "after_ms": rec.backgrounded_at.unwrap_or(0).saturating_sub(rec.started_at) }),
+    );
+    Ok(UnitOk {})
+}
+
+/// After the grace, SIGKILL the *group* if anything in it may survive: the
+/// leader, or descendants that ignored SIGTERM after the leader died.
 fn spawn_kill_reaper(state: &Shared, task_id: &str, pid: u32) {
     let state2 = state.clone();
     let tid = task_id.to_string();
+    let clock = state.lock().unwrap().clock.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(KILL_GRACE).await;
-        let still_running = {
+        clock.sleep("kill-grace", KILL_GRACE).await;
+        let group_live = {
             state2
                 .lock()
                 .unwrap()
                 .registry
                 .tasks
                 .get(&tid)
-                .map(|e| e.record.status == TaskStatus::Running)
+                .map(|e| e.owns_live_group())
                 .unwrap_or(false)
         };
-        if still_running {
+        if group_live {
             let _ = task::signal_group(pid, task::SIGKILL);
+        }
+    });
+}
+
+/// Track a process group whose leader exited while members remain, until the
+/// group empties. Polling keeps the pgid ours: POSIX does not reuse a pid
+/// while a group with that id exists.
+fn spawn_group_watcher(state: &Shared, task_id: &str, pgid: u32) {
+    let state2 = state.clone();
+    let tid = task_id.to_string();
+    let clock = state.lock().unwrap().clock.clone();
+    tokio::spawn(async move {
+        loop {
+            clock.sleep("group-poll", GROUP_POLL).await;
+            if task::group_alive(pgid) {
+                continue;
+            }
+            if let Some(e) = state2.lock().unwrap().registry.tasks.get_mut(&tid) {
+                e.group_lingering = false;
+            }
+            break;
         }
     });
 }
@@ -822,7 +1086,7 @@ fn handle_watch(
 }
 
 fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessionOk, ProtoError> {
-    let victims = {
+    let (victims, home, sid) = {
         let mut st = state.lock().unwrap();
         let h = st
             .conns
@@ -837,21 +1101,39 @@ fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessi
                 ))
             }
         };
+        // (task_id, pgid, was_running): lingering groups of finished tasks are
+        // killed too, but only running tasks are reported as stopped.
         let mut v = Vec::new();
         for e in st.registry.tasks.values_mut() {
-            if e.record.session_id == sid && e.record.status == TaskStatus::Running {
-                e.kill_requested = true;
-                v.push((e.record.task_id.clone(), e.record.pid));
+            if e.record.session_id == sid && e.owns_live_group() {
+                let running = e.record.status == TaskStatus::Running;
+                if running {
+                    e.request_kill(end_reason::SESSION_END);
+                }
+                v.push((e.record.task_id.clone(), e.record.pid, running));
             }
         }
-        v
+        (v, st.home.clone(), sid)
     };
-    for (tid, pid) in &victims {
+    for (tid, pid, running) in &victims {
+        if *running {
+            crate::events::emit(
+                &home,
+                Some(&sid),
+                "task.stop",
+                Some(tid),
+                serde_json::json!({ "reason": "session-end" }),
+            );
+        }
         let _ = task::signal_group(*pid, task::SIGTERM);
         spawn_kill_reaper(state, tid, *pid);
     }
     Ok(ShutdownSessionOk {
-        stopped: victims.into_iter().map(|(t, _)| t).collect(),
+        stopped: victims
+            .into_iter()
+            .filter(|(_, _, running)| *running)
+            .map(|(t, _, _)| t)
+            .collect(),
     })
 }
 
@@ -867,6 +1149,10 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
             pi_pid: s.pi_pid,
             connected: s.conn_id.is_some(),
             cwd: s.cwd.clone(),
+            extension_version: s.extension_version.clone(),
+            protocol: s.protocol,
+            connected_at: s.connected_at,
+            last_seen: if s.conn_id.is_some() { now_ms() } else { s.last_seen },
         })
         .collect();
     let running = st
@@ -882,6 +1168,7 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         uptime_ms: st.started.elapsed().as_millis() as u64,
         sessions,
         task_counts: TaskCounts { running, terminal },
+        protocol: PROTOCOL,
     })
 }
 
@@ -921,12 +1208,31 @@ fn spawn_output_fanout(state: &Shared, task_id: &str) {
     let state2 = state.clone();
     let tid = task_id.to_string();
     tokio::spawn(async move {
-        while let Some(chunk) = rx.recv().await {
+        // Pipe reads split UTF-8 sequences arbitrarily. Hold an incomplete
+        // trailing sequence back and prepend it to the next read, so events
+        // never carry U+FFFD for valid text; `next_cursor` points at the
+        // first byte not yet sent. The remainder is flushed at EOF.
+        let mut carry: Vec<u8> = Vec::new();
+        let mut last_cursor = 0u64;
+        loop {
+            let (bytes, next_cursor) = match rx.recv().await {
+                Some(c) => {
+                    last_cursor = c.next_cursor;
+                    let mut data = std::mem::take(&mut carry);
+                    data.extend_from_slice(&c.bytes);
+                    let n = task::utf8_chunk_len(&data, usize::MAX, CHUNK_JSON_BUDGET, true);
+                    carry = data.split_off(n);
+                    (data, c.next_cursor - carry.len() as u64)
+                }
+                None if !carry.is_empty() => (std::mem::take(&mut carry), last_cursor),
+                None => break,
+            };
+            let chunk = task::OutputChunk { bytes, next_cursor };
             let targets: Vec<OutTx> = {
                 let mut st = state2.lock().unwrap();
                 let watcher_ids: Vec<u64> = match st.registry.tasks.get_mut(&tid) {
                     Some(e) => {
-                        e.record.output_size = chunk.next_cursor; // monotonic (§3.4)
+                        e.record.output_size = last_cursor; // monotonic (§3.4)
                         e.watchers.iter().copied().collect()
                     }
                     None => break,
@@ -936,7 +1242,7 @@ fn spawn_output_fanout(state: &Shared, task_id: &str) {
                     .filter_map(|cid| st.conns.get(cid).map(|h| h.tx.clone()))
                     .collect()
             };
-            if !targets.is_empty() {
+            if !targets.is_empty() && !chunk.bytes.is_empty() {
                 let ev = encode_event(&EventKind::Output {
                     task_id: tid.clone(),
                     chunk: String::from_utf8_lossy(&chunk.bytes).into_owned(),
@@ -975,7 +1281,7 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
                             let mut st = state2.lock().unwrap();
                             if let Some(e) = st.registry.tasks.get_mut(&tid) {
                                 if e.record.status == TaskStatus::Running {
-                                    e.kill_requested = true;
+                                    e.request_kill(end_reason::TIMEOUT);
                                 }
                             }
                         }
@@ -990,55 +1296,30 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
     });
 }
 
-/// §3.4 re-adopt: poll kill(pid, 0) every second; keep tailing the output
-/// file for late writes. Exit code is unobtainable -> completed/null.
+/// §3.4 re-adopt: poll kill(pid, 0) every second. Exit code is unobtainable
+/// -> completed/null. No output tailing: the task's stdout pipe died with the
+/// old manager, so the output file cannot grow; `scan_tasks` already
+/// recovered its final size.
 fn spawn_adopted_poller(state: &Shared, task_id: &str, pid: u32) {
     let state2 = state.clone();
     let tid = task_id.to_string();
+    let clock = state.lock().unwrap().clock.clone();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(ADOPT_POLL);
+        let mut first = true;
         loop {
-            tick.tick().await;
-            let (path, known) = {
-                let st = state2.lock().unwrap();
-                match st.registry.tasks.get(&tid) {
-                    Some(e) if e.record.status == TaskStatus::Running => {
-                        let total = e.output.lock().unwrap().total_size;
-                        (e.record.output_path.clone(), total)
-                    }
-                    _ => break, // finalized elsewhere (stop/shutdown)
-                }
-            };
-            if let Ok((bytes, next)) =
-                task::read_file_range(std::path::Path::new(&path), known, MAX_OUTPUT_READ as usize)
-            {
-                if !bytes.is_empty() {
-                    let targets: Vec<OutTx> = {
-                        let mut st = state2.lock().unwrap();
-                        let watcher_ids: Vec<u64> = match st.registry.tasks.get_mut(&tid) {
-                            Some(e) => {
-                                e.output.lock().unwrap().append(&bytes);
-                                e.record.output_size = next;
-                                e.watchers.iter().copied().collect()
-                            }
-                            None => break,
-                        };
-                        watcher_ids
-                            .iter()
-                            .filter_map(|cid| st.conns.get(cid).map(|h| h.tx.clone()))
-                            .collect()
-                    };
-                    if !targets.is_empty() {
-                        let ev = encode_event(&EventKind::Output {
-                            task_id: tid.clone(),
-                            chunk: String::from_utf8_lossy(&bytes).into_owned(),
-                            next_cursor: next,
-                        });
-                        for tx in targets {
-                            let _ = tx.try_send(ev.clone());
-                        }
-                    }
-                }
+            if !first {
+                clock.sleep("adopt-poll", ADOPT_POLL).await;
+            }
+            first = false;
+            let running = state2
+                .lock()
+                .unwrap()
+                .registry
+                .tasks
+                .get(&tid)
+                .is_some_and(|e| e.record.status == TaskStatus::Running);
+            if !running {
+                break; // finalized elsewhere (stop/shutdown)
             }
             if !task::pid_alive(pid) {
                 finalize_exit(&state2, &tid, None);
@@ -1051,7 +1332,8 @@ fn spawn_adopted_poller(state: &Shared, task_id: &str, pid: u32) {
 /// Map an observed exit to a terminal status, persist the record, wake
 /// `wait`ers, and push `task_exited` to the owning session (§3.3/§3.4).
 fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::ExitStatus>) {
-    let (sid, event) = {
+    let mut lingering = None;
+    let (sid, event, home) = {
         let mut st = state.lock().unwrap();
         let home = st.home.clone();
         let Some(entry) = st.registry.tasks.get_mut(task_id) else {
@@ -1064,26 +1346,70 @@ fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::Exi
         let signal = status.and_then(|s| s.signal());
         let now = now_ms();
         entry.record.exit_code = code;
-        entry.record.signal = signal;
+        entry.record.signal = signal.map(signal_name);
         entry.record.ended_at = Some(now);
         entry.record.output_size = entry.output.lock().unwrap().total_size;
         entry.record.status = registry::terminal_status(entry.kill_requested, code, signal);
+        // Why it ended: our kill's reason; otherwise a natural exit. A
+        // re-adopted task (no exit status) ended while we only polled it.
+        entry.record.end_reason = Some(match (&entry.kill_reason, status) {
+            (Some(r), _) => r.clone(),
+            (None, Some(_)) => end_reason::EXITED.to_string(),
+            (None, None) => end_reason::MANAGER_RESTART.to_string(),
+        });
         if let Err(e) = registry::persist_record(&home, &entry.record) {
             lifecycle::log_line(&home, &format!("persist {} failed: {e}", entry.record.task_id));
         }
         let _ = entry.status_tx.send(entry.record.status);
+        // The leader is gone; descendants it backgrounded may not be.
+        let pgid = entry.record.pid;
+        if task::group_alive(pgid) {
+            entry.group_lingering = true;
+            lingering = Some(pgid);
+        }
         let event = EventKind::TaskExited {
             task_id: task_id.to_string(),
             exit_code: code,
-            signal,
+            signal: entry.record.signal.clone(),
             duration_ms: now.saturating_sub(entry.record.started_at),
             output_path: entry.record.output_path.clone(),
             output_size: entry.record.output_size,
             ts: now,
+            end_reason: entry.record.end_reason.clone(),
         };
-        (entry.record.session_id.clone(), event)
+        (entry.record.session_id.clone(), event, home)
     };
+    if let Some(pgid) = lingering {
+        spawn_group_watcher(state, task_id, pgid);
+    }
+    log_task_exit(&home, &sid, &event);
     send_event_to_session(state, &sid, event);
+}
+
+/// events.jsonl `task.exit` from a task_exited event.
+fn log_task_exit(home: &std::path::Path, sid: &str, ev: &EventKind) {
+    if let EventKind::TaskExited {
+        task_id,
+        exit_code,
+        signal,
+        duration_ms,
+        end_reason,
+        ..
+    } = ev
+    {
+        crate::events::emit(
+            home,
+            Some(sid),
+            "task.exit",
+            Some(task_id),
+            serde_json::json!({
+                "exit_code": exit_code,
+                "signal": signal,
+                "end_reason": end_reason,
+                "duration_ms": duration_ms,
+            }),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,25 +1420,34 @@ async fn graceful_shutdown(state: &Shared) {
     let home = state.lock().unwrap().home.clone();
     lifecycle::log_line(&home, "graceful shutdown: terminating running tasks");
 
-    // 1) SIGTERM every running process group.
-    let pids: Vec<u32> = {
+    // 1) SIGTERM every process group that may have members: running tasks,
+    //    and finished tasks whose leader left descendants behind (§3.2).
+    let (pids, running): (Vec<u32>, usize) = {
         let mut st = state.lock().unwrap();
-        st.registry
+        let mut running = 0;
+        let pids = st
+            .registry
             .tasks
             .values_mut()
-            .filter(|e| e.record.status == TaskStatus::Running)
+            .filter(|e| e.owns_live_group())
             .map(|e| {
-                e.kill_requested = true; // disk state must say `killed` (§3.2)
+                if e.record.status == TaskStatus::Running {
+                    e.request_kill(end_reason::MANAGER_SHUTDOWN); // disk says `killed` (§3.2)
+                    running += 1;
+                }
                 e.record.pid
             })
-            .collect()
+            .collect();
+        (pids, running)
     };
     for pid in &pids {
         let _ = task::signal_group(*pid, task::SIGTERM);
     }
     if !pids.is_empty() {
-        // 2) 2s grace, then SIGKILL the survivors.
-        tokio::time::sleep(KILL_GRACE).await;
+        // 2) 2s grace, then SIGKILL every group that may still have members,
+        //    even if its leader already died (SIGTERM-ignoring descendants).
+        let clock = state.lock().unwrap().clock.clone();
+        clock.sleep("shutdown-grace", KILL_GRACE).await;
         let survivors: Vec<u32> = {
             state
                 .lock()
@@ -1120,7 +1455,7 @@ async fn graceful_shutdown(state: &Shared) {
                 .registry
                 .tasks
                 .values()
-                .filter(|e| e.record.status == TaskStatus::Running)
+                .filter(|e| e.owns_live_group())
                 .map(|e| e.record.pid)
                 .collect()
         };
@@ -1130,9 +1465,8 @@ async fn graceful_shutdown(state: &Shared) {
         // Let exit watchers / adopted pollers observe and persist.
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    // 3) Force-finalize anything still marked running (safety net; the
-    //    kill reason "manager_shutdown" goes to manager.log — TaskRecord's
-    //    field set is contractual, §3.4).
+    // 3) Force-finalize anything still marked running (safety net), with
+    //    end_reason "manager-shutdown" (also in manager.log below).
     {
         let mut st = state.lock().unwrap();
         let home = st.home.clone();
@@ -1142,6 +1476,11 @@ async fn graceful_shutdown(state: &Shared) {
                 e.record.status = TaskStatus::Killed;
                 e.record.ended_at = Some(now);
                 e.record.output_size = e.output.lock().unwrap().total_size;
+                e.record.end_reason = Some(
+                    e.kill_reason
+                        .clone()
+                        .unwrap_or_else(|| end_reason::MANAGER_SHUTDOWN.to_string()),
+                );
                 if let Err(err) = registry::persist_record(&home, &e.record) {
                     lifecycle::log_line(
                         &home,
@@ -1149,19 +1488,46 @@ async fn graceful_shutdown(state: &Shared) {
                     );
                 }
                 let _ = e.status_tx.send(TaskStatus::Killed);
+                let ev = EventKind::TaskExited {
+                    task_id: e.record.task_id.clone(),
+                    exit_code: None,
+                    signal: None,
+                    duration_ms: now.saturating_sub(e.record.started_at),
+                    output_path: e.record.output_path.clone(),
+                    output_size: e.record.output_size,
+                    ts: now,
+                    end_reason: e.record.end_reason.clone(),
+                };
+                log_task_exit(&home, &e.record.session_id, &ev);
             }
         }
     }
-    if !pids.is_empty() {
+    if running > 0 {
         lifecycle::log_line(
             &home,
-            &format!("killed {} task(s) (reason: manager_shutdown)", pids.len()),
+            &format!("killed {running} task(s) (reason: manager_shutdown)"),
+        );
+    }
+    if pids.len() > running {
+        lifecycle::log_line(
+            &home,
+            &format!(
+                "killed {} leftover process group(s) of finished tasks (reason: manager_shutdown)",
+                pids.len() - running
+            ),
         );
     }
     // Let pending responses (e.g. the shutdown ack) flush to clients.
     tokio::time::sleep(Duration::from_millis(250)).await;
     // 4) Remove socket/pid files and exit (§3.2).
     let _ = lifecycle::cleanup_stale_files(&home);
+    crate::events::emit(
+        &home,
+        None,
+        "daemon.shutdown",
+        None,
+        serde_json::json!({ "pid": std::process::id(), "killed_tasks": running }),
+    );
     lifecycle::log_line(&home, "shutdown complete");
 }
 

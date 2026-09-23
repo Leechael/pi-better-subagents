@@ -1,0 +1,496 @@
+# Code-ablation manifest for pbs-manager.
+#
+# Each entry removes (or neuters) one load-bearing mechanism with a literal
+# find/replace on a *temporary copy* of manager/, then runs the listed tests.
+# `expect = "red"`: every listed test must FAIL (or hang past the timeout)
+# with the mechanism gone; otherwise the tests do not actually guard it.
+# `expect = "green"`: the ablation is expected to be undetectable by the
+# black-box suite (redundant / defensive code); listed tests must still pass.
+# That is a finding, not a goal: see the `note`.
+#
+# Runner: manager/scripts/ablate.sh (see manager/TESTING.md). The `find`
+# string must occur exactly once in `file`; a miss means the manifest went
+# stale against src and the runner reports it instead of guessing.
+#
+# Test ids are "<integration test target>::<test fn>".
+
+[[ablation]]
+id = "idle-grace-5s"
+mechanism = "zero active connections must persist 5s before graceful shutdown (§3.2)"
+file = "src/daemon.rs"
+find = "const IDLE_SHUTDOWN: Duration = Duration::from_secs(5);"
+replace = "const IDLE_SHUTDOWN: Duration = Duration::from_millis(50);"
+tests = [
+  "lifecycle_adversarial::d5_client_crash_grace_then_kill_everything_and_clean_files",
+  "lifecycle_adversarial::d6_connection_inside_grace_cancels_shutdown",
+  "lifecycle_adversarial::d6b_brief_reconnect_restarts_grace",
+  "protocol::t09_zero_connections_shutdown_kills_tasks",
+]
+expect = "red"
+
+[[ablation]]
+id = "idle-shutdown-fires"
+mechanism = "the idle timer actually triggers shutdown (anti-zombie, §3.2)"
+file = "src/daemon.rs"
+find = "            notify.notify_one();"
+replace = "            let _ = notify;"
+tests = [
+  "lifecycle_adversarial::d5_client_crash_grace_then_kill_everything_and_clean_files",
+  "lifecycle_adversarial::d7_unhelloed_connection_does_not_hold_daemon_alive",
+  "lifecycle_adversarial::d4_crash_restart_readopts_live_and_orphans_dead",
+  "protocol::t09_zero_connections_shutdown_kills_tasks",
+]
+expect = "red"
+
+[[ablation]]
+id = "idle-timer-cancel-on-hello"
+mechanism = "a hello inside the grace aborts the pending countdown; the grace restarts when that client leaves"
+file = "src/daemon.rs"
+find = "        t.abort();"
+replace = "        let _ = t;"
+tests = ["lifecycle_adversarial::d6b_brief_reconnect_restarts_grace"]
+expect = "red"
+
+[[ablation]]
+id = "sigkill-grace-2s"
+mechanism = "stop sends SIGTERM and waits 2s before SIGKILL (§3.3 stop)"
+file = "src/daemon.rs"
+find = "const KILL_GRACE: Duration = Duration::from_secs(2);"
+replace = "const KILL_GRACE: Duration = Duration::from_millis(0);"
+tests = ["lifecycle_adversarial::t5_sigterm_ignoring_task_is_sigkilled_after_grace"]
+expect = "red"
+
+[[ablation]]
+id = "stop-sigkill-escalation"
+mechanism = "stop escalates to SIGKILL on the process group for anything that ignored SIGTERM, leader or descendants"
+file = "src/daemon.rs"
+find = "        if group_live {"
+replace = "        if group_live && false {"
+tests = [
+  "lifecycle_adversarial::t5_sigterm_ignoring_task_is_sigkilled_after_grace",
+  "lifecycle_adversarial::t6b_stop_kills_term_ignoring_grandchild_after_leader_exits",
+]
+expect = "red"
+
+[[ablation]]
+id = "lingering-group-tracking"
+mechanism = "a task whose leader exited while its process group still has members keeps owning that group, so stop/shutdown_session/shutdown still kill it (§3.2)"
+file = "src/daemon.rs"
+find = "            entry.group_lingering = true;"
+replace = ""
+tests = [
+  "lifecycle_adversarial::t6b_stop_kills_term_ignoring_grandchild_after_leader_exits",
+  "lifecycle_adversarial::t6c_shutdown_kills_leftover_group_of_exited_task",
+  "lifecycle_adversarial::t6d_stop_and_shutdown_session_reach_leftover_group",
+]
+expect = "red"
+
+[[ablation]]
+id = "shutdown-sigkill-escalation"
+mechanism = "graceful shutdown SIGKILLs survivors after the 2s grace (§3.2 step 2)"
+file = "src/daemon.rs"
+find = "        for pid in survivors {"
+replace = "        for pid in survivors.into_iter().filter(|_| false) {"
+tests = [
+  "lifecycle_adversarial::d5_client_crash_grace_then_kill_everything_and_clean_files",
+  "lifecycle_adversarial::d9_shutdown_command_kills_tasks_and_cleans_files",
+  "lifecycle_adversarial::d8_hello_during_shutdown_is_refused_and_does_not_cancel",
+]
+expect = "red"
+
+[[ablation]]
+id = "setsid-process-group"
+mechanism = "tasks are spawned as session leaders (setsid) so pgid == pid"
+file = "src/task.rs"
+find = "    crate::sys::apply_new_session_tokio(&mut cmd);"
+replace = ""
+tests = [
+  "lifecycle_adversarial::t6_stop_kills_grandchildren",
+  "lifecycle_adversarial::t5_sigterm_ignoring_task_is_sigkilled_after_grace",
+  "lifecycle_adversarial::d5_client_crash_grace_then_kill_everything_and_clean_files",
+  "lifecycle_adversarial::d4_crash_restart_readopts_live_and_orphans_dead",
+]
+expect = "red"
+
+[[ablation]]
+id = "group-signal"
+mechanism = "signals go to the whole process group (kill(-pgid)), reaching grandchildren"
+file = "src/sys.rs"
+find = "libc::kill(-(pid as i32), sig)"
+replace = "libc::kill(pid as i32, sig)"
+tests = [
+  "lifecycle_adversarial::t6_stop_kills_grandchildren",
+  "lifecycle_adversarial::d5_client_crash_grace_then_kill_everything_and_clean_files",
+  "lifecycle_adversarial::d4b_stop_readopted_task_kills_group",
+]
+expect = "red"
+
+[[ablation]]
+id = "bounded-conn-queue"
+mechanism = "per-connection outbound queue is bounded (1024 frames) and events use try_send, so a stuck reader cannot grow memory"
+file = "src/daemon.rs"
+find = "mpsc::channel::<Arc<Vec<u8>>>(1024)"
+replace = "mpsc::channel::<Arc<Vec<u8>>>(1 << 28)"
+tests = ["lifecycle_adversarial::c6_never_reading_watcher_is_bounded_and_isolated"]
+expect = "red"
+
+[[ablation]]
+id = "bounded-tee-channel"
+mechanism = "tee -> fanout channel bounded at CHUNK_CHANNEL_CAP=64"
+file = "src/task.rs"
+find = "pub const CHUNK_CHANNEL_CAP: usize = 64;"
+replace = "pub const CHUNK_CHANNEL_CAP: usize = 1 << 28;"
+tests = ["lifecycle_adversarial::c6_never_reading_watcher_is_bounded_and_isolated"]
+expect = "red"
+note = "load-bearing: the fanout task (state mutex + per-chunk JSON encode) lags the tee under high output rates; unbounded, RSS grew 191 MiB for 256 MiB of output"
+
+[[ablation]]
+id = "daemon-lifetime-lock"
+mechanism = "the daemon holds manager.lock for its whole life; that lock, not pid liveness, is the singleton identity (§3.1)"
+file = "src/daemon.rs"
+find = "        Ok(Claim::Acquired(guard)) => guard,"
+replace = "        Ok(Claim::Acquired(guard)) => drop(guard),"
+tests = [
+  "protocol::t10_second_daemon_refused",
+  "lifecycle_adversarial::d3_concurrent_daemon_processes_leave_one_survivor",
+]
+expect = "red"
+
+[[ablation]]
+id = "claim-removes-stale-files"
+mechanism = "the lock holder removes the stale socket/pid files a crashed daemon left, then binds"
+file = "src/lifecycle.rs"
+find = '''
+            cleanup_stale_files(home)?;
+            Ok(Claim::Acquired'''
+replace = '''
+            Ok(Claim::Acquired'''
+tests = [
+  "lifecycle_adversarial::d10_client_recovers_from_dead_daemon_files",
+  "lifecycle_adversarial::d4_crash_restart_readopts_live_and_orphans_dead",
+  "protocol::t12_restart_readopts_live_task",
+]
+expect = "red"
+
+[[ablation]]
+id = "clients-never-clean"
+mechanism = "clients never delete socket/pid files. This entry is a regression check: it re-adds the removed client-side zombie cleanup"
+file = "src/client.rs"
+find = "        // Steps 2–4: spawn lock; winner spawns, losers wait for the socket."
+replace = '''
+        match lifecycle::read_pid_file(home) {
+            Some(pf) if !task::pid_alive(pf.pid) => {
+                let _ = lifecycle::cleanup_stale_files(home);
+            }
+            None => {
+                let _ = std::fs::remove_file(lifecycle::socket_path(home));
+            }
+            _ => {}
+        }'''
+tests = ["lifecycle_adversarial::d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon"]
+expect = "red"
+note = "a race; red in 3/3 runs with the reproducer's CPU load"
+
+[[ablation]]
+id = "spawn-lock"
+mechanism = "clients serialize daemon spawning through an fd-lock on manager.spawn.lock (§3.1 steps 2-4)"
+file = "src/lifecycle.rs"
+find = "    home.join(\"manager.spawn.lock\")"
+replace = "    home.join(format!(\"manager.spawn.lock.{}\", std::process::id()))"
+tests = [
+  "lifecycle_adversarial::d1_concurrent_clients_spawn_exactly_one_daemon",
+  "lifecycle_adversarial::d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon",
+]
+expect = "green"
+note = "no longer load-bearing for correctness: the daemon lifetime lock alone guarantees one daemon, and extra spawns exit at once with 'already running'. The spawn lock only avoids starting redundant processes"
+
+[[ablation]]
+id = "utf8-chunk-boundary"
+mechanism = "output reads cut at a UTF-8 boundary within an escaped-size budget (§3.3)"
+file = "src/daemon.rs"
+find = "    let n = task::utf8_chunk_len(&bytes, cap, CHUNK_JSON_BUDGET, status == TaskStatus::Running);"
+replace = "    let n = bytes.len().min(cap);"
+tests = [
+  "lifecycle_adversarial::o4_multibyte_utf8_survives_chunk_boundaries",
+  "lifecycle_adversarial::o3_control_byte_output_large_read_still_answers",
+]
+expect = "red"
+
+[[ablation]]
+id = "escaped-size-budget"
+mechanism = "an output chunk's JSON-escaped size stays under the frame cap"
+file = "src/daemon.rs"
+find = "const CHUNK_JSON_BUDGET: usize = MAX_FRAME_SIZE as usize - 64 * 1024;"
+replace = "const CHUNK_JSON_BUDGET: usize = usize::MAX;"
+tests = ["lifecycle_adversarial::o3_control_byte_output_large_read_still_answers"]
+expect = "red"
+
+[[ablation]]
+id = "watch-utf8-carry"
+mechanism = "watch events hold back an incomplete trailing UTF-8 sequence until the next pipe read"
+file = "src/daemon.rs"
+find = "                    let n = task::utf8_chunk_len(&data, usize::MAX, CHUNK_JSON_BUDGET, true);"
+replace = "                    let n = data.len();"
+tests = ["lifecycle_adversarial::o4b_watch_events_never_split_utf8"]
+expect = "red"
+
+[[ablation]]
+id = "oversize-response-fallback"
+mechanism = "a response that does not fit a frame is replaced by an E_INTERNAL error for the same id"
+file = "src/daemon.rs"
+find = "    if frame.len() > MAX_FRAME_SIZE as usize {"
+replace = "    if false {"
+tests = ["lifecycle_adversarial::o3b_oversized_response_does_not_mute_connection"]
+expect = "red"
+
+[[ablation]]
+id = "writer-skips-oversize"
+mechanism = "the connection writer drops an unsendable frame instead of exiting, so the connection keeps serving"
+file = "src/daemon.rs"
+find = '''
+        if payload.len() > MAX_FRAME_SIZE as usize {
+            continue;
+        }'''
+replace = ""
+tests = ["lifecycle_adversarial::o3c_unanswerable_request_does_not_mute_connection"]
+expect = "red"
+
+[[ablation]]
+id = "readopt-liveness"
+mechanism = "restart re-adopts running records whose pid is alive (§3.4)"
+file = "src/lifecycle.rs"
+find = "            if task::pid_alive(rec.pid) {"
+replace = "            if false {"
+tests = [
+  "lifecycle_adversarial::d4_crash_restart_readopts_live_and_orphans_dead",
+  "protocol::t12_restart_readopts_live_task",
+]
+expect = "red"
+
+[[ablation]]
+id = "orphan-dead-pids"
+mechanism = "restart marks running records with a dead pid as orphaned (§3.4)"
+file = "src/lifecycle.rs"
+find = "            if task::pid_alive(rec.pid) {"
+replace = "            if true {"
+tests = ["lifecycle_adversarial::d4_crash_restart_readopts_live_and_orphans_dead"]
+expect = "red"
+
+[[ablation]]
+id = "adopted-exit-poller"
+mechanism = "re-adopted tasks are polled with kill(pid,0) to detect exit (§3.4)"
+file = "src/daemon.rs"
+find = "        spawn_adopted_poller(&state, &task_id, pid);"
+replace = ""
+tests = ["lifecycle_adversarial::d4_crash_restart_readopts_live_and_orphans_dead"]
+expect = "red"
+
+[[ablation]]
+id = "session-rebound-close"
+mechanism = "the old connection of a rebound session is closed by the server (§3.3 hello)"
+file = "src/daemon.rs"
+find = "                old_h.die.notify_one();"
+replace = ""
+tests = ["lifecycle_adversarial::c4_duplicate_hello_rebinds_session"]
+expect = "red"
+
+[[ablation]]
+id = "refuse-hello-while-shutting-down"
+mechanism = "hello during shutdown is refused and cannot resurrect the daemon"
+file = "src/daemon.rs"
+find = '''
+    if st.shutdown {
+        return Err(ProtoError::new(E_INTERNAL, SHUTTING_DOWN));
+    }
+    // A fresh'''
+replace = '''
+    // A fresh'''
+tests = ["lifecycle_adversarial::d8_hello_during_shutdown_is_refused_and_does_not_cancel"]
+expect = "red"
+
+[[ablation]]
+id = "cleanup-files-on-shutdown"
+mechanism = "graceful shutdown removes manager.sock and manager.pid (§3.2 step 4)"
+file = "src/daemon.rs"
+find = "    let _ = lifecycle::cleanup_stale_files(&home);"
+replace = ""
+tests = [
+  "lifecycle_adversarial::d5_client_crash_grace_then_kill_everything_and_clean_files",
+  "lifecycle_adversarial::d9_shutdown_command_kills_tasks_and_cleans_files",
+  "lifecycle_adversarial::d15_sigterm_to_daemon_is_graceful",
+]
+expect = "red"
+
+[[ablation]]
+id = "frame-size-limit"
+mechanism = "inbound frames over 4 MiB are rejected before allocation (§3.3)"
+file = "src/proto.rs"
+find = "    if len > MAX_FRAME_SIZE {"
+replace = "    if len > u32::MAX {"
+tests = ["lifecycle_adversarial::f1_frame_limits_and_malformed_input"]
+expect = "red"
+
+[[ablation]]
+id = "timeout-hard-kill"
+mechanism = "timeout_ms is a hard kill ceiling (§3.3 start)"
+file = "src/daemon.rs"
+find = "        let status = match timeout_ms {"
+replace = "        let status = match None::<u64> {"
+tests = ["lifecycle_adversarial::t3_timeout_ms_hard_kill"]
+expect = "red"
+
+[[ablation]]
+id = "daemon-detach-setsid"
+mechanism = "an auto-spawned daemon leaves the client's process group (setsid), so Ctrl-C in the client's terminal cannot kill the manager and every task"
+file = "src/client.rs"
+find = "    crate::sys::apply_new_session_std(&mut cmd);"
+replace = ""
+tests = ["mutation_gaps::g2_autospawned_daemon_survives_sigint_to_spawning_group"]
+expect = "red"
+
+# --- Observability contract -------------------------------------------------
+
+[[ablation]]
+id = "events-line-cap"
+mechanism = "events.jsonl lines stay below 4 KiB (oversized fields truncated) so one O_APPEND write never interleaves"
+file = "src/events.rs"
+find = "        if line.len() + 1 < MAX_LINE {"
+replace = "        if true {"
+tests = ["observability::e2_event_lines_stay_below_4k"]
+expect = "red"
+
+[[ablation]]
+id = "events-single-write"
+mechanism = "an event line is appended with one write() call, so concurrent writers (manager + extension) never interleave"
+file = "src/events.rs"
+find = "    let n = f.write(&buf)?;"
+replace = "    let n = f.write(&buf[..buf.len() / 2])?; std::thread::sleep(std::time::Duration::from_millis(1));"
+tests = ["observability::e3_concurrent_appends_never_interleave"]
+expect = "red"
+note = "the test's extension writers append ~2400 lines while the manager writes 80; with the split write a manager line lands mid-way through another line"
+
+[[ablation]]
+id = "stop-reason-first-wins"
+mechanism = "the first kill reason is kept (a later shutdown does not overwrite stopped:cli)"
+file = "src/registry.rs"
+find = "        if self.kill_reason.is_none() {"
+replace = "        if true {"
+tests = ["observability::p1_origin_background_and_end_reasons"]
+expect = "red"
+
+[[ablation]]
+id = "end-reason-manager-restart"
+mechanism = "a re-adopted task whose exit is only seen by polling ends as manager-restart, not exited"
+file = "src/daemon.rs"
+find = "            (None, None) => end_reason::MANAGER_RESTART.to_string(),"
+replace = "            (None, None) => end_reason::EXITED.to_string(),"
+tests = ["observability::p2_end_reasons_across_manager_lifecycle"]
+expect = "red"
+
+[[ablation]]
+id = "end-reason-orphaned"
+mechanism = "a running record whose pid died before the restart ends as orphaned"
+file = "src/lifecycle.rs"
+find = "                rec.end_reason = Some(crate::proto::end_reason::ORPHANED.to_string());"
+replace = ""
+tests = ["observability::p2_end_reasons_across_manager_lifecycle"]
+expect = "red"
+
+[[ablation]]
+id = "sigpipe-quiet-exit"
+mechanism = "a closed stdout (… | head) ends the CLI with status 0 and no panic"
+file = "src/out.rs"
+find = "            std::process::exit(0);"
+replace = "            panic!(\"broken pipe\");"
+tests = ["observability::c7_output_max_bytes_sigpipe_and_log_timestamps"]
+expect = "red"
+
+[[ablation]]
+id = "output-max-bytes-total"
+mechanism = "output --max-bytes caps the total printed, not each read"
+file = "src/client.rs"
+find = "            Some(r) => cut_utf8(&resp.chunk, r as usize),"
+replace = "            Some(_) => resp.chunk.as_str(),"
+tests = ["observability::c7_output_max_bytes_sigpipe_and_log_timestamps"]
+expect = "red"
+
+[[ablation]]
+id = "status-never-spawns"
+mechanism = "status reports 'not running' instead of starting a daemon"
+file = "src/inspect.rs"
+find = "    let mut conn = client::connect_existing(home, &HelloMode::Cli)"
+replace = "    let mut conn = client::connect(home, &HelloMode::Cli)"
+tests = ["observability::c6_status_counts_uptime_and_not_running"]
+expect = "red"
+
+[[ablation]]
+id = "display-width-cjk"
+mechanism = "ls truncates TITLE by terminal display width (CJK = 2 columns)"
+file = "src/fmt.rs"
+find = "        2\n    } else {"
+replace = "        1\n    } else {"
+tests = ["observability::c1_ls_columns_filters_json_and_cjk"]
+expect = "red"
+
+[[ablation]]
+id = "session-prefix-min-8"
+mechanism = "SESSION shows the shortest unique prefix of at least 8 characters"
+file = "src/inspect.rs"
+find = "        let mut len = 8.min(chars.len());"
+replace = "        let mut len = 4.min(chars.len());"
+tests = ["observability::c5_sessions_connected_and_gone"]
+expect = "red"
+
+[[ablation]]
+id = "stale-agent-records"
+mechanism = "an agent record that says running while its session is gone is treated as interrupted (and reported by doctor)"
+file = "src/inspect.rs"
+find = "                rec.status = \"interrupted\".into();\n                rec.stale = true;"
+replace = ""
+tests = [
+  "observability::c5_sessions_connected_and_gone",
+  "observability::c8_doctor_checks_and_exit_status",
+]
+expect = "red"
+
+[[ablation]]
+id = "transcript-preamble-hidden"
+mechanism = "agent transcripts hide the system prompt and agent preamble unless --full"
+file = "src/inspect.rs"
+find = "    if !full && (role == \"system\""
+replace = "    if false && (role == \"system\""
+tests = ["observability::c3_agent_transcript_and_ch_ids_in_log_tail_output_wait_stop"]
+expect = "red"
+
+[[ablation]]
+id = "doctor-exit-status"
+mechanism = "doctor exits 1 when any check fails"
+file = "src/client.rs"
+find = "        outln!(\"{} problem(s) found\", r.failures);\n        1\n    }\n}"
+replace = "        outln!(\"{} problem(s) found\", r.failures);\n        0\n    }\n}"
+tests = [
+  "observability::c8_doctor_checks_and_exit_status",
+  "mutation_gaps::g13_doctor_cleans_only_without_a_daemon",
+]
+expect = "red"
+
+[[ablation]]
+id = "accept-during-shutdown"
+mechanism = "the daemon keeps accepting during graceful shutdown and refuses hello at once (no client stalls until its response timeout)"
+file = "src/daemon.rs"
+find = "            _ = shutdown_notify.notified(), if shutdown_task.is_none() => {\n                shutdown_task = Some(begin_shutdown(&state));\n            }"
+replace = "            _ = shutdown_notify.notified(), if shutdown_task.is_none() => {\n                let _ = begin_shutdown(&state).await;\n                break;\n            }"
+tests = [
+  "lifecycle_adversarial::d8_hello_during_shutdown_is_refused_and_does_not_cancel",
+  "lifecycle_adversarial::d8b_cli_during_shutdown_reaches_a_successor",
+]
+expect = "red"
+
+[[ablation]]
+id = "client-waits-out-shutdown"
+mechanism = "a client refused with 'manager is shutting down' waits for that manager to exit, then spawns a successor"
+file = "src/client.rs"
+find = "            wait_for_manager_exit(home, Duration::from_secs(5)).await;"
+replace = ""
+tests = ["lifecycle_adversarial::d8b_cli_during_shutdown_reaches_a_successor"]
+expect = "red"

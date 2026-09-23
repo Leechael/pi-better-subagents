@@ -1,0 +1,841 @@
+//! Black-box tests for the observability contract (manager + CLI side):
+//! protocol additions (origin, mark_background, stop.reason, end_reason,
+//! hello extension_version/protocol, status protocol), the manager's
+//! events.jsonl writes, and the inspection CLI (ls/show/agent/events/
+//! sessions/status/doctor/log/tail/output/stop).
+//!
+//! Extension-owned files (agent records, transcripts, extension events) are
+//! written here as fixtures in the contract's format, since the extension
+//! side may land later.
+
+mod common;
+
+use common::*;
+use serde_json::{json, Value};
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::Duration;
+
+const S: fn(u64) -> Duration = Duration::from_secs;
+const MS: fn(u64) -> Duration = Duration::from_millis;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// Extension-style hello that announces the current protocol.
+fn hello_v2(c: &mut Conn, session: &str, cwd: &str) -> Value {
+    c.request_ok(json!({"type":"hello","client_kind":"extension","session_id":session,
+        "pi_pid":std::process::id(),"cwd":cwd,"extension_version":"0.9.0-test","protocol":2}))
+}
+
+fn start(c: &mut Conn, cmd: &str, extra: Value) -> (String, u32) {
+    let mut req = json!({"type":"start","kind":"shell","command":cmd,"cwd":"/tmp","env":{"PATH":PATH_ENV}});
+    if let (Some(o), Some(e)) = (req.as_object_mut(), extra.as_object()) {
+        for (k, v) in e {
+            o.insert(k.clone(), v.clone());
+        }
+    }
+    c.start_with(req)
+}
+
+fn events_of(home: &Home, sid: &str) -> Vec<Value> {
+    let p = home.path.join("sessions").join(sid).join("events.jsonl");
+    std::fs::read_to_string(p)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad event line ({e}): {l}")))
+        .collect()
+}
+
+fn wait_event(home: &Home, sid: &str, ty: &str, id: Option<&str>) -> Value {
+    poll_until(S(5), || {
+        events_of(home, sid)
+            .into_iter()
+            .find(|e| e["type"] == ty && id.map_or(true, |i| e["id"] == i))
+    })
+    .unwrap_or_else(|| panic!("no {ty} event for {id:?} in {sid}: {:?}", events_of(home, sid)))
+}
+
+fn agent_fixture(home: &Home, sid: &str, rec: Value) {
+    let dir = home.path.join("sessions").join(sid).join("agents");
+    std::fs::create_dir_all(&dir).unwrap();
+    let id = rec["child_id"].as_str().unwrap().to_string();
+    std::fs::write(dir.join(format!("{id}.json")), serde_json::to_vec(&rec).unwrap()).unwrap();
+}
+
+fn transcript_fixture(home: &Home, sid: &str, child: &str, lines: &[Value]) -> PathBuf {
+    let dir = home.path.join("sessions").join(sid).join("agents");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join(format!("{child}.jsonl"));
+    let mut f = std::fs::File::create(&p).unwrap();
+    for l in lines {
+        writeln!(f, "{l}").unwrap();
+    }
+    p
+}
+
+fn append_event(home: &Home, sid: &str, ev: Value) {
+    let p = home.path.join("sessions").join(sid).join("events.jsonl");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(p).unwrap();
+    f.write_all(format!("{ev}\n").as_bytes()).unwrap();
+}
+
+/// Minimal display width for assertions (CJK and fullwidth = 2).
+fn width(s: &str) -> usize {
+    s.chars()
+        .map(|c| {
+            let u = c as u32;
+            if (0x4E00..=0x9FFF).contains(&u) || (0xFF00..=0xFF60).contains(&u) || (0x3040..=0x30FF).contains(&u) {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+fn cli_ok(home: &Home, args: &[&str]) -> CliOut {
+    let out = home.cli(args, S(15));
+    assert!(out.status.success(), "{args:?} failed: {}{}", out.stdout, out.stderr);
+    out
+}
+
+// ===========================================================================
+// Protocol additions
+// ===========================================================================
+
+/// start.origin is stored; mark_background records backgrounded_at once;
+/// every way a task can end sets end_reason, and task_exited carries it.
+#[test]
+fn p1_origin_background_and_end_reasons() {
+    let home = Home::new("p1");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-p1", "/tmp");
+
+    let origin = json!({"via":"child-bash","child_id":"ch_0000beef","run_id":"run_0000cafe"});
+    let (a, _) = start(&mut c, "sleep 300", json!({"origin": origin}));
+    assert_eq!(c.task(&a).unwrap()["origin"], origin);
+
+    let t0 = now_ms();
+    c.request_ok(json!({"type":"mark_background","task_id":a}));
+    let bg = c.task(&a).unwrap()["backgrounded_at"].as_u64().expect("backgrounded_at");
+    assert!(bg >= t0 && bg <= now_ms() + 1000);
+    std::thread::sleep(MS(20));
+    c.request_ok(json!({"type":"mark_background","task_id":a}));
+    assert_eq!(c.task(&a).unwrap()["backgrounded_at"].as_u64(), Some(bg), "first time is kept");
+    assert_eq!(home.record(&a).unwrap()["backgrounded_at"].as_u64(), Some(bg), "persisted");
+
+    // stop reasons
+    let cases = [
+        (Some("cli"), "stopped:cli"),
+        (Some("tui"), "stopped:tui"),
+        (Some("tool"), "stopped:tool"),
+        (None, "stopped:tool"),
+        (Some("timeout"), "timeout"),
+        (Some("rate-limit"), "rate-limit"),
+        (Some("session-end"), "session-end"),
+    ];
+    for (reason, want) in cases {
+        let (id, _) = start(&mut c, "sleep 300", json!({}));
+        let mut req = json!({"type":"stop","task_id":id});
+        if let Some(r) = reason {
+            req["reason"] = json!(r);
+        }
+        c.request_ok(req);
+        let t = c.wait_terminal(&id, S(5)).unwrap();
+        assert_eq!(t["end_reason"], want, "reason {reason:?}: {t}");
+        assert_eq!(t["status"], "killed");
+        let ev = c
+            .wait_event(S(3), |e| e["event"] == "task_exited" && e["task_id"] == json!(id))
+            .unwrap();
+        assert_eq!(ev["end_reason"], want, "task_exited for {reason:?}: {ev}");
+    }
+    let r = c.request(json!({"type":"stop","task_id":a,"reason":"because"}));
+    assert_eq!(r["error"]["code"], "E_BAD_REQUEST", "{r}");
+    assert_eq!(c.status_of(&a).as_deref(), Some("running"), "a rejected stop does nothing");
+
+    // natural exits (any code) and the hard timeout
+    let (ok, _) = start(&mut c, "true", json!({}));
+    let (bad, _) = start(&mut c, "exit 3", json!({}));
+    let (slow, _) = start(&mut c, "sleep 300", json!({"timeout_ms": 200}));
+    assert_eq!(c.wait_terminal(&ok, S(3)).unwrap()["end_reason"], "exited");
+    assert_eq!(c.wait_terminal(&bad, S(3)).unwrap()["end_reason"], "exited");
+    assert_eq!(c.wait_terminal(&slow, S(3)).unwrap()["end_reason"], "timeout");
+
+    // shutdown_session: session-end
+    let (x, _) = start(&mut c, "sleep 300", json!({}));
+    c.request_ok(json!({"type":"shutdown_session"}));
+    assert_eq!(c.wait_terminal(&x, S(5)).unwrap()["end_reason"], "session-end");
+    assert_eq!(c.wait_terminal(&a, S(5)).unwrap()["end_reason"], "session-end");
+    // The first reason wins: a task that ignores the cli stop's SIGTERM is
+    // still running when shutdown_session arrives, and keeps "stopped:cli".
+    let (y, _) = start(&mut c, "trap '' TERM; echo armed; sleep 300", json!({}));
+    assert!(poll_true(S(3), || c.task(&y).unwrap()["output_size"].as_u64().unwrap_or(0) > 0));
+    c.request_ok(json!({"type":"stop","task_id":y,"reason":"cli"}));
+    c.request_ok(json!({"type":"shutdown_session"}));
+    home.advance("kill-grace", 2000);
+    assert_eq!(c.wait_terminal(&y, S(6)).unwrap()["end_reason"], "stopped:cli");
+}
+
+/// manager-shutdown, orphaned and manager-restart end reasons.
+#[test]
+fn p2_end_reasons_across_manager_lifecycle() {
+    let home = Home::new("p2");
+    let mut d1 = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-p2", "/tmp");
+    let (dead, dead_pid) = start(&mut c, "sleep 300", json!({}));
+    let (late, late_pid) = start(&mut c, "sleep 300", json!({}));
+    let (keep, _) = start(&mut c, "sleep 300", json!({}));
+    drop(c);
+    d1.kill().unwrap();
+    d1.wait().unwrap();
+    kill_group(dead_pid, libc::SIGKILL);
+    assert!(poll_true(S(3), || !pid_running(dead_pid)));
+
+    let mut d2 = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-p2", "/tmp");
+    assert_eq!(c.task(&dead).unwrap()["end_reason"], "orphaned");
+    let ev = wait_event(&home, "sess-p2", "task.exit", Some(&dead));
+    assert_eq!(ev["end_reason"], "orphaned");
+    kill_group(late_pid, libc::SIGKILL);
+    assert!(poll_true(S(3), || !pid_running(late_pid)));
+    home.advance("adopt-poll", 1000);
+    let t = c.wait_terminal(&late, S(5)).unwrap();
+    assert_eq!(t["end_reason"], "manager-restart", "{t}");
+    drop(c);
+    assert!(home.cli(&["shutdown"], S(10)).status.success());
+    home.advance("shutdown-grace", 2000);
+    assert!(wait_child(&mut d2, S(10)).is_some());
+    assert_eq!(home.record(&keep).unwrap()["end_reason"], "manager-shutdown");
+    let ev = wait_event(&home, "sess-p2", "task.exit", Some(&keep));
+    assert_eq!(ev["end_reason"], "manager-shutdown");
+}
+
+/// hello's extension_version/protocol are stored per session; status
+/// returns the manager's protocol and session timing.
+#[test]
+fn p3_hello_protocol_and_status() {
+    let home = Home::new("p3");
+    let _d = home.start_daemon();
+    let t0 = now_ms();
+    let mut a = home.connect();
+    hello_v2(&mut a, "sess-p3", "/tmp/p3");
+    let mut cli = home.connect();
+    cli.hello_cli();
+    let st = cli.request_ok(json!({"type":"status"}));
+    assert_eq!(st["protocol"], 2, "{st}");
+    let s = &st["sessions"][0];
+    assert_eq!((s["protocol"].as_u64(), s["extension_version"].as_str()), (Some(2), Some("0.9.0-test")), "{st}");
+    let since = s["connected_at"].as_u64().unwrap();
+    assert!(since >= t0 && since <= now_ms());
+    drop(a);
+    assert!(poll_true(S(3), || {
+        let st = cli.request_ok(json!({"type":"status"}));
+        st["sessions"][0]["connected"] == false
+    }));
+    let st = cli.request_ok(json!({"type":"status"}));
+    let seen = st["sessions"][0]["last_seen"].as_u64().unwrap();
+    assert!(seen >= since && seen <= now_ms(), "{st}");
+    // reconnecting keeps the first connected_at
+    let mut b = home.connect();
+    hello_v2(&mut b, "sess-p3", "/tmp/p3");
+    let st = cli.request_ok(json!({"type":"status"}));
+    assert_eq!(st["sessions"][0]["connected_at"].as_u64(), Some(since));
+}
+
+// ===========================================================================
+// events.jsonl (manager writes)
+// ===========================================================================
+
+#[test]
+fn e1_manager_writes_session_and_task_events() {
+    let home = Home::new("e1");
+    let mut d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-e1", "/tmp/e1");
+    let long_cmd = format!("sleep 300 # {}", "x".repeat(1000));
+    let (a, pid) = start(&mut c, &long_cmd, json!({"origin":{"via":"bash-fg"}}));
+    c.request_ok(json!({"type":"mark_background","task_id":a}));
+    c.request_ok(json!({"type":"stop","task_id":a,"reason":"tui"}));
+    c.wait_terminal(&a, S(5)).unwrap();
+    drop(c);
+    home.advance("idle", 5000);
+    assert!(wait_child(&mut d, S(12)).is_some());
+
+    let evs = events_of(&home, "sess-e1");
+    let types: Vec<&str> = evs.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        types,
+        ["session.connect", "task.start", "task.background", "task.stop", "task.exit", "session.disconnect"],
+        "{evs:#?}"
+    );
+    for e in &evs {
+        assert_eq!(e["src"], "manager");
+        assert!(e["ts"].as_u64().is_some());
+    }
+    assert_eq!(evs[0]["pi_pid"], std::process::id());
+    assert_eq!(evs[0]["cwd"], "/tmp/e1");
+    assert_eq!(evs[0]["protocol"], 2);
+    let start = &evs[1];
+    assert_eq!((start["id"].as_str(), start["kind"].as_str()), (Some(a.as_str()), Some("shell")));
+    assert_eq!(start["origin"], json!({"via":"bash-fg"}));
+    assert_eq!(start["pid"], pid);
+    let cmd = start["command"].as_str().unwrap();
+    assert_eq!(cmd.chars().count(), 200, "command clipped to 200 chars");
+    assert!(cmd.ends_with('…'));
+    assert_eq!(evs[3]["reason"], "tui");
+    let exit = &evs[4];
+    assert_eq!(exit["end_reason"], "stopped:tui");
+    assert!(exit["signal"].is_string() && exit["exit_code"].is_null() && exit["duration_ms"].is_u64(), "{exit}");
+    // daemon-level events live in <home>/events.jsonl
+    let daemon: Vec<Value> = std::fs::read_to_string(home.path.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let dt: Vec<&str> = daemon.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(dt, ["daemon.start", "daemon.shutdown"]);
+    assert_eq!(daemon[0]["protocol"], 2);
+}
+
+/// Oversized fields are truncated so every line stays below 4 KiB.
+#[test]
+fn e2_event_lines_stay_below_4k() {
+    let home = Home::new("e2");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-e2", &"/tmp/".repeat(2000));
+    let origin = json!({"via":"child-bash","child_id":"c".repeat(9000),"run_id":"r".repeat(9000)});
+    let (a, _) = start(&mut c, "true", json!({"origin": origin}));
+    c.wait_terminal(&a, S(3)).unwrap();
+    wait_event(&home, "sess-e2", "task.exit", Some(&a));
+    let raw = std::fs::read_to_string(home.path.join("sessions/sess-e2/events.jsonl")).unwrap();
+    for line in raw.lines() {
+        assert!(line.len() + 1 < 4096, "line of {} bytes", line.len());
+        let v: Value = serde_json::from_str(line).unwrap();
+        assert!(v["type"].is_string() && v["ts"].is_u64());
+    }
+    let start_ev = events_of(&home, "sess-e2").into_iter().find(|e| e["type"] == "task.start").unwrap();
+    assert_eq!(start_ev["truncated"], true);
+    assert_eq!(start_ev["id"], a, "the id is never truncated");
+    let connect = events_of(&home, "sess-e2").into_iter().find(|e| e["type"] == "session.connect").unwrap();
+    assert_eq!(connect["truncated"], true);
+}
+
+/// Concurrent appends from the manager and several extension-style writers
+/// never interleave: every line parses and nothing is lost.
+#[test]
+fn e3_concurrent_appends_never_interleave() {
+    let home = Home::new("e3");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-e3", "/tmp");
+    let path = home.path.join("sessions/sess-e3/events.jsonl");
+    const WRITERS: usize = 8;
+    const LINES: usize = 300;
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|w| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for i in 0..LINES {
+                    // ~1-3.5 KiB lines, written the way the extension must:
+                    // one O_APPEND write per line.
+                    let pad = "p".repeat(1000 + (i * 37 + w * 101) % 2500);
+                    let line = format!(
+                        "{}\n",
+                        json!({"ts":now_ms(),"src":"extension","type":"wake.emit","id":format!("w{w}-{i}"),"ids":[format!("w{w}-{i}")],"pad":pad})
+                    );
+                    assert!(line.len() < 4096);
+                    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+                    assert_eq!(f.write(line.as_bytes()).unwrap(), line.len());
+                }
+            })
+        })
+        .collect();
+    // Meanwhile the manager writes its own events.
+    let mut ids = Vec::new();
+    for _ in 0..40 {
+        ids.push(start(&mut c, "true", json!({})).0);
+    }
+    for w in writers {
+        w.join().unwrap();
+    }
+    for id in &ids {
+        c.wait_terminal(id, S(5)).unwrap();
+    }
+    for id in &ids {
+        wait_event(&home, "sess-e3", "task.exit", Some(id));
+    }
+    let evs = events_of(&home, "sess-e3"); // panics on any malformed line
+    let ext = evs.iter().filter(|e| e["src"] == "extension").count();
+    let starts = evs.iter().filter(|e| e["type"] == "task.start").count();
+    let exits = evs.iter().filter(|e| e["type"] == "task.exit").count();
+    assert_eq!((ext, starts, exits), (WRITERS * LINES, 40, 40));
+    // The CLI reads it back without complaint.
+    let out = cli_ok(&home, &["events", "--session", "sess-e3", "--json"]);
+    assert_eq!(out.stdout.lines().count(), evs.len());
+    assert!(out.stderr.is_empty(), "{}", out.stderr);
+}
+
+/// `events`: malformed lines are skipped (with a note), filters work, the
+/// merge across sessions is time-ordered, and -f picks up new lines.
+#[test]
+fn e4_events_cli_filters_and_skips_malformed() {
+    let home = Home::new("e4");
+    let base = now_ms() - 60_000;
+    append_event(&home, "sess-aaaaaaaa-1", json!({"ts":base + 3,"src":"extension","type":"wake.emit","ids":["sh_11111111"],"batch":1}));
+    append_event(&home, "sess-bbbbbbbb-2", json!({"ts":base + 1,"src":"manager","type":"task.start","id":"sh_11111111","kind":"shell"}));
+    let p = home.path.join("sessions/sess-aaaaaaaa-1/events.jsonl");
+    let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+    f.write_all(b"this is not json\n{\"no\":\"ts\"}\n[1,2]\n").unwrap();
+    drop(f);
+    append_event(&home, "sess-aaaaaaaa-1", json!({"ts":base + 2,"src":"extension","type":"wake.deliver","id":"sh_22222222","mode":"steer"}));
+    append_event(&home, "sess-aaaaaaaa-1", json!({"ts":base - 3_600_000,"src":"extension","type":"agent.start","child_id":"ch_33333333"}));
+
+    let out = cli_ok(&home, &["events"]);
+    assert!(out.stderr.contains("skipped 3 malformed"), "{}", out.stderr);
+    let types: Vec<&str> = out.stdout.lines().map(|l| l.split_whitespace().nth(4).unwrap()).collect();
+    assert_eq!(types, ["agent.start", "task.start", "wake.deliver", "wake.emit"], "{}", out.stdout);
+
+    let out = cli_ok(&home, &["events", "--id", "sh_11111111", "--json"]);
+    let got: Vec<Value> = out.stdout.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(got.len(), 2, "id matches `id` and `ids[]`: {}", out.stdout);
+    assert_eq!(got[0]["session"], "sess-bbbbbbbb-2");
+    let out = cli_ok(&home, &["events", "--id", "ch_33333333"]);
+    assert_eq!(out.stdout.lines().count(), 1, "child_id matches too");
+    let out = cli_ok(&home, &["events", "--session", "sess-aaaa"]);
+    assert_eq!(out.stdout.lines().count(), 3);
+    let out = cli_ok(&home, &["events", "--since", "30m"]);
+    assert_eq!(out.stdout.lines().count(), 3, "the hour-old event is filtered out");
+    // no daemon was started by any of this
+    assert!(!home.sock().exists());
+
+    // -f follows new lines
+    let mut child = std::process::Command::new(BIN)
+        .args(["--home", home.path.to_str().unwrap(), "events", "-f", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut rd = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut seen = String::new();
+    for _ in 0..4 {
+        std::io::BufRead::read_line(&mut rd, &mut seen).unwrap();
+    }
+    append_event(&home, "sess-new", json!({"ts":now_ms(),"src":"extension","type":"monitor.drop","id":"mon_1","lines":7}));
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut rd, &mut line).unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    let v: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!((v["type"].as_str(), v["session"].as_str(), v["lines"].as_u64()), (Some("monitor.drop"), Some("sess-new"), Some(7)));
+}
+
+// ===========================================================================
+// CLI: ls / show / agent / sessions / status
+// ===========================================================================
+
+fn record_fixture(home: &Home, sid: &str, id: &str, started_at: u64, extra: Value) {
+    let dir = home.path.join("sessions").join(sid).join("tasks");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join(format!("{id}.output"));
+    std::fs::write(&out, b"old output\n").unwrap();
+    let mut rec = json!({"task_id":id,"session_id":sid,"kind":"shell","command":"echo old","cwd":"/tmp",
+        "pid":1,"status":"completed","exit_code":0,"signal":null,"started_at":started_at,
+        "ended_at":started_at + 1000,"output_path":out,"output_size":11,"end_reason":"exited"});
+    for (k, v) in extra.as_object().unwrap() {
+        rec[k] = v.clone();
+    }
+    std::fs::write(dir.join(format!("{id}.json")), serde_json::to_vec(&rec).unwrap()).unwrap();
+}
+
+#[test]
+fn c1_ls_columns_filters_json_and_cjk() {
+    let home = Home::new("c1");
+    // Two sessions sharing their first 8 characters, and an old record.
+    record_fixture(&home, "0199aaaa-1111", "sh_0000a001", now_ms() - 7_200_000, json!({"cwd":"/tmp/elsewhere"}));
+    agent_fixture(&home, "0199aaaa-2222", json!({"v":1,"kind":"agent","child_id":"ch_0000b001","run_id":"run_0000c001",
+        "session_id":"0199aaaa-2222","name":"alpha","agent":"worker","model":"m1","status":"completed",
+        "started_at":now_ms() - 5000,"ended_at":now_ms() - 1000,"end_reason":"completed"}));
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    let cwd = std::env::temp_dir().canonicalize().unwrap();
+    hello_v2(&mut c, "0199aaaa-2222", cwd.to_str().unwrap());
+    let cjk = format!("echo {}", "中文".repeat(60));
+    let (a, _) = c.start_with(json!({"type":"start","kind":"shell","command":cjk,"cwd":cwd,"env":{"PATH":PATH_ENV}}));
+    let (b, _) = c.start_with(json!({"type":"start","kind":"shell","command":"sleep 300\nsecond line","cwd":cwd,"env":{"PATH":PATH_ENV}}));
+    c.wait_terminal(&a, S(3)).unwrap();
+
+    let out = cli_ok(&home, &["ls"]);
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    let header: Vec<&str> = lines[0].split_whitespace().collect();
+    assert_eq!(header, ["ID", "KIND", "SESSION", "CWD", "STATUS", "STARTED", "DUR", "EXIT", "REASON", "TITLE"]);
+    assert_eq!(lines.len(), 2, "default is running only: {}", out.stdout);
+    assert!(lines[1].starts_with(&b) && lines[1].contains("0199aaaa-2 ") && lines[1].ends_with("sleep 300"), "{}", out.stdout);
+
+    let out = cli_ok(&home, &["ls", "-a"]);
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    let rows: Vec<&str> = lines[1..].to_vec();
+    assert_eq!(rows.len(), 4, "{}", out.stdout);
+    // SESSION: shortest unique prefix, at least 8 chars
+    assert!(rows.iter().any(|r| r.starts_with("sh_0000a001") && r.contains(" 0199aaaa-1 ")), "{}", out.stdout);
+    let agent = rows.iter().find(|r| r.starts_with("ch_0000b001")).expect("agents are listed");
+    assert!(agent.contains(" agent ") && agent.contains("alpha (worker) m1") && agent.contains("completed"), "{agent}");
+    // CJK: TITLE truncated by display width, all rows the same width budget
+    let cjk_row = rows.iter().find(|r| r.starts_with(&a)).unwrap();
+    assert!(cjk_row.ends_with('…'), "{cjk_row}");
+    let title_start = lines[0].find("TITLE").unwrap();
+    let title = &cjk_row[cjk_row.char_indices().nth(lines[0][..title_start].chars().count()).unwrap().0..];
+    assert!(width(title) <= 60, "title {} columns: {title}", width(title));
+    assert!(cjk_row.contains("exited") && cjk_row.contains(" 0 "), "{cjk_row}");
+
+    // filters
+    let ids = |args: &[&str]| -> Vec<String> {
+        let out = cli_ok(&home, args);
+        let v: Value = serde_json::from_str(&out.stdout).unwrap();
+        v.as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect()
+    };
+    let mut all = ids(&["ls", "-a", "--json"]);
+    all.sort();
+    let mut want = vec![a.clone(), b.clone(), "ch_0000b001".into(), "sh_0000a001".into()];
+    want.sort();
+    assert_eq!(all, want);
+    assert_eq!(ids(&["ls", "-a", "--json", "--session", "0199aaaa-1"]), ["sh_0000a001"]);
+    assert_eq!(ids(&["ls", "-a", "--json", "--since", "1h"]).len(), 3);
+    let mut in_cwd = ids(&["ls", "-a", "--json", "--cwd", cwd.to_str().unwrap()]);
+    in_cwd.sort();
+    let mut want_cwd = vec![a.clone(), b.clone(), "ch_0000b001".into()];
+    want_cwd.sort();
+    assert_eq!(in_cwd, want_cwd, "agents inherit their session's cwd");
+    let out = cli_ok(&home, &["ls", "-a", "--json"]);
+    let v: Value = serde_json::from_str(&out.stdout).unwrap();
+    let row = v.as_array().unwrap().iter().find(|r| r["id"] == b).unwrap();
+    assert_eq!((row["kind"].as_str(), row["status"].as_str(), row["title"].as_str()), (Some("shell"), Some("running"), Some("sleep 300")));
+    let bad = home.cli(&["ls", "--since", "10x"], S(5));
+    assert!(!bad.status.success());
+}
+
+#[test]
+fn c2_show_task_agent_and_run() {
+    let home = Home::new("c2");
+    let sid = "sess-c2";
+    agent_fixture(&home, sid, json!({"v":1,"kind":"agent","child_id":"ch_0000c201","run_id":"run_0000c2ff",
+        "session_id":sid,"name":"broken","agent":"worker","model":"m9","status":"failed",
+        "started_at":now_ms() - 9000,"ended_at":now_ms() - 1000,"error":"529 overloaded_error",
+        "end_reason":"model-error","prompt_head":"summarize the repo","tool_calls":4,
+        "result_tail":(1..=30).map(|i| format!("result line {i}")).collect::<Vec<_>>().join("\n")}));
+    agent_fixture(&home, sid, json!({"child_id":"ch_0000c202","run_id":"run_0000c2ff","session_id":sid,
+        "name":"ok","agent":"worker","status":"completed","started_at":now_ms() - 8000}));
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, sid, "/tmp");
+    let (t, pid) = start(&mut c, "for i in $(seq 1 25); do echo line $i; done; sleep 300",
+        json!({"origin":{"via":"child-bash","child_id":"ch_0000c201","run_id":"run_0000c2ff"}}));
+    c.request_ok(json!({"type":"mark_background","task_id":t}));
+    assert!(poll_true(S(3), || c.task(&t).unwrap()["output_size"].as_u64().unwrap_or(0) > 60));
+    append_event(&home, sid, json!({"ts":now_ms(),"src":"extension","type":"wake.emit","ids":[t],"kind":"task"}));
+    append_event(&home, sid, json!({"ts":now_ms() + 5,"src":"extension","type":"wake.deliver","ids":[t],"kind":"task","mode":"steer"}));
+
+    let out = cli_ok(&home, &["show", &t]);
+    let s = &out.stdout;
+    for want in [
+        format!("id:           {t}"),
+        "kind:         shell".into(),
+        "status:       running".into(),
+        format!("session:      {sid} (connected, pi pid {})", std::process::id()),
+        "cwd:          /tmp".into(),
+        format!("pid:          {pid}"),
+        "spawned by:   child-bash (ch_0000c201, run run_0000c2ff)".into(),
+        "--- last 10 line(s) of output ---".into(),
+        "line 25".into(),
+    ] {
+        assert!(s.contains(&want), "missing {want:?} in:\n{s}");
+    }
+    assert!(s.contains("backgrounded: after "), "{s}");
+    assert!(s.contains("wake:") && s.contains("delivered") && s.contains("(steer)"), "{s}");
+    assert!(!s.contains("line 15\n"), "only the last 10 lines: {s}");
+    // fuzzy id + json
+    let out = cli_ok(&home, &["show", &t[3..], "--json"]);
+    let v: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(v["task"]["task_id"], t);
+    assert_eq!(v["output_tail"].as_array().unwrap().len(), 10);
+    assert_eq!(v["events"].as_array().unwrap().len(), 2 + 2, "task.start/background + wake.*: {v}");
+
+    let out = cli_ok(&home, &["show", "ch_0000c201"]);
+    let s = &out.stdout;
+    for want in [
+        "kind:         agent",
+        "name:         broken (worker) m9",
+        "run:          run_0000c2ff",
+        "status:       failed (model-error)",
+        "error:        529 overloaded_error",
+        "tool calls:   4",
+        "--- prompt ---",
+        "summarize the repo",
+        "--- result (last 20 line(s)) ---",
+        "result line 30",
+    ] {
+        assert!(s.contains(want), "missing {want:?} in:\n{s}");
+    }
+    assert!(s.contains(&format!("shells:       {t} (running)")), "{s}");
+    assert!(!s.contains("result line 10\n"), "result tail is 20 lines: {s}");
+    assert!(s.contains("transcript:") && s.contains("ch_0000c201.jsonl"), "{s}");
+
+    let out = cli_ok(&home, &["show", "run_0000c2ff"]);
+    assert!(out.stdout.contains("children:     2 (2 finished)") && out.stdout.contains("ch_0000c202"), "{}", out.stdout);
+
+    // not found: one line, closest match only
+    let out = home.cli(&["show", "ch_0000c209"], S(5));
+    assert!(!out.status.success());
+    assert_eq!(out.stderr.trim(), "pbs-manager: unknown id 'ch_0000c209' (did you mean 'ch_0000c201'?)");
+    assert!(!out.stderr.contains(&t), "no id dump: {}", out.stderr);
+}
+
+#[test]
+fn c3_agent_transcript_and_ch_ids_in_log_tail_output_wait_stop() {
+    let home = Home::new("c3");
+    let sid = "sess-c3";
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, sid, "/tmp");
+    agent_fixture(&home, sid, json!({"child_id":"ch_0000c301","run_id":"run_0000c3ff","session_id":sid,
+        "name":"alpha","agent":"worker","status":"running","started_at":now_ms(),"prompt_head":"count to three",
+        "result_tail":"one\ntwo\nthree"}));
+    let tpath = transcript_fixture(&home, sid, "ch_0000c301", &[
+        json!({"role":"system","text":"SYSTEM PROMPT","ts":now_ms()}),
+        json!({"role":"user","text":"You are a worker agent. Rules...\n\ncount to three","ts":now_ms()}),
+        json!({"role":"assistant","text":"one","ts":now_ms()}),
+        json!({"role":"tool","tool":"bash","args":"echo two","isError":false,"text":"two","ts":now_ms()}),
+    ]);
+
+    let out = cli_ok(&home, &["agent", "ch_0000c301"]);
+    let s = &out.stdout;
+    assert!(!s.contains("SYSTEM PROMPT") && !s.contains("You are a worker"), "preamble hidden: {s}");
+    assert!(s.contains("user: count to three") && s.contains("preamble hidden; --full"), "{s}");
+    assert!(s.contains("assistant: one") && s.contains("tool bash(echo two) → two"), "{s}");
+    let out = cli_ok(&home, &["agent", "c301", "--full"]);
+    assert!(out.stdout.contains("system: SYSTEM PROMPT") && out.stdout.contains("You are a worker"), "{}", out.stdout);
+
+    // log/tail on a ch_ id render the transcript; -f follows
+    let out = cli_ok(&home, &["log", "ch_0000c301", "-n", "1"]);
+    assert_eq!(out.stdout.lines().count(), 1);
+    assert!(out.stdout.contains("tool bash(echo two)"), "{}", out.stdout);
+    let mut tail = std::process::Command::new(BIN)
+        .args(["--home", home.path.to_str().unwrap(), "tail", "ch_0000c301", "-n", "0"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(MS(400));
+    let mut f = std::fs::OpenOptions::new().append(true).open(&tpath).unwrap();
+    writeln!(f, "{}", json!({"role":"assistant","text":"three","ts":now_ms()})).unwrap();
+    let mut rd = std::io::BufReader::new(tail.stdout.take().unwrap());
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut rd, &mut line).unwrap();
+    let _ = tail.kill();
+    let _ = tail.wait();
+    assert!(line.contains("assistant: three"), "{line}");
+
+    // output = the agent's result; wait polls the record; stop is refused
+    let out = cli_ok(&home, &["output", "ch_0000c301"]);
+    assert_eq!(out.stdout, "one\ntwo\nthree");
+    let out = cli_ok(&home, &["wait", "ch_0000c301", "--budget-ms", "300"]);
+    assert!(out.stdout.contains("not done"), "{}", out.stdout);
+    let rec_path = home.path.join("sessions").join(sid).join("agents/ch_0000c301.json");
+    let mut rec: Value = serde_json::from_slice(&std::fs::read(&rec_path).unwrap()).unwrap();
+    rec["status"] = json!("completed");
+    std::fs::write(&rec_path, serde_json::to_vec(&rec).unwrap()).unwrap();
+    let out = cli_ok(&home, &["wait", "ch_0000c301", "--budget-ms", "3000"]);
+    assert_eq!(out.stdout.trim(), "done status=completed");
+    let out = home.cli(&["stop", "ch_0000c301"], S(5));
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stderr.trim(), "pbs-manager: agents run inside pi; stop from /tasks or ask the agent");
+}
+
+#[test]
+fn c4_stop_messages_and_reason() {
+    let home = Home::new("c4");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-c4", "/tmp");
+    let (run, _) = start(&mut c, "sleep 300", json!({}));
+    let (done, _) = start(&mut c, "true", json!({}));
+    c.wait_terminal(&done, S(3)).unwrap();
+    let out = cli_ok(&home, &["stop", &run]);
+    assert_eq!(out.stdout.trim(), format!("stopped {run}"));
+    assert_eq!(c.wait_terminal(&run, S(5)).unwrap()["end_reason"], "stopped:cli");
+    let out = cli_ok(&home, &["stop", &done]);
+    assert_eq!(out.stdout.trim(), format!("{done} already finished (exited)"));
+    let out = cli_ok(&home, &["stop", &run]);
+    assert_eq!(out.stdout.trim(), format!("{run} already finished (stopped:cli)"));
+}
+
+#[test]
+fn c5_sessions_connected_and_gone() {
+    let home = Home::new("c5");
+    // A session from an earlier pi, known only from disk.
+    let old = now_ms() - 3_600_000;
+    append_event(&home, "sess-gone-1", json!({"ts":old,"src":"manager","type":"session.connect","pi_pid":4242,"cwd":"/tmp/gone"}));
+    append_event(&home, "sess-gone-1", json!({"ts":old + 60_000,"src":"manager","type":"session.disconnect"}));
+    record_fixture(&home, "sess-gone-1", "sh_0000c501", old, json!({}));
+    agent_fixture(&home, "sess-gone-1", json!({"child_id":"ch_0000c501","session_id":"sess-gone-1","name":"x",
+        "agent":"worker","status":"running","started_at":old}));
+    // Without a daemon: nothing connected, -a still lists history.
+    let out = cli_ok(&home, &["sessions"]);
+    assert!(out.stdout.contains("not running"), "{}", out.stdout);
+    assert!(!home.sock().exists(), "sessions must not start the daemon");
+
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-live-1", "/tmp/live");
+    let (_t, _) = start(&mut c, "sleep 300", json!({}));
+    let out = cli_ok(&home, &["sessions"]);
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(
+        lines[0].split_whitespace().collect::<Vec<_>>(),
+        ["SESSION", "PI_PID", "STATE", "CWD", "SINCE", "LAST_SEEN", "RUNNING", "TASKS", "AGENTS"]
+    );
+    assert_eq!(lines.len(), 2, "{}", out.stdout);
+    let live: Vec<&str> = lines[1].split_whitespace().collect();
+    assert_eq!(live[0], "sess-liv", "shortest unique prefix, at least 8 chars");
+    assert_eq!((live[1], live[2], live[3]), (std::process::id().to_string().as_str(), "connected", "/tmp/live"));
+    assert_eq!(&live[live.len() - 3..], ["1", "1", "0"]);
+
+    let out = cli_ok(&home, &["sessions", "-a"]);
+    let gone = out.stdout.lines().find(|l| l.starts_with("sess-gon")).expect("gone session listed");
+    let g: Vec<&str> = gone.split_whitespace().collect();
+    assert_eq!((g[1], g[2], g[3]), ("4242", "gone", "/tmp/gone"), "{gone}");
+    assert!(gone.contains(" ago "), "LAST_SEEN is an age: {gone}");
+    assert_eq!(&g[g.len() - 3..], ["0", "1", "1"], "stale running agent is not counted as running: {gone}");
+    let out = cli_ok(&home, &["sessions", "-a", "--json"]);
+    let v: Value = serde_json::from_str(&out.stdout).unwrap();
+    let gj = v.as_array().unwrap().iter().find(|s| s["session_id"] == "sess-gone-1").unwrap();
+    assert_eq!((gj["state"].as_str(), gj["pi_pid"].as_u64(), gj["since"].as_u64()), (Some("gone"), Some(4242), Some(old)));
+    assert_eq!(gj["last_seen"].as_u64(), Some(old + 60_000));
+}
+
+#[test]
+fn c6_status_counts_uptime_and_not_running() {
+    let home = Home::new("c6");
+    let out = home.cli(&["status"], S(5));
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stderr.trim(), "pbs-manager: pbs-manager is not running");
+    assert!(!home.sock().exists(), "status must not start the daemon");
+
+    agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c601","session_id":"sess-c6","name":"a","agent":"w","status":"completed"}));
+    agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c602","session_id":"sess-c6","name":"b","agent":"w","status":"failed"}));
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-c6", "/tmp");
+    let (t, _) = start(&mut c, "true", json!({}));
+    c.wait_terminal(&t, S(3)).unwrap();
+    start(&mut c, "sleep 300", json!({}));
+    std::thread::sleep(MS(1100));
+    let out = cli_ok(&home, &["status"]);
+    let s = &out.stdout;
+    assert!(s.contains("version:  0.1.0 (protocol 2)"), "{s}");
+    let uptime = s.lines().find(|l| l.starts_with("uptime:")).unwrap();
+    assert!(uptime.ends_with('s') && !uptime.contains('.'), "human uptime: {uptime}");
+    assert!(s.contains("tasks:    1 running, 3 finished (shells 1/1, agents 0/2)"), "{s}");
+    let out = cli_ok(&home, &["status", "--json"]);
+    let v: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(v["protocol"], 2);
+    assert_eq!(v["agent_counts"], json!({"running":0,"terminal":2}));
+}
+
+// ===========================================================================
+// CLI: output bytes, SIGPIPE, log timestamps
+// ===========================================================================
+
+#[test]
+fn c7_output_max_bytes_sigpipe_and_log_timestamps() {
+    let home = Home::new("c7");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-c7", "/tmp");
+    let (big, _) = start(&mut c, "head -c 3000000 /dev/zero | tr '\\0' 'a'", json!({}));
+    let (cjk, _) = start(&mut c, "yes 中文 | head -n 3000", json!({}));
+    c.wait_terminal(&big, S(10)).unwrap();
+    c.wait_terminal(&cjk, S(10)).unwrap();
+
+    let out = cli_ok(&home, &["output", &big, "--max-bytes", "120"]);
+    assert_eq!(out.stdout.len(), 120, "--max-bytes is a total cap");
+    let out = cli_ok(&home, &["output", &big, "--max-bytes", "100000"]);
+    assert_eq!(out.stdout.len(), 100_000, "caps across several reads too");
+    let out = cli_ok(&home, &["output", &cjk, "--max-bytes", "121"]);
+    // 7-byte lines: 17 whole lines (119 bytes) + "中" (3) would pass 121.
+    assert!(out.stdout.len() <= 121 && out.stdout.len() >= 118, "{}", out.stdout.len());
+    assert!(!out.stdout.contains('\u{FFFD}'));
+    let out = cli_ok(&home, &["output", &big]);
+    assert_eq!(out.stdout.len(), 3_000_000, "no cap without --max-bytes");
+
+    // SIGPIPE: a closed reader ends the CLI quietly with status 0.
+    for args in [format!("output {big}"), "ls -a".into(), "events".into(), format!("log {big}")] {
+        let script = format!(
+            "set -o pipefail; '{BIN}' --home '{}' {args} | head -c 1 >/dev/null",
+            home.path.display()
+        );
+        let o = std::process::Command::new("bash").args(["-c", &script]).output().unwrap();
+        assert!(o.status.success(), "{args}: {:?} stderr={}", o.status, String::from_utf8_lossy(&o.stderr));
+        assert!(o.stderr.is_empty(), "{args}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    let out = cli_ok(&home, &["log", "-n", "5"]);
+    for l in out.stdout.lines() {
+        assert!(l.starts_with("[20") && l.as_bytes()[24] == b']', "human timestamp: {l}");
+    }
+}
+
+// ===========================================================================
+// doctor
+// ===========================================================================
+
+#[test]
+fn c8_doctor_checks_and_exit_status() {
+    // Nonexistent home: failure, and doctor does not create it.
+    let missing = std::env::temp_dir().join(format!("pbsx-{}-c8-missing", std::process::id()));
+    let _ = std::fs::remove_dir_all(&missing);
+    let out = run_cli(&missing, &["doctor"], S(5));
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.contains("FAIL  home: does not exist"), "{}", out.stdout);
+    assert!(!missing.exists(), "doctor created the home");
+
+    // Healthy empty home.
+    let home = Home::new("c8");
+    let out = run_cli(&home.path, &["doctor"], S(5));
+    assert_eq!(out.status.code(), Some(0), "{}", out.stdout);
+    assert!(out.stdout.contains("ok    sessions dir:"), "{}", out.stdout);
+
+    // Broken config.json, missing managerPath, stale agent record, orphan pid.
+    std::fs::write(home.path.join("config.json"), b"{ not json").unwrap();
+    let out = run_cli(&home.path, &["doctor"], S(5));
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.contains("FAIL  config.json: does not parse"), "{}", out.stdout);
+    std::fs::write(home.path.join("config.json"), br#"{"managerPath":"/nonexistent/pbs-manager"}"#).unwrap();
+    agent_fixture(&home, "sess-c8", json!({"child_id":"ch_0000c801","session_id":"sess-c8","name":"x","agent":"w","status":"running"}));
+    let mut orphan = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+    record_fixture(&home, "sess-c8", "sh_0000c801", now_ms(), json!({"status":"running","pid":orphan.id(),"exit_code":null,"ended_at":null,"end_reason":null}));
+    let out = run_cli(&home.path, &["doctor"], S(5));
+    let _ = orphan.kill();
+    let _ = orphan.wait();
+    assert_eq!(out.status.code(), Some(1));
+    let s = &out.stdout;
+    assert!(s.contains("FAIL  manager path: /nonexistent/pbs-manager from config.json managerPath does not exist"), "{s}");
+    assert!(s.contains("FAIL  agent record: ch_0000c801 says running but session sess-c8 is gone"), "{s}");
+    assert!(s.contains(&format!("FAIL  orphan pid: sh_0000c801 (pid {})", orphan.id())), "{s}");
+    assert!(s.lines().any(|l| l == "3 problem(s) found"), "{s}");
+
+    // Socket path too long for a unix socket.
+    let long = home.path.join("x".repeat(60)).join("y".repeat(60));
+    std::fs::create_dir_all(&long).unwrap();
+    let out = run_cli(&long, &["doctor"], S(5));
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.contains("FAIL  socket path:"), "{}", out.stdout);
+}

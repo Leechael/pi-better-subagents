@@ -2,8 +2,14 @@
 //! Single binary: `daemon` runs the manager; every other subcommand is a
 //! socket client (design doc §3.5).
 
+mod out;
+
 mod client;
+mod clock;
 mod daemon;
+mod events;
+mod fmt;
+mod inspect;
 mod lifecycle;
 mod proto;
 mod registry;
@@ -35,35 +41,89 @@ enum Sub {
         #[arg(long)]
         foreground: bool,
     },
-    /// Show version/uptime/sessions/task counts.
-    Status,
-    /// List connected pi sessions.
-    Sessions,
-    /// List tasks (running only by default). Alias: `ls`.
-    #[command(visible_alias = "ls")]
-    List {
-        /// Only show this session's tasks.
+    /// Version, protocol, uptime, sessions, task and agent counts. Never
+    /// starts the daemon ("pbs-manager is not running", exit 1).
+    Status {
         #[arg(long)]
-        session: Option<String>,
-        /// Include exited/terminal tasks (default: running only).
+        json: bool,
+    },
+    /// pi sessions: connected ones, or with -a also past (gone) sessions.
+    Sessions {
+        /// Include sessions that are no longer connected (from disk).
         #[arg(short = 'a', long)]
         all: bool,
+        #[arg(long)]
+        json: bool,
     },
-    /// Read a task's output; -f follows (long-lived).
+    /// List tasks and agents (running only by default). Alias: `ls`.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Only sessions whose id starts with this prefix.
+        #[arg(long)]
+        session: Option<String>,
+        /// Only work whose cwd is this directory or below it.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Only work started within this long (e.g. 30s, 10m, 2h, 1d).
+        #[arg(long)]
+        since: Option<String>,
+        /// Include finished tasks and agents (default: running only).
+        #[arg(short = 'a', long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Everything about one task, monitor, agent (ch_…) or run (run_…).
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Render an agent's transcript (preamble hidden unless --full).
+    Agent {
+        id: String,
+        /// Include the system prompt / agent preamble.
+        #[arg(long)]
+        full: bool,
+        /// Keep following the transcript.
+        #[arg(short = 'f', long)]
+        follow: bool,
+    },
+    /// Event log, merged and time-ordered across sessions.
+    Events {
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Only sessions whose id starts with this prefix.
+        #[arg(long)]
+        session: Option<String>,
+        /// Only events about this task/agent id.
+        #[arg(long)]
+        id: Option<String>,
+        /// Only events within this long (e.g. 30s, 10m, 2h).
+        #[arg(long)]
+        since: Option<String>,
+        /// One raw JSON object per line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read a task's output through the protocol; -f follows. For an agent
+    /// id, prints its result.
     Output {
         task_id: String,
         /// Follow the output stream.
         #[arg(short = 'f', long)]
         follow: bool,
-        /// Per-read chunk cap.
-        #[arg(long, default_value_t = 65536)]
-        max_bytes: u64,
+        /// Print at most this many bytes in total.
+        #[arg(long)]
+        max_bytes: Option<u64>,
     },
     /// Stop a task (SIGTERM group -> 2s -> SIGKILL).
     Stop { task_id: String },
     /// Stop all running tasks of a session.
     KillSession { session_id: String },
-    /// Check socket/pid/lock consistency; clean zombie files.
+    /// Health checks (daemon, socket, config, protocol, stale records,
+    /// orphan pids, disk use); fixes stale socket/pid files. Exit 1 on any
+    /// failure.
     Doctor,
     /// Gracefully shut the manager down (kills remaining tasks).
     Shutdown,
@@ -130,9 +190,44 @@ async fn main() {
     let home = lifecycle::resolve_home(cli.home.as_deref());
     let code = match cli.cmd {
         Sub::Daemon { foreground } => daemon::run(home, foreground).await,
-        Sub::Status => run_client(client::cmd_status(&home)).await,
-        Sub::Sessions => run_client(client::cmd_sessions(&home)).await,
-        Sub::List { session, all } => run_client(client::cmd_list(&home, session, all)).await,
+        Sub::Status { json } => run_client(inspect::cmd_status(&home, json)).await,
+        Sub::Sessions { all, json } => run_client(inspect::cmd_sessions(&home, all, json)).await,
+        Sub::List {
+            session,
+            cwd,
+            since,
+            all,
+            json,
+        } => {
+            let opts = inspect::LsOpts {
+                all,
+                session,
+                cwd,
+                since,
+                json,
+            };
+            run_client(inspect::cmd_ls(&home, opts)).await
+        }
+        Sub::Show { id, json } => run_client(inspect::cmd_show(&home, &id, json)).await,
+        Sub::Agent { id, full, follow } => {
+            run_client(inspect::cmd_agent(&home, &id, full, follow)).await
+        }
+        Sub::Events {
+            follow,
+            session,
+            id,
+            since,
+            json,
+        } => {
+            let opts = inspect::EventsOpts {
+                follow,
+                session,
+                id,
+                since,
+                json,
+            };
+            run_client(inspect::cmd_events(&home, opts)).await
+        }
         Sub::Output {
             task_id,
             follow,

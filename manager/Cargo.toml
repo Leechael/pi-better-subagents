@@ -14,6 +14,13 @@ interprocess = { version = "2", features = ["tokio"] }
 fd-lock = "4"
 libc = "0.2"
 
+[features]
+# Test-only: the daemon's own timers (idle grace, SIGKILL escalation,
+# re-adopt / leftover-group polls) can run on a manual clock, advanced with
+# the `clock_advance` debug request, when the daemon starts with
+# PBS_TEST_CLOCK=manual. Never enable in release builds.
+test-clock = []
+
 [profile.release]
 lto = true
 codegen-units = 1
