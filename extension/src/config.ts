@@ -171,6 +171,24 @@ export function loadConfig(home: string = getPbsHome()): PbsConfig {
  * Priority: config.managerPath > PBS_MANAGER_PATH env > <home>/bin/pbs-manager > PATH.
  * Returns null when no candidate exists.
  */
+/**
+ * Human-readable account of where the manager binary was looked for, for the
+ * degraded-startup warning. Mentions configured paths that do not exist, since
+ * those are silently skipped by resolveManagerPath.
+ */
+export function describeManagerSearch(
+  config: PbsConfig,
+  home: string = getPbsHome(),
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const tried: string[] = [];
+  if (config.managerPath) tried.push(`config managerPath ${config.managerPath}${existsSync(config.managerPath) ? "" : " (missing, ignored)"}`);
+  if (env.PBS_MANAGER_PATH) tried.push(`PBS_MANAGER_PATH ${env.PBS_MANAGER_PATH}${existsSync(env.PBS_MANAGER_PATH) ? "" : " (missing, ignored)"}`);
+  tried.push(join(home, "bin", "pbs-manager"));
+  tried.push("pbs-manager on PATH");
+  return tried.join("; ");
+}
+
 export function resolveManagerPath(
   config: PbsConfig,
   home: string = getPbsHome(),

@@ -191,6 +191,14 @@ async function openTasksUi(ctx: ExtensionContext, deps: TasksCommandDeps): Promi
     ctx.ui.notify("No background tasks.", "info");
     return;
   }
+  const manager = deps.getClient();
+  if (currentItems().length === 0 && !(manager?.isAvailable() ?? false)) {
+    ctx.ui.notify(
+      "No background tasks. pbs-manager is unavailable, so bash runs locally and nothing is backgrounded (see the startup warning).",
+      "warning",
+    );
+    return;
+  }
 
   let selectedId: string | undefined;
   for (;;) {

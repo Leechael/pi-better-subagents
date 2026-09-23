@@ -20,7 +20,7 @@ import { createComms, type CommsWithOrigin } from "./comms/comms";
 import { createRegistryCommsHost } from "./comms/registry-host";
 import { createAgentMessageTool, createContactSupervisorTool } from "./comms/tools";
 import { registerReplyCommand } from "./comms/reply-command";
-import { getPbsHome, loadConfig, resolveManagerPath, resolveSubagentConfig } from "./config";
+import { describeManagerSearch, getPbsHome, loadConfig, resolveManagerPath, resolveSubagentConfig } from "./config";
 import type { TaskExitInfo } from "./format";
 import { ManagerClient, type ManagerEvent } from "./manager-client";
 import { createMonitorTool, MonitorRegistry } from "./monitor";
@@ -532,10 +532,12 @@ export default function (pi: ExtensionAPI): void {
       .then((ok) => {
         if (!ok && startCtx.hasUI) {
           const detail = c.lastError();
+          const reason = detail ? ` (${detail})` : "";
+          const searched = managerPath ? `using ${managerPath}` : `looked in: ${describeManagerSearch(config, home)}`;
           startCtx.ui.notify(
-            detail
-              ? `pbs-manager unavailable (${detail}): bash runs locally, task_*/monitor tools are disabled`
-              : "pbs-manager unavailable: bash runs locally, task_*/monitor tools are disabled",
+            `pbs-manager unavailable${reason}; ${searched}. ` +
+              "Bash runs locally without auto-backgrounding, task_*/monitor are disabled, " +
+              "and subagents cannot run bash. Install it or set PBS_MANAGER_PATH (see README Install).",
             "warning",
           );
         }
