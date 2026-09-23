@@ -30,7 +30,8 @@ const MAX_OUTPUT_READ: u64 = 1024 * 1024;
 /// Cap on a chunk's JSON-escaped size (control bytes escape to 6 bytes each),
 /// leaving room for the response envelope inside the 4 MiB frame.
 const CHUNK_JSON_BUDGET: usize = MAX_FRAME_SIZE as usize - 64 * 1024;
-/// Poll interval for a process group that outlived its leader.
+/// Poll interval for a process group that outlived its runner (fallback
+/// only: normally the runner guards its group and its exit says "empty").
 const GROUP_POLL: Duration = Duration::from_millis(500);
 
 type OutTx = mpsc::Sender<Arc<Vec<u8>>>;
@@ -806,6 +807,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         .map_err(|e| ProtoError::new(E_INTERNAL, format!("spawn failed: {e}")))?;
     let SpawnedTask {
         child,
+        status,
         pid,
         output,
         chunks,
@@ -852,7 +854,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
                 "pid": pid,
             }),
         );
-        let mut entry = TaskEntry::new_running(record, child, output, chunks, timeout_ms);
+        let mut entry = TaskEntry::new_running(record, child, status, output, chunks, timeout_ms);
         // A monitor exists to stream: its starter watches from spawn on, so a
         // command that prints and exits at once loses nothing to a late watch.
         if kind == TaskKind::Monitor {
@@ -1317,27 +1319,96 @@ fn spawn_output_fanout(state: &Shared, task_id: &str) {
     });
 }
 
-/// Await child exit (or the hard timeout), then finalize the record.
+/// How a task's process ended, as far as we could observe it.
+#[derive(Clone, Copy)]
+struct Outcome {
+    code: Option<i32>,
+    signal: Option<i32>,
+}
+
+impl Outcome {
+    fn of(status: Option<std::process::ExitStatus>) -> Self {
+        Outcome {
+            code: status.and_then(|s| s.code()),
+            signal: status.and_then(|s| s.signal()),
+        }
+    }
+}
+
+/// What may be left of the task's process group once its command ended.
+enum Leftover {
+    /// Nothing: the runner saw an empty group.
+    None,
+    /// Descendants remain; the runner guards them and its exit means empty.
+    Guarded,
+    /// Unknown (the runner died without reporting): probe the group.
+    Probe,
+}
+
+enum FirstSeen {
+    Report(Option<crate::runner::Reported>),
+    RunnerExit(Option<std::process::ExitStatus>),
+}
+
+/// Read the runner's status line (see `crate::runner`). `line` keeps a
+/// partial read across calls. None at EOF without a well-formed line.
+async fn read_status_line(
+    rx: &mut tokio::net::unix::pipe::Receiver,
+    line: &mut Vec<u8>,
+) -> Option<crate::runner::Reported> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 64];
+    loop {
+        if let Some(i) = line.iter().position(|b| *b == b'\n') {
+            return crate::runner::parse_status(std::str::from_utf8(&line[..i]).ok()?);
+        }
+        match rx.read(&mut buf).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => line.extend_from_slice(&buf[..n]),
+        }
+    }
+}
+
+/// Await the task's end (or the hard timeout), then finalize the record.
+///
+/// The runner reports the command's real status on its status pipe, and its
+/// own exit means its process group is empty (§3.4). Without a report (the
+/// runner was SIGKILLed with its group, e.g. after a stop grace or the
+/// timeout), the runner's wait status stands in: it died of the same
+/// signal as the group.
 fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
     let state2 = state.clone();
     let tid = task_id.to_string();
     tokio::spawn(async move {
-        let (child, timeout_ms) = {
+        let (child, status_rx, timeout_ms) = {
             let mut st = state2.lock().unwrap();
             match st.registry.tasks.get_mut(&tid) {
-                Some(e) => (e.child.take(), e.timeout_ms),
-                None => (None, None),
+                Some(e) => (e.child.take(), e.status_rx.take(), e.timeout_ms),
+                None => (None, None, None),
             }
         };
-        let Some(mut child) = child else { return };
-        let wait = child.wait();
-        tokio::pin!(wait);
-        let status = match timeout_ms {
-            Some(ms) => {
+        let (Some(mut child), Some(mut status_rx)) = (child, status_rx) else { return };
+        let mut line = Vec::new();
+        let first = {
+            let wait = child.wait();
+            tokio::pin!(wait);
+            let report = read_status_line(&mut status_rx, &mut line);
+            tokio::pin!(report);
+            let timeout = async {
+                match timeout_ms {
+                    Some(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(timeout);
+            let mut timed_out = false;
+            loop {
                 tokio::select! {
-                    s = &mut wait => s.ok(),
-                    _ = tokio::time::sleep(Duration::from_millis(ms)) => {
+                    r = &mut report => break FirstSeen::Report(r),
+                    s = &mut wait => break FirstSeen::RunnerExit(s.ok()),
+                    _ = &mut timeout, if !timed_out => {
                         // §3.3: timeout_ms is a hard kill ceiling.
+                        timed_out = true;
                         {
                             let mut st = state2.lock().unwrap();
                             if let Some(e) = st.registry.tasks.get_mut(&tid) {
@@ -1347,19 +1418,47 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
                             }
                         }
                         let _ = task::signal_group(pid, task::SIGKILL);
-                        wait.await.ok()
                     }
                 }
             }
-            None => wait.await.ok(),
         };
-        finalize_exit(&state2, &tid, status);
+        match first {
+            FirstSeen::Report(Some(r)) => {
+                let outcome = Outcome { code: r.code, signal: r.signal };
+                if r.linger {
+                    finalize_exit(&state2, &tid, outcome, Leftover::Guarded);
+                    // The runner exits once the group is empty.
+                    let _ = child.wait().await;
+                    if let Some(e) = state2.lock().unwrap().registry.tasks.get_mut(&tid) {
+                        e.group_lingering = false;
+                    }
+                } else {
+                    finalize_exit(&state2, &tid, outcome, Leftover::None);
+                    let _ = child.wait().await; // reap the runner
+                }
+            }
+            FirstSeen::Report(None) => {
+                let s = child.wait().await.ok();
+                finalize_exit(&state2, &tid, Outcome::of(s), Leftover::Probe);
+            }
+            FirstSeen::RunnerExit(s) => {
+                // A report written just before the runner exited may still
+                // be in the pipe; the write end is closed now, so this ends.
+                match read_status_line(&mut status_rx, &mut line).await {
+                    Some(r) => {
+                        let leftover = if r.linger { Leftover::Probe } else { Leftover::None };
+                        finalize_exit(&state2, &tid, Outcome { code: r.code, signal: r.signal }, leftover);
+                    }
+                    None => finalize_exit(&state2, &tid, Outcome::of(s), Leftover::Probe),
+                }
+            }
+        }
     });
 }
 
 /// Map an observed exit to a terminal status, persist the record, wake
 /// `wait`ers, and push `task_exited` to the owning session (§3.3/§3.4).
-fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::ExitStatus>) {
+fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Leftover) {
     let mut lingering = None;
     let (sid, event) = {
         let mut st = state.lock().unwrap();
@@ -1370,8 +1469,7 @@ fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::Exi
         if entry.record.status.is_terminal() {
             return; // already finalized (e.g. shutdown force-pass)
         }
-        let code = status.and_then(|s| s.code());
-        let signal = status.and_then(|s| s.signal());
+        let Outcome { code, signal } = outcome;
         let now = now_ms();
         entry.record.exit_code = code;
         entry.record.signal = signal.map(signal_name);
@@ -1388,11 +1486,17 @@ fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::Exi
         if let Err(e) = registry::persist_record(&home, &entry.record) {
             lifecycle::log_line(&home, &format!("persist {} failed: {e}", entry.record.task_id));
         }
-        // The leader is gone; descendants it backgrounded may not be.
+        // The command is gone; descendants it backgrounded may not be.
         let pgid = entry.record.pid;
-        if task::group_alive(pgid) {
-            entry.group_lingering = true;
-            lingering = Some(pgid);
+        match leftover {
+            Leftover::None => {}
+            Leftover::Guarded => entry.group_lingering = true,
+            Leftover::Probe => {
+                if task::group_alive(pgid) {
+                    entry.group_lingering = true;
+                    lingering = Some(pgid);
+                }
+            }
         }
         let event = EventKind::TaskExited {
             task_id: task_id.to_string(),

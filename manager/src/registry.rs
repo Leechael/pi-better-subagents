@@ -12,6 +12,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tokio::net::unix::pipe;
 use tokio::process::Child;
 use tokio::sync::{mpsc, watch};
 
@@ -40,6 +41,8 @@ pub struct TaskEntry {
     /// The task's runner (`pbs-manager __run`), taken by the exit watch at
     /// spawn time; None for records loaded from disk.
     pub child: Option<Child>,
+    /// Read end of the runner's status pipe, taken with `child`.
+    pub status_rx: Option<pipe::Receiver>,
     pub output: Arc<Mutex<OutputState>>,
     /// Tee channel receiver; taken by the output fanout task at spawn time.
     /// Bounded (`task::CHUNK_CHANNEL_CAP`) so a slow watcher cannot grow RAM.
@@ -54,9 +57,10 @@ pub struct TaskEntry {
     /// Connection ids subscribed to output events (§3.3 watch).
     pub watchers: HashSet<u64>,
     pub timeout_ms: Option<u64>,
-    /// The leader exited but other members of its process group (children
-    /// it backgrounded) are still alive. The group is still ours to kill on
-    /// stop/shutdown (§3.2: background work must not outlive the manager).
+    /// The command exited but other members of its process group (children
+    /// it backgrounded) are still alive, guarded by the runner. The group is
+    /// still ours to kill on stop/shutdown (§3.2: background work must not
+    /// outlive the manager); the runner's exit clears the flag.
     pub group_lingering: bool,
 }
 
@@ -93,6 +97,7 @@ impl TaskEntry {
     pub fn new_running(
         record: TaskRecord,
         child: Child,
+        status_rx: pipe::Receiver,
         output: Arc<Mutex<OutputState>>,
         chunks_rx: mpsc::Receiver<OutputChunk>,
         timeout_ms: Option<u64>,
@@ -101,6 +106,7 @@ impl TaskEntry {
         TaskEntry {
             record,
             child: Some(child),
+            status_rx: Some(status_rx),
             output,
             chunks_rx: Some(chunks_rx),
             status_tx,
@@ -119,6 +125,7 @@ impl TaskEntry {
         TaskEntry {
             record,
             child: None,
+            status_rx: None,
             output: Arc::new(Mutex::new(OutputState::new(None, total))),
             chunks_rx: None,
             status_tx,
@@ -373,6 +380,7 @@ mod tests {
             TaskEntry {
                 record: rec,
                 child: None,
+                status_rx: None,
                 output: Arc::new(Mutex::new(OutputState::new(None, 0))),
                 chunks_rx: None,
                 status_tx,

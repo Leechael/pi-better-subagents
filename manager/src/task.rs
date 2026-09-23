@@ -14,6 +14,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::AsyncReadExt;
+use tokio::net::unix::pipe;
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::mpsc;
 
@@ -117,6 +118,8 @@ pub struct OutputChunk {
 pub struct SpawnedTask {
     /// The task's runner (`pbs-manager __run`), leader of its process group.
     pub child: Child,
+    /// Read end of the runner's status pipe (see `crate::runner`).
+    pub status: pipe::Receiver,
     pub pid: u32,
     pub output: Arc<Mutex<OutputState>>,
     pub chunks: mpsc::Receiver<OutputChunk>,
@@ -178,7 +181,7 @@ pub fn runner_exe() -> io::Result<PathBuf> {
 /// Spawn `<runner> __run <command>` as a session leader (setsid in
 /// pre_exec, §3.4) so the whole process tree can be signalled as one group.
 /// The runner execs `sh -c <command>` in that group, holds the lifeline,
-/// and ends the way the command did (see `crate::runner`).
+/// and reports the command's real status (see `crate::runner`).
 ///
 /// stdout and stderr are read on separate pipes (`Stdio::piped`). Both are
 /// appended to the merged `.output` file + ring (protocol / agent view stays
@@ -193,6 +196,8 @@ pub fn spawn(
     output_path: &Path,
 ) -> io::Result<SpawnedTask> {
     let lifeline = lifeline()?;
+    let (status_read, status_write) = crate::sys::pipe_cloexec()?;
+    let status_write = crate::sys::dup_cloexec_high(&status_write)?;
     let mut cmd = Command::new(runner_exe()?);
     cmd.arg("__run").arg(command);
     cmd.current_dir(cwd);
@@ -203,9 +208,11 @@ pub fn spawn(
     cmd.stderr(Stdio::piped());
     // Safety net only — explicit group kills (stop/shutdown/timeout) are primary.
     cmd.kill_on_drop(true);
-    crate::sys::apply_runner_setup_tokio(&mut cmd, lifeline.read.as_raw_fd());
+    crate::sys::apply_runner_setup_tokio(&mut cmd, lifeline.read.as_raw_fd(), status_write.as_raw_fd());
 
     let mut child = cmd.spawn()?;
+    drop(status_write); // the runner has its copy at fd 4
+    let status = pipe::Receiver::from_owned_fd(status_read)?;
     let stdout = child.stdout.take().ok_or_else(|| {
         io::Error::new(io::ErrorKind::Other, "child stdout pipe missing")
     })?;
@@ -245,6 +252,7 @@ pub fn spawn(
 
     Ok(SpawnedTask {
         child,
+        status,
         pid,
         output,
         chunks: rx,

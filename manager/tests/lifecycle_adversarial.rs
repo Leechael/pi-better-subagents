@@ -299,10 +299,10 @@ fn d3_concurrent_daemon_processes_leave_one_survivor() {
 struct CrashFixture {
     /// (task id, runner pid) of the tasks still running at the crash.
     running: Vec<(String, u32)>,
-    /// A finished task (loaded as history after the restart).
+    /// A finished task whose background child is still alive.
     finished: String,
-    /// Every process that must be gone after the crash: runners and the
-    /// shells' children.
+    /// Every process that must be gone after the crash: runners, the
+    /// shells' children, and the finished task's leftover.
     all_pids: Vec<u32>,
     /// A grandchild that ignores SIGTERM: only the SIGKILL after the grace
     /// takes it down.
@@ -313,11 +313,12 @@ fn start_crash_fixture(c: &mut Conn) -> CrashFixture {
     let (plain, p_plain) = c.start("sleep 300");
     let (stubborn, p_stubborn) = c.start("trap '' TERM; sleep 300 & echo $!; wait");
     let (with_bg, p_with_bg) = c.start("sleep 300 >/dev/null 2>&1 & echo $!; sleep 300");
-    let (finished, _) = c.start("true");
+    let (finished, p_finished) = c.start("sleep 300 >/dev/null 2>&1 & echo $!");
     let g_stubborn = wait_for_pids(c, &stubborn, 1)[0];
     let g_with_bg = wait_for_pids(c, &with_bg, 1)[0];
+    let g_finished = wait_for_pids(c, &finished, 1)[0];
     assert_eq!(c.wait_terminal(&finished, S(3)).unwrap()["status"], "completed");
-    let all_pids = vec![p_plain, p_stubborn, p_with_bg, g_stubborn, g_with_bg];
+    let all_pids = vec![p_plain, p_stubborn, p_with_bg, p_finished, g_stubborn, g_with_bg, g_finished];
     assert!(all_pids.iter().all(|p| pid_running(*p)), "fixture not running: {all_pids:?}");
     CrashFixture {
         running: vec![(plain, p_plain), (stubborn, p_stubborn), (with_bg, p_with_bg)],
@@ -362,8 +363,7 @@ fn assert_crash_cleaned_up(home: &Home, f: &CrashFixture, crashed_at: Instant) {
 /// task's parent: when it ends by any means, every runner sees its lifeline
 /// break and takes its process group down (SIGTERM, 2s, SIGKILL). There is
 /// no crash recovery: the next daemon marks the running records orphaned
-/// (manager-crash) and re-adopts nothing. (Not yet covered: a finished
-/// task's leftover child, whose runner has already exited.)
+/// (manager-crash) and re-adopts nothing.
 #[test]
 fn d4_daemon_kill9_takes_every_task_down() {
     let home = Home::new("d4");

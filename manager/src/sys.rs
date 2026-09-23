@@ -68,25 +68,28 @@ fn child_setup(limit: i32) -> io::Result<()> {
     Ok(())
 }
 
-/// Fixed descriptor number a task runner (`pbs-manager __run`) finds the read
-/// end of the daemon's lifeline at (see `crate::runner`).
+/// Fixed descriptor numbers a task runner (`pbs-manager __run`) starts with:
+/// the read end of the daemon's lifeline and the write end of its own status
+/// pipe (see `crate::runner`).
 pub const RUNNER_LIFELINE_FD: i32 = 3;
+pub const RUNNER_STATUS_FD: i32 = 4;
 
 /// Spawn setup for a task runner: session leader and stdio-only fds as in
-/// [`apply_new_session_std`], and then `lifeline` at [`RUNNER_LIFELINE_FD`]
-/// without close-on-exec. The source must be ≥ 4 (see [`dup_cloexec_high`])
-/// so the `dup2` is a real copy.
+/// [`apply_new_session_std`], and then `lifeline` and `status`
+/// at [`RUNNER_LIFELINE_FD`] / [`RUNNER_STATUS_FD`] without close-on-exec.
+/// Both sources must be ≥ 5 (see [`dup_cloexec_high`]) so neither `dup2`
+/// can land on the other's source.
 ///
 /// # Safety boundary
-/// As for [`apply_new_session_std`]; the closure adds one `dup2` call,
-/// which is async-signal-safe.
-pub fn apply_runner_setup_tokio(cmd: &mut tokio::process::Command, lifeline: i32) {
+/// As for [`apply_new_session_std`]; the closure adds two `dup2` calls,
+/// which are async-signal-safe.
+pub fn apply_runner_setup_tokio(cmd: &mut tokio::process::Command, lifeline: i32, status: i32) {
     let limit = fd_scan_limit();
     // SAFETY: see above; only integers are captured.
     unsafe {
         cmd.pre_exec(move || {
             child_setup(limit)?;
-            if libc::dup2(lifeline, RUNNER_LIFELINE_FD) < 0 {
+            if libc::dup2(lifeline, RUNNER_LIFELINE_FD) < 0 || libc::dup2(status, RUNNER_STATUS_FD) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -109,7 +112,7 @@ pub fn pipe_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 /// A close-on-exec duplicate of `fd` numbered ≥ 10, clear of the fixed
-/// runner slot 3.
+/// runner slots 3 and 4.
 pub fn dup_cloexec_high(fd: &OwnedFd) -> io::Result<OwnedFd> {
     // SAFETY: F_DUPFD_CLOEXEC on a valid fd returns a new fd we then own.
     let n = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
@@ -162,25 +165,68 @@ pub fn read_raw(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
+/// Write all of `data` to a raw fd, retrying EINTR.
+pub fn write_raw(fd: RawFd, mut data: &[u8]) -> io::Result<()> {
+    while !data.is_empty() {
+        // SAFETY: writes from a buffer we own, at most its length.
+        let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        data = &data[n as usize..];
+    }
+    Ok(())
+}
+
 pub fn getpid() -> u32 {
     std::process::id()
 }
 
-/// End this process with `sig`, as the command it ran ended: default
-/// action, unblocked, raised on ourselves. Returns an exit code to use if
-/// the signal did not end us (it cannot be caught or ignored here).
-pub fn die_by_signal(sig: i32) -> i32 {
-    // SAFETY: resets one disposition, edits this thread's mask, and signals
-    // ourselves; no memory is shared.
-    unsafe {
-        libc::signal(sig, libc::SIG_DFL);
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, sig);
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-        libc::kill(libc::getpid(), sig);
+/// Pids in process group `pgid` (zombies included, which is fine: they are
+/// reaped by their parent within moments).
+#[cfg(target_os = "macos")]
+pub fn group_members(pgid: u32) -> io::Result<Vec<u32>> {
+    let mut buf: Vec<libc::pid_t> = vec![0; 256];
+    loop {
+        let bytes = (buf.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        // SAFETY: the kernel writes at most `bytes` into `buf`. libproc
+        // returns a pid count here (it divides the byte count itself).
+        let n = unsafe { libc::proc_listpgrppids(pgid as libc::pid_t, buf.as_mut_ptr().cast(), bytes) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let count = n as usize;
+        if count < buf.len() {
+            return Ok(buf[..count].iter().filter(|p| **p > 0).map(|p| *p as u32).collect());
+        }
+        buf.resize(buf.len() * 2, 0);
     }
-    128 + sig
+}
+
+/// Pids in process group `pgid`, from `/proc/<pid>/stat` (field 5).
+#[cfg(not(target_os = "macos"))]
+pub fn group_members(pgid: u32) -> io::Result<Vec<u32>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir("/proc")?.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else {
+            continue;
+        };
+        // "pid (comm) state ppid pgrp …": comm may contain spaces/parens.
+        let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+            continue;
+        };
+        if rest.split_whitespace().nth(2).and_then(|g| g.parse::<u32>().ok()) == Some(pgid) {
+            out.push(pid);
+        }
+    }
+    Ok(out)
 }
 
 /// Is `sig` pending (blocked and delivered) for this process?
@@ -343,3 +389,26 @@ pub fn max_rss_bytes() -> u64 {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A process we start in a fresh group shows up as that group's member
+    /// (and only it); once it is gone the group is empty.
+    #[test]
+    fn group_members_lists_a_real_group() {
+        let mut child = std::process::Command::new("/bin/sleep");
+        child.arg("30");
+        apply_new_session_std(&mut child);
+        let mut child = child.spawn().unwrap();
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while group_members(pid).unwrap() != vec![pid] {
+            assert!(std::time::Instant::now() < deadline, "members: {:?}", group_members(pid));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        signal_group(pid, SIGKILL).unwrap();
+        child.wait().unwrap();
+        assert!(group_members(pid).unwrap().is_empty());
+    }
+}

@@ -287,24 +287,23 @@ fn g10_daemon_is_idle_after_watched_tasks_finish() {
     assert!(used < 300, "idle daemon used {used}ms CPU in 1.5s");
 }
 
-/// Kills: daemon.rs spawn_group_watcher. A leftover process group stops
-/// being tracked once it empties, so shutdown only reports (and signals)
-/// groups that still have members; a pgid that died is never signalled.
+/// A leftover process group stops being tracked once it empties (its
+/// guardian runner exits), so shutdown only reports (and signals) groups
+/// that still have members; a pgid that died is never signalled.
 #[test]
 fn g11_shutdown_counts_only_live_leftover_groups() {
     let home = Home::new("g11");
     let mut d = home.start_daemon();
     let mut c = home.connect();
     c.hello_ext("sess-a");
-    let (gone, _) = c.start("sleep 0.3 >/dev/null 2>&1 & echo $!");
+    let (gone, gone_runner) = c.start("sleep 0.3 >/dev/null 2>&1 & echo $!");
     let (live, _) = c.start("sleep 300 >/dev/null 2>&1 & echo $!");
     c.wait_terminal(&gone, S(3)).unwrap();
     c.wait_terminal(&live, S(3)).unwrap();
     let gone_gc = wait_for_pids(&mut c, &gone, 1)[0];
     let gc = wait_for_pids(&mut c, &live, 1)[0];
-    // The first group empties; the leftover-group poll notices on its next tick.
-    assert!(poll_true(S(3), || !pid_running(gone_gc)));
-    home.advance("group-poll", 500);
+    // The first group empties; its guardian runner then exits.
+    assert!(poll_true(S(3), || !pid_running(gone_gc) && !pid_running(gone_runner)));
     settle();
     drop(c);
     assert!(home.cli(&["shutdown"], S(10)).status.success());
@@ -413,4 +412,25 @@ fn g6_crashed_task_output_survives_on_the_orphaned_record() {
     assert_eq!(r["chunk"], "before-crash\n");
     assert_eq!(r["total_size"], 13);
     assert_eq!(r["status"], "orphaned");
+}
+
+/// Kills: runner.rs guardian poll (without its sleep the runner of a
+/// finished task that left a child behind busy-loops until the child
+/// exits). The guardian must be idle.
+#[test]
+fn g14_guardian_runner_does_not_spin() {
+    let home = Home::new("g14");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, runner) = c.start("sleep 300 >/dev/null 2>&1 & echo $!");
+    let gc = wait_for_pids(&mut c, &id, 1)[0];
+    assert_eq!(c.wait_terminal(&id, S(3)).unwrap()["status"], "completed");
+    assert!(pid_running(runner), "the runner guards the leftover child");
+    std::thread::sleep(Duration::from_millis(300));
+    let before = cpu_ms(runner);
+    std::thread::sleep(Duration::from_millis(1500));
+    let used = cpu_ms(runner) - before;
+    kill_group(gc, libc::SIGKILL);
+    assert!(used < 150, "guardian runner used {used}ms CPU in 1.5s");
 }
