@@ -7,9 +7,6 @@ use crate::lifecycle::{self, Claim};
 use crate::proto::*;
 use crate::registry::{self, Access, Registry, TaskEntry};
 use crate::task::{self, SpawnedTask};
-use interprocess::local_socket::tokio::prelude::*; // traits for accept()/connect()
-use interprocess::local_socket::tokio::Stream;
-use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::process::ExitStatusExt;
@@ -117,16 +114,10 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
         clock: crate::clock::Clock::from_env(),
     }));
 
-    // Bind the well-known socket (§3.1).
+    // Bind the well-known socket (§3.1). A plain tokio UnixListener: the
+    // daemon owns its descriptor, which an in-place upgrade hands over.
     let sock = lifecycle::socket_path(&home);
-    let name = match sock.as_os_str().to_fs_name::<GenericFilePath>() {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("pbs-manager: bad socket path {}: {e}", sock.display());
-            return 1;
-        }
-    };
-    let listener = match ListenerOptions::new().name(name).create_tokio() {
+    let listener = match tokio::net::UnixListener::bind(&sock) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("pbs-manager: cannot listen on {}: {e}", sock.display());
@@ -187,7 +178,7 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
     loop {
         tokio::select! {
             res = listener.accept() => match res {
-                Ok(stream) => {
+                Ok((stream, _addr)) => {
                     let s = state.clone();
                     tokio::spawn(async move { handle_conn(s, stream).await });
                 }
@@ -277,7 +268,7 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin>(
     }
 }
 
-async fn handle_conn(state: Shared, stream: Stream) {
+async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
     let (mut rd, wr) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Arc<Vec<u8>>>(1024);
     let die = Arc::new(Notify::new());
