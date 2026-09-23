@@ -225,15 +225,16 @@ pub fn scan_tasks(home: &Path, registry: &mut Registry) -> ScanResult {
         loaded: 0,
     };
     for mut rec in registry::load_all_records(home) {
+        // The persisted output_size lags the output file: a running task's
+        // is only written at exit, and the exit snapshot can precede the tee
+        // draining the pipe. The file is append-only and can no longer grow
+        // (the stdout pipe died with the old manager), so it is the truth.
+        if let Ok(m) = fs::metadata(&rec.output_path) {
+            rec.output_size = rec.output_size.max(m.len());
+        }
         if rec.status == TaskStatus::Running {
             if task::pid_alive(rec.pid) {
-                // §3.4: pid alive -> re-adopt. The persisted output_size lags
-                // (it is only written at exit), so recover it from the file.
-                // The file cannot grow any more: the task's stdout pipe died
-                // with the old manager.
-                if let Ok(m) = fs::metadata(&rec.output_path) {
-                    rec.output_size = rec.output_size.max(m.len());
-                }
+                // §3.4: pid alive -> re-adopt.
                 result.readopted.push((rec.task_id.clone(), rec.pid));
                 registry.tasks.insert(rec.task_id.clone(), TaskEntry::adopted(rec));
             } else {
@@ -363,6 +364,42 @@ mod tests {
         // Persisted too.
         let loaded = registry::load_all_records(&home);
         assert_eq!(loaded[0].status, TaskStatus::Orphaned);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The exit path persists `output_size` when the child exits, which can
+    /// be before the tee has drained the pipe. The output file is the truth:
+    /// a loaded terminal record must report its full size.
+    #[test]
+    fn scan_recovers_output_size_of_terminal_records_from_the_file() {
+        let home = temp_home("scan-size");
+        let out = registry::task_output_path(&home, "s1", "sh_0000000b");
+        let rec = crate::proto::TaskRecord {
+            task_id: "sh_0000000b".into(),
+            session_id: "s1".into(),
+            kind: crate::proto::TaskKind::Shell,
+            command: "seq 1 3".into(),
+            cwd: "/tmp".into(),
+            pid: 99_999_999,
+            status: TaskStatus::Completed,
+            exit_code: Some(0),
+            signal: None,
+            started_at: now_ms(),
+            ended_at: Some(now_ms()),
+            output_path: out.to_string_lossy().into_owned(),
+            output_size: 0, // snapshot taken before the pipe was drained
+            origin: None,
+            backgrounded_at: None,
+            end_reason: None,
+        };
+        registry::persist_record(&home, &rec).unwrap();
+        fs::write(&out, b"1\n2\n3\n").unwrap();
+        let mut reg = Registry::new(home.clone());
+        let res = scan_tasks(&home, &mut reg);
+        assert_eq!(res.loaded, 1);
+        let e = &reg.tasks["sh_0000000b"];
+        assert_eq!(e.record.output_size, 6);
+        assert_eq!(e.output.lock().unwrap().total_size, 6);
         std::fs::remove_dir_all(&home).ok();
     }
 }
