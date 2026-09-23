@@ -58,6 +58,27 @@ impl Clock {
         tokio::time::sleep(d).await
     }
 
+    /// Current time on this clock, in ms: wall time (epoch) normally, the
+    /// virtual time on the manual clock. Deadlines of this clock's timers
+    /// (e.g. a stop's kill grace) are kept in these units.
+    pub fn now_ms(&self) -> u64 {
+        #[cfg(feature = "test-clock")]
+        if let Some(m) = &self.manual {
+            return m.now_ms();
+        }
+        crate::proto::now_ms()
+    }
+
+    /// Continue the manual clock's virtual time after an in-place upgrade
+    /// (the new image starts a fresh clock). No-op on the real clock.
+    #[allow(unused_variables)]
+    pub fn resume_at(&self, now_ms: u64) {
+        #[cfg(feature = "test-clock")]
+        if let Some(m) = &self.manual {
+            m.set_now_ms(now_ms);
+        }
+    }
+
     #[cfg(feature = "test-clock")]
     pub fn manual(&self) -> Option<&manual::Manual> {
         self.manual.as_deref()
@@ -143,6 +164,14 @@ mod manual {
                 }
                 notified.await;
             }
+        }
+
+        pub fn now_ms(&self) -> u64 {
+            self.state.lock().unwrap().now_ms
+        }
+
+        pub fn set_now_ms(&self, ms: u64) {
+            self.state.lock().unwrap().now_ms = ms;
         }
 
         /// Move virtual time forward and wake every timer now due.

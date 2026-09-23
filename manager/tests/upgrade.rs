@@ -319,7 +319,8 @@ fn u8_kill_grace_carries_over() {
     // real time a slow upgrade (parallel load) may outlast the 2 s; the
     // outcome below must hold either way.
     if home.manual {
-        assert!(!members.is_empty(), "SIGTERM-ignoring group still there after the upgrade");
+        assert!(!members.is_empty(), "SIGTERM-ignoring group still there after the upgrade\nmanager.log:\n{}",
+            std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default());
     }
     // The new image re-armed the grace with what was left of it.
     home.advance_partial("kill-grace", 2_000);
