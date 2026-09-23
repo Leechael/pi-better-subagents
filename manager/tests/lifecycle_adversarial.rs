@@ -559,7 +559,6 @@ fn t5_sigterm_ignoring_task_is_sigkilled_after_grace() {
 /// T5b: §3.3 says killed task_exited carries `signal:"SIGTERM"|"SIGKILL"`;
 /// the extension types it as `string | null`.
 #[test]
-#[ignore = "bug: task_exited/TaskRecord.signal is an integer (15/9), contract §3.3 and extension type say a string \"SIGTERM\"|\"SIGKILL\""]
 fn t5b_signal_field_is_signal_name() {
     let home = Home::new("t5b");
     let _d = home.start_daemon();
@@ -672,7 +671,7 @@ fn t2_exit_status_mapping() {
     assert_eq!((r["status"].as_str(), r["exit_code"].as_i64()), (Some("failed"), Some(3)));
     let r = c.wait_terminal(&sig, S(3)).unwrap();
     assert_eq!(r["status"], "failed", "{r}");
-    assert!(r["exit_code"].is_null() && r["signal"] == 9, "{r}");
+    assert!(r["exit_code"].is_null() && r["signal"] == "SIGKILL", "{r}");
     let w = c.request_ok(json!({"type":"wait","task_id":bad,"budget_ms":100}));
     assert_eq!((w["done"].as_bool(), w["exit_code"].as_i64()), (Some(true), Some(3)));
     // Records on disk agree with the wire.

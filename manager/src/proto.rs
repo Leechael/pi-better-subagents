@@ -24,6 +24,48 @@ pub const E_SESSION_REQUIRED: &str = "E_SESSION_REQUIRED";
 pub const E_FORBIDDEN: &str = "E_FORBIDDEN";
 pub const E_INTERNAL: &str = "E_INTERNAL";
 
+/// §3.3: signals travel as names ("SIGTERM", "SIGKILL"). Unknown numbers
+/// render as "SIG<n>".
+pub fn signal_name(sig: i32) -> String {
+    let name = match sig {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGUSR2 => "SIGUSR2",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGXCPU => "SIGXCPU",
+        libc::SIGXFSZ => "SIGXFSZ",
+        _ => return format!("SIG{sig}"),
+    };
+    name.to_string()
+}
+
+/// Accept a signal as a name (current format) or a number (records written
+/// before signal names, which are converted).
+fn de_signal<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Sig {
+        Name(String),
+        Num(i32),
+    }
+    Ok(match Option::<Sig>::deserialize(d)? {
+        None => None,
+        Some(Sig::Name(s)) => Some(s),
+        Some(Sig::Num(n)) => Some(signal_name(n)),
+    })
+}
+
 /// Epoch milliseconds; used for started_at/ended_at/ts fields everywhere.
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -89,7 +131,10 @@ pub struct TaskRecord {
     pub pid: u32,
     pub status: TaskStatus,
     pub exit_code: Option<i32>,
-    pub signal: Option<i32>,
+    /// Terminating signal name, e.g. "SIGTERM" / "SIGKILL" (§3.3). Records
+    /// written by older managers stored the number; those still load.
+    #[serde(default, deserialize_with = "de_signal")]
+    pub signal: Option<String>,
     pub started_at: u64,
     pub ended_at: Option<u64>,
     pub output_path: String,
@@ -318,7 +363,8 @@ pub enum EventKind {
     TaskExited {
         task_id: String,
         exit_code: Option<i32>,
-        signal: Option<i32>,
+        /// Signal name ("SIGTERM"/"SIGKILL"/...), null when the task exited.
+        signal: Option<String>,
         duration_ms: u64,
         output_path: String,
         output_size: u64,
@@ -606,6 +652,59 @@ mod tests {
             v,
             serde_json::json!({"v": 1, "type": "event", "event": "session_rebound"})
         );
+    }
+
+    #[test]
+    fn signal_names_on_wire_and_legacy_numbers_load() {
+        for (sig, name) in [
+            (libc::SIGHUP, "SIGHUP"),
+            (libc::SIGINT, "SIGINT"),
+            (libc::SIGQUIT, "SIGQUIT"),
+            (libc::SIGILL, "SIGILL"),
+            (libc::SIGTRAP, "SIGTRAP"),
+            (libc::SIGABRT, "SIGABRT"),
+            (libc::SIGBUS, "SIGBUS"),
+            (libc::SIGFPE, "SIGFPE"),
+            (libc::SIGKILL, "SIGKILL"),
+            (libc::SIGUSR1, "SIGUSR1"),
+            (libc::SIGSEGV, "SIGSEGV"),
+            (libc::SIGUSR2, "SIGUSR2"),
+            (libc::SIGPIPE, "SIGPIPE"),
+            (libc::SIGALRM, "SIGALRM"),
+            (libc::SIGTERM, "SIGTERM"),
+            (libc::SIGXCPU, "SIGXCPU"),
+            (libc::SIGXFSZ, "SIGXFSZ"),
+        ] {
+            assert_eq!(signal_name(sig), name);
+        }
+        assert_eq!(signal_name(250), "SIG250");
+        let base = serde_json::json!({
+            "task_id":"sh_00000001","session_id":"s","kind":"shell","command":"x",
+            "cwd":"/","pid":1,"status":"killed","exit_code":null,
+            "started_at":1,"ended_at":2,"output_path":"/x","output_size":0
+        });
+        let with = |sig: serde_json::Value| {
+            let mut v = base.clone();
+            v["signal"] = sig;
+            serde_json::from_value::<TaskRecord>(v).unwrap().signal
+        };
+        assert_eq!(with(serde_json::json!(9)).as_deref(), Some("SIGKILL"));
+        assert_eq!(with(serde_json::json!("SIGTERM")).as_deref(), Some("SIGTERM"));
+        assert_eq!(with(serde_json::Value::Null), None);
+        // Missing field is fine too.
+        assert_eq!(serde_json::from_value::<TaskRecord>(base).unwrap().signal, None);
+        // And it serializes as the name.
+        let ev = Event::new(EventKind::TaskExited {
+            task_id: "sh_a".into(),
+            exit_code: None,
+            signal: Some(signal_name(libc::SIGKILL)),
+            duration_ms: 1,
+            output_path: "/x".into(),
+            output_size: 0,
+            ts: 1,
+        });
+        let v: serde_json::Value = serde_json::from_slice(&encode(&ev)).unwrap();
+        assert_eq!(v["signal"], serde_json::json!("SIGKILL"));
     }
 
     #[test]

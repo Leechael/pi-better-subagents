@@ -267,7 +267,7 @@ pub async fn cmd_list(home: &Path, session: Option<String>, include_exited: bool
         let exit = t
             .exit_code
             .map(|c| c.to_string())
-            .or_else(|| t.signal.map(|s| format!("sig{s}")))
+            .or_else(|| t.signal.clone())
             .unwrap_or_else(|| "-".into());
         println!(
             "{}",
@@ -310,7 +310,7 @@ pub async fn cmd_list(home: &Path, session: Option<String>, include_exited: bool
 /// `TASK_ID KIND SESSION STATUS PID EXIT SIZE COMMAND`
 pub fn ls_header() -> String {
     format!(
-        "{:<14} {:<8} {:<8} {:<10} {:>7} {:>5} {:>9} COMMAND",
+        "{:<14} {:<8} {:<8} {:<10} {:>7} {:>7} {:>9} COMMAND",
         "TASK_ID", "KIND", "SESSION", "STATUS", "PID", "EXIT", "SIZE"
     )
 }
@@ -326,7 +326,7 @@ pub fn format_ls_row(
     command: &str,
 ) -> String {
     format!(
-        "{:<14} {:<8} {:<8} {:<10} {:>7} {:>5} {:>9} {}",
+        "{:<14} {:<8} {:<8} {:<10} {:>7} {:>7} {:>9} {}",
         task_id,
         kind,
         truncate(session_id, 8),
@@ -830,5 +830,9 @@ mod resolve_tests {
         assert!(agent.contains("agent"), "{agent}");
         let shell = format_ls_row("sh_071f52c1", "shell", "sess", "running", "2", "-", "0", "echo hi");
         assert!(shell.contains("shell"), "{shell}");
+        // EXIT shows signal names (§3.3); they must not shift COMMAND.
+        let killed = format_ls_row("sh_071f52c1", "shell", "sess", "killed", "2", "SIGTERM", "0", "echo hi");
+        assert_eq!(killed.find("echo hi"), header.find("COMMAND"), "{header}\n{killed}");
+        assert_eq!(shell.find("echo hi"), header.find("COMMAND"));
     }
 }

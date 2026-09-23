@@ -1064,7 +1064,7 @@ fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::Exi
         let signal = status.and_then(|s| s.signal());
         let now = now_ms();
         entry.record.exit_code = code;
-        entry.record.signal = signal;
+        entry.record.signal = signal.map(signal_name);
         entry.record.ended_at = Some(now);
         entry.record.output_size = entry.output.lock().unwrap().total_size;
         entry.record.status = registry::terminal_status(entry.kill_requested, code, signal);
@@ -1075,7 +1075,7 @@ fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::Exi
         let event = EventKind::TaskExited {
             task_id: task_id.to_string(),
             exit_code: code,
-            signal,
+            signal: entry.record.signal.clone(),
             duration_ms: now.saturating_sub(entry.record.started_at),
             output_path: entry.record.output_path.clone(),
             output_size: entry.record.output_size,
