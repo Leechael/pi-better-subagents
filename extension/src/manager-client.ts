@@ -22,7 +22,7 @@ const HELLO_TIMEOUT_MS = 5000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const SOCKET_READY_TIMEOUT_MS = 2000;
 const SOCKET_READY_POLL_MS = 50;
-const RECONNECT_DELAYS_MS = [500, 1000, 2000];
+const RECONNECT_DELAYS_MS = [0, 100, 250];
 const RETRY_COOLDOWN_MS = 30000;
 const MANAGER_SHUTDOWN_WAIT_MS = 5000;
 const MANAGER_SHUTTING_DOWN = "manager is shutting down";
@@ -139,6 +139,9 @@ interface PendingRequest {
   resolve: (value: Record<string, unknown>) => void;
   reject: (err: Error) => void;
   timer: ClockTimer;
+  message: Record<string, unknown>;
+  timeoutMs: number;
+  retryable: boolean;
 }
 
 /** Reassembles `u32 BE length + JSON` frames from a byte stream. */
@@ -341,7 +344,7 @@ export class ManagerClient {
   }
 
   async start(req: StartRequest): Promise<StartResponse> {
-    const res = await this.request({ type: "start", ...req });
+    const res = await this.request({ type: "start", ...req, key: randomUUID() });
     return { task_id: res.task_id as string, pid: res.pid as number };
   }
 
@@ -693,21 +696,45 @@ export class ManagerClient {
     if (!socket || this.state !== "connected") {
       return Promise.reject(new Error("pbs-manager not connected"));
     }
-    const id = randomUUID();
+    const type = String(msg.type);
+    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start"].includes(type);
     return new Promise((resolve, reject) => {
-      const timer = this.clock.setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`pbs-manager request timed out: ${String(msg.type)}`));
-      }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
-      socket.write(encodeFrame({ v: 1, id, ...msg }));
+      const entry: PendingRequest = {
+        resolve, reject, message: msg, timeoutMs, retryable,
+        timer: this.clock.setTimeout(() => {
+          for (const [id, pending] of this.pending) {
+            if (pending === entry) this.pending.delete(id);
+          }
+          reject(new Error(`pbs-manager request timed out: ${type}`));
+        }, timeoutMs),
+      };
+      this.sendPending(entry);
     });
+  }
+
+  private sendPending(entry: PendingRequest): void {
+    const socket = this.socket;
+    if (!socket || this.state !== "connected") return;
+    const id = randomUUID();
+    this.pending.set(id, entry);
+    socket.write(encodeFrame({ v: 1, id, ...entry.message }));
+  }
+
+  private resendPending(): void {
+    const entries = [...new Set(this.pending.values())].filter((entry) => entry.retryable);
+    this.pending.clear();
+    for (const entry of entries) this.sendPending(entry);
   }
 
   private onClose(): void {
     const wasConnected = this.state === "connected";
     this.detachSocket();
-    this.failAllPending(new Error("pbs-manager connection lost"));
+    for (const [id, entry] of [...this.pending]) {
+      if (entry.retryable && !this.intentionalClose && !this.rebound) continue;
+      this.pending.delete(id);
+      this.clock.clearTimeout(entry.timer);
+      entry.reject(new Error("pbs-manager connection lost"));
+    }
     if (this.helloWaiter) {
       this.helloWaiter.reject(new Error("connection closed during hello"));
       this.helloWaiter = null;
@@ -724,11 +751,12 @@ export class ManagerClient {
 
   private async reconnectLoop(): Promise<void> {
     for (const delayMs of RECONNECT_DELAYS_MS) {
-      await delay(this.clock, delayMs);
+      if (delayMs > 0) await delay(this.clock, delayMs);
       if (this.intentionalClose || this.rebound) return;
       try {
         await this.connectFlow(true);
         this.state = "connected";
+        this.resendPending();
         this.log("reconnected to pbs-manager");
         for (const handler of this.reconnectHandlers) {
           try {
