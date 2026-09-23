@@ -10,6 +10,7 @@ mod daemon;
 mod events;
 mod fmt;
 mod gc;
+mod handover;
 mod inspect;
 mod lifecycle;
 mod proto;
@@ -42,6 +43,9 @@ enum Sub {
         /// Also log to stderr (for debugging).
         #[arg(long)]
         foreground: bool,
+        /// Internal: continue an in-place upgrade from this handover file.
+        #[arg(long, hide = true)]
+        handover: Option<PathBuf>,
     },
     /// Version, protocol, uptime, sessions, task and agent counts. Never
     /// starts the daemon ("pbs-manager is not running", exit 1).
@@ -126,6 +130,10 @@ enum Sub {
     Doctor,
     /// Gracefully shut the manager down (kills remaining tasks).
     Shutdown,
+    /// Replace the running manager, in place, with the binary now installed
+    /// at its path: same pid, every task keeps running, clients reconnect.
+    /// The daemon also does this by itself when that file changes.
+    Upgrade,
     /// Tail manager.log, or a task's output when TASK_ID is given.
     /// With TASK_ID: follows the merged `.output` file (use --stderr for the
     /// stderr-only sibling). Without TASK_ID: tails manager.log.
@@ -186,11 +194,18 @@ enum Sub {
 fn main() {
     // `__run` is every task's process-group leader (`runner`): plain
     // threads, no async runtime, and not a user-facing subcommand.
-    // args_os: the executable path or the command may not be UTF-8.
-    let mut args = std::env::args_os().skip(1);
-    if args.next().as_deref() == Some(std::ffi::OsStr::new("__run")) {
-        let command = args.next().unwrap_or_default();
-        std::process::exit(runner::main(&command));
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("__run") => {
+            let command = args.next().unwrap_or_default();
+            std::process::exit(runner::main(&command));
+        }
+        // An in-place upgrade asks the new binary this before exec'ing it.
+        Some(handover::CHECK_ARG) => {
+            println!("{}", handover::check_line());
+            std::process::exit(0);
+        }
+        _ => {}
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -203,7 +218,7 @@ async fn async_main() {
     let cli = Cli::parse();
     let home = lifecycle::resolve_home(cli.home.as_deref());
     let code = match cli.cmd {
-        Sub::Daemon { foreground } => daemon::run(home, foreground).await,
+        Sub::Daemon { foreground, handover } => daemon::run(home, foreground, handover).await,
         Sub::Status { json } => run_client(inspect::cmd_status(&home, json)).await,
         Sub::Sessions { json } => run_client(inspect::cmd_sessions(&home, json)).await,
         Sub::List {
@@ -251,6 +266,7 @@ async fn async_main() {
         }
         Sub::Doctor => client::cmd_doctor(&home).await,
         Sub::Shutdown => run_client(client::cmd_shutdown(&home)).await,
+        Sub::Upgrade => run_client(client::cmd_upgrade(&home)).await,
         Sub::Log {
             task_id,
             follow,

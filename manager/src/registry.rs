@@ -91,6 +91,10 @@ pub struct TaskEntry {
     /// Output bytes the fanout has pushed to watchers, as a cursor (an
     /// incomplete trailing UTF-8 sequence it holds back is not counted).
     pub delivered_cursor: u64,
+    /// Sessions that watched this task when an in-place upgrade closed
+    /// their connections, with the cursor they had received up to. Resumed
+    /// (and the gap sent) when the session reconnects.
+    pub watch_sessions: Vec<(String, u64)>,
     /// The command exited but other members of its process group (children
     /// it backgrounded) are still alive, guarded by the runner. The group is
     /// still ours to kill on stop/shutdown (§3.2: background work must not
@@ -153,6 +157,7 @@ impl TaskEntry {
             exit_watch: None,
             status_partial: Vec::new(),
             delivered_cursor: 0,
+            watch_sessions: Vec::new(),
             group_lingering: false,
         }
     }

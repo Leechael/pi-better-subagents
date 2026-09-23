@@ -112,6 +112,25 @@ pub struct DaemonLockGuard {
     _guard: fd_lock::RwLockWriteGuard<'static, std::fs::File>,
 }
 
+impl DaemonLockGuard {
+    /// The lock file's descriptor. An in-place upgrade keeps it open across
+    /// the exec, so the lock (it belongs to the open file) is never released.
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self._guard.as_raw_fd()
+    }
+}
+
+/// Take over the daemon lock from a descriptor inherited across an in-place
+/// upgrade. The lock is already ours; re-locking the same open file is a
+/// no-op that must succeed.
+pub fn adopt_daemon_lock(fd: std::os::fd::OwnedFd) -> io::Result<DaemonLockGuard> {
+    let lock: &'static mut fd_lock::RwLock<std::fs::File> =
+        Box::leak(Box::new(fd_lock::RwLock::new(std::fs::File::from(fd))));
+    let guard = lock.try_write()?;
+    Ok(DaemonLockGuard { _guard: guard })
+}
+
 fn open_daemon_lock(home: &Path) -> io::Result<fd_lock::RwLock<std::fs::File>> {
     // std opens files with O_CLOEXEC, so task processes never inherit the
     // lock: after a daemon crash, live tasks cannot keep a new daemon out.
@@ -139,6 +158,15 @@ pub fn claim_daemon(home: &Path) -> io::Result<Claim> {
             pid: read_pid_file(home).map(|p| p.pid),
         }),
         Err(e) => Err(e),
+    }
+}
+
+/// True when some process holds manager.lock (a daemon is alive). Takes and
+/// releases the lock when it is free; touches no file.
+pub fn lock_held(home: &Path) -> bool {
+    match open_daemon_lock(home) {
+        Ok(mut lock) => matches!(lock.try_write(), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+        Err(_) => false,
     }
 }
 
@@ -237,8 +265,21 @@ fn wait_group_gone(pgid: u32, bound: std::time::Duration) {
 /// record is marked orphaned. Nothing is signalled: the recorded pid may
 /// already belong to an unrelated process.
 pub fn scan_tasks(home: &Path, registry: &mut Registry) -> ScanResult {
+    scan_tasks_except(home, registry, &std::collections::HashSet::new())
+}
+
+/// [`scan_tasks`], skipping the tasks in `live`: after an in-place upgrade
+/// those are still running and come from the handover, not from disk.
+pub fn scan_tasks_except(
+    home: &Path,
+    registry: &mut Registry,
+    live: &std::collections::HashSet<String>,
+) -> ScanResult {
     let mut result = ScanResult { orphaned: 0, loaded: 0 };
     for mut rec in registry::load_all_records(home) {
+        if live.contains(&rec.task_id) {
+            continue;
+        }
         // The persisted output_size lags the output file: a running task's
         // is only written at exit. The file can no longer grow, so it is
         // the truth.

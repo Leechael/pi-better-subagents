@@ -344,6 +344,61 @@ pub async fn cmd_shutdown(home: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// `pbs-manager upgrade`: ask the running daemon to exec the binary now at
+/// its path, then report how it went (from the new image's status).
+pub async fn cmd_upgrade(home: &Path) -> Result<(), String> {
+    let Ok(mut conn) = connect_existing(home, &HelloMode::Cli).await else {
+        outln!("pbs-manager is not running; the next client starts the installed binary");
+        return Ok(());
+    };
+    let before: StatusOk = conn.roundtrip(RequestKind::Status).await?;
+    let asked = now_ms();
+    let ok: UpgradeOk = conn.roundtrip(RequestKind::Upgrade).await?;
+    drop(conn);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if std::time::Instant::now() > deadline {
+            return Err("no answer from the manager within 30s of the upgrade".into());
+        }
+        if !lifecycle::lock_held(home) {
+            return Err(format!(
+                "the manager (pid {}) exited during the upgrade; its tasks were cleaned up. See manager.log",
+                before.pid
+            ));
+        }
+        let Ok(mut c) = connect_existing(home, &HelloMode::Cli).await else { continue };
+        let Ok(st) = c.roundtrip::<StatusOk>(RequestKind::Status).await else { continue };
+        if st.pid != before.pid {
+            return Err(format!(
+                "the manager was replaced by a new process (pid {} -> {}): the upgrade did not carry over",
+                before.pid, st.pid
+            ));
+        }
+        match st.last_upgrade {
+            Some(u) if u.at >= asked && u.ok && st.generation > ok.generation => {
+                outln!(
+                    "upgraded in place: {} -> {} (pid {}, generation {}, {} running task(s) kept)",
+                    u.from_version,
+                    u.to_version.as_deref().unwrap_or("?"),
+                    st.pid,
+                    st.generation,
+                    st.task_counts.running
+                );
+                return Ok(());
+            }
+            Some(u) if u.at >= asked && !u.ok => {
+                return Err(format!(
+                    "upgrade not done, still running {}: {}",
+                    u.from_version,
+                    u.error.unwrap_or_default()
+                ));
+            }
+            _ => continue,
+        }
+    }
+}
+
 /// Extra CLI convenience (not in §3.5): start a task. Needs a session to own
 /// the task, so this hellos as an extension connection.
 pub async fn cmd_start(
@@ -385,6 +440,7 @@ pub async fn cmd_start(
             run_in_background: background,
             timeout_ms,
             origin: None,
+            key: None,
         })
         .await?;
     outln!("task_id={} pid={}", res.task_id, res.pid);
