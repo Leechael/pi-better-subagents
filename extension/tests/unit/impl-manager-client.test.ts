@@ -105,6 +105,11 @@ async function startFakeManager(home: string): Promise<FakeManager> {
         return { v: 1, id: msg.id, ok: true };
       case "list":
         return { v: 1, id: msg.id, ok: true, tasks };
+      case "status":
+        return {
+          v: 1, id: msg.id, ok: true, sessions: [], generation: 2,
+          last_upgrade: { at: 123, ok: true, from_version: "0.1.0", to_version: "0.2.0", trigger: "cli" },
+        };
       case "shutdown_session":
         return { v: 1, id: msg.id, ok: true, stopped: ["sh_a1b2c3d4"] };
       case "watch":
@@ -237,6 +242,15 @@ describe("ManagerClient (integration, fake manager)", () => {
     expect(fake.received.find((message) => message.type === "stop")).toMatchObject({ reason: "tui" });
     await expect(client.list()).resolves.toEqual([]);
     await expect(client.shutdownSession()).resolves.toEqual(["sh_a1b2c3d4"]);
+  });
+
+  it("preserves upgrade generation metadata from status", async () => {
+    await client.connect();
+    await expect(client.status()).resolves.toEqual({
+      sessions: [],
+      generation: 2,
+      last_upgrade: { at: 123, ok: true, from_version: "0.1.0", to_version: "0.2.0", trigger: "cli" },
+    });
   });
 
   it("dispatches server-pushed events to onEvent handlers", async () => {

@@ -122,6 +122,21 @@ export interface ManagerClientOptions {
   clock?: Clock;
 }
 
+export interface LastUpgrade {
+  at: number;
+  ok: boolean;
+  from_version: string;
+  to_version?: string;
+  error?: string;
+  trigger: string;
+}
+
+export interface ManagerStatusResponse {
+  sessions: SessionInfo[];
+  generation?: number;
+  last_upgrade?: LastUpgrade | null;
+}
+
 export interface SessionInfo {
   session_id: string;
   pi_pid: number;
@@ -385,10 +400,21 @@ export class ManagerClient {
     return ((res.tasks as TaskRecord[] | undefined) ?? []) as TaskRecord[];
   }
 
+  /** Daemon status, including optional in-place upgrade metadata. */
+  async status(): Promise<ManagerStatusResponse> {
+    const res = await this.request({ type: "status" });
+    return {
+      sessions: (res.sessions as SessionInfo[] | undefined) ?? [],
+      ...(typeof res.generation === "number" ? { generation: res.generation } : {}),
+      ...(res.last_upgrade && typeof res.last_upgrade === "object"
+        ? { last_upgrade: res.last_upgrade as LastUpgrade }
+        : {}),
+    };
+  }
+
   /** Connected sessions (status). Older managers may reject this for extension clients. */
   async sessions(): Promise<SessionInfo[]> {
-    const res = await this.request({ type: "status" });
-    return ((res.sessions as SessionInfo[] | undefined) ?? []) as SessionInfo[];
+    return (await this.status()).sessions;
   }
 
   async watch(taskId: string): Promise<void> {
