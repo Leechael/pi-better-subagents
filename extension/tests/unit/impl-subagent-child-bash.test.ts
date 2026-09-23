@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { ManualClock } from "../../src/clock";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ManagerClient } from "../../src/manager-client";
 import { createChildBashTool, type ChildBashDeps } from "../../src/subagent/child-bash";
@@ -20,7 +21,7 @@ function fakeClient(overrides: Partial<Record<string, unknown>> = {}): ManagerCl
   } as unknown as ManagerClient;
 }
 
-function makeDeps(client: ManagerClient | null): ChildBashDeps & { client: ManagerClient | null } {
+function makeDeps(client: ManagerClient | null, clock?: ManualClock): ChildBashDeps & { client: ManagerClient | null } {
   return {
     client,
     getClient: () => client,
@@ -28,6 +29,7 @@ function makeDeps(client: ManagerClient | null): ChildBashDeps & { client: Manag
     sessionId: () => "parent-session",
     sessionEnv: () => ({ PI_SESSION_ID: "parent-session" }),
     trackTask: vi.fn(),
+    clock,
   };
 }
 
@@ -105,33 +107,20 @@ describe("child bash (no-background variant)", () => {
     expect(client.stop).toHaveBeenCalledWith("sh_test1234");
   });
 
-  describe("timeout (fake timers)", () => {
-    beforeEach(() => {
-      vi.useFakeTimers();
-    });
-    afterEach(() => {
-      vi.useRealTimers();
-    });
-
+  describe("timeout (ManualClock)", () => {
     it("kills the task and returns a timeout error instead of backgrounding", async () => {
+      const clock = new ManualClock();
       const client = fakeClient({
-        // Each wait consumes its budget in fake time and reports not-done.
+        // Each wait consumes its supplied budget in deterministic time.
         wait: vi.fn(async (_id: string, budgetMs: number) => {
-          vi.advanceTimersByTime(budgetMs);
+          clock.advanceBy(budgetMs);
           return { done: false };
         }),
       });
-      const tool = createChildBashTool(makeDeps(client));
-      const pending = tool.execute(
-        "tc",
-        { command: "slow", timeout: 5 },
-        undefined,
-        undefined,
-        ctx,
-      );
-      const assertion = expect(pending).rejects.toThrow(/timed out after 5 seconds and was killed/);
-      await vi.advanceTimersByTimeAsync(10_000);
-      await assertion;
+      const tool = createChildBashTool(makeDeps(client, clock));
+      await expect(
+        tool.execute("tc", { command: "slow", timeout: 5 }, undefined, undefined, ctx),
+      ).rejects.toThrow(/timed out after 5 seconds and was killed/);
       expect(client.stop).toHaveBeenCalledWith("sh_test1234");
     });
   });

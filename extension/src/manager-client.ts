@@ -13,6 +13,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { pbsPaths } from "./config";
+import { realClock, type Clock, type ClockTimer } from "./clock";
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
 const HELLO_TIMEOUT_MS = 5000;
@@ -103,6 +104,7 @@ export interface ManagerClientOptions {
   /** Session working directory, sent on hello (optional; older managers ignore it). */
   cwd?: string;
   log?: (message: string) => void;
+  clock?: Clock;
 }
 
 export interface SessionInfo {
@@ -119,7 +121,7 @@ type EventHandler = (event: ManagerEvent) => void;
 interface PendingRequest {
   resolve: (value: Record<string, unknown>) => void;
   reject: (err: Error) => void;
-  timer: NodeJS.Timeout;
+  timer: ClockTimer;
 }
 
 /** Reassembles `u32 BE length + JSON` frames from a byte stream. */
@@ -205,13 +207,10 @@ export function releaseSpawnLockFile(lockPath: string): void {
   }
 }
 
-function delay(ms: number): Promise<void> {
-  // NOTE: timers here must stay ref'd. Awaited connect/request paths rely on
-  // them; with unref'd timers a print-mode pi process can exit mid-handshake
-  // (empty event loop) before the manager connection completes.
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
+function delay(clock: Clock, ms: number): Promise<void> {
+  // These awaited timers intentionally remain ref'd; an unref'd handshake
+  // timer can let print-mode pi exit before the manager connection completes.
+  return clock.sleep(ms);
 }
 
 export class ManagerClient {
@@ -221,6 +220,7 @@ export class ManagerClient {
   private readonly piPid: number;
   private readonly cwd: string | undefined;
   private readonly log: (message: string) => void;
+  private readonly clock: Clock;
 
   private socket: net.Socket | null = null;
   private decoder = new FrameDecoder();
@@ -244,6 +244,11 @@ export class ManagerClient {
     this.piPid = options.piPid ?? process.pid;
     this.cwd = options.cwd;
     this.log = options.log ?? (() => {});
+    this.clock = options.clock ?? realClock;
+  }
+
+  private now(): number {
+    return this.clock.now();
   }
 
   isAvailable(): boolean {
@@ -267,7 +272,7 @@ export class ManagerClient {
       await this.reconnecting;
       return this.isAvailable();
     }
-    if (this.state === "unavailable" && Date.now() - this.lastFailureAt < RETRY_COOLDOWN_MS) {
+    if (this.state === "unavailable" && this.now() - this.lastFailureAt < RETRY_COOLDOWN_MS) {
       return false;
     }
     return this.connect();
@@ -301,7 +306,7 @@ export class ManagerClient {
       } catch (err) {
         this.log(`connect failed: ${(err as Error).message}`);
         this.state = "unavailable";
-        this.lastFailureAt = Date.now();
+        this.lastFailureAt = this.now();
         this.lastFailureMessage = (err as Error).message;
         return false;
       } finally {
@@ -474,7 +479,7 @@ export class ManagerClient {
   }
 
   private async waitForSocket(socketPath: string, timeoutMs: number): Promise<void> {
-    const deadline = Date.now() + timeoutMs;
+    const deadline = this.now() + timeoutMs;
     for (;;) {
       if (existsSync(socketPath)) {
         const ok = await new Promise<boolean>((resolve) => {
@@ -487,10 +492,10 @@ export class ManagerClient {
         });
         if (ok) return;
       }
-      if (Date.now() >= deadline) {
+      if (this.now() >= deadline) {
         throw new Error("timed out waiting for pbs-manager socket");
       }
-      await delay(SOCKET_READY_POLL_MS);
+      await delay(this.clock, SOCKET_READY_POLL_MS);
     }
   }
 
@@ -553,13 +558,13 @@ export class ManagerClient {
     const id = randomUUID();
     return new Promise<void>((resolve, reject) => {
       const done = (err?: Error) => {
-        clearTimeout(timer);
+        this.clock.clearTimeout(timer);
         this.pending.delete(id);
         this.helloWaiter = null;
         if (err) reject(err);
         else resolve();
       };
-      const timer = setTimeout(() => done(new Error("hello timed out")), HELLO_TIMEOUT_MS);
+      const timer = this.clock.setTimeout(() => done(new Error("hello timed out")), HELLO_TIMEOUT_MS);
       this.helloWaiter = { resolve: () => done(), reject: (err) => done(err) };
       this.pending.set(id, { resolve: () => done(), reject: (err) => done(err), timer });
       socket.write(
@@ -627,7 +632,7 @@ export class ManagerClient {
     const entry = this.pending.get(id);
     if (!entry) return;
     this.pending.delete(id);
-    clearTimeout(entry.timer);
+    this.clock.clearTimeout(entry.timer);
     if (msg.ok === true) {
       entry.resolve(msg);
     } else {
@@ -642,7 +647,7 @@ export class ManagerClient {
     }
     const id = randomUUID();
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const timer = this.clock.setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`pbs-manager request timed out: ${String(msg.type)}`));
       }, timeoutMs);
@@ -671,7 +676,7 @@ export class ManagerClient {
 
   private async reconnectLoop(): Promise<void> {
     for (const delayMs of RECONNECT_DELAYS_MS) {
-      await delay(delayMs);
+      await delay(this.clock, delayMs);
       if (this.intentionalClose || this.rebound) return;
       try {
         await this.connectFlow(true);
@@ -690,14 +695,14 @@ export class ManagerClient {
       }
     }
     this.state = "unavailable";
-    this.lastFailureAt = Date.now();
+    this.lastFailureAt = this.now();
     this.lastFailureMessage = "reconnect exhausted";
     this.log("giving up on pbs-manager; bash falls back to local execution");
   }
 
   private failAllPending(err: Error): void {
     for (const entry of this.pending.values()) {
-      clearTimeout(entry.timer);
+      this.clock.clearTimeout(entry.timer);
       entry.reject(err);
     }
     this.pending.clear();

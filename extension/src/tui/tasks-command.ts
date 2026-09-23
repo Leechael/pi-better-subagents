@@ -5,6 +5,7 @@
  * Finished items stay viewable while they remain in the work index.
  */
 import { DynamicBorder, keyHint, rawKeyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { realClock, type Clock } from "../clock";
 import type { ManagerClient } from "../manager-client";
 import { formatConversation } from "../subagent/conversation";
 import type { SubagentRegistry } from "../subagent/registry";
@@ -53,6 +54,7 @@ export interface TasksCommandDeps {
   getRegistry: () => SubagentRegistry | null;
   getIndex: () => WorkIndex | null;
   getClient: () => ManagerClient | null;
+  clock?: Clock;
 }
 
 export function registerTasksCommand(pi: ExtensionAPI, deps: TasksCommandDeps): void {
@@ -111,12 +113,13 @@ export interface TaskListChoice {
 
 async function openTasksUi(ctx: ExtensionContext, deps: TasksCommandDeps): Promise<void> {
   const index = deps.getIndex();
-  const items = () => index?.list() ?? [];
+  const clock = deps.clock ?? realClock;
+  const items = () => index?.list(clock.now()) ?? [];
   if (!ctx.hasUI) {
     const list = items();
     ctx.ui.notify(
       list.length
-        ? formatWorkRows(list, undefined, Date.now(), 100).join("\n")
+        ? formatWorkRows(list, undefined, clock.now(), 100).join("\n")
         : "No background tasks.",
       "info",
     );
@@ -129,7 +132,7 @@ async function openTasksUi(ctx: ExtensionContext, deps: TasksCommandDeps): Promi
 
   let selectedId: string | undefined;
   for (;;) {
-    const choice = await showTaskList(ctx, () => index.list(), (cb) => index.onChange(cb), selectedId);
+    const choice = await showTaskList(ctx, () => index.list(clock.now()), (cb) => index.onChange(cb), selectedId, clock);
     if (!choice || choice.action === "close") return;
     selectedId = choice.id ?? selectedId;
     if (!choice.id) continue;
@@ -157,6 +160,7 @@ async function showTaskList(
   getItems: () => WorkItem[],
   subscribe: (cb: () => void) => () => void,
   initialSelectedId: string | undefined,
+  clock: Clock,
 ): Promise<TaskListChoice | undefined> {
   const piTui = loadPiTui();
   if (!piTui) {
@@ -164,7 +168,7 @@ async function showTaskList(
     notifyPlainFallback(
       ctx.ui.notify.bind(ctx.ui),
       "Background tasks",
-      items.length ? formatWorkRows(items, initialSelectedId, Date.now(), 100).join("\n") : "No background tasks.",
+      items.length ? formatWorkRows(items, initialSelectedId, clock.now(), 100).join("\n") : "No background tasks.",
     );
     return { action: "close" };
   }
@@ -174,8 +178,8 @@ async function showTaskList(
     (tui, theme, kb, done) => {
       let selectedId = initialSelectedId;
       const unsub = subscribe(() => tui.requestRender());
-      const ageTimer = setInterval(() => tui.requestRender(), AGE_TICK_MS);
-      ageTimer.unref?.();
+      const ageTimer = clock.setInterval(() => tui.requestRender(), AGE_TICK_MS);
+      clock.unref?.(ageTimer);
       const border = new DynamicBorder((text) => theme.fg("border", text));
       const matches = (
         data: string,
@@ -194,7 +198,7 @@ async function showTaskList(
           const inner = Math.max(1, width);
           const title = truncateToWidth(theme.fg("accent", "Background tasks"), inner, "…");
           const hint = truncateToWidth(selectorHint(theme), inner, "…");
-          const rows = formatWorkRows(items, selectedId, Date.now(), inner);
+          const rows = formatWorkRows(items, selectedId, clock.now(), inner);
           return [...border.render(inner), title, hint, ...rows, ...border.render(inner)];
         },
         invalidate() {
@@ -229,7 +233,7 @@ async function showTaskList(
           }
         },
         dispose() {
-          clearInterval(ageTimer);
+          clock.clearInterval(ageTimer);
           unsub();
         },
       };
@@ -262,7 +266,7 @@ async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksComman
       item.text ||
       "(no output)";
     try {
-      await showScrollDetail(ctx.ui, { title: `subagent ${item.title}`, content: read, pollMs: 500 });
+      await showScrollDetail(ctx.ui, { title: `subagent ${item.title}`, content: read, pollMs: 500, clock: deps.clock });
     } catch {
       notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), item.title, read());
     }
@@ -278,6 +282,7 @@ async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksComman
         stderr: () => readTaskFileTailCached(stderrPath),
       },
       pollMs: 500,
+      clock: deps.clock,
     });
   } catch {
     notifyPlainFallback(ctx.ui.notify.bind(ctx.ui), item.title, readTaskFileTailCached(outputPath));

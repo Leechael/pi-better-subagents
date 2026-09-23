@@ -1,17 +1,21 @@
 import { describe, expect, it } from "vitest";
+import { ManualClock } from "../../src/clock";
 import { SubagentRegistry, type RunRecord } from "../../src/subagent/registry";
 import { InProcessRunner } from "../../src/subagent/runner";
 import type { ChildRunRequest } from "../../src/subagent/types";
 import { SessionFactory, tick, WORKER_AGENT } from "./subagent-fakes";
 
 function makeStack(opts: { maxConcurrentChildren?: number; spawnBudgetPerHour?: number } = {}) {
+  const clock = new ManualClock();
   const registry = new SubagentRegistry({
     maxConcurrentChildren: opts.maxConcurrentChildren ?? 8,
     spawnBudgetPerHour: opts.spawnBudgetPerHour ?? 32,
+    clock,
   });
   const factory = new SessionFactory();
   const runner = new InProcessRunner({
     createSession: factory.fn,
+    clock,
     acquire: (req) => registry.admitChild(req.childId),
   });
   registry.setRunner(runner);

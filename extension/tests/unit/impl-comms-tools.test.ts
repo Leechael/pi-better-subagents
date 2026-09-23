@@ -79,7 +79,10 @@ class FakeHost implements CommsHost {
 }
 
 const CTX = {} as ExtensionContext;
-const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+const tick = async () => {
+  await Promise.resolve();
+  await Promise.resolve();
+};
 
 /** Extract the text of a tool result's first content block (assumes text). */
 function textOf(res: { content: ({ type: "text"; text: string } | { type: string })[] }): string {

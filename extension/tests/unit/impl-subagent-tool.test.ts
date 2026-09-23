@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { ManualClock } from "../../src/clock";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SubagentRegistry } from "../../src/subagent/registry";
 import { InProcessRunner } from "../../src/subagent/runner";
@@ -7,11 +8,13 @@ import { PBS_WAKE_CUSTOM_TYPE } from "../../src/wake";
 import { SessionFactory, tick } from "./subagent-fakes";
 
 function makeStack(opts: { budgetMs?: number; autoComplete?: string | null } = {}) {
-  const registry = new SubagentRegistry({});
+  const clock = new ManualClock();
+  const registry = new SubagentRegistry({ clock });
   const factory = new SessionFactory();
   factory.autoComplete = opts.autoComplete === undefined ? "done" : opts.autoComplete;
   const runner = new InProcessRunner({
     createSession: factory.fn,
+    clock,
     acquire: (req) => registry.admitChild(req.childId),
   });
   registry.setRunner(runner);
@@ -22,11 +25,12 @@ function makeStack(opts: { budgetMs?: number; autoComplete?: string | null } = {
     budgetMs: () => opts.budgetMs ?? 45_000,
     defaultTimeoutMs: 600_000,
     defaultConcurrency: 4,
+    clock,
   });
   const ctx = { cwd: "/tmp" } as ExtensionContext;
   const exec = (params: Record<string, unknown>, signal?: AbortSignal) =>
     tool.execute("tc", params as never, signal, undefined, ctx);
-  return { registry, factory, notify, exec };
+  return { registry, factory, notify, exec, clock };
 }
 
 describe("subagent tool — validation", () => {
@@ -123,8 +127,11 @@ describe("subagent tool — tasks", () => {
   });
 
   it("backgrounds the run when the foreground budget elapses, then notifies", async () => {
-    const { exec, factory, notify } = makeStack({ budgetMs: 50, autoComplete: null });
-    const result = await exec({ tasks: [{ prompt: "slow" }] });
+    const { exec, factory, notify, clock } = makeStack({ budgetMs: 50, autoComplete: null });
+    const pending = exec({ tasks: [{ prompt: "slow" }] });
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    clock.advanceBy(50);
+    const result = await pending;
     const text = result.content[0].type === "text" ? result.content[0].text : "";
     expect(text).toContain("run_");
     expect(text).toContain("background");

@@ -86,7 +86,10 @@ class FakeHost implements CommsHost {
   }
 }
 
-const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+const tick = async () => {
+  await Promise.resolve();
+  await Promise.resolve();
+};
 
 // ---------------------------------------------------------------------------
 

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { FleetWidget, FLEET_WIDGET_KEY, summaryLabel, type FleetUi } from "../../src/subagent/fleet-widget";
 import { WorkIndex } from "../../src/work-index";
 
@@ -47,12 +47,6 @@ function lastFactory(ui: ReturnType<typeof fakeUi>): ((w: number) => string[]) |
 }
 
 describe("FleetWidget (passive counts)", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-  });
 
   it("shows workers, subagents, and monitors without a total", () => {
     const ui = fakeUi();
@@ -100,7 +94,7 @@ describe("FleetWidget (passive counts)", () => {
     const widget = new FleetWidget({ index, getUi: () => ui });
     widget.start();
     const before = ui.renders;
-    await vi.advanceTimersByTimeAsync(500);
+    await Promise.resolve();
     expect(ui.renders).toBe(before);
     index.upsert({ id: "mon_1", kind: "monitor", status: "running", title: "tick", startedAt: 1, countsAsWorker: false });
     expect(lastFactory(ui)?.(80).join("\n")).toMatch(/1 monitor/);

@@ -16,6 +16,7 @@
 import { Type } from "typebox";
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { formatSubagentHandover, formatSubagentNotification, truncateTail } from "../format";
+import { realClock, type Clock, type ClockTimer } from "../clock";
 
 import type { NotifyCenter } from "../notify";
 import { runChain, runTasks, validateChainSteps } from "./pool";
@@ -126,6 +127,7 @@ export interface SubagentToolDeps {
   defaultTimeoutMs: number;
   /** Default tasks worker-pool concurrency. */
   defaultConcurrency: number;
+  clock?: Clock;
   /** Agent definition resolver (M5 wires the real loader; default: worker). */
   resolveAgent?: (name: string | undefined) => AgentDefinition;
   /** Selectable models for action:"models" (§4.6); absent → action errors. */
@@ -184,7 +186,7 @@ function runDurationMs(record: RunRecord, now: number): number {
 }
 
 /** Per-child sections plus a summary header, capped to 512 lines / 48KB. */
-export function formatRunResults(record: RunRecord, now: number = Date.now()): string {
+export function formatRunResults(record: RunRecord, now: number = realClock.now()): string {
   const completed = record.children.filter((c) => c.status === "completed").length;
   const header =
     `Run ${record.runId} [${record.kind}] ${record.status} — ` +
@@ -231,11 +233,13 @@ function raceBudget<T>(
   promise: Promise<T>,
   budgetMs: number,
   signal: AbortSignal | undefined,
+  clock: Clock,
 ): Promise<RaceOutcome<T>> {
   return new Promise((resolve) => {
     let finished = false;
+    let timer: ClockTimer;
     const cleanup = () => {
-      clearTimeout(timer);
+      clock.clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
     };
     const settle = (outcome: RaceOutcome<T>) => {
@@ -244,8 +248,8 @@ function raceBudget<T>(
       cleanup();
       resolve(outcome);
     };
-    const timer = setTimeout(() => settle({ done: false }), budgetMs);
-    timer.unref?.();
+    timer = clock.setTimeout(() => settle({ done: false }), budgetMs);
+    clock.unref?.(timer);
     const onAbort = () => settle({ done: false });
     if (signal?.aborted) {
       settle({ done: false });
@@ -267,6 +271,7 @@ export function createSubagentTool(
   deps: SubagentToolDeps,
 ): ToolDefinition<typeof subagentParameters, unknown> {
   const resolveAgent = deps.resolveAgent ?? defaultResolveAgent;
+  const clock = deps.clock ?? realClock;
 
   const requireRegistry = (): SubagentRegistry => {
     const registry = deps.getRegistry();
@@ -279,7 +284,7 @@ export function createSubagentTool(
   const notifyRunCompleted = (registry: SubagentRegistry, runId: string): void => {
     const record = registry.get(runId);
     if (!record) return;
-    deps.getNotifyCenter()?.notify(formatSubagentNotification(toNotificationInfo(record, Date.now())));
+    deps.getNotifyCenter()?.notify(formatSubagentNotification(toNotificationInfo(record, clock.now())));
   };
 
   /**
@@ -436,7 +441,7 @@ export function createSubagentTool(
     }
 
     const budgetMs = deps.budgetMs();
-    const outcome = await raceBudget(tracked, budgetMs, signal);
+    const outcome = await raceBudget(tracked, budgetMs, signal, clock);
     if (outcome.done) {
       deliveredSync = true;
       settleSync();
@@ -508,7 +513,7 @@ export function createSubagentTool(
       if (runs.length === 0) {
         return { content: [{ type: "text", text: "No subagent runs in this session." }], details: { runs: [] } };
       }
-      const now = Date.now();
+      const now = clock.now();
       const lines = runs.map((run) => {
         const counts = new Map<string, number>();
         for (const c of run.children) counts.set(c.status, (counts.get(c.status) ?? 0) + 1);
@@ -526,13 +531,13 @@ export function createSubagentTool(
 
     if (action === "get") {
       return {
-        content: [{ type: "text", text: formatRunResults(record) }],
+        content: [{ type: "text", text: formatRunResults(record, clock.now()) }],
         details: { run_id: record.runId, status: record.status },
       };
     }
 
     if (action === "status") {
-      const now = Date.now();
+      const now = clock.now();
       const lines = record.children.map((child) => {
         const elapsed = formatDurationMs((child.endedAt ?? now) - child.startedAt);
         let line = `${child.name} (${child.childId}): ${child.status}, ${elapsed} elapsed`;

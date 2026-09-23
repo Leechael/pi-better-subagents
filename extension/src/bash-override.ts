@@ -25,6 +25,7 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { taskOutputPath, type PbsConfig } from "./config";
+import { realClock, type Clock, type ClockTimer } from "./clock";
 import { formatBackgroundNotice, truncateTail } from "./format";
 import type { ManagerClient } from "./manager-client";
 import {
@@ -77,6 +78,7 @@ export interface BashOverrideDeps {
    * budget hit, child-bash) must not wake the parent session.
    */
   markNotifyOnExit: (taskId: string) => void;
+  clock?: Clock;
 }
 
 const BARE_SLEEP_GUIDANCE =
@@ -111,6 +113,7 @@ async function executeLocal(
   params: BashParams,
   signal: AbortSignal | undefined,
   ctx: ExtensionContext,
+  clock: Clock,
 ): Promise<AgentToolResult<PbsBashDetails | undefined>> {
   const timeoutMs = resolveTimeoutMs(params.timeout);
   const shell = process.env.SHELL && process.env.SHELL.length > 0 ? process.env.SHELL : "/bin/bash";
@@ -126,10 +129,11 @@ async function executeLocal(
       let settled = false;
       let timedOut = false;
       let aborted = false;
+      let timer: ClockTimer | null = null;
       const finish = (exitCode: number | null) => {
         if (settled) return;
         settled = true;
-        if (timer) clearTimeout(timer);
+        if (timer !== null) clock.clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
         resolve({ text: Buffer.concat(chunks).toString("utf8"), exitCode, timedOut, aborted });
       };
@@ -144,19 +148,19 @@ async function executeLocal(
         aborted = true;
         kill();
       };
-      const timer =
+      timer =
         timeoutMs !== null
-          ? setTimeout(() => {
+          ? clock.setTimeout(() => {
               timedOut = true;
               kill();
             }, timeoutMs)
           : null;
-      timer?.unref?.();
+      if (timer !== null) clock.unref?.(timer);
       signal?.addEventListener("abort", onAbort, { once: true });
       child.stdout?.on("data", (d: Buffer) => chunks.push(d));
       child.stderr?.on("data", (d: Buffer) => chunks.push(d));
       child.on("error", (err) => {
-        if (timer) clearTimeout(timer);
+        if (timer !== null) clock.clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
         if (!settled) {
           settled = true;
@@ -236,7 +240,7 @@ export function createBashOverride(
       const managed = client !== null && (await client.ensureAvailable());
       if (!managed || client === null) {
         // Degraded mode: run locally like the built-in bash tool.
-        return executeLocal(input, signal, ctx);
+        return executeLocal(input, signal, ctx, deps.clock ?? realClock);
       }
 
       const timeoutMs = resolveTimeoutMs(input.timeout);
@@ -252,7 +256,7 @@ export function createBashOverride(
         });
       } catch {
         // Manager request failed mid-session; degrade to local execution.
-        return executeLocal(input, signal, ctx);
+        return executeLocal(input, signal, ctx, deps.clock ?? realClock);
       }
       deps.trackTask(start.task_id, { kind: "shell", command: input.command });
       const outputPath = taskOutputPath(deps.home, deps.sessionId(), start.task_id);

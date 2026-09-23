@@ -23,6 +23,7 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { taskOutputPath } from "../config";
+import { realClock, type Clock } from "../clock";
 import type { ManagerClient } from "../manager-client";
 import {
   appendStatus,
@@ -60,6 +61,7 @@ export interface ChildBashDeps {
   /** Precomputed PI_* env injection (from the parent session). */
   sessionEnv: () => Record<string, string>;
   trackTask: (taskId: string, meta: { kind: string; command: string }) => void;
+  clock?: Clock;
 }
 
 const CHILD_SLEEP_GUIDANCE =
@@ -122,13 +124,14 @@ export function createChildBashTool(
       deps.trackTask(start.task_id, { kind: "shell", command: input.command });
       const outputPath = taskOutputPath(deps.home, deps.sessionId(), start.task_id);
 
-      const deadline = timeoutMs !== null ? Date.now() + timeoutMs : null;
+      const clock = deps.clock ?? realClock;
+      const deadline = timeoutMs !== null ? clock.now() + timeoutMs : null;
       let waitResult: { done: boolean; exit_code?: number | null } | null = null;
       for (;;) {
         const budget =
           deadline === null
             ? WAIT_SLICE_MS
-            : Math.min(WAIT_SLICE_MS, Math.max(1, deadline - Date.now()));
+            : Math.min(WAIT_SLICE_MS, Math.max(1, deadline - clock.now()));
         try {
           waitResult = await withAbort(client.wait(start.task_id, budget), signal, () => {
             client.stop(start.task_id).catch(() => {});
@@ -143,7 +146,7 @@ export function createChildBashTool(
           );
         }
         if (waitResult.done) break;
-        if (deadline !== null && Date.now() >= deadline) {
+        if (deadline !== null && clock.now() >= deadline) {
           await client.stop(start.task_id).catch(() => {});
           const collected = await collectOutput(client, start.task_id).catch(() => null);
           const text = collected ? formatFinishedOutput(collected, outputPath).text : "";

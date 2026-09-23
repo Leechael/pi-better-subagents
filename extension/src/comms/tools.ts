@@ -9,6 +9,7 @@
  * Zero runtime pi dependency: ToolDefinition is a type-only import.
  */
 import { Type } from "typebox";
+import { realClock, type Clock } from "../clock";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { CommsWithOrigin } from "./comms";
 import { assertSiblingAllowed } from "./routing";
@@ -171,8 +172,8 @@ function formatListText(
   pending: { childId: string; name: string; message: string; sinceMs: number }[],
   children: ChildRef[],
   entries: MailboxEntry[],
+  now: number,
 ): string {
-  const now = Date.now();
   const lines: string[] = [];
   lines.push(`Pending decision requests: ${pending.length}`);
   for (const p of pending) {
@@ -202,6 +203,7 @@ export function createAgentMessageTool(
   comms: CommsWithOrigin,
   sender: AgentMessageSender,
   host: CommsHost,
+  clock: Clock = realClock,
 ): ToolDefinition<typeof agentMessageParameters, AgentMessageDetails> {
   const isChild = sender.kind === "child";
   return {
@@ -240,7 +242,7 @@ export function createAgentMessageTool(
             .sort((a, b) => a.ts - b.ts)
             .slice(-20);
         }
-        return okResult("list", formatListText(pending, children, entries), {
+        return okResult("list", formatListText(pending, children, entries, clock.now()), {
           pending,
           children,
           log: entries,

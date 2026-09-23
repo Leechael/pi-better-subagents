@@ -6,6 +6,7 @@
  * M3: subagent tool (InProcessRunner + tasks/chain + budget-to-async) + fleet widget.
  */
 import { applyBehaviorGuidelines } from "./behavior-guidelines";
+import { realClock } from "./clock";
 import { ExitNotifyGate } from "./exit-notify-gate";
 import { readFileTail } from "./file-tail";
 import { homedir } from "node:os";
@@ -57,6 +58,7 @@ export default function (pi: ExtensionAPI): void {
   const home = getPbsHome();
   const config = loadConfig(home);
   const managerPath = resolveManagerPath(config, home);
+  const clock = realClock;
 
   // Claude-style transcript pills for notifications (TUI only; no-ops elsewhere).
   registerPbsMessageRenderers(pi);
@@ -77,8 +79,8 @@ export default function (pi: ExtensionAPI): void {
    * is mis-labeled as a parent "Background command" wake (§4.2 / §4.6).
    */
   const notifyOnExit = new Set<string>();
-  const exitGate = new ExitNotifyGate<ManagerEvent>();
-  const workIndex = new WorkIndex();
+  const exitGate = new ExitNotifyGate<ManagerEvent>({ clock });
+  const workIndex = new WorkIndex({ clock });
 
   const trackTask = (taskId: string, meta: { kind: string; command: string }) => {
     taskMeta.set(taskId, meta);
@@ -89,7 +91,7 @@ export default function (pi: ExtensionAPI): void {
     taskMeta.delete(taskId);
     workIndex.patch(taskId, {
       status: toExitStatus(event),
-      endedAt: Date.now(),
+      endedAt: clock.now(),
       ...(event.output_path
             ? { outputPath: event.output_path, stderrPath: stderrPathFor(event.output_path) }
             : {}),
@@ -120,7 +122,7 @@ export default function (pi: ExtensionAPI): void {
       kind: "shell",
       status: "running",
       title: meta?.command?.replace(/\s+/g, " ").trim() || taskId,
-      startedAt: Date.now(),
+      startedAt: clock.now(),
       countsAsWorker: true,
     };
     workIndex.upsert(item);
@@ -142,6 +144,7 @@ export default function (pi: ExtensionAPI): void {
     sessionEnv,
     trackTask,
     markNotifyOnExit,
+    clock,
     getRegistry: () => subagentRegistry,
   };
 
@@ -150,6 +153,7 @@ export default function (pi: ExtensionAPI): void {
     sessionEnv,
     getNotifyCenter: () => notifyCenter,
     trackTask,
+    clock,
     toast: (message, type) => {
       if (ctx?.hasUI) ctx.ui.notify(message, type);
     },
@@ -164,6 +168,7 @@ export default function (pi: ExtensionAPI): void {
     getRegistry: () => subagentRegistry,
     getIndex: () => workIndex,
     getClient: () => client,
+    clock,
   });
   monitorRegistry.onChange(() => {
     for (const mon of monitorRegistry.listActive()) {
@@ -193,6 +198,7 @@ export default function (pi: ExtensionAPI): void {
   });
   const comms: CommsWithOrigin = createComms(commsHost, {
     decisionTimeoutMs: subagentConfig.decisionTimeoutMs,
+    clock,
   });
   pi.registerTool(
     createSubagentTool({
@@ -201,6 +207,7 @@ export default function (pi: ExtensionAPI): void {
       budgetMs: () => subagentConfig.budgetMs,
       defaultTimeoutMs: subagentConfig.timeoutMs,
       defaultConcurrency: subagentConfig.concurrency,
+      clock,
       resolveAgent: (name) => {
         const loader = agentLoader;
         if (!loader) return resolveAgentDef([], name); // builtins-only fallback
@@ -220,7 +227,7 @@ export default function (pi: ExtensionAPI): void {
   );
   // M4: parent-side agent_message tool (child-side variant is injected into
   // each child session via customTools, see below).
-  pi.registerTool(createAgentMessageTool(comms, { kind: "parent" }, commsHost));
+  pi.registerTool(createAgentMessageTool(comms, { kind: "parent" }, commsHost, clock));
 
   pi.on("session_start", async (_event, startCtx) => {
     ctx = startCtx;
@@ -232,6 +239,7 @@ export default function (pi: ExtensionAPI): void {
     notifyCenter = new NotifyCenter({
       sendMessage: (msg, opts) => pi.sendMessage(msg, opts),
       isIdle: () => ctx?.isIdle() ?? true,
+      clock,
       listStillRunning: () =>
         [...notifyOnExit].map((id) => {
           const command = taskMeta.get(id)?.command;
@@ -249,6 +257,7 @@ export default function (pi: ExtensionAPI): void {
       sessionId: startCtx.sessionManager.getSessionId(),
       managerPath,
       cwd: startCtx.cwd,
+      clock,
       log: () => {}, // keep quiet; degradation is surfaced via tools
     });
 
@@ -261,7 +270,7 @@ export default function (pi: ExtensionAPI): void {
             kind: "monitor",
             status: "running",
             title: event.command || event.task_id,
-            startedAt: Date.now(),
+            startedAt: clock.now(),
             countsAsWorker: false,
           });
         }
@@ -276,7 +285,7 @@ export default function (pi: ExtensionAPI): void {
           monitorRegistry.handleExit(event.task_id, event);
           workIndex.patch(event.task_id, {
             status: toExitStatus(event),
-            endedAt: Date.now(),
+            endedAt: clock.now(),
             ...(event.output_path
             ? { outputPath: event.output_path, stderrPath: stderrPathFor(event.output_path) }
             : {}),
@@ -285,7 +294,7 @@ export default function (pi: ExtensionAPI): void {
         }
         workIndex.patch(event.task_id, {
           status: toExitStatus(event),
-          endedAt: Date.now(),
+          endedAt: clock.now(),
           ...(event.output_path
             ? { outputPath: event.output_path, stderrPath: stderrPathFor(event.output_path) }
             : {}),
@@ -306,6 +315,7 @@ export default function (pi: ExtensionAPI): void {
     const registry = new SubagentRegistry({
       maxConcurrentChildren: subagentConfig.maxConcurrentChildren,
       spawnBudgetPerHour: subagentConfig.spawnBudgetPerHour,
+      clock,
     });
     // M5: agent definitions, reloaded lazily (mtime-cached) per subagent call.
     agentLoader = createAgentLoader({
@@ -334,7 +344,7 @@ export default function (pi: ExtensionAPI): void {
         const tools: Array<ToolDefinition<any, any, any>> = [
           // M4: every child can reach the supervisor and its siblings.
           createContactSupervisorTool(comms, req.childId),
-          createAgentMessageTool(comms, { kind: "child", childId: req.childId, runId: req.runId }, commsHost),
+          createAgentMessageTool(comms, { kind: "child", childId: req.childId, runId: req.runId }, commsHost, clock),
         ];
         // The no-background bash variant replaces the built-in bash inside
         // child sessions (custom tools override builtins by name).
@@ -346,6 +356,7 @@ export default function (pi: ExtensionAPI): void {
               sessionId: () => ctx?.sessionManager.getSessionId() ?? "",
               sessionEnv: () => (ctx ? sessionEnv(ctx) : {}),
               trackTask,
+              clock,
             }),
           );
         }
@@ -354,6 +365,7 @@ export default function (pi: ExtensionAPI): void {
     });
     const runner = new InProcessRunner({
       createSession,
+      clock,
       stallMs: subagentConfig.stallMs,
       acquire: (req) => registry.admitChild(req.childId),
     });

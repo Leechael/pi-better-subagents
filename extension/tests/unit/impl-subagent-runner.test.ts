@@ -268,6 +268,22 @@ describe("InProcessRunner", () => {
       expect((await handle.result).error).toBe("stalled");
     });
 
+    it("pauses the stall watchdog while a supervisor decision is pending", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock });
+      const handle = await runner.start(makeReq());
+      const stallControl = handle as typeof handle & { pauseStall(): void; resumeStall(): void };
+      stallControl.pauseStall();
+      clock.advanceBy(2_000);
+      expect(handle.status()).toBe("running");
+      stallControl.resumeStall();
+      clock.advanceBy(499);
+      expect(handle.status()).toBe("running");
+      clock.advanceBy(1);
+      expect((await handle.result).error).toBe("stalled");
+    });
+
     it("session events reset the stall watchdog", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
@@ -309,15 +325,20 @@ describe("InProcessRunner", () => {
     });
   });
 
-  it("dispose releases the session and never hangs result waiters", async () => {
+  it("dispose releases the session, closes generation timers, and never hangs result waiters", async () => {
+    const clock = new ManualClock();
     const factory = new SessionFactory();
     factory.autoComplete = null;
-    const runner = new InProcessRunner({ createSession: factory.fn });
-    const handle = await runner.start(makeReq());
+    const runner = new InProcessRunner({ createSession: factory.fn, clock, stallMs: 50 });
+    const handle = await runner.start(makeReq({ timeoutMs: 100 }));
     handle.dispose();
     const result = await handle.result;
+    clock.advanceBy(1000);
     expect(result.status).toBe("interrupted");
+    expect(result.error).toBe("disposed");
+    expect(handle.status()).toBe("interrupted");
     expect(factory.sessions[0].disposed).toBe(true);
+    expect(factory.sessions[0].aborts).toBe(0);
     await tick();
   });
 });

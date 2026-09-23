@@ -281,7 +281,7 @@ describe("createAgentLoader (mtime cache)", () => {
 
     writeFileSync(path, agentMd("alpha", "v2"));
     // Force a distinct mtime so the fingerprint changes regardless of fs granularity.
-    const future = new Date(Date.now() + 60_000);
+    const future = new Date("2100-01-01T00:00:00.000Z");
     utimesSync(path, future, future);
 
     const second = loader.reload();

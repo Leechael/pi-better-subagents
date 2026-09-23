@@ -8,6 +8,7 @@
  */
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { fitLines, loadPiTui, truncateToWidth } from "./pi-tui-load";
+import { realClock, type Clock, type ClockTimer } from "../clock";
 
 export type TaskLogTab = "output" | "stderr";
 
@@ -20,6 +21,7 @@ export interface ScrollDetailOptions {
   /** Poll for live updates while the task is running. */
   pollMs?: number;
   followEnd?: boolean;
+  clock?: Clock;
 }
 
 /** Wrap on visible width. ANSI is preserved; CJK is not split by JS length. */
@@ -42,7 +44,8 @@ export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDe
       let tab: TaskLogTab = "output";
       let scroll = 0;
       let stuckToEnd = follow;
-      let timer: NodeJS.Timeout | null = null;
+      let timer: ClockTimer | null = null;
+      const clock = options.clock ?? realClock;
       let disposed = false;
       let lastLineCount = 0;
 
@@ -63,8 +66,8 @@ export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDe
       }
 
       if (options.pollMs && options.pollMs > 0) {
-        timer = setInterval(refresh, options.pollMs);
-        timer.unref?.();
+        timer = clock.setInterval(refresh, options.pollMs);
+        clock.unref?.(timer);
       }
 
       return {
@@ -139,7 +142,7 @@ export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDe
         },
         dispose() {
           disposed = true;
-          if (timer) clearInterval(timer);
+          if (timer !== null) clock.clearInterval(timer);
         },
       };
     },

@@ -2,6 +2,7 @@
  * task_* tools (design doc §4.3): inspect and stop manager tasks.
  */
 import { Type } from "typebox";
+import { realClock, type Clock } from "./clock";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ManagerClient, TaskRecord } from "./manager-client";
 import {
@@ -21,6 +22,7 @@ export interface TaskToolsDeps {
   getIndex?: () => WorkIndex | null;
   home?: string;
   sessionId?: () => string;
+  clock?: Clock;
 }
 
 function requireClient(deps: TaskToolsDeps): Promise<ManagerClient> {
@@ -52,15 +54,15 @@ function agentTextFor(deps: TaskToolsDeps, id: string): string | undefined {
   return undefined;
 }
 
-function formatDuration(startedAt: number, endedAt: number | null): string {
-  const end = endedAt ?? Date.now();
+function formatDuration(startedAt: number, endedAt: number | null, now: number): string {
+  const end = endedAt ?? now;
   const ms = Math.max(0, end - startedAt);
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
   return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
 }
 
-function formatTaskLine(task: TaskRecord): string {
+function formatTaskLine(task: TaskRecord, now: number): string {
   const exit =
     task.status === "running"
       ? `pid=${task.pid}`
@@ -70,7 +72,7 @@ function formatTaskLine(task: TaskRecord): string {
   const command = task.command.replace(/\s+/g, " ").trim();
   const shortCommand = command.length > 100 ? `${command.slice(0, 99)}…` : command;
   return (
-    `${task.task_id} [${task.kind}] ${task.status} (${exit}, ${formatDuration(task.started_at, task.ended_at)})` +
+    `${task.task_id} [${task.kind}] ${task.status} (${exit}, ${formatDuration(task.started_at, task.ended_at, now)})` +
     ` "${shortCommand}"` +
     `\n    output: ${task.output_path} (${task.output_size} bytes)`
   );
@@ -97,6 +99,7 @@ export function createTaskListTool(
       const client = await requireClient(deps);
       const tasks = await client.list(params.all === true);
       const index = deps.getIndex?.() ?? null;
+      const now = (deps.clock ?? realClock).now();
       const lines: string[] = [];
       const seen = new Set<string>();
 
@@ -104,7 +107,7 @@ export function createTaskListTool(
         if (seen.has(item.id)) return;
         if (!params.all && item.status !== "running" && item.status !== "pending") return;
         seen.add(item.id);
-        const age = formatAge(item.startedAt, item.endedAt, Date.now());
+        const age = formatAge(item.startedAt, item.endedAt, now);
         lines.push(`${item.id} [${item.kind}] ${item.status} (${age}) "${item.title}"`);
       };
 
@@ -117,7 +120,7 @@ export function createTaskListTool(
         // Sync-waited shells are not in the index and must not be listed as workers.
         if (task.kind === "shell" && !index?.get(task.task_id)) continue;
         seen.add(task.task_id);
-        lines.push(formatTaskLine(task));
+        lines.push(formatTaskLine(task, now));
       }
 
       const agentLines: string[] = [];
