@@ -11,6 +11,7 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 | `tests/protocol.rs` | black box | message round-trips, basic lifecycle (t01–t13) |
 | `tests/lifecycle_adversarial.rs` | black box | every cell of the lifecycle table below, adversarial conditions |
 | `tests/mutation_gaps.rs` | black box | behaviours found unguarded by cargo-mutants survivors (g1–g13) |
+| `tests/observability.rs` | black box | observability contract: protocol additions, events.jsonl, inspection CLI (p1–p3, e1–e4, c1–c8) |
 | `tests/common/mod.rs` | helpers | wire client, isolated `--home`, process probes, crashable helper client |
 
 All black-box tests start the compiled binary with an isolated `--home`
@@ -34,16 +35,16 @@ Determinism rules:
 
 ```bash
 cd manager
-cargo test                                               # everything (~42s wall, warm build)
+cargo test                                               # everything (~48s wall, warm build)
 cargo test --test lifecycle_adversarial                  # adversarial suite
 scripts/ablate.sh                                        # ablation check (~20 min idle)
 cargo mutants -j 3 --timeout 150 -f src/lifecycle.rs -f src/task.rs -f src/registry.rs \
   -f src/daemon.rs -f src/sys.rs -f src/proto.rs          # mutation score (~55 min)
 ```
 
-Measured on an M-series Mac with a warm build: `cargo test` takes 42s wall
-for 102 passing tests: unit 0.2s (34), `lifecycle_adversarial` 19s (42),
-`mutation_gaps` 14s (13), `protocol` 8s (13). Binaries run one after
+Measured on an M-series Mac with a warm build: `cargo test` takes 48s wall
+for 125 passing tests: unit 0.2s (42), `lifecycle_adversarial` 19s (42),
+`mutation_gaps` 14s (13), `observability` 5s (15), `protocol` 8s (13). Binaries run one after
 another; tests inside a binary run in parallel. The suite is stable across
 repeated runs and with 3 concurrent copies of the integration suites. Most
 of the time goes to the contract's own timers (5s grace, 2s kill grace).
@@ -160,6 +161,40 @@ added while fixing and were also run against the pre-fix code: all red.
 | `o4` | Chunks were lossy-decoded per read; a `max_bytes` or pipe boundary inside a multi-byte char produced U+FFFD while `next_cursor` skipped the bytes. | Reads fetch `cap + 3` bytes and cut at the last char boundary (a first char wider than `max_bytes` is sent whole, so reads always progress). A truncated tail is held back while the task runs. Watch events carry an incomplete tail over to the next pipe read and flush it at EOF. | `o4`, `o4b`, `o4c`, `g12`, unit `chunk_len_*` |
 | `t5b` | `signal` was an integer on the wire and on disk; §3.3 and the extension type say `"SIGTERM"`/`"SIGKILL"`. | `signal` is a name (`proto::signal_name`) in `task_exited`, `TaskRecord` and the CLI `EXIT` column (widened to 7). Legacy numeric records still load (converted). The extension only tests truthiness / displays it; verified with `tsc`, its unit tests, and its real-binary integration tests. | `t5b`, `t2`, unit `signal_names_on_wire_and_legacy_numbers_load` |
 
+## Observability contract (manager + CLI side)
+
+`tests/observability.rs` covers the contract black-box. Extension-owned
+files (agent records, transcripts, extension events) are written as
+fixtures in the contract's format, because the extension side may land later.
+
+| Requirement | Test |
+|---|---|
+| `start.origin` stored; `mark_background` → `backgrounded_at` (first time kept, persisted) | `p1` |
+| `stop.reason` → `end_reason` (`stopped:tui/cli/tool`, `timeout`, `rate-limit`, `session-end`; none = `stopped:tool`; unknown → `E_BAD_REQUEST`); natural exit → `exited`; `timeout_ms` → `timeout`; `shutdown_session` → `session-end`; first reason wins; `task_exited.end_reason` | `p1` |
+| `manager-shutdown`, `orphaned`, `manager-restart` | `p2` |
+| hello `extension_version`/`protocol` stored per session; `status.protocol`; `connected_at` kept across reconnects; `last_seen` | `p3` |
+| manager writes `session.connect/disconnect`, `task.start` (command ≤ 200 chars, origin, pid), `task.background`, `task.stop`, `task.exit`, `daemon.start/shutdown` | `e1` |
+| every line < 4 KiB, oversized fields truncated (`truncated:true`), ids never cut | `e2`, unit `events::*` |
+| concurrent appends (8 extension-style writers × 300 lines of 1–3.5 KiB, plus the manager) never interleave or lose lines | `e3` |
+| `events`: malformed lines skipped with a stderr count; `--id` matches `id`/`ids[]`/`child_id`; `--session`, `--since`, `--json`, `-f` (incl. new sessions); cross-session time order; never starts the daemon | `e4` |
+| `ls`: columns, running-only default, `-a`, agents included, SESSION shortest unique prefix ≥ 8, CJK display-width truncation, `--json`, `--session`/`--cwd`/`--since`, bad duration rejected | `c1`, unit `fmt::*`, `inspect::*` |
+| `show` for sh_/ch_/run_ (header, origin, backgrounded, wake emitted→delivered, last 10 lines; agent error/tool calls/shells/prompt/result tail 20), fuzzy + `--json`, one-line not-found with closest match | `c2` |
+| `agent` (preamble hidden, `--full`), `log`/`tail -f` on ch_ ids, `output`/`wait` on ch_, `stop` on an agent refused with the contract message | `c3` |
+| `stop` → `stopped:cli`; "already finished (<reason>)" | `c4` |
+| `sessions` / `-a` (gone sessions from events.jsonl, counts, `--json`), no spawn | `c5` |
+| `status`: human uptime, counts incl. agents, protocol, `--json`; not running → exit 1, no spawn | `c6` |
+| `output --max-bytes` is a total cap (UTF-8 safe); SIGPIPE → exit 0, silent (output, ls, events, log); human timestamps in `log` | `c7` |
+| `doctor`: home missing (not created), config.json, managerPath, stale agent records, orphan pids, socket path length, exit status; protocol per session | `c8`, `protocol::t11`, `mutation_gaps::g13` |
+
+Interpretation decisions where the contract is silent (also in design §3.3
+and docs/cli.md): `PROTOCOL = 2`; a stop without `reason` ends as
+`stopped:tool`; `shutdown_session` maps to `session-end`; a re-adopted
+task whose exit is only seen after a restart ends as `manager-restart`;
+`daemon.*` events go to `<home>/events.jsonl`; doctor counts stale
+socket/pid files it removed as `fixed` (exit 0), not failures;
+`status`, `sessions`, `show`, `agent`, `events`, `log`/`tail` and
+`shutdown` never start the daemon.
+
 ## Mutation score
 
 `cargo mutants 27.1.0`. A timeout is an infinite loop the tests detect by
@@ -227,13 +262,24 @@ dead or unneeded code:
 
 ## Ablation
 
-`ablation.toml` lists 29 load-bearing mechanisms, each with a literal
+`ablation.toml` lists 42 load-bearing mechanisms (29 lifecycle, 13
+observability), each with a literal
 find/replace and the tests that must go red. `scripts/ablate.sh` applies
 each one to a scratch copy (sharing one build cache), first checks that
 every listed test passes on the pristine copy (a test that is already red
 proves nothing), then runs them one by one and compares the result with
 `expect`. Per-test logs go to `$ABLATE_WORK/logs/`. Needs `cargo`,
 `python3` ≥ 3.11 (tomllib), `perl`, `rsync`.
+
+**Runner bug found and fixed (`fix(ablate)` commit).** `fresh_copy` used
+`rsync -a`, which restores a file changed by an earlier ablation with the
+pristine file's *older* mtime, so cargo kept the ablated binary. Within one
+run every ablation edits a file and forces a rebuild, so verdicts were
+sound; but a later run's **baseline** could test the previous run's last
+ablated binary. That was the one unexplained `c6` baseline failure seen
+during part A (the previous run ended on a bounded-queue ablation), which
+had been filed as a possible flake. Restores now rewrite differing files
+with a new mtime.
 
 Final pass on the fixed code: **29/29 entries behave as declared** (28 red,
 1 green), with no baseline flakes and exit status 0.
@@ -306,4 +352,3 @@ No removal turned a test red.
 - deferred: Windows named-pipe path (design §3.1) has no tests; `sys.rs` is unix-only | impact: none until Windows ships | trigger: first Windows build
 - deferred: a client that connects while the daemon is in graceful shutdown (accept loop gone, listener still bound) waits for its 30s hello timeout instead of failing fast and spawning a successor | impact: rare 30s stall right after an idle shutdown | trigger: any report of a slow first command after idle
 - deferred: re-adopted tasks are identified by pid liveness only (`kill(pid,0)`); a task pid reused while no manager ran would be re-adopted, and signalled on stop/shutdown | impact: wrong process signalled after a crash plus a long gap | trigger: persisting process start time in TaskRecord (a contract change)
-- deferred: `c6` failed once on a pristine copy during an early ablation pass (no log kept then); it passed every other run, with typical margins of 17 MiB RSS growth against 96 MiB and ~10ms latency against 2s. ablate.sh now keeps per-test logs | impact: possible rare flake | trigger: the next c6 failure

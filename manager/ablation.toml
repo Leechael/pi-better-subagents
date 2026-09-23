@@ -347,3 +347,129 @@ find = "    crate::sys::apply_new_session_std(&mut cmd);"
 replace = ""
 tests = ["mutation_gaps::g2_autospawned_daemon_survives_sigint_to_spawning_group"]
 expect = "red"
+
+# --- Observability contract -------------------------------------------------
+
+[[ablation]]
+id = "events-line-cap"
+mechanism = "events.jsonl lines stay below 4 KiB (oversized fields truncated) so one O_APPEND write never interleaves"
+file = "src/events.rs"
+find = "        if line.len() + 1 < MAX_LINE {"
+replace = "        if true {"
+tests = ["observability::e2_event_lines_stay_below_4k"]
+expect = "red"
+
+[[ablation]]
+id = "events-single-write"
+mechanism = "an event line is appended with one write() call, so concurrent writers (manager + extension) never interleave"
+file = "src/events.rs"
+find = "    let n = f.write(&buf)?;"
+replace = "    let n = f.write(&buf[..buf.len() / 2])?; std::thread::sleep(std::time::Duration::from_millis(1));"
+tests = ["observability::e3_concurrent_appends_never_interleave"]
+expect = "red"
+note = "the test's extension writers append ~2400 lines while the manager writes 80; with the split write a manager line lands mid-way through another line"
+
+[[ablation]]
+id = "stop-reason-first-wins"
+mechanism = "the first kill reason is kept (a later shutdown does not overwrite stopped:cli)"
+file = "src/registry.rs"
+find = "        if self.kill_reason.is_none() {"
+replace = "        if true {"
+tests = ["observability::p1_origin_background_and_end_reasons"]
+expect = "red"
+
+[[ablation]]
+id = "end-reason-manager-restart"
+mechanism = "a re-adopted task whose exit is only seen by polling ends as manager-restart, not exited"
+file = "src/daemon.rs"
+find = "            (None, None) => end_reason::MANAGER_RESTART.to_string(),"
+replace = "            (None, None) => end_reason::EXITED.to_string(),"
+tests = ["observability::p2_end_reasons_across_manager_lifecycle"]
+expect = "red"
+
+[[ablation]]
+id = "end-reason-orphaned"
+mechanism = "a running record whose pid died before the restart ends as orphaned"
+file = "src/lifecycle.rs"
+find = "                rec.end_reason = Some(crate::proto::end_reason::ORPHANED.to_string());"
+replace = ""
+tests = ["observability::p2_end_reasons_across_manager_lifecycle"]
+expect = "red"
+
+[[ablation]]
+id = "sigpipe-quiet-exit"
+mechanism = "a closed stdout (… | head) ends the CLI with status 0 and no panic"
+file = "src/out.rs"
+find = "            std::process::exit(0);"
+replace = "            panic!(\"broken pipe\");"
+tests = ["observability::c7_output_max_bytes_sigpipe_and_log_timestamps"]
+expect = "red"
+
+[[ablation]]
+id = "output-max-bytes-total"
+mechanism = "output --max-bytes caps the total printed, not each read"
+file = "src/client.rs"
+find = "            Some(r) => cut_utf8(&resp.chunk, r as usize),"
+replace = "            Some(_) => resp.chunk.as_str(),"
+tests = ["observability::c7_output_max_bytes_sigpipe_and_log_timestamps"]
+expect = "red"
+
+[[ablation]]
+id = "status-never-spawns"
+mechanism = "status reports 'not running' instead of starting a daemon"
+file = "src/inspect.rs"
+find = "    let mut conn = client::connect_existing(home, &HelloMode::Cli)"
+replace = "    let mut conn = client::connect(home, &HelloMode::Cli)"
+tests = ["observability::c6_status_counts_uptime_and_not_running"]
+expect = "red"
+
+[[ablation]]
+id = "display-width-cjk"
+mechanism = "ls truncates TITLE by terminal display width (CJK = 2 columns)"
+file = "src/fmt.rs"
+find = "        2\n    } else {"
+replace = "        1\n    } else {"
+tests = ["observability::c1_ls_columns_filters_json_and_cjk"]
+expect = "red"
+
+[[ablation]]
+id = "session-prefix-min-8"
+mechanism = "SESSION shows the shortest unique prefix of at least 8 characters"
+file = "src/inspect.rs"
+find = "        let mut len = 8.min(chars.len());"
+replace = "        let mut len = 4.min(chars.len());"
+tests = ["observability::c5_sessions_connected_and_gone"]
+expect = "red"
+
+[[ablation]]
+id = "stale-agent-records"
+mechanism = "an agent record that says running while its session is gone is treated as interrupted (and reported by doctor)"
+file = "src/inspect.rs"
+find = "                rec.status = \"interrupted\".into();\n                rec.stale = true;"
+replace = ""
+tests = [
+  "observability::c5_sessions_connected_and_gone",
+  "observability::c8_doctor_checks_and_exit_status",
+]
+expect = "red"
+
+[[ablation]]
+id = "transcript-preamble-hidden"
+mechanism = "agent transcripts hide the system prompt and agent preamble unless --full"
+file = "src/inspect.rs"
+find = "    if !full && (role == \"system\""
+replace = "    if false && (role == \"system\""
+tests = ["observability::c3_agent_transcript_and_ch_ids_in_log_tail_output_wait_stop"]
+expect = "red"
+
+[[ablation]]
+id = "doctor-exit-status"
+mechanism = "doctor exits 1 when any check fails"
+file = "src/client.rs"
+find = "        outln!(\"{} problem(s) found\", r.failures);\n        1\n    }\n}"
+replace = "        outln!(\"{} problem(s) found\", r.failures);\n        0\n    }\n}"
+tests = [
+  "observability::c8_doctor_checks_and_exit_status",
+  "mutation_gaps::g13_doctor_cleans_only_without_a_daemon",
+]
+expect = "red"
