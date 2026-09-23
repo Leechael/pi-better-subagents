@@ -385,6 +385,33 @@ fn e3_concurrent_appends_never_interleave() {
     assert!(out.stderr.is_empty(), "{}", out.stderr);
 }
 
+/// A task's event lines are on disk, in causal order, before any client can
+/// see the change they record. Once `list` (or `wait`) shows a task as
+/// finished, its `task.exit` line is already in the session's events.jsonl,
+/// after its `task.start`. A client that reacts (e.g. disconnects) therefore
+/// never gets its own line in ahead of it: that race flaked `e1` under
+/// full-suite load. `list` is polled from a second connection because it is
+/// served by another worker as soon as the state lock is free, which is the
+/// path that raced.
+#[test]
+fn e5_event_lines_precede_the_state_they_record() {
+    let home = Home::new("e5");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-e5", "/tmp");
+    let mut cli = home.connect();
+    cli.hello_cli();
+    for i in 0..100 {
+        let (id, _) = start(&mut c, "true", json!({}));
+        cli.wait_terminal(&id, S(5)).expect("task finished");
+        let evs = events_of(&home, "sess-e5");
+        let pos = |ty: &str| evs.iter().position(|e| e["type"] == ty && e["id"] == json!(id));
+        let (s, x) = (pos("task.start"), pos("task.exit"));
+        assert!(x.is_some(), "round {i}: task shown as finished, but task.exit is not written yet");
+        assert!(s < x, "round {i}: task.exit written before task.start");
+    }
+}
+
 /// `events`: malformed lines are skipped (with a note), filters work, the
 /// merge across sessions is time-ordered, and -f picks up new lines.
 #[test]
@@ -424,16 +451,27 @@ fn e4_events_cli_filters_and_skips_malformed() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let mut rd = std::io::BufReader::new(child.stdout.take().unwrap());
-    let mut seen = String::new();
+    // Lines arrive through a channel so a missed event fails the test
+    // instead of blocking it forever.
+    let rd = std::io::BufReader::new(child.stdout.take().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for l in std::io::BufRead::lines(rd).map_while(Result::ok) {
+            if tx.send(l).is_err() {
+                break;
+            }
+        }
+    });
     for _ in 0..4 {
-        std::io::BufRead::read_line(&mut rd, &mut seen).unwrap();
+        rx.recv_timeout(S(10)).expect("history line from events -f");
     }
+    // Appended the moment history is out: a line written while the
+    // follower starts must not fall between history and following.
     append_event(&home, "sess-new", json!({"ts":now_ms(),"src":"extension","type":"monitor.drop","id":"mon_1","lines":7}));
-    let mut line = String::new();
-    std::io::BufRead::read_line(&mut rd, &mut line).unwrap();
+    let line = rx.recv_timeout(S(5));
     let _ = child.kill();
     let _ = child.wait();
+    let line = line.expect("events -f never printed the line appended right after its history");
     let v: Value = serde_json::from_str(&line).unwrap();
     assert_eq!((v["type"].as_str(), v["session"].as_str(), v["lines"].as_u64()), (Some("monitor.drop"), Some("sess-new"), Some(7)));
 }

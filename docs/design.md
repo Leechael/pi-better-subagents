@@ -75,6 +75,10 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 3. 抢到 → spawn `pbs-manager daemon`(detached)→ 轮询等 socket 就绪(2s 超时)→ 释放锁
 4. 没抢到 → 说明别人正在 spawn,轮询等 socket 就绪
 5. socket 存在但连不上(僵尸 socket)→ 同 2–4:spawn 一个 daemon,由它清理。**客户端从不删除 socket/pid 文件**(否则可能删掉另一个客户端刚 spawn 出的 daemon 的 socket)
+6. `hello` 被拒且是 manager 正在 graceful shutdown(§3.2)→ 等它退出,再走 2–4。精确协议(Rust CLI `client::connect` 即此实现,测试 `d8`/`d8b`):
+   - 识别:对 `hello` 的响应为 `{"ok":false,"error":{"code":"E_INTERNAL","message":"manager is shutting down"}}`(`id` 为该 hello 的 id),随后 manager 关闭该连接。以 `code == "E_INTERNAL"` 且 `message == "manager is shutting down"` 精确匹配;其他 `E_INTERNAL` 不适用本步骤。该响应立即返回(shutdown 期间 manager 仍 accept),不会等到 hello 超时
+   - 等待:读 `manager.pid` 的 `pid`,每 50ms 以 `kill(pid, 0)` 探测,直到进程不存在或累计 5s(graceful shutdown 最多 2s kill grace + 收尾)。读不到 pid 文件则不等。等待期间不删任何文件、不重连旧连接
+   - 之后:走 2–4(抢 spawn 锁 → spawn → 等 socket 2s),再连接 + `hello` 一次;仍失败才向上报错。5s 到了旧 manager 仍在时也照此继续:新 spawn 的 daemon 拿不到 `manager.lock` 会以 "already running" 退出,本次连接按普通失败处理
 
 `manager.pid` 与 socket 所有权: daemon 身份 = 持有 `manager.lock` 的独占 flock,从启动持有到退出(崩溃时由 OS 释放;fd 为 CLOEXEC,任务进程不继承)。daemon 启动时 trylock:失败 → 已有 daemon,打印 "already running" 退出码 0;成功 → 此时 socket/pid 文件必然陈旧,删除后 bind 并写 pid。不以 pid 存活判断身份(pid 可能被无关进程复用)。`doctor` 同理:只在拿到锁时清理陈旧文件。
 
@@ -87,7 +91,7 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
   2. 2s grace → 对仍可能有成员的**进程组**发 SIGKILL(即使 leader 已死,忽略 SIGTERM 的子孙也会被杀)
   3. 任务状态落盘标记 `killed`(reason: "manager_shutdown")
   4. 删除 socket/pid 文件,退出
-- shutdown 期间 manager 仍接受新连接,但立即拒绝其 `hello`(`E_INTERNAL` "manager is shutting down");客户端等该 manager 退出(最多 2s kill grace)后 spawn 继任者,而不是卡到响应超时
+- shutdown 期间 manager 仍接受新连接,但立即拒绝其 `hello`(`E_INTERNAL` "manager is shutting down");客户端按 §3.1 第 6 步等该 manager 退出后 spawn 继任者,而不是卡到响应超时
 - 后台任务不允许比最后一个 pi 活得久。`pi --resume` 的 reattach 只在"还有其他 pi 活着"时成立
 - manager **永不自我复活**;只有客户端(扩展/CLI)在需要时 spawn
 

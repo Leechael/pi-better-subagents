@@ -13,7 +13,7 @@ mod common;
 
 use common::*;
 use serde_json::json;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 /// Re-exec entry point for `HelperClient` (a killable stand-in for pi). It is
@@ -39,20 +39,69 @@ fn wait_output_contains(c: &mut Conn, task_id: &str, needle: &str) {
 // Daemon: spawn race / singleton (D1, D2, D3)
 // ===========================================================================
 
-/// D1: N clients race to auto-spawn the daemon on an empty home. Invariant:
-/// every client succeeds, they all talk to the same daemon, and exactly one
-/// daemon process exists afterwards.
+/// Is manager.lock (the daemon's lifetime lock, §3.1) free right now?
+/// Takes and immediately releases it when free.
+fn lifetime_lock_free(home: &Home) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(home.path.join("manager.lock"))
+        .unwrap();
+    // SAFETY: flock on an fd we own; released when `f` is dropped.
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+/// Everything the diagnostics of a failed D1 round need.
+fn d1_diagnostics(home: &Home) -> String {
+    let ps = std::process::Command::new("ps").args(["-axww", "-o", "pid=,stat=,command="]).output().unwrap();
+    let home_s = home.path.to_string_lossy().to_string();
+    let lines: Vec<String> = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|l| l.contains(&home_s))
+        .map(|l| l.to_string())
+        .collect();
+    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
+    format!(
+        "pidfile={:?}; ps lines for home: {lines:#?}\nmanager.log:\n{log}",
+        home.pidfile_pid()
+    )
+}
+
+/// D1: N clients race to auto-spawn the daemon on an empty home.
+///
+/// The singleton invariant (§3.1), checked directly:
+/// (a) every client was served by the same daemon: each client opens its
+///     own extension session (`start --session`), and sessions live only in
+///     the memory of the daemon that served them, so the survivor's
+///     `status` must list all of them;
+/// (b) exactly one process holds the lifetime lock: the lock is held while
+///     the socket's daemon runs and is free the moment that daemon exits,
+///     so no other process held it;
+/// (c) the daemon process count converges to 1 within 2s. A redundant
+///     daemon spawned by a client that lost the race exits "already
+///     running" without binding; it may be seen only transiently.
+///
+/// Counting processes right after the clients return (the old check)
+/// flaked twice. A snapshot can catch a redundant daemon before it exits,
+/// and the count is not the invariant.
 #[test]
 fn d1_concurrent_clients_spawn_exactly_one_daemon() {
     let home = Home::new("d1");
+    let clock = if home.manual { "manual" } else { "" };
     for round in 0..3 {
-        // `ls` auto-spawns (`status` never does, by contract).
-        let kids: Vec<_> = (0..12)
-            .map(|_| {
+        let sessions: Vec<String> = (0..12).map(|i| format!("d1-r{round}-c{i}")).collect();
+        // `start` auto-spawns like every task command (`status` never does).
+        let kids: Vec<_> = sessions
+            .iter()
+            .map(|sid| {
                 std::process::Command::new(BIN)
                     .arg("--home")
                     .arg(&home.path)
-                    .arg("ls")
+                    .args(["start", "--session", sid, "--", "true"])
+                    .env("PBS_TEST_CLOCK", clock)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -64,39 +113,72 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
             let out = k.wait_with_output().unwrap();
             assert!(
                 out.status.success(),
-                "round {round}: client failed: {} {}",
+                "round {round}: client failed: {} {}\n{}",
                 String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
+                String::from_utf8_lossy(&out.stderr),
+                d1_diagnostics(&home)
             );
         }
-        let live = daemon_pids_for(&home.path);
-        if live.len() != 1 {
-            let ps = std::process::Command::new("ps").args(["-axww", "-o", "pid=,stat=,command="]).output().unwrap();
-            let home_s = home.path.to_string_lossy().to_string();
-            let lines: Vec<String> = String::from_utf8_lossy(&ps.stdout)
-                .lines()
-                .filter(|l| l.contains(&home_s))
-                .map(|l| l.to_string())
-                .collect();
-            let pf = home.pidfile_pid();
+
+        // (c) Redundant daemons exit on their own, promptly (no timer is
+        // involved, so real time is right in both clock modes).
+        let settled = poll_until(S(2), || {
+            let live = daemon_pids_for(&home.path);
+            (live.len() == 1).then(|| live[0])
+        });
+        let Some(daemon) = settled else {
             panic!(
-                "round {round}: expected one daemon process, found {live:?}; \
-                 pidfile={pf:?} running={:?}; ps lines for home: {lines:#?}",
-                pf.map(pid_running)
+                "round {round}: daemon count did not converge to 1 within 2s: {:?}\n{}",
+                daemon_pids_for(&home.path),
+                d1_diagnostics(&home)
+            );
+        };
+
+        // The survivor is the daemon on the socket and in the pid file.
+        let mut c = home.connect();
+        let hello = c.hello_cli();
+        assert_eq!(hello["pid"].as_u64(), Some(daemon as u64), "round {round}: socket owner");
+        assert_eq!(home.pidfile_pid(), Some(daemon), "round {round}: pid file");
+
+        // (a) It served every client.
+        let st = c.request_ok(json!({"type":"status"}));
+        let served: Vec<&str> = st["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["session_id"].as_str())
+            .collect();
+        for sid in &sessions {
+            assert!(
+                served.contains(&sid.as_str()),
+                "round {round}: client {sid} was not served by the surviving daemon {daemon}: {st}\n{}",
+                d1_diagnostics(&home)
             );
         }
-        // Every client talked to that daemon: it is the one on the socket.
-        let mut c = home.connect();
-        assert_eq!(c.hello_cli()["pid"].as_u64(), Some(live[0] as u64), "round {round}");
         drop(c);
-        // Tear down so the next round races a cold start again.
+
+        // (b) The lifetime lock is held while it runs...
+        assert!(!lifetime_lock_free(&home), "round {round}: nobody holds manager.lock");
+        // ...and free as soon as it has exited: no other process held it.
         let out = home.cli(&["shutdown"], S(10));
-        assert!(out.status.success());
+        assert!(out.status.success(), "{}", out.stderr);
+        assert!(poll_true(S(5), || !pid_running(daemon)), "round {round}: daemon did not exit");
         assert!(
-            poll_true(S(5), || daemon_pids_for(&home.path).is_empty()),
-            "daemon did not exit after shutdown"
+            lifetime_lock_free(&home),
+            "round {round}: manager.lock still held after the daemon exited\n{}",
+            d1_diagnostics(&home)
+        );
+        assert!(
+            poll_true(S(2), || daemon_pids_for(&home.path).is_empty()),
+            "round {round}: a daemon outlived the singleton\n{}",
+            d1_diagnostics(&home)
         );
     }
+    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
+    eprintln!(
+        "d1: redundant daemons that exited \"already running\": {}",
+        log.matches("already running").count()
+    );
 }
 
 /// CPU burners for race reproducers; killed on drop.
@@ -548,7 +630,8 @@ fn d10_client_recovers_from_dead_daemon_files() {
 #[test]
 fn d11_client_recovers_from_socket_without_pidfile() {
     let home = Home::new("d11");
-    drop(UnixListener::bind(home.sock()).unwrap()); // leaves a dead socket inode
+    // Not a plain bind+drop: see `dead_socket` (that flaked in the suite).
+    dead_socket(&home.sock()); // what a SIGKILLed daemon leaves behind
     assert!(home.sock().exists());
     let out = home.cli(&["ls"], S(10));
     assert!(out.status.success(), "{}", out.stderr);
@@ -1413,4 +1496,89 @@ fn d16_extension_cannot_shutdown() {
     assert_eq!((s["session_id"].as_str(), s["cwd"].as_str()), (Some("sess-a"), Some("/tmp/d16-cwd")), "{r}");
     std::thread::sleep(MS(500));
     assert!(d.try_wait().unwrap().is_none(), "extension shut the manager down");
+}
+
+// ===========================================================================
+// Descriptor hygiene: tasks inherit only stdin/stdout/stderr (T14, S6)
+// ===========================================================================
+
+/// T14: a task inherits only fds 0, 1 and 2. The daemon here holds an extra
+/// descriptor without close-on-exec (fd 20), as it would after inheriting
+/// one from whatever spawned it, or through the window between accept()
+/// and FD_CLOEXEC on macOS. Two client connections are open while the task
+/// starts. The task lists its own open descriptors.
+#[test]
+fn t14_tasks_inherit_only_stdio() {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let home = Home::new("t14");
+    let extra = std::fs::File::open("/dev/null").unwrap(); // O_CLOEXEC here
+    let raw = extra.as_raw_fd();
+    let mut cmd = std::process::Command::new(BIN);
+    cmd.arg("--home")
+        .arg(&home.path)
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: only dup2, which is async-signal-safe; the copy at fd 20 has
+    // no close-on-exec flag, so the daemon inherits it.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(raw, 20) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let _d = cmd.spawn().expect("spawn daemon");
+    drop(extra);
+    assert!(poll_true(S(3), || UnixStream::connect(home.sock()).is_ok()), "daemon did not start");
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let mut other = home.connect();
+    other.hello_ext("sess-b");
+    let (id, _) = c.start("for i in $(seq 3 255); do [ -e /dev/fd/$i ] && echo \"fd $i\"; done; echo end");
+    c.wait_terminal(&id, S(5)).expect("task finished");
+    let (text, _, _) = c.read_all_output(&id, 65536);
+    assert_eq!(text, "end\n", "task inherited descriptors beyond stdio");
+    drop(other);
+}
+
+/// S6: a connection the daemon closes (session rebind) is seen as closed
+/// by its client right away, even while tasks are being spawned around that
+/// moment and keep running. A task that inherited a copy of the connection
+/// (forked between accept() and FD_CLOEXEC) would hide the close until it
+/// exits.
+#[test]
+fn s6_rebound_connection_closes_while_tasks_run() {
+    let home = Home::new("s6");
+    let _d = home.start_daemon();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spawner = {
+        let mut sp = home.connect();
+        sp.hello_ext("spawner");
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut n = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) && n < 120 {
+                sp.start("sleep 30");
+                n += 1;
+            }
+            sp
+        })
+    };
+    let mut cur = home.connect();
+    cur.hello_ext("sess-r");
+    for round in 0..40 {
+        let mut next = home.connect();
+        next.hello_ext("sess-r");
+        assert!(
+            cur.wait_closed(S(2)),
+            "round {round}: rebound connection not seen as closed while tasks run"
+        );
+        cur = next;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _sp = spawner.join().unwrap();
 }

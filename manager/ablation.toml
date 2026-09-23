@@ -153,6 +153,7 @@ replace = "        Ok(Claim::Acquired(guard)) => drop(guard),"
 tests = [
   "protocol::t10_second_daemon_refused",
   "lifecycle_adversarial::d3_concurrent_daemon_processes_leave_one_survivor",
+  "lifecycle_adversarial::d1_concurrent_clients_spawn_exactly_one_daemon",
 ]
 expect = "red"
 
@@ -493,4 +494,13 @@ file = "src/client.rs"
 find = "            wait_for_manager_exit(home, Duration::from_secs(5)).await;"
 replace = ""
 tests = ["lifecycle_adversarial::d8b_cli_during_shutdown_reaches_a_successor"]
+expect = "red"
+
+[[ablation]]
+id = "child-fd-hygiene"
+mechanism = "a spawned task inherits only fds 0-2 (fds >= 3 marked close-on-exec in pre_exec); this disables the fcntl scan, the macOS path"
+file = "src/sys.rs"
+find = "fn child_setup(limit: i32) -> io::Result<()> {"
+replace = "fn child_setup(_limit: i32) -> io::Result<()> {\n    let limit = 3;"
+tests = ["lifecycle_adversarial::t14_tasks_inherit_only_stdio"]
 expect = "red"

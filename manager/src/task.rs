@@ -532,17 +532,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let out_path = dir.join("t.output");
         let env = HashMap::new();
+        // The task reports its own process group. Asking from outside
+        // (getpgid) raced the task's exit: on macOS a finished task is
+        // already gone for getpgid, and a stress run caught that.
         let mut t = spawn(
-            "printf 'out-line\\n'; printf 'err-line\\n' >&2",
+            "printf 'out-line\\n'; printf 'err-line\\n' >&2; echo \"pgid=$(ps -o pgid= -p $$ | tr -d ' ')\"",
             "/",
             &env,
             &out_path,
         )
         .unwrap();
         let _ = &dir;
-        assert!(pid_alive(t.pid));
-        // Child leads its own process group/session (setsid, §3.4).
-        assert_eq!(crate::sys::getpgid(t.pid), Some(t.pid as i32));
 
         let (status, collected) = wait_and_drain(&mut t).await;
         assert_eq!(status.code(), Some(0));
@@ -551,6 +551,8 @@ mod tests {
         let text = String::from_utf8_lossy(&collected);
         assert!(text.contains("out-line"), "stdout captured: {text:?}");
         assert!(text.contains("err-line"), "stderr merged: {text:?}");
+        // Child leads its own process group/session (setsid, §3.4).
+        assert!(text.contains(&format!("pgid={}\n", t.pid)), "own process group: {text:?}");
 
         let st = t.output.lock().unwrap();
         assert_eq!(st.total_size, collected.len() as u64);
@@ -578,8 +580,13 @@ mod tests {
         signal_group(t.pid, SIGKILL).unwrap();
         let (status, _) = wait_and_drain(&mut t).await;
         assert_eq!(status.signal(), Some(SIGKILL));
-        // Signalling a dead group is a no-op, not an error.
-        signal_group(t.pid, SIGKILL).unwrap();
+        // Signalling a dead group is a no-op: ESRCH is success. On macOS a
+        // group whose last member (the reparented grandchild) is still an
+        // unreaped zombie answers EPERM instead, which a stress run caught.
+        // Callers ignore the result either way.
+        if let Err(e) = signal_group(t.pid, SIGKILL) {
+            assert_eq!(e.raw_os_error(), Some(libc::EPERM), "{e}");
+        }
         wait_tee_idle(&t.tee_remaining).await;
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -10,7 +10,7 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 | `src/**` `#[cfg(test)]` | unit | ring buffer, record persistence, state mapping, daemon lock claim, UTF-8 chunk cutting, signal names, id format, manual clock (`test-clock` only) |
 | `tests/protocol.rs` | black box | message round-trips, basic lifecycle (t01–t13) |
 | `tests/lifecycle_adversarial.rs` | black box | every cell of the lifecycle table below, adversarial conditions |
-| `tests/mutation_gaps.rs` | black box | behaviours found unguarded by cargo-mutants survivors (g1–g13) |
+| `tests/mutation_gaps.rs` | black box | behaviours found unguarded by cargo-mutants survivors (g1–g14) |
 | `tests/observability.rs` | black box | observability contract: protocol additions, events.jsonl, inspection CLI (p1–p3, e1–e4, c1–c8) |
 | `tests/timing_canary.rs` | black box, real time | the actual 5s idle grace and 2s kill grace (always on the real clock) |
 | `tests/common/mod.rs` | helpers | wire client, isolated `--home`, process probes, crashable helper client, clock stepping (`Home::advance*`) |
@@ -188,7 +188,7 @@ States: `absent` → `starting` (claim) → `serving` (≥1 active conn) ⇄ `id
 
 | # | State | Event | Next state | Side effects | Before | After |
 |---|---|---|---|---|---|---|
-| D1 | absent | N clients race to auto-spawn | serving | every client succeeds, reaches the same pid; exactly one daemon process | no | `d1` |
+| D1 | absent | N clients race to auto-spawn | serving | every client succeeds and is served by the same daemon (its session is in that daemon's `status`); exactly one process holds `manager.lock` (held while it runs, free once it exits); the process count converges to 1 within 2s (a redundant daemon exits "already running" without binding) | no | `d1` |
 | D2 | crashed | N clients race over stale files | serving | clients never delete files; exactly one reachable daemon; no client fails | no | **FIXED** `d2` |
 | D3 | absent | N `daemon` processes at once (no spawn lock) | 1 survivor | lifetime lock on manager.lock: losers exit 0 "already running" | no | **FIXED** `d3` |
 | D4 | crashed | restart | serving | lock holder removes stale files; T7/T8 applied; idle rule still applies to adopted tasks | `t12` | `d4` |
@@ -233,6 +233,13 @@ added while fixing and were also run against the pre-fix code: all red.
 | `o4` | Chunks were lossy-decoded per read; a `max_bytes` or pipe boundary inside a multi-byte char produced U+FFFD while `next_cursor` skipped the bytes. | Reads fetch `cap + 3` bytes and cut at the last char boundary (a first char wider than `max_bytes` is sent whole, so reads always progress). A truncated tail is held back while the task runs. Watch events carry an incomplete tail over to the next pipe read and flush it at EOF. | `o4`, `o4b`, `o4c`, `g12`, unit `chunk_len_*` |
 | `d8b` | Once shutdown began, the accept loop was gone but the socket stayed bound: a client connecting in that window waited for its 30s response timeout, then failed (was deferred in part A). | The daemon keeps accepting during shutdown and refuses hello at once; a client refused with `manager is shutting down` waits (≤ 5s) for that manager's pid to exit, then spawns a successor. | `d8` (fresh connection), `d8b` |
 | `t13` flake | `finalize_exit` persisted `output_size` at child exit, before the tee had drained the pipe. After a restart the loaded record reported too few bytes (0 under load; seen once in a stress run as `t13` `total_size` 0 vs 13893). | `scan_tasks` takes `max(record, file length)` for every loaded record, not only re-adopted ones: the file is append-only and can no longer grow. | unit `scan_recovers_output_size_of_terminal_records_from_the_file` |
+| `d11` flake (test harness) | The test made its "dead" socket with `UnixListener::bind` + `drop` inside the multi-threaded test binary. On macOS, std sets FD_CLOEXEC only after `socket()` returns, so a child spawned by another test thread in that window inherits the socket and keeps it listening after the drop. `ls` then connected, got no hello answer, and hit the 10s test timeout. A standalone repro under heavy concurrent spawning: 833 of 3000 dropped listeners still accepted connections. Keeping the listener open in d11 reproduces the exact failure (`cli ["ls"] did not finish within 10s`). Not product behaviour: the daemon binds its listener before it spawns any task, and a task inherits only fds 0–2 (checked by listing `/dev/fd` from a task). | `common::dead_socket` checks that a connect is refused and otherwise retries on a fresh inode (0 of 3000 left live in the same repro). Used by `d11` and `g13`. | `d11`; full suite 5× × 3 copies: plain 15/15, test-clock 15/15 |
+| `e1` flake (events.jsonl order) | `finalize_exit` published a task's terminal status under the state lock but wrote its `task.exit` line after unlocking. A client that saw the task finish (`list` served by another worker) and then disconnected could get `session.disconnect` into the file first (seen once in the 10×3 stress run: disconnect at …372 ahead of exit at …371). A reader of events.jsonl right after a finished `wait`/`list` could also miss the line. `task.start` was written after the exit watcher was spawned, and `task.background` after unlocking, so both could land after a fast `task.exit`. | Every task event line is written under the state lock, before the state it records becomes visible: `task.start` before the task is inserted, `task.exit` before `status_tx` fires (also in the shutdown force-finalize pass), `task.background` together with `backgrounded_at`. | `e5` (100 fast tasks, `list` from a second connection, then read the file). Red-first needed a 50 ms sleep in the old unlocked window (`round 0: … task.exit is not written yet`); after the fix it stayed green with the same sleep in place. |
+| `e4` hang (`events -f` gap) | `events -f` printed history, *then* took every file's length as its follow offset. A line appended in between was skipped for good. `e4` appends to a new session the moment history is out; in one stress run the follower missed it, and the test's unbounded `read_line` blocked for hours until the follower was killed. | History reading returns, per file, the offset just past the last complete line it consumed, and following continues from exactly there (no gap, no duplicates). `e4` reads through a channel with a 5s bound, so a miss fails instead of hanging. | `e4`. Red-first: with a 300 ms sleep in the old window, `events -f never printed the line appended right after its history`; green with the same sleep after the fix. |
+| `d6b` flake (manual-clock helper) | `Home::advance` waited for "any timer with that label". Cancelling the idle countdown is an async `abort()`, so under load the aborted timer was still listed, and the helper stepped 4,999 ms before the daemon had armed the new countdown (`pending: [idle due 0]` at t=6999). | `advance(label, ms)` waits for a `label` timer with at least `ms` left; `advance_almost(label, total)` for one with exactly `total` left (freshly armed). A leftover never has that much left, because the clock has moved since it was armed. A shortened constant still fails deterministically. | test-clock 5×3 stress: 14/15 before, 15/15 after |
+| `t14` (descriptor leak into tasks) | Tasks inherited every daemon fd that lacked close-on-exec. On macOS, std sets FD_CLOEXEC only after `accept()` returns, so a task forked in that window got a copy of a client connection. That client then saw no EOF when the daemon closed it (session rebind, shutdown) until the task exited. The same happened to anything the daemon itself inherited without the flag. Found while root-causing `d11`. | The `pre_exec` hook that runs `setsid` now marks every fd ≥ 3 close-on-exec: `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` on Linux ≥ 5.11, otherwise an `fcntl` loop up to a bound computed before fork: the highest fd open in `/dev/fd` plus 64 slack, never above the soft RLIMIT_NOFILE. The limit alone is often 10^6, and even capped at 65536 it cost every spawn ~65k syscalls. That load made two existing `task.rs` unit-test races show up (next row). Nothing in the hook allocates. The fds are marked rather than closed, because std reports exec failures over a close-on-exec pipe that must stay open until exec. Applies to tasks and to the daemon the CLI spawns. | `t14` (the daemon holds an inherited fd 20 and two client connections; the task lists its own fds): red before (`"fd 20\nend\n"`), green after. `s6` (40 session rebinds while 120 tasks spawn; each old connection must see EOF within 2s) guards the behaviour; its pre-fix red is only statistical (a microsecond window), so it passed before the fix too. |
+| `task.rs` unit-test races (macOS) | Found while verifying the fd fix in a clean copy, 1 run in 300. `spawn_captures_merged_output_and_exit` called `getpgid` on a task that had usually already exited; on macOS a finished process is already gone for `getpgid`. `signal_group_kills_whole_tree` required `Ok` from signalling a dead group, but while the reparented grandchild is still an unreaped zombie, macOS answers EPERM, not ESRCH. Callers ignore that result either way. | The task reports its own process group (`ps -o pgid= -p $$`); the dead-group call accepts EPERM. The test-only `sys::getpgid` is removed. | full unit harness 300× in a loop: 0 failures |
+| `d1` flake (process-count snapshot) | `d1` counted daemon processes once, right after the 12 clients returned, and required exactly one. It failed twice (under mutation load in part A, and once in a clean-copy test-clock run), and the diagnostics were lost both times. A client that loses the race can spawn a redundant daemon, which exits "already running" without binding; a snapshot can catch it before it exits. The count was also standing in for the invariant: the old test never checked that the clients were served by that daemon. | Nothing in the product: the lifetime lock already guarantees one serving daemon. `d1` now asserts the invariant itself. (a) Each client opens its own session with `start --session`, and all 12 must appear in the survivor's `status` (sessions live only in the memory of the daemon that served them). (b) `manager.lock` is held while the socket's daemon runs, and free the moment it exits. (c) The process count converges to 1 within 2s. Failures print `ps -ww` lines and manager.log. | `d1` 100 rounds × 3 parallel copies in each mode: plain 300/300, test-clock 300/300. Proof it can fail: the `daemon-lifetime-lock` ablation turns it red at (b) (`nobody holds manager.lock`); expecting one session no client opened turns (a) red. |
 | `t5b` | `signal` was an integer on the wire and on disk; §3.3 and the extension type say `"SIGTERM"`/`"SIGKILL"`. | `signal` is a name (`proto::signal_name`) in `task_exited`, `TaskRecord` and the CLI `EXIT` column (widened to 7). Legacy numeric records still load (converted). The extension only tests truthiness / displays it; verified with `tsc`, its unit tests, and its real-binary integration tests. | `t5b`, `t2`, unit `signal_names_on_wire_and_legacy_numbers_load` |
 
 ## Observability contract (manager + CLI side)
@@ -248,6 +255,7 @@ fixtures in the contract's format, because the extension side may land later.
 | `manager-shutdown`, `orphaned`, `manager-restart` | `p2` |
 | hello `extension_version`/`protocol` stored per session; `status.protocol`; `connected_at` kept across reconnects; `last_seen` | `p3` |
 | manager writes `session.connect/disconnect`, `task.start` (command ≤ 200 chars, origin, pid), `task.background`, `task.stop`, `task.exit`, `daemon.start/shutdown` | `e1` |
+| a task event line is on disk before anyone can see the state it records, in causal order (`task.start` < `task.exit`) | `e5` |
 | every line < 4 KiB, oversized fields truncated (`truncated:true`), ids never cut | `e2`, unit `events::*` |
 | concurrent appends (8 extension-style writers × 300 lines of 1–3.5 KiB, plus the manager) never interleave or lose lines | `e3` |
 | `events`: malformed lines skipped with a stderr count; `--id` matches `id`/`ids[]`/`child_id`; `--session`, `--since`, `--json`, `-f` (incl. new sessions); cross-session time order; never starts the daemon | `e4` |
@@ -320,6 +328,45 @@ dead or unneeded code:
 | client.rs:161:20, 167:20 delete `!` in `connect` | b | Only changes which error text is kept; a successful spawn is still found on the retry. |
 | client.rs:239:40 ×2, 242:28 ×2 in `cmd_list` | a (not this work) | The "N terminal hidden, use -a" hint arithmetic from the KIND/agent-records change. Untested, but not code touched here. |
 
+### Observability and test-clock code (parts B and C)
+
+`cargo mutants --features test-clock --in-diff` over every `src` change
+since the part-A docs commit (`6ec4135..`): 493 mutants, 35 unviable,
+**458 viable, 330 caught + 12 timeouts = 74.7%**. The run took 68 min at
+`-j 4`. `clock.rs`: all 15 viable mutants killed.
+
+The two manager survivors were followed up:
+
+- `daemon.rs` `touch_session` → `()`: **dead code, removed**. `status`
+  reports `now` as `last_seen` for a connected session, and disconnect
+  sets `last_seen` itself, so the per-request update could never be seen.
+- `daemon.rs` `delete !` in `spawn_adopted_poller`: **missing test**. The
+  poller then stops sleeping after its first tick and spins. `g14` (daemon
+  CPU with one re-adopted task) now kills it. It first survived `g14`
+  because the manual clock never passed the first `adopt-poll` tick; the
+  test now advances it.
+
+After those: 343 / 457 = **75.1%**. The other 114 survivors are all in the
+CLI presentation code. Classes: (a) missing test, (b) equivalent or not
+observable in tests, (c) dead.
+
+| Area | Survivors | Class | What |
+|---|---|---|---|
+| `fmt.rs` `char_width` ranges | 11 | a | Only a few CJK and emoji ranges are exercised. `\|\|`→`&&` on the others goes unseen. |
+| `fmt.rs` `human_duration`, `datetime`, `short_time`, `local` | 10 | a / b | Boundary values (exactly 60s, 60m, 24h) are untested (a). Human timestamps are only checked for shape, not value (a). The tz offset arithmetic is equivalent on a UTC-offset-0 check (b). |
+| `events.rs` `encode_line`, `shrink_longest_string` | 18 | a | Truncation arithmetic at the edges of the 4 KiB cap. The tests assert that every line is under the cap and still valid JSON, not the exact size removed. Some `<`/`<=` swaps sit exactly on the cap (b). |
+| `sys.rs` `stdout_tty_columns`, `inspect.rs` `term_width` | 12 | b | The tests never run on a TTY, so terminal width is always unknown. |
+| `inspect.rs` `cmd_ls`, `render_ls`, `session_views` | 16 | a | The "N hidden, use -a" hint counts, session sort order for equal timestamps, and the COMMAND width arithmetic. |
+| `inspect.rs` transcripts, `wake_summary`, `cmd_show`, `render_event`, `cmd_events`, `cmd_sessions`, `cmd_status`, `wait_agent` | 19 | a | Rendering details (preamble detection edges, tail windows, `-f` poll bookkeeping), and the `wait` budget arithmetic for agents. |
+| `client.rs` `cmd_doctor`, `dir_size`, `Report::warn` | 16 | a | The doctor's disk-usage line and warnings are printed but not asserted. The protocol-match branch is only tested as a mismatch. |
+| `client.rs` `resolve_task_id` closest match | 6 | a | The distance thresholds of the "did you mean" hint. |
+| `client.rs` `cmd_kill_session`, `cmd_start` → `Ok(())` | 2 | a | Convenience commands without black-box tests. |
+| `client.rs` `wait_for_manager_exit` | 2 | b | `&&`→`\|\|` always waits the full 5s and `<`→`<=` changes nothing. Only latency differs, and `d8b` still passes. |
+| `client.rs` `cmd_output` | 1 | a | The `--max-bytes` read-size clamp. |
+| `out.rs` `bytes` | 1 | b | The EPIPE check vs. other write errors; both end the command. |
+
+deferred: tests for the (a) rows above | impact: CLI rendering regressions (widths, hints, doctor text) would not be caught; no effect on the lifecycle or wire contract | trigger: the first user-visible CLI rendering bug, or before the CLI output is declared stable for scripts
+
 ## Changed code for the fixes
 
 | File | Change |
@@ -336,7 +383,7 @@ dead or unneeded code:
 
 ## Ablation
 
-`ablation.toml` lists 44 load-bearing mechanisms (31 lifecycle, 13
+`ablation.toml` lists 45 load-bearing mechanisms (32 lifecycle, 13
 observability), each with a literal
 find/replace and the tests that must go red. `scripts/ablate.sh` applies
 each one to a scratch copy (sharing one build cache), first checks that
@@ -376,7 +423,7 @@ below); after that fix it was re-run and is red.
 | group-signal (kill(-pgid) → kill(pid)) | 3/3: t6, d5, d4b |
 | bounded-conn-queue (1024 → 2^28) | 1/1: c6 |
 | bounded-tee-channel (64 → 2^28) | 1/1: c6 |
-| daemon-lifetime-lock (guard dropped at startup) | 2/2: t10, d3 |
+| daemon-lifetime-lock (guard dropped at startup) | 3/3: t10, d3, d1 |
 | claim-removes-stale-files | 3/3: d10, d4, t12 |
 | clients-never-clean (re-adds the old client cleanup) | 1/1: d2 |
 | spawn-lock | 0/2 (declared green, see below) |
@@ -396,6 +443,7 @@ below); after that fix it was re-run and is red.
 | daemon-detach-setsid (auto-spawned daemon) | 1/1: g2 |
 | accept-during-shutdown (accept loop stops at shutdown, as before) | 2/2: d8, d8b |
 | client-waits-out-shutdown | 1/1: d8b |
+| child-fd-hygiene (fd scan disabled; macOS path) | 1/1: t14 |
 
 Changes from the first manifest:
 
@@ -431,6 +479,7 @@ Changes from the first manifest:
 | Hand-rolled read loop + `Interrupted` arm in `read_file_range` | Replaced by `take(max).read_to_end`, which retries EINTR itself | `read_file_range_offsets`, `g1`, `g8`, `o1`, `t13` green |
 | Client-side zombie cleanup in `connect` (§3.1 step 5) | Redundant with the daemon's cleanup, and the cause of bug d2 | `d2`, `d10`, `d11`, `d11b` green; ablation `clients-never-clean` |
 | `claim_pid` (pid-liveness identity) | Replaced by the lifetime lock | `t10`, `d3`, `d12` |
+| `touch_session` (per-request `last_seen` update, part B) | Unobservable: `status` reports `now` for connected sessions and disconnect sets `last_seen` | `p3`, `c5` green; found as a mutation survivor |
 
 No removal turned a test red.
 
@@ -438,6 +487,6 @@ No removal turned a test red.
 
 - deferred: HELLO_TIMEOUT (10s) close of a silent connection is not asserted, only that it does not keep the daemon alive | impact: a silent peer holds one fd for 10s; not customer-visible | trigger: if connection limits are added
 - deferred: Windows named-pipe path (design §3.1) has no tests; `sys.rs` is unix-only | impact: none until Windows ships | trigger: first Windows build
-- deferred: the extension's own connect path (TypeScript) is not changed to wait out a shutting-down manager the way the Rust client now does | impact: an extension connecting in the ≤ 2s shutdown window gets `manager is shutting down` at once instead of a successor | trigger: extension side of this branch's merge
+- deferred: the extension's own connect path (TypeScript) is not changed to wait out a shutting-down manager the way the Rust client now does; the exact protocol to implement is design §3.1 step 6 | impact: an extension connecting in the ≤ 2s shutdown window gets `manager is shutting down` at once instead of a successor | trigger: extension side of this branch's merge (handed to the extension engineer)
 - deferred: `task_exited.output_size` (live event) is the size at child exit and can be short by what was still in the pipe; the in-memory record catches up and a restart recovers it from the file | impact: the extension's byte count hint can be low for a fast-exiting, high-output task; reads still return every byte | trigger: any consumer that uses `output_size` as a read bound
 - deferred: re-adopted tasks are identified by pid liveness only (`kill(pid,0)`); a task pid reused while no manager ran would be re-adopted, and signalled on stop/shutdown | impact: wrong process signalled after a crash plus a long gap | trigger: persisting process start time in TaskRecord (a contract change)

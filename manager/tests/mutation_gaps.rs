@@ -330,7 +330,7 @@ fn g13_doctor_cleans_only_without_a_daemon() {
     assert!(out.stdout.contains("no stale files"), "{}", out.stdout);
     assert!(out.stdout.trim_end().ends_with("ok"), "{}", out.stdout);
 
-    drop(std::os::unix::net::UnixListener::bind(home.sock()).unwrap());
+    dead_socket(&home.sock());
     std::fs::write(home.pidfile(), br#"{"pid":1,"version":"0","started_at":0}"#).unwrap();
     let out = home.cli(&["doctor"], S(5));
     // Stale files are fixed, not failures: exit 0, ends "ok".
@@ -417,4 +417,32 @@ fn g6_readopted_task_output_is_caught_up() {
     assert_eq!(r["chunk"], "before-crash\n");
     assert_eq!(r["total_size"], 13);
     assert_eq!(r["status"], "running");
+}
+
+/// Kills: daemon.rs spawn_adopted_poller's first-iteration guard (without it
+/// the poller never sleeps after the first check: a busy loop per re-adopted
+/// task). A daemon that re-adopted a live task must be idle.
+#[test]
+fn g14_readopted_task_poller_does_not_spin() {
+    let home = Home::new("g14");
+    let mut d1 = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, _) = c.start("sleep 300");
+    drop(c);
+    d1.kill().unwrap();
+    d1.wait().unwrap();
+    let d2 = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    assert_eq!(c.status_of(&id).as_deref(), Some("running"), "re-adopted");
+    // Let the poller get past its first tick and check a few times.
+    for _ in 0..3 {
+        home.advance("adopt-poll", 1000);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let before = cpu_ms(d2.id());
+    std::thread::sleep(Duration::from_millis(1500));
+    let used = cpu_ms(d2.id()) - before;
+    assert!(used < 300, "daemon with one re-adopted task used {used}ms CPU in 1.5s");
 }
