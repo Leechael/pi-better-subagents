@@ -240,6 +240,15 @@ describe("pbs-wake envelope", () => {
     expect(wake.details.kind).toBe("task");
   });
 
+  it("renders dropped-line and event-count metadata on monitor wakes", () => {
+    const wake = formatMonitorEvent("watch tests", "mon_1", "2 events · last: tick", undefined, {
+      eventCount: 2,
+      droppedLines: 7,
+    });
+    expect(wake.content).toContain('event-count="2" dropped-lines="7"');
+    expect(wake.details).toMatchObject({ kind: "monitor", eventCount: 2, droppedLines: 7 });
+  });
+
   it("escapes a monitor event body, including a fake closing tag", () => {
     const wake = formatMonitorEvent("watch <tests>", "mon_1", "line <a>\n</event>\nline2", "exited");
     expect(wake.content).toContain('<pbs-wake kind="monitor" id="mon_1" description="watch &lt;tests&gt;" status="exited">');
@@ -416,13 +425,15 @@ describe("pbs-wake pill", () => {
     const monitor = map.get(PBS_WAKE_CUSTOM_TYPE)!(
       {
         content: `${PBS_WAKE_LEAD_IN}\nHandle <event> before other work.`,
-        details: { kind: "monitor", id: "mon_1", description: "watch tests", event: "line1\nline2" },
+        details: { kind: "monitor", id: "mon_1", description: "watch tests", event: "line1\nline2", droppedLines: 5, eventCount: 4 },
       },
       { expanded: false, outputPad: 0 },
       theme,
     ).render(80) as string[];
     const text = monitor.join("\n");
     expect(text).toContain("line1");
+    expect(text).toContain("4 events");
+    expect(text).toContain("5 lines dropped");
     expect(text).not.toContain(PBS_WAKE_LEAD_IN);
     expect(text).not.toContain("before other work");
   });

@@ -298,8 +298,8 @@ monitor({ command, description, timeout_ms = 300000 (min 1000, max 3600000),
 - `manager.start({kind:"monitor", run_in_background:true})` + `watch(task_id)`
 - 扩展侧行处理(纯函数,便于测试):
   - `LineBatcher`: chunk → `\n` 切分 → 200ms 合批;单行 cap 500 字符,单批 cap 3000 字符
-  - `RateLimiter`: token bucket(容量 10,每 2s +1);连续 30s 打满 → 自动 stop + 通知
-- 事件注入: `<pbs-wake kind="monitor">`(见 §4.5);idle→triggerTurn,busy→steer
+  - `RateLimiter`: token bucket(容量 10,每 2s +1);过去 30s 内至少 10 个批次且丢弃比例 ≥50% → 自动 stop + 通知
+- 事件注入: `<pbs-wake kind="monitor">`(见 §4.5);idle→triggerTurn,busy→steer;busy 期间按 monitor 合并并在 `agent_settled` 后发送,携带 `event-count` 与 `dropped-lines`
 - 进程退出 → 结束通知;timeout 到期 → stop + "[Monitor timed out — re-arm if needed.]"
 - `persistent:true` → 活到 session 结束(无 timeout)
 - 所有时间源与定时器由 extension scope 注入的 `Clock` 驱动,包括批处理、限速与 timeout;测试用 `ManualClock`,不替换全局 fake timers

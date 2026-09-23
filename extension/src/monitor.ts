@@ -4,7 +4,8 @@
  * Starts a long-lived `kind:"monitor"` process via pbs-manager, watches its
  * output stream, and injects line batches as <pbs-wake kind="monitor"> messages.
  * Batching (LineBatcher) and throttling (RateLimiter) happen extension-side;
- * a monitor that saturates the rate limiter for 30s continuously is stopped.
+ * a monitor is stopped when at least half its batches are dropped in a rolling
+ * 30-second window.
  */
 import { Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -12,7 +13,7 @@ import { formatMonitorEvent } from "./format";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
 import type { ManagerClient, ManagerEvent } from "./manager-client";
-import { LineBatcher, RateLimiter } from "./monitor-batching";
+import { LineBatcher, RateLimiter, SaturationWindow } from "./monitor-batching";
 import type { NotifyCenter } from "./notify";
 import { statusGlyph, toolComponent } from "./tui/tool-component";
 
@@ -20,8 +21,10 @@ import { statusGlyph, toolComponent } from "./tui/tool-component";
 const DEFAULT_TIMEOUT_MS = 300_000;
 const MIN_TIMEOUT_MS = 1_000;
 const MAX_TIMEOUT_MS = 3_600_000;
-/** Continuous rate-limit saturation before a monitor is auto-stopped. */
-const SATURATION_LIMIT_MS = 30_000;
+/** Rolling-window drop ratio required before a monitor is auto-stopped. */
+const SATURATION_WINDOW_MS = 30_000;
+const SATURATION_DROP_RATIO = 0.5;
+const SATURATION_MIN_BATCHES = 10;
 
 export interface MonitorDeps {
   getClient: () => ManagerClient | null;
@@ -39,7 +42,8 @@ interface MonitorEntry {
   startedAt: number;
   batcher: LineBatcher;
   limiter: RateLimiter;
-  saturatedSince: number | null;
+  saturation: SaturationWindow;
+  droppedLinesPending: number;
   timeoutTimer: ClockTimer | null;
   stopped: boolean;
 }
@@ -117,7 +121,12 @@ export class MonitorRegistry {
       startedAt: this.clock.now(),
       batcher: null as unknown as LineBatcher, // assigned below (self-reference in callback)
       limiter: new RateLimiter({ clock: this.clock }),
-      saturatedSince: null,
+      saturation: new SaturationWindow({
+        windowMs: SATURATION_WINDOW_MS,
+        dropRatio: SATURATION_DROP_RATIO,
+        minimumBatches: SATURATION_MIN_BATCHES,
+      }),
+      droppedLinesPending: 0,
       timeoutTimer: null,
       stopped: false,
     };
@@ -157,8 +166,9 @@ export class MonitorRegistry {
       formatMonitorEvent(
         entry.description,
         entry.taskId,
-        `Monitor process exited (exit code ${exitCode === null ? "null" : exitCode}, after ${duration}). No further events will be delivered.`,
+        `Monitor process exited (exit code ${exitCode === null ? "null" : exitCode}, after ${duration}). No further events will be delivered.${entry.droppedLinesPending > 0 ? ` ${entry.droppedLinesPending} output lines were dropped.` : ""}`,
         "exited",
+        { droppedLines: entry.droppedLinesPending },
       ),
     );
     this.deps.toast?.(
@@ -185,17 +195,17 @@ export class MonitorRegistry {
 
   private onBatch(entry: MonitorEntry, text: string): void {
     if (entry.stopped) return;
-    if (!entry.limiter.tryConsume()) {
-      // Saturated: drop the batch and track continuous saturation.
-      if (entry.saturatedSince === null) {
-        entry.saturatedSince = this.clock.now();
-      } else if (this.clock.now() - entry.saturatedSince >= SATURATION_LIMIT_MS) {
-        void this.autoStop(entry);
-      }
+    const now = this.clock.now();
+    const accepted = entry.limiter.tryConsume();
+    entry.saturation.record(!accepted, now);
+    if (!accepted) {
+      entry.droppedLinesPending += text.split("\n").length;
+      if (entry.saturation.isSaturated(now)) void this.autoStop(entry);
       return;
     }
-    entry.saturatedSince = null;
-    this.deps.getNotifyCenter()?.notify(formatMonitorEvent(entry.description, entry.taskId, text));
+    const droppedLines = entry.droppedLinesPending;
+    entry.droppedLinesPending = 0;
+    this.deps.getNotifyCenter()?.notifyMonitorEvent(entry.description, entry.taskId, text, droppedLines);
   }
 
   /** Timeout reached: stop the process and notify (§4.4). */
@@ -205,7 +215,13 @@ export class MonitorRegistry {
     const client = this.deps.getClient();
     await client?.stop(entry.taskId).catch(() => {});
     this.deps.getNotifyCenter()?.notify(
-      formatMonitorEvent(entry.description, entry.taskId, "[Monitor timed out — re-arm if needed.]", "timeout"),
+      formatMonitorEvent(
+        entry.description,
+        entry.taskId,
+        "[Monitor timed out — re-arm if needed.]",
+        "timeout",
+        { droppedLines: entry.droppedLinesPending },
+      ),
     );
     this.deps.toast?.(`Monitor "${entry.description}" timed out — re-arm if needed.`, "warning");
     this.cleanup(entry);
@@ -221,8 +237,9 @@ export class MonitorRegistry {
       formatMonitorEvent(
         entry.description,
         entry.taskId,
-        "[Monitor stopped: event rate limit saturated for 30s.]",
+        "[Monitor stopped: at least half of output batches were dropped in the last 30s.]",
         "stopped",
+        { droppedLines: entry.droppedLinesPending },
       ),
     );
     this.deps.toast?.(

@@ -63,7 +63,13 @@ function collapsedText(details: PbsWake, theme: Theme): string {
       const preview = details.event.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "(event)";
       const { color, glyph } = statusGlyph(details.status);
       const statusBit = details.status ? ` ${theme.fg("dim", `· ${details.status}`)}` : "";
-      return `${theme.fg(color, glyph)} ${theme.fg("muted", "monitor")} ${theme.fg("accent", `"${details.description}"`)}${statusBit}\n${theme.fg("dim", preview)}`;
+      const countBit = details.eventCount && details.eventCount > 1
+        ? ` ${theme.fg("dim", `· ${details.eventCount} events`)}`
+        : "";
+      const droppedBit = details.droppedLines
+        ? ` ${theme.fg("warning", `· ${details.droppedLines} lines dropped`)}`
+        : "";
+      return `${theme.fg(color, glyph)} ${theme.fg("muted", "monitor")} ${theme.fg("accent", `"${details.description}"`)}${statusBit}${countBit}${droppedBit}\n${theme.fg("dim", preview)}`;
     }
     case "subagent-handover": {
       const { color, glyph } = statusGlyph(details.status);

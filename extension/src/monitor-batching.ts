@@ -106,6 +106,49 @@ export class LineBatcher {
   }
 }
 
+export interface SaturationWindowOptions {
+  windowMs: number;
+  dropRatio: number;
+  minimumBatches: number;
+}
+
+/** Tracks whether a rolling window has a sustained ratio of dropped batches. */
+export class SaturationWindow {
+  private readonly windowMs: number;
+  private readonly dropRatio: number;
+  private readonly minimumBatches: number;
+  private samples: { at: number; dropped: boolean }[] = [];
+
+  constructor(opts: SaturationWindowOptions) {
+    this.windowMs = opts.windowMs;
+    this.dropRatio = opts.dropRatio;
+    this.minimumBatches = opts.minimumBatches;
+  }
+
+  record(dropped: boolean, at: number): void {
+    this.prune(at);
+    this.samples.push({ at, dropped });
+  }
+
+  isSaturated(now: number): boolean {
+    this.prune(now);
+    if (this.samples.length < this.minimumBatches) return false;
+    const first = this.samples[0];
+    // Require the retained samples to span a full window; sparse bursts alone
+    // should not be treated as sustained saturation.
+    if (!first || now - first.at < this.windowMs) return false;
+    const dropped = this.samples.reduce((count, sample) => count + Number(sample.dropped), 0);
+    return dropped / this.samples.length >= this.dropRatio;
+  }
+
+  private prune(now: number): void {
+    const cutoff = now - this.windowMs;
+    let firstLive = 0;
+    while (firstLive < this.samples.length && this.samples[firstLive].at < cutoff) firstLive++;
+    if (firstLive > 0) this.samples = this.samples.slice(firstLive);
+  }
+}
+
 export interface RateLimiterOptions {
   capacity?: number; // default 10
   refillIntervalMs?: number; // default 2000

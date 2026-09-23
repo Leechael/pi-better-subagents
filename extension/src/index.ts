@@ -484,6 +484,10 @@ export default function (pi: ExtensionAPI): void {
     ctx = null;
   });
 
+  pi.on("agent_settled", async () => {
+    notifyCenter?.flushMonitorEvents();
+  });
+
   pi.on("before_agent_start", async (event) => {
     applyBehaviorGuidelines(event.systemPromptOptions as { sections?: Record<string, string> });
   });

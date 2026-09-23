@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { ManualClock } from "../../src/clock";
-import { LineBatcher, RateLimiter } from "../../src/monitor-batching";
+import { LineBatcher, RateLimiter, SaturationWindow } from "../../src/monitor-batching";
 
 describe("LineBatcher", () => {
   let clock: ManualClock;
@@ -109,6 +109,29 @@ describe("LineBatcher", () => {
     clock.advanceBy(1);
     expect(batches).toEqual(["x"]);
     batcher.dispose();
+  });
+});
+
+describe("SaturationWindow", () => {
+  it("stops only after a full window with at least half of batches dropped", () => {
+    const window = new SaturationWindow({ windowMs: 30_000, dropRatio: 0.5, minimumBatches: 10 });
+    for (let i = 0; i < 10; i++) window.record(i % 2 === 0, i * 2_000);
+    expect(window.isSaturated(29_999)).toBe(false);
+    expect(window.isSaturated(30_000)).toBe(true);
+  });
+
+  it("does not trip when drops fall below half of the rolling window", () => {
+    const window = new SaturationWindow({ windowMs: 30_000, dropRatio: 0.5, minimumBatches: 10 });
+    for (let i = 0; i < 10; i++) window.record(i < 4, i * 2_000);
+    expect(window.isSaturated(30_000)).toBe(false);
+  });
+
+  it("expires old samples so a past burst cannot keep saturation latched", () => {
+    const window = new SaturationWindow({ windowMs: 30_000, dropRatio: 0.5, minimumBatches: 10 });
+    for (let i = 0; i < 10; i++) window.record(true, i * 1_000);
+    expect(window.isSaturated(30_000)).toBe(true);
+    for (let i = 0; i < 10; i++) window.record(false, 31_000 + i * 1_000);
+    expect(window.isSaturated(60_000)).toBe(false);
   });
 });
 

@@ -153,6 +153,7 @@ export function formatMonitorEvent(
   taskId: string,
   batchText: string,
   status?: string,
+  extras: { eventCount?: number; droppedLines?: number } = {},
 ): FormattedWake {
   return formatPbsWake({
     kind: "monitor",
@@ -160,6 +161,8 @@ export function formatMonitorEvent(
     description,
     ...(status ? { status } : {}),
     event: batchText,
+    ...(extras.eventCount !== undefined ? { eventCount: extras.eventCount } : {}),
+    ...(extras.droppedLines !== undefined ? { droppedLines: extras.droppedLines } : {}),
   });
 }
 

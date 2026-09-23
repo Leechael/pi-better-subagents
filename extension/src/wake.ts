@@ -40,7 +40,15 @@ export interface SubagentDoneChild {
 
 export type PbsWake =
   | { kind: "task"; stillRunning: WakeItem[]; tasks: TaskWake[] }
-  | { kind: "monitor"; id: string; description: string; status?: string; event: string }
+  | {
+      kind: "monitor";
+      id: string;
+      description: string;
+      status?: string;
+      event: string;
+      eventCount?: number;
+      droppedLines?: number;
+    }
   | {
       kind: "subagent-handover";
       runId: string;
@@ -145,6 +153,10 @@ function renderMonitor(details: Extract<PbsWake, { kind: "monitor" }>): string {
     `description="${escapeXmlAttr(details.description)}"`,
   ];
   if (details.status) attrs.push(`status="${escapeXmlAttr(details.status)}"`);
+  if (details.eventCount !== undefined && details.eventCount > 1) attrs.push(`event-count="${details.eventCount}"`);
+  if (details.droppedLines !== undefined && details.droppedLines > 0) {
+    attrs.push(`dropped-lines="${details.droppedLines}"`);
+  }
   return [`<pbs-wake ${attrs.join(" ")}>`, `  <event>${escapeXml(details.event)}</event>`, "</pbs-wake>"].join("\n");
 }
 
