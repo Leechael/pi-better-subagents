@@ -16,34 +16,93 @@ pub const SIGTERM: i32 = libc::SIGTERM;
 pub const SIGKILL: i32 = libc::SIGKILL;
 
 /// Make the child a session leader (`setsid`) so `pgid == pid` and
-/// [`signal_group`] can address the whole tree with `kill(-pgid, …)`.
+/// [`signal_group`] can address the whole tree with `kill(-pgid, …)`, and
+/// let it inherit only fds 0, 1 and 2 (see [`child_setup`]).
 ///
 /// # Safety boundary
-/// `pre_exec` is the only `unsafe` call site. Inside the closure we only
-/// call `setsid`, which is async-signal-safe.
+/// `pre_exec` is the only `unsafe` call site. The closure calls only
+/// `setsid`, `fcntl` and (Linux) the `close_range` syscall, all
+/// async-signal-safe, and allocates nothing: the fd bound is computed here,
+/// before fork.
 pub fn apply_new_session_tokio(cmd: &mut tokio::process::Command) {
-    // SAFETY: closure only calls async-signal-safe `setsid`.
+    let limit = fd_scan_limit();
+    // SAFETY: see above; `limit` is a captured integer.
     unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        cmd.pre_exec(move || child_setup(limit));
     }
 }
 
 /// Same as [`apply_new_session_tokio`] for `std::process::Command`
 /// (used when detaching the daemon itself from a short-lived CLI).
 pub fn apply_new_session_std(cmd: &mut std::process::Command) {
-    // SAFETY: closure only calls async-signal-safe `setsid`.
+    let limit = fd_scan_limit();
+    // SAFETY: as for `apply_new_session_tokio`.
     unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        cmd.pre_exec(move || child_setup(limit));
+    }
+}
+
+/// Runs in the forked child, before exec.
+///
+/// Every fd ≥ 3 is marked close-on-exec, so the new program starts with
+/// stdin/stdout/stderr only. Rust sets FD_CLOEXEC on its descriptors, but
+/// on macOS only after `socket()`/`accept()` return. A fork in that window
+/// (a task starting while a client connects) would otherwise give the task
+/// a copy of a client connection. That client would then see no EOF when
+/// the daemon closes the connection, until the task exits. The same applies
+/// to anything the daemon inherited without the flag.
+///
+/// The fds are marked, not closed: std's fork path reports exec failures to
+/// the parent over a close-on-exec pipe, which must stay open until exec.
+/// The effect after exec is the same.
+fn child_setup(limit: i32) -> io::Result<()> {
+    if unsafe { libc::setsid() } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // Linux ≥ 5.11: one syscall. Older kernels (ENOSYS / EINVAL) fall back.
+    #[cfg(target_os = "linux")]
+    {
+        let r = unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, libc::CLOSE_RANGE_CLOEXEC) };
+        if r == 0 {
+            return Ok(());
+        }
+    }
+    for fd in 3..limit {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        }
+    }
+    Ok(())
+}
+
+/// Upper bound for the fd scan in [`child_setup`], computed in the parent
+/// before fork (the child must not allocate).
+///
+/// The highest fd open right now (from `/dev/fd`), plus slack for fds other
+/// threads open before the fork. A new fd takes the lowest free number, so
+/// it lands at most one past the current highest per concurrent open.
+/// Never above the soft RLIMIT_NOFILE, where no fd can exist. That limit
+/// alone is not used as the bound, because it is often 10^6 (raised by
+/// shells and cargo): even capped at 65536 it made every spawn cost ~65k
+/// syscalls. Without `/dev/fd`, the limit (capped) is the bound.
+fn fd_scan_limit() -> i32 {
+    const CAP: i64 = 1 << 16;
+    const SLACK: i64 = 64;
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
+        i64::try_from(rl.rlim_cur).unwrap_or(CAP).min(CAP)
+    } else {
+        CAP
+    };
+    let highest = std::fs::read_dir("/dev/fd").ok().and_then(|d| {
+        d.flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<i64>().ok())
+            .max()
+    });
+    match highest {
+        Some(h) => (h + 1 + SLACK).min(soft) as i32,
+        None => soft as i32,
     }
 }
 
@@ -117,18 +176,6 @@ pub fn pid_alive(pid: u32) -> bool {
     // SAFETY: signal 0 is a pure existence check; no side effects on success.
     let rc = unsafe { libc::kill(pid as i32, 0) };
     rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Process group id for `pid`, or `None` on error.
-#[cfg(test)]
-pub fn getpgid(pid: u32) -> Option<i32> {
-    // SAFETY: getpgid is a pure query.
-    let pg = unsafe { libc::getpgid(pid as i32) };
-    if pg < 0 {
-        None
-    } else {
-        Some(pg)
-    }
 }
 
 /// Peak resident set size for this process (bytes on Darwin, KiB on Linux).

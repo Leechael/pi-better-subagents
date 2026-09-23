@@ -1415,3 +1415,88 @@ fn d16_extension_cannot_shutdown() {
     std::thread::sleep(MS(500));
     assert!(d.try_wait().unwrap().is_none(), "extension shut the manager down");
 }
+
+// ===========================================================================
+// Descriptor hygiene: tasks inherit only stdin/stdout/stderr (T14, S6)
+// ===========================================================================
+
+/// T14: a task inherits only fds 0, 1 and 2. The daemon here holds an extra
+/// descriptor without close-on-exec (fd 20), as it would after inheriting
+/// one from whatever spawned it, or through the window between accept()
+/// and FD_CLOEXEC on macOS. Two client connections are open while the task
+/// starts. The task lists its own open descriptors.
+#[test]
+fn t14_tasks_inherit_only_stdio() {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let home = Home::new("t14");
+    let extra = std::fs::File::open("/dev/null").unwrap(); // O_CLOEXEC here
+    let raw = extra.as_raw_fd();
+    let mut cmd = std::process::Command::new(BIN);
+    cmd.arg("--home")
+        .arg(&home.path)
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: only dup2, which is async-signal-safe; the copy at fd 20 has
+    // no close-on-exec flag, so the daemon inherits it.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(raw, 20) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let _d = cmd.spawn().expect("spawn daemon");
+    drop(extra);
+    assert!(poll_true(S(3), || UnixStream::connect(home.sock()).is_ok()), "daemon did not start");
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let mut other = home.connect();
+    other.hello_ext("sess-b");
+    let (id, _) = c.start("for i in $(seq 3 255); do [ -e /dev/fd/$i ] && echo \"fd $i\"; done; echo end");
+    c.wait_terminal(&id, S(5)).expect("task finished");
+    let (text, _, _) = c.read_all_output(&id, 65536);
+    assert_eq!(text, "end\n", "task inherited descriptors beyond stdio");
+    drop(other);
+}
+
+/// S6: a connection the daemon closes (session rebind) is seen as closed
+/// by its client right away, even while tasks are being spawned around that
+/// moment and keep running. A task that inherited a copy of the connection
+/// (forked between accept() and FD_CLOEXEC) would hide the close until it
+/// exits.
+#[test]
+fn s6_rebound_connection_closes_while_tasks_run() {
+    let home = Home::new("s6");
+    let _d = home.start_daemon();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spawner = {
+        let mut sp = home.connect();
+        sp.hello_ext("spawner");
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut n = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) && n < 120 {
+                sp.start("sleep 30");
+                n += 1;
+            }
+            sp
+        })
+    };
+    let mut cur = home.connect();
+    cur.hello_ext("sess-r");
+    for round in 0..40 {
+        let mut next = home.connect();
+        next.hello_ext("sess-r");
+        assert!(
+            cur.wait_closed(S(2)),
+            "round {round}: rebound connection not seen as closed while tasks run"
+        );
+        cur = next;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _sp = spawner.join().unwrap();
+}
