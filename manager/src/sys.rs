@@ -273,6 +273,20 @@ pub fn group_has_others(pgid: u32) -> bool {
     }
 }
 
+/// Clear FD_CLOEXEC so `fd` survives an exec (the in-place upgrade hands
+/// these descriptors to the new image).
+pub fn clear_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fcntl on an integer fd; no memory is touched.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Non-blocking `waitpid` on one child: `Ok(None)` while it runs,
 /// `Ok(Some(status))` once reaped. Used for runners the process did not
 /// spawn itself in this image (after an in-place upgrade they are still its

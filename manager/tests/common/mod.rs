@@ -138,6 +138,18 @@ impl Home {
             clock_request(&self.path, json!({"type":"clock_status"}))
         );
     }
+    /// Advance by `ms` once a `label` timer is armed with any time left (a
+    /// timer re-armed with what remained of it, e.g. after an in-place
+    /// upgrade). Real clock: sleep `ms`.
+    pub fn advance_partial(&self, label: &str, ms: u64) {
+        if !self.manual {
+            std::thread::sleep(Duration::from_millis(ms));
+            return;
+        }
+        self.wait_armed(label, 1);
+        let r = clock_request(&self.path, json!({"type":"clock_advance","ms":ms}));
+        assert_eq!(r["ok"], true, "clock_advance: {r}");
+    }
     /// Advance time without waiting for a particular timer (e.g. to show a
     /// cancelled countdown does not fire). Real clock: sleep `ms`.
     pub fn advance_now(&self, ms: u64) {
@@ -227,6 +239,38 @@ impl Home {
             .spawn()
             .expect("spawn daemon")
     }
+    /// A private copy of the binary under this home, so a test can replace
+    /// it (in-place upgrade) without touching the one other tests use.
+    pub fn install_copy(&self) -> PathBuf {
+        let dir = self.path.join("bin");
+        fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("pbs-manager");
+        replace_binary(&dst, Path::new(BIN));
+        dst
+    }
+    /// Start a daemon from `bin` with extra environment; waits until it
+    /// accepts connections.
+    pub fn start_daemon_from(&self, bin: &Path, env: &[(&str, &str)]) -> Child {
+        let mut cmd = Command::new(bin);
+        cmd.arg("--home")
+            .arg(&self.path)
+            .env("PBS_TEST_CLOCK", self.clock_env())
+            .arg("daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().expect("spawn daemon");
+        // The first run of a freshly copied binary is slow on macOS (code
+        // signature assessment), hence the longer wait.
+        assert!(
+            poll_true(Duration::from_secs(20), || UnixStream::connect(self.sock()).is_ok()),
+            "daemon did not start listening within 20s"
+        );
+        child
+    }
     /// Spawn a daemon and wait until it accepts connections.
     pub fn start_daemon(&self) -> Child {
         let child = self.spawn_daemon();
@@ -272,6 +316,17 @@ pub struct CliOut {
     pub status: ExitStatus,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// Atomically put a copy of `src` at `dst` (copy beside it, then rename),
+/// the way `install` does: a new inode, never a half-written file.
+pub fn replace_binary(dst: &Path, src: &Path) {
+    let tmp = dst.with_extension("new");
+    fs::copy(src, &tmp).expect("copy binary");
+    // The first run of a new binary file is slow on macOS (signature
+    // assessment): take it here, not inside a timed step of the test.
+    let _ = Command::new(&tmp).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status();
+    fs::rename(&tmp, dst).expect("rename binary");
 }
 
 pub fn run_cli(home: &Path, args: &[&str], timeout: Duration) -> CliOut {

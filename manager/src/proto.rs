@@ -247,6 +247,11 @@ pub enum RequestKind {
         timeout_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<Origin>,
+        /// Client-chosen idempotency key. A start resent with the same key
+        /// (after a lost connection, e.g. an in-place upgrade) returns the
+        /// task the first one started instead of starting it again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     /// Record that the extension moved a task to the background.
     MarkBackground {
@@ -282,6 +287,10 @@ pub enum RequestKind {
     ShutdownSession,
     Status,
     Shutdown,
+    /// CLI only: replace this daemon in place with the binary now at its
+    /// executable path (exec, same pid; see `handover.rs`). Answered before
+    /// the handover starts; the result shows in `status.last_upgrade`.
+    Upgrade,
     /// Test-only (`test-clock` feature): pending manual-clock timers. Sent
     /// as the first frame of a connection, without hello, so it never counts
     /// as an active connection.
@@ -413,6 +422,35 @@ pub struct StatusOk {
     /// The manager's protocol level ([`PROTOCOL`]).
     #[serde(default)]
     pub protocol: u32,
+    /// In-place upgrades this daemon (this pid) has gone through.
+    #[serde(default)]
+    pub generation: u32,
+    /// The latest in-place upgrade attempt, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_upgrade: Option<UpgradeInfo>,
+}
+
+/// Outcome of an in-place upgrade attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UpgradeInfo {
+    /// When it finished (ms epoch).
+    pub at: u64,
+    pub ok: bool,
+    pub from_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
+    /// Why it did not happen; the daemon kept running the old binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// What started it: "cli" (`pbs-manager upgrade`) or "binary-changed".
+    #[serde(default)]
+    pub trigger: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpgradeOk {
+    pub from_version: String,
+    pub generation: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -665,7 +703,9 @@ mod tests {
                 run_in_background,
                 timeout_ms,
                 origin,
+                key,
             } => {
+                assert_eq!(key, None, "key is optional (older clients)");
                 assert_eq!(kind, TaskKind::Shell);
                 assert_eq!(command, "ls -la");
                 assert_eq!(cwd.as_deref(), Some("/tmp"));

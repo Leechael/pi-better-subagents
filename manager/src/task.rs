@@ -174,12 +174,21 @@ pub struct Lifeline {
     /// Read end, numbered >= 10, close-on-exec (placed at fd 3 in runners).
     pub read: OwnedFd,
     /// Write end, close-on-exec: it must never reach a task. Never written;
-    /// only its closing matters.
-    #[allow(dead_code)]
+    /// only its closing matters (an in-place upgrade keeps it open).
     pub write: OwnedFd,
 }
 
 static LIFELINE: OnceLock<Lifeline> = OnceLock::new();
+
+/// Install the lifeline inherited across an in-place upgrade: the same pipe
+/// every runner already holds. Both ends go back to close-on-exec.
+pub fn adopt_lifeline(read: OwnedFd, write: OwnedFd) -> io::Result<()> {
+    crate::sys::set_cloexec(read.as_raw_fd())?;
+    crate::sys::set_cloexec(write.as_raw_fd())?;
+    LIFELINE
+        .set(Lifeline { read, write })
+        .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "lifeline already set"))
+}
 
 pub fn lifeline() -> io::Result<&'static Lifeline> {
     if let Some(l) = LIFELINE.get() {

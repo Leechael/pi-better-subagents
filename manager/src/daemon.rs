@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 
 /// §3.2: zero active connections for this long -> graceful shutdown.
@@ -58,7 +58,6 @@ pub struct SessionEntry {
 
 pub struct DaemonState {
     pub home: PathBuf,
-    pub started: Instant,
     pub started_at_ms: u64,
     pub registry: Registry,
     /// Active (hello-completed) connections; the §3.2 idle rule counts these.
@@ -73,20 +72,77 @@ pub struct DaemonState {
     /// Turned true to park every task's pumps and exit watch between two
     /// reads, so their state sits in the entries (an in-place upgrade).
     pub park_tx: tokio::sync::watch::Sender<bool>,
+    /// An in-place upgrade is quiescing: no idle shutdown, no new requests.
+    pub upgrading: bool,
+    /// Right after an in-place upgrade: every client is reconnecting, so the
+    /// zero-connection idle shutdown must not fire yet.
+    pub hold_idle: bool,
+    pub foreground: bool,
+    /// Requests being served, and connection writers still flushing (an
+    /// upgrade waits for both).
+    pub inflight: Arc<std::sync::atomic::AtomicUsize>,
+    pub writers: Arc<std::sync::atomic::AtomicUsize>,
+    /// In-place upgrades this pid has gone through, and the latest attempt.
+    pub generation: u32,
+    pub last_upgrade: Option<UpgradeInfo>,
+    /// Asks the accept loop to upgrade in place (the trigger is kept next
+    /// to it).
+    pub upgrade_notify: Arc<Notify>,
+    /// Asked for and being preflighted, or preflighted and ready.
+    pub upgrade_pending: bool,
+    pub upgrade_ready: Option<crate::handover::Ready>,
+    /// Recent `start` request keys ("<session>\0<key>", task id), oldest
+    /// first: a retried start returns the task it already started.
+    pub start_keys: std::collections::VecDeque<(String, String)>,
+}
+
+/// Bound on remembered start keys.
+const START_KEYS_MAX: usize = 512;
+
+impl DaemonState {
+    fn new(home: PathBuf, registry: Registry, foreground: bool) -> DaemonState {
+        DaemonState {
+            home,
+            started_at_ms: now_ms(),
+            registry,
+            conns: HashMap::new(),
+            sessions: HashMap::new(),
+            next_conn_id: 1,
+            idle_timer: None,
+            shutdown: false,
+            shutdown_notify: Arc::new(Notify::new()),
+            clock: crate::clock::Clock::from_env(),
+            park_tx: tokio::sync::watch::channel(false).0,
+            upgrading: false,
+            hold_idle: false,
+            foreground,
+            inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            writers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            generation: 0,
+            last_upgrade: None,
+            upgrade_notify: Arc::new(Notify::new()),
+            upgrade_pending: false,
+            upgrade_ready: None,
+            start_keys: std::collections::VecDeque::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run(home: PathBuf, foreground: bool) -> i32 {
+pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> i32 {
+    if let Some(path) = handover {
+        return run_restored(home, path).await;
+    }
     if let Err(e) = std::fs::create_dir_all(&home) {
         eprintln!("pbs-manager: cannot create {}: {e}", home.display());
         return 1;
     }
     // §3.1: the lifetime lock on manager.lock decides who the daemon is; the
     // holder removes stale socket/pid files before binding. Held until exit.
-    let _daemon_lock = match lifecycle::claim_daemon(&home) {
+    let daemon_lock = match lifecycle::claim_daemon(&home) {
         Ok(Claim::Acquired(guard)) => guard,
         Ok(Claim::AlreadyRunning { pid }) => {
             match pid {
@@ -103,20 +159,7 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
 
     let mut registry = Registry::new(home.clone());
     let scan = lifecycle::scan_tasks(&home, &mut registry);
-    let state: Shared = Arc::new(Mutex::new(DaemonState {
-        home: home.clone(),
-        started: Instant::now(),
-        started_at_ms: now_ms(),
-        registry,
-        conns: HashMap::new(),
-        sessions: HashMap::new(),
-        next_conn_id: 1,
-        idle_timer: None,
-        shutdown: false,
-        shutdown_notify: Arc::new(Notify::new()),
-        clock: crate::clock::Clock::from_env(),
-        park_tx: tokio::sync::watch::channel(false).0,
-    }));
+    let state: Shared = Arc::new(Mutex::new(DaemonState::new(home.clone(), registry, foreground)));
 
     // Bind the well-known socket (§3.1). A plain tokio UnixListener: the
     // daemon owns its descriptor, which an in-place upgrade hands over.
@@ -163,6 +206,93 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
             std::process::id()
         );
     }
+    serve(state, listener, daemon_lock).await
+}
+
+/// Clients get this long to reconnect after an in-place upgrade before the
+/// zero-connection idle rule (§3.2) applies again.
+const HANDOVER_GRACE: Duration = Duration::from_secs(30);
+
+/// The new image after an in-place upgrade (`daemon --handover <file>`).
+async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
+    let restored = match crate::handover::restore(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            // No crash recovery (§3.2): exiting closes the lifeline and
+            // every runner takes its group down.
+            lifecycle::log_line(&home, &format!("upgrade: restore failed: {e}; exiting"));
+            eprintln!("pbs-manager: upgrade restore failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let live = crate::handover::live_ids(&restored);
+    let crate::handover::Restored { snap, listener, lock, entries } = restored;
+    let mut registry = Registry::new(home.clone());
+    lifecycle::scan_tasks_except(&home, &mut registry, &live);
+    for e in entries {
+        registry.tasks.insert(e.record.task_id.clone(), e);
+    }
+    let mut st = DaemonState::new(home.clone(), registry, snap.foreground);
+    st.started_at_ms = snap.started_at_ms;
+    st.generation = snap.generation;
+    st.hold_idle = true;
+    st.last_upgrade = Some(UpgradeInfo {
+        at: now_ms(),
+        ok: true,
+        from_version: snap.from_version.clone(),
+        to_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        error: None,
+        trigger: snap.trigger.clone(),
+    });
+    for s in &snap.sessions {
+        st.sessions.insert(
+            s.session_id.clone(),
+            SessionEntry {
+                pi_pid: s.pi_pid,
+                conn_id: None,
+                cwd: s.cwd.clone(),
+                extension_version: s.extension_version.clone(),
+                protocol: s.protocol,
+                connected_at: s.connected_at,
+                last_seen: s.last_seen,
+            },
+        );
+    }
+    for (sid, key) in snap.start_keys.iter().cloned() {
+        st.start_keys.push_back((sid, key));
+    }
+    let clock = st.clock.clone();
+    let state: Shared = Arc::new(Mutex::new(st));
+    for id in &live {
+        crate::handover::restart_task(&state, id);
+        crate::handover::rearm_timers(&state, id);
+    }
+    lifecycle::log_line(
+        &home,
+        &format!(
+            "upgraded in place: {} -> {} (pid {}, generation {}, {} live task(s))",
+            snap.from_version,
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
+            snap.generation,
+            live.len()
+        ),
+    );
+    // Clients reconnect within moments; the idle rule waits for them.
+    let s2 = state.clone();
+    tokio::spawn(async move {
+        clock.sleep("handover-grace", HANDOVER_GRACE).await;
+        s2.lock().unwrap().hold_idle = false;
+        maybe_arm_idle_timer(&s2);
+    });
+    serve(state, listener, lock).await
+}
+
+/// The accept loop, shared by a fresh daemon and one restored after an
+/// in-place upgrade. Also runs the upgrade itself when asked.
+async fn serve(state: Shared, listener: tokio::net::UnixListener, daemon_lock: lifecycle::DaemonLockGuard) -> i32 {
+    use std::os::fd::AsRawFd;
+    let home = state.lock().unwrap().home.clone();
 
     // §3.2: forget gone sessions past their retention, now and periodically.
     spawn_session_gc(&state);
@@ -171,7 +301,10 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
     // spawn per §3.1, so this never fires for a healthy startup).
     maybe_arm_idle_timer(&state);
 
-    let shutdown_notify = state.lock().unwrap().shutdown_notify.clone();
+    let (shutdown_notify, upgrade_notify) = {
+        let st = state.lock().unwrap();
+        (st.shutdown_notify.clone(), st.upgrade_notify.clone())
+    };
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
 
@@ -191,6 +324,13 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             },
+            _ = upgrade_notify.notified(), if shutdown_task.is_none() => {
+                let ready = state.lock().unwrap().upgrade_ready.take();
+                if let Some(ready) = ready {
+                    // Returns only if the upgrade did not happen.
+                    let _ = crate::handover::perform(&state, listener.as_raw_fd(), daemon_lock.raw_fd(), ready).await;
+                }
+            }
             _ = shutdown_notify.notified(), if shutdown_task.is_none() => {
                 shutdown_task = Some(begin_shutdown(&state));
             }
@@ -220,6 +360,7 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
             } => break,
         }
     }
+    drop(daemon_lock);
     0
 }
 
@@ -254,9 +395,26 @@ fn parse_request(bytes: &[u8]) -> Result<Request, (String, String)> {
     serde_json::from_value::<Request>(v).map_err(|e| (id, format!("bad request: {e}")))
 }
 
+/// Decrements a counter when dropped.
+struct CountGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl CountGuard {
+    fn new(c: &Arc<std::sync::atomic::AtomicUsize>) -> CountGuard {
+        c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        CountGuard(c.clone())
+    }
+}
+
+impl Drop for CountGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 async fn writer_task<W: tokio::io::AsyncWrite + Unpin>(
     mut w: W,
     mut rx: mpsc::Receiver<Arc<Vec<u8>>>,
+    _live: CountGuard,
 ) {
     while let Some(payload) = rx.recv().await {
         // An oversized frame is dropped, not written: write_frame would
@@ -276,7 +434,11 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
     let (mut rd, wr) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Arc<Vec<u8>>>(1024);
     let die = Arc::new(Notify::new());
-    tokio::spawn(writer_task(wr, rx));
+    let (writers, inflight) = {
+        let st = state.lock().unwrap();
+        (st.writers.clone(), st.inflight.clone())
+    };
+    tokio::spawn(writer_task(wr, rx, CountGuard::new(&writers)));
 
     // ---- hello: must be the first message on the connection (§3.3) ----
     let first = match tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut rd)).await {
@@ -364,6 +526,7 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
             },
         ))
         .await;
+    resume_carried_watches(&state, conn_id, &tx).await;
 
     // ---- request loop (requests may be pipelined; each runs in its own task) ----
     loop {
@@ -389,7 +552,19 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
         }
         let s2 = state.clone();
         let tx2 = tx.clone();
-        tokio::spawn(async move { dispatch(s2, conn_id, req, tx2).await });
+        let guard = CountGuard::new(&inflight);
+        let mut park = state.lock().unwrap().park_tx.subscribe();
+        tokio::spawn(async move {
+            // An in-place upgrade cancels requests at their next await and
+            // leaves them unanswered: the client resends them after it
+            // reconnects to the new image.
+            tokio::select! {
+                biased;
+                _ = task::parked(&mut park) => {}
+                _ = dispatch(s2, conn_id, req, tx2) => {}
+            }
+            drop(guard);
+        });
     }
 
     // ---- disconnect (§3.2: socket close marks the session disconnected) ----
@@ -503,6 +678,76 @@ fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
     }
 }
 
+/// Close every client connection (an in-place upgrade). A session's
+/// output subscriptions are remembered with how far it got
+/// (`delivered_cursor`), to be resumed when it reconnects.
+pub fn close_all_connections(state: &Shared, why: &str) {
+    let mut st = state.lock().unwrap();
+    let conn_sessions: HashMap<u64, String> = st
+        .conns
+        .iter()
+        .filter_map(|(id, h)| h.session_id.clone().map(|s| (*id, s)))
+        .collect();
+    for e in st.registry.tasks.values_mut() {
+        let delivered = e.delivered_cursor;
+        for w in std::mem::take(&mut e.watchers) {
+            if let Some(sid) = conn_sessions.get(&w) {
+                if !e.watch_sessions.iter().any(|(s, _)| s == sid) {
+                    e.watch_sessions.push((sid.clone(), delivered));
+                }
+            }
+        }
+    }
+    let ids: Vec<u64> = st.conns.keys().copied().collect();
+    for id in ids {
+        if let Some(h) = st.conns.get(&id) {
+            h.die.notify_one();
+        }
+        remove_conn(&mut st, id, why);
+    }
+}
+
+/// A session reconnecting after an in-place upgrade gets its output
+/// subscriptions back, plus the output it missed while away (from where
+/// the old image stopped pushing up to what the fanout has pushed since).
+async fn resume_carried_watches(state: &Shared, conn_id: u64, tx: &OutTx) {
+    let backlog: Vec<(String, String, u64, u64)> = {
+        let mut st = state.lock().unwrap();
+        let Some(sid) = st.conns.get(&conn_id).and_then(|h| h.session_id.clone()) else { return };
+        let mut out = Vec::new();
+        for (tid, e) in st.registry.tasks.iter_mut() {
+            if let Some(i) = e.watch_sessions.iter().position(|(s, _)| *s == sid) {
+                let (_, from) = e.watch_sessions.remove(i);
+                e.watchers.insert(conn_id);
+                // Under the state lock, like the fanout: every later chunk
+                // reaches this connection through the fanout, every earlier
+                // one is in [from, delivered_cursor).
+                out.push((tid.clone(), e.record.output_path.clone(), from, e.delivered_cursor));
+            }
+        }
+        out
+    };
+    for (tid, path, from, to) in backlog {
+        let mut cursor = from;
+        while cursor < to {
+            let want = ((to - cursor) as usize).min(256 * 1024);
+            let Ok((bytes, _)) = task::read_file_range(std::path::Path::new(&path), cursor, want) else { break };
+            if bytes.is_empty() {
+                break;
+            }
+            let n = task::utf8_chunk_len(&bytes, want, CHUNK_JSON_BUDGET, false).max(1);
+            let chunk = &bytes[..n.min(bytes.len())];
+            cursor += chunk.len() as u64;
+            let ev = encode_event(&EventKind::Output {
+                task_id: tid.clone(),
+                chunk: String::from_utf8_lossy(chunk).into_owned(),
+                next_cursor: cursor,
+            });
+            let _ = tx.send(ev).await;
+        }
+    }
+}
+
 /// §3.2: sweep gone sessions at startup and then every
 /// `gc::interval_ms(retention)`. The retention is read once per daemon.
 fn spawn_session_gc(state: &Shared) {
@@ -567,9 +812,9 @@ fn run_session_gc(state: &Shared, retention_ms: u64) {
 }
 
 /// §3.2: arm the 5s idle timer when the last active connection went away.
-fn maybe_arm_idle_timer(state: &Shared) {
+pub fn maybe_arm_idle_timer(state: &Shared) {
     let mut st = state.lock().unwrap();
-    if st.shutdown || !st.conns.is_empty() || st.idle_timer.is_some() {
+    if st.shutdown || st.upgrading || st.hold_idle || !st.conns.is_empty() || st.idle_timer.is_some() {
         return;
     }
     let state2 = state.clone();
@@ -611,6 +856,7 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             env,
             timeout_ms,
             origin,
+            key,
             ..
         } => {
             let spec = StartSpec {
@@ -620,6 +866,7 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
                 env,
                 timeout_ms,
                 origin,
+                key,
             };
             respond(&tx, &id, handle_start(&state, conn_id, spec)).await
         }
@@ -651,6 +898,7 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         }
         RequestKind::Status => respond(&tx, &id, handle_status(&state, conn_id)).await,
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
+        RequestKind::Upgrade => respond(&tx, &id, handle_upgrade(&state, conn_id)).await,
         #[cfg(feature = "test-clock")]
         ref k @ (RequestKind::ClockStatus | RequestKind::ClockAdvance { .. }) => {
             respond(&tx, &id, handle_clock(&state, k)).await
@@ -748,6 +996,7 @@ pub struct StartSpec {
     pub env: HashMap<String, String>,
     pub timeout_ms: Option<u64>,
     pub origin: Option<Origin>,
+    pub key: Option<String>,
 }
 
 fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk, ProtoError> {
@@ -758,6 +1007,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         env,
         timeout_ms,
         origin,
+        key,
     } = spec;
     let (session_id, home) = {
         let st = state.lock().unwrap();
@@ -780,6 +1030,17 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         };
         (sid, st.home.clone())
     };
+    // A resent start (same session, same key) gets the task it started.
+    if let Some(k) = &key {
+        let st = state.lock().unwrap();
+        let want = format!("{session_id}\u{0}{k}");
+        let prior = st.start_keys.iter().rev().find(|(sk, _)| *sk == want).map(|(_, t)| t.clone());
+        if let Some(tid) = prior {
+            if let Some(e) = st.registry.tasks.get(&tid) {
+                return Ok(StartOk { task_id: tid, pid: e.record.pid });
+            }
+        }
+    }
     if command.trim().is_empty() {
         return Err(ProtoError::new(E_BAD_REQUEST, "empty command"));
     }
@@ -852,6 +1113,12 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
             entry.watchers.insert(conn_id);
         }
         st.registry.tasks.insert(task_id.clone(), entry);
+        if let Some(k) = &key {
+            st.start_keys.push_back((format!("{session_id}\u{0}{k}"), task_id.clone()));
+            while st.start_keys.len() > START_KEYS_MAX {
+                st.start_keys.pop_front();
+            }
+        }
     }
     start_task_io(state, &task_id);
     spawn_exit_watch(state, &task_id);
@@ -1079,6 +1346,12 @@ fn spawn_kill_reaper(state: &Shared, task_id: &str, pid: u32) {
     arm_kill_reaper(state, task_id, pid, clock, KILL_GRACE);
 }
 
+/// Re-arm a stop's SIGKILL escalation with the time it had left.
+pub fn rearm_kill_reaper(state: &Shared, task_id: &str, pid: u32, left: Duration) {
+    let clock = state.lock().unwrap().clock.clone();
+    arm_kill_reaper(state, task_id, pid, clock, left);
+}
+
 fn arm_kill_reaper(state: &Shared, task_id: &str, pid: u32, clock: crate::clock::Clock, grace: Duration) {
     let state2 = state.clone();
     let tid = task_id.to_string();
@@ -1103,7 +1376,7 @@ fn arm_kill_reaper(state: &Shared, task_id: &str, pid: u32, clock: crate::clock:
 /// Track a process group whose leader exited while members remain, until the
 /// group empties. Polling keeps the pgid ours: POSIX does not reuse a pid
 /// while a group with that id exists.
-fn spawn_group_watcher(state: &Shared, task_id: &str, pgid: u32) {
+pub fn spawn_group_watcher(state: &Shared, task_id: &str, pgid: u32) {
     let state2 = state.clone();
     let tid = task_id.to_string();
     let clock = state.lock().unwrap().clock.clone();
@@ -1245,10 +1518,33 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
     Ok(StatusOk {
         version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
-        uptime_ms: st.started.elapsed().as_millis() as u64,
+        uptime_ms: now_ms().saturating_sub(st.started_at_ms),
         sessions,
         task_counts: TaskCounts { running, terminal },
         protocol: PROTOCOL,
+        generation: st.generation,
+        last_upgrade: st.last_upgrade.clone(),
+    })
+}
+
+fn handle_upgrade(state: &Shared, conn_id: u64) -> Result<UpgradeOk, ProtoError> {
+    let st = state.lock().unwrap();
+    if let Some(h) = st.conns.get(&conn_id) {
+        if h.kind != ClientKind::Cli {
+            return Err(ProtoError::new(E_FORBIDDEN, "upgrade is a cli-only operation"));
+        }
+    }
+    if st.shutdown {
+        return Err(ProtoError::new(E_INTERNAL, SHUTTING_DOWN));
+    }
+    let generation = st.generation;
+    drop(st);
+    if !crate::handover::request(state, "cli") {
+        return Err(ProtoError::new(E_INTERNAL, "an upgrade is already in progress"));
+    }
+    Ok(UpgradeOk {
+        from_version: env!("CARGO_PKG_VERSION").to_string(),
+        generation,
     })
 }
 
@@ -1274,7 +1570,7 @@ fn handle_shutdown(state: &Shared, conn_id: u64) -> Result<UnitOk, ProtoError> {
 /// (§3.3: output events only after watch).
 /// Start (or restart) a task's tee pumps and output fanout from the
 /// descriptors in its entry. A pipe already at EOF (None) is skipped.
-fn start_task_io(state: &Shared, task_id: &str) {
+pub fn start_task_io(state: &Shared, task_id: &str) {
     let mut st = state.lock().unwrap();
     let park = st.park_tx.subscribe();
     let Some(e) = st.registry.tasks.get_mut(task_id) else { return };
@@ -1416,7 +1712,7 @@ async fn read_status_line(
 ///
 /// The watch resumes from the entry (`exit_phase`, runner, status pipe,
 /// partial status line) and, when parked, puts all of it back there.
-fn spawn_exit_watch(state: &Shared, task_id: &str) {
+pub fn spawn_exit_watch(state: &Shared, task_id: &str) {
     let handle = tokio::spawn(run_exit_watch(state.clone(), task_id.to_string()));
     if let Some(e) = state.lock().unwrap().registry.tasks.get_mut(task_id) {
         e.exit_watch = Some(handle);
