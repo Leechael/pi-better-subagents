@@ -71,6 +71,52 @@ impl Conn {
     }
 }
 
+/// A CLI connection that outlives an in-place upgrade of the daemon, which
+/// closes every connection and leaves requests in flight unanswered. Use it
+/// only for idempotent requests (`output`, `wait`, `list`, `status`): one
+/// whose connection dropped is resent once on a fresh connection.
+pub struct Resilient {
+    home: PathBuf,
+    conn: Conn,
+}
+
+impl Resilient {
+    pub async fn connect(home: &Path) -> Result<Resilient, String> {
+        Ok(Resilient {
+            home: home.to_path_buf(),
+            conn: connect(home, &HelloMode::Cli).await?,
+        })
+    }
+
+    pub async fn call<T: DeserializeOwned>(&mut self, kind: RequestKind) -> Result<T, String> {
+        match self.conn.roundtrip(kind.clone()).await {
+            Err(e) if is_disconnect(&e) => {
+                self.conn = reconnect(&self.home).await.map_err(|re| format!("{e}; reconnect: {re}"))?;
+                self.conn.roundtrip(kind).await
+            }
+            r => r,
+        }
+    }
+}
+
+fn is_disconnect(e: &str) -> bool {
+    e == "manager closed the connection" || e.starts_with("send:") || e.starts_with("recv:")
+}
+
+/// Reconnect to the daemon that just closed our connection. During an
+/// upgrade the socket stays bound, so this succeeds as soon as the new image
+/// accepts; allow the whole preflight-free part of an upgrade (a few s).
+async fn reconnect(home: &Path) -> Result<Conn, String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match connect_existing(home, &HelloMode::Cli).await {
+            Ok(c) => return Ok(c),
+            Err(e) if std::time::Instant::now() > deadline => return Err(e),
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Connect + spawn flow (§3.1)
 // ---------------------------------------------------------------------------
@@ -223,7 +269,7 @@ pub async fn cmd_output(home: &Path, typed: &str, follow: bool, max_bytes: Optio
         }
         Target::Run(r, _) => return Err(format!("{r} is a run; pick one of its children (`show {r}`)")),
     };
-    let mut conn = connect(home, &HelloMode::Cli).await?;
+    let mut conn = Resilient::connect(home).await?;
     let mut cursor = 0u64;
     let mut remaining = max_bytes;
     loop {
@@ -233,7 +279,7 @@ pub async fn cmd_output(home: &Path, typed: &str, follow: bool, max_bytes: Optio
             None => 65536,
         };
         let resp: OutputOk = conn
-            .roundtrip(RequestKind::Output {
+            .call(RequestKind::Output {
                 task_id: task_id.clone(),
                 cursor,
                 max_bytes: want,
@@ -455,9 +501,9 @@ pub async fn cmd_wait(home: &Path, typed: &str, budget_ms: u64) -> Result<(), St
         Target::Agent(a) => return inspect::wait_agent(home, &a.child_id, budget_ms).await,
         Target::Run(r, _) => return Err(format!("{r} is a run; wait on one of its children")),
     };
-    let mut conn = connect(home, &HelloMode::Cli).await?;
+    let mut conn = Resilient::connect(home).await?;
     let res: WaitOk = conn
-        .roundtrip(RequestKind::Wait {
+        .call(RequestKind::Wait {
             task_id: task_id.to_string(),
             budget_ms,
         })
