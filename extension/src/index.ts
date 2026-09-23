@@ -377,7 +377,7 @@ export default function (pi: ExtensionAPI): void {
         return;
       }
       if (event.event === "output" && event.task_id && typeof event.chunk === "string") {
-        monitorRegistry?.handleOutput(event.task_id, event.chunk);
+        monitorRegistry?.handleOutput(event.task_id, event.chunk, event.next_cursor);
         return;
       }
       if (event.event === "task_exited" && event.task_id) {

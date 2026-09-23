@@ -57,6 +57,92 @@ describe("MonitorRegistry saturation", () => {
   });
 });
 
+describe("MonitorRegistry reconnect output recovery", () => {
+  it("slices a replayed UTF-8 byte overlap after the backfill cursor", async () => {
+    const clock = new ManualClock();
+    const delivered: string[] = [];
+    let registry!: MonitorRegistry;
+    let watchCount = 0;
+    const backfill = `${"中\n".repeat(200)}${"字\n".repeat(50)}`;
+    const replay = `${"字\n".repeat(25)}${"N".repeat(96)}\n`;
+    const manager = {
+      ensureAvailable: async () => true,
+      isAvailable: () => true,
+      start: async () => ({ task_id: "mon_utf8", pid: 13 }),
+      watch: async () => { watchCount++; },
+      output: async (_id: string, cursor: number) => {
+        if (cursor === 0) {
+          registry.handleOutput("mon_utf8", replay, 1097);
+          return { chunk: backfill, next_cursor: 1000, status: "running", exit_code: null, total_size: 1097 };
+        }
+        return { chunk: "", next_cursor: cursor, status: "running", exit_code: null, total_size: 1097 };
+      },
+      stop: async () => {},
+    } as unknown as ManagerClient;
+    const center = {
+      notifyMonitorEvent: (_description: string, _taskId: string, text: string) => delivered.push(text),
+      notify: () => {},
+    } as unknown as NotifyCenter;
+    registry = new MonitorRegistry({
+      getClient: () => manager,
+      sessionEnv: () => ({}),
+      getNotifyCenter: () => center,
+      trackTask: () => {},
+      clock,
+    });
+    await registry.start({ command: "ticker", description: "ticker", persistent: true }, { cwd: "/tmp" } as ExtensionContext);
+    await registry.rewatchAll();
+    clock.advanceBy(200);
+    expect(watchCount).toBe(2);
+    expect(delivered.join("\n")).toBe(`${backfill.slice(0, -1)}\n${"N".repeat(96)}`);
+    expect(delivered.join("\n").match(/字/g)).toHaveLength(50);
+    expect(delivered.join("\n").match(/N/g)).toHaveLength(96);
+    registry.disposeAll();
+  });
+
+  it("fetches the gap before queued events and dedupes overlapping cursors", async () => {
+    const clock = new ManualClock();
+    const sent: { details?: unknown; content?: string }[] = [];
+    let watchCount = 0;
+    const manager = {
+      ensureAvailable: async () => true,
+      isAvailable: () => true,
+      start: async () => ({ task_id: "mon_gap", pid: 12 }),
+      watch: async () => {
+        watchCount++;
+        if (watchCount === 2) registry.handleOutput("mon_gap", "new\n", 12);
+      },
+      output: async (_id: string, cursor: number) => {
+        if (cursor === 4) {
+          // Simulate a delayed overlapping output event racing the gap read.
+          registry.handleOutput("mon_gap", "gap\n", 8);
+          return { chunk: "gap\n", next_cursor: 8, status: "running", exit_code: null, total_size: 12 };
+        }
+        return { chunk: "", next_cursor: cursor, status: "running", exit_code: null, total_size: 12 };
+      },
+      stop: async () => {},
+    } as unknown as ManagerClient;
+    const center = new NotifyCenter({ sendMessage: (m) => sent.push(m), isIdle: () => true, clock });
+    const registry = new MonitorRegistry({
+      getClient: () => manager,
+      sessionEnv: () => ({}),
+      getNotifyCenter: () => center,
+      trackTask: () => {},
+      clock,
+    });
+    await registry.start({ command: "ticker", description: "ticker", persistent: true }, { cwd: "/tmp" } as ExtensionContext);
+    // The event stream skips the gap line, then overlaps it and continues.
+    registry.handleOutput("mon_gap", "old\n", 4);
+    await registry.rewatchAll();
+    clock.advanceBy(200);
+    const wake = sent.map((m) => m.details as PbsWake | undefined).find((d) => d?.kind === "monitor");
+    expect(wake).toMatchObject({ kind: "monitor", event: "old\ngap\nnew" });
+    expect(sent[0]?.content).not.toContain("gap\ngap");
+    center.dispose();
+    registry.disposeAll();
+  });
+});
+
 describe("MonitorRegistry early exit (manual testing, 2026-09-24)", () => {
   function setup(opts: { list?: () => unknown[] } = {}) {
     const clock = new ManualClock();
