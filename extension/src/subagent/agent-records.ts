@@ -20,6 +20,7 @@ export interface AgentChildRecord {
   status: "pending" | "running" | "completed" | "failed" | "interrupted";
   started_at: number;
   ended_at?: number;
+  error?: string;
 }
 
 export function agentRecordsDir(home: string, sessionId: string): string {

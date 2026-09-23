@@ -417,6 +417,7 @@ export default function (pi: ExtensionAPI): void {
           status: c.status,
           started_at: c.startedAt,
           ...(c.endedAt !== undefined ? { ended_at: c.endedAt } : {}),
+          ...(c.result?.error ? { error: c.result.error } : {}),
         };
         writeAgentChildRecord(home, rec);
         workIndex.upsert({
@@ -432,6 +433,7 @@ export default function (pi: ExtensionAPI): void {
           agent: c.agent,
           ...(c.model !== undefined ? { model: c.model } : {}),
           ...(c.result?.text ? { text: c.result.text } : {}),
+          ...(c.result?.error ? { error: c.result.error } : {}),
         });
       }
     });

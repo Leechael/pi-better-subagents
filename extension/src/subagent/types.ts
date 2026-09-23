@@ -86,6 +86,8 @@ export interface ChildSessionAdapter {
   abort(): Promise<void>;
   waitForIdle(): Promise<void>;
   getLastAssistantText(): string | undefined;
+  /** Provider/model failure outcome of the last assistant turn, when any. */
+  getLastAssistantFailure?(): { stopReason: "error" | "aborted"; errorMessage?: string } | undefined;
   getConversation(): ConversationTurn[];
   /** Introspection for child-session orchestration and contract tests. */
   getActiveToolNames?(): string[];

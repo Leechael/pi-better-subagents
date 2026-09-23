@@ -28,6 +28,8 @@ export interface WorkItem {
   model?: string;
   /** Last assistant text, for task_output on ch_ ids. */
   text?: string;
+  /** Failure reason for failed agents (shown in /tasks and task_list). */
+  error?: string;
 }
 
 export interface WorkCounts {

@@ -85,7 +85,8 @@ export function formatWorkRows(
   return items.map((item, i) => {
     const mark = i === selected ? "▸" : " ";
     const age = formatAge(item.startedAt, item.endedAt, now);
-    const raw = `${mark} ${item.kind.padEnd(7)} ${item.status.padEnd(11)} ${age.padEnd(6)} ${item.title}`;
+    const title = item.error ? `${item.title} · ${item.error}` : item.title;
+    const raw = `${mark} ${item.kind.padEnd(7)} ${item.status.padEnd(11)} ${age.padEnd(6)} ${title}`;
     return truncateToWidth(raw, Math.max(1, width), "…");
   });
 }
@@ -261,10 +262,11 @@ async function stopItem(item: WorkItem, deps: TasksCommandDeps): Promise<void> {
 async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksCommandDeps): Promise<void> {
   if (!ctx.hasUI) return;
   if (item.kind === "agent") {
-    const read = () =>
-      formatConversation(deps.getRegistry()?.handle(item.id)?.conversation() ?? []) ||
-      item.text ||
-      "(no output)";
+    const read = () => {
+      const body =
+        formatConversation(deps.getRegistry()?.handle(item.id)?.conversation() ?? []) || item.text || "(no output)";
+      return item.error ? `${body}\n\nError: ${item.error}` : body;
+    };
     try {
       await showScrollDetail(ctx.ui, { title: `subagent ${item.title}`, content: read, pollMs: 500, clock: deps.clock });
     } catch {

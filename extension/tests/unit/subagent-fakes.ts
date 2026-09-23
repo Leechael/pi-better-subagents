@@ -25,6 +25,7 @@ export class FakeChildSession implements ChildSessionAdapter {
   aborts = 0;
   disposed = false;
   lastText: string | undefined;
+  lastAssistantFailure: { stopReason: "error" | "aborted"; errorMessage?: string } | undefined;
   streaming = false;
   /** When set, runner prepends "You are running as model …" on first prompt. */
   resolvedModel?: string;
@@ -88,6 +89,10 @@ export class FakeChildSession implements ChildSessionAdapter {
 
   getLastAssistantText(): string | undefined {
     return this.lastText;
+  }
+
+  getLastAssistantFailure() {
+    return this.lastAssistantFailure;
   }
 
   getConversation() {

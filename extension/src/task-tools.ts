@@ -47,10 +47,13 @@ function agentTextFor(deps: TaskToolsDeps, id: string): string | undefined {
   const handle = deps.getRegistry?.()?.handle(id);
   const convo = handle?.conversation?.();
   if (convo && convo.length > 0) {
-    return convo.map((t) => `${t.role}: ${t.text}`).join("\n");
+    const text = convo.map((t) => `${t.role}: ${t.text}`).join("\n");
+    return indexed?.error ? `${text}\n\nError: ${indexed.error}` : text;
   }
-  if (indexed?.text) return indexed.text;
-  if (isAgent) return indexed?.text ?? "";
+  if (indexed?.text || indexed?.error) {
+    return [indexed.text, indexed.error ? `Error: ${indexed.error}` : undefined].filter(Boolean).join("\n\n");
+  }
+  if (isAgent) return "";
   return undefined;
 }
 
@@ -146,7 +149,8 @@ export function createTaskListTool(
           if (liveIds.has(rec.child_id) || seen.has(rec.child_id)) continue;
           if (!params.all && !isAgentStatusActive(rec.status)) continue;
           agentLines.push(
-            `${rec.child_id} [agent] ${rec.status} (run=${rec.run_id}) "${formatAgentCommand(rec).replace(/^agent:/, "")}"`,
+            `${rec.child_id} [agent] ${rec.status} (run=${rec.run_id}) "${formatAgentCommand(rec).replace(/^agent:/, "")}"` +
+              (rec.error ? ` — error: ${rec.error}` : ""),
           );
         }
       }

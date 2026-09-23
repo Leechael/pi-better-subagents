@@ -342,6 +342,16 @@ class InProcessChildHandle implements DisposableChildHandle {
       }
     }
     if (!this.isCurrent(gen)) return;
+    const failure = session?.getLastAssistantFailure?.();
+    if (failure) {
+      this.settle(gen, {
+        status: "failed",
+        text: this.partialText(),
+        error: failure.errorMessage?.trim() || `Model stopped with ${failure.stopReason}`,
+        durationMs: this.now() - this.startedAt,
+      });
+      return;
+    }
     this.settle(gen, {
       status: "completed",
       text: this.partialText(),

@@ -131,6 +131,23 @@ describe("subagent tool — tasks", () => {
     expect(factory.sessions).toHaveLength(2); // third never spawned
   });
 
+  it("reports provider stopReason errors as failed in the result and wake", async () => {
+    const { exec, factory, notify } = makeStack({ autoComplete: null });
+    factory.configure = (session) => {
+      session.lastAssistantFailure = { stopReason: "error", errorMessage: "529 overloaded_error" };
+    };
+    const result = await exec({ tasks: [{ prompt: "slow" }], async: true });
+    await flushMicrotasks();
+    expect(factory.sessions).toHaveLength(1);
+    factory.sessions[0].complete();
+    await flushMicrotasks();
+
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0].content).toContain('status="failed"');
+    expect(notify.mock.calls[0][0].content).toContain("<error>529 overloaded_error</error>");
+    expect(result.details).toMatchObject({ status: "backgrounded" });
+  });
+
   it("backgrounds the run when the foreground budget elapses, then notifies", async () => {
     const { exec, factory, notify, clock } = makeStack({ budgetMs: 50, autoComplete: null });
     const pending = exec({ tasks: [{ prompt: "slow" }] });

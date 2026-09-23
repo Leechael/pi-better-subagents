@@ -49,6 +49,11 @@ describe("tasks view", () => {
     expect(rows.join("\n")).toContain("running");
   });
 
+  it("shows failed agent error inline in the task row", () => {
+    const failed = { ...item("ch_error", "failed"), kind: "agent" as const, error: "529 overloaded_error" };
+    expect(formatWorkRows([failed], failed.id, 1000, 100)[0]).toContain("529 overloaded_error");
+  });
+
   it("shows elapsed time from the task start, not when it was backgrounded", () => {
     const index = new WorkIndex({ clock: new ManualClock(20_000) });
     index.upsert({

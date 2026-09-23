@@ -18,6 +18,23 @@ function makeReq(overrides: Partial<ChildRunRequest> = {}): ChildRunRequest {
 }
 
 describe("InProcessRunner", () => {
+  for (const stopReason of ["error", "aborted"] as const) {
+    it(`settles provider stopReason=${stopReason} as failed`, async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      factory.configure = (session) => {
+        session.lastAssistantFailure = { stopReason, errorMessage: "529 overloaded_error" };
+      };
+      const runner = new InProcessRunner({ createSession: factory.fn });
+      const handle = await runner.start(makeReq());
+      factory.sessions[0].complete();
+      const result = await handle.result;
+      expect(result.status).toBe("failed");
+      expect(result.error).toBe("529 overloaded_error");
+      expect(handle.status()).toBe("failed");
+    });
+  }
+
   it("completes with the last assistant text", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = "all done";

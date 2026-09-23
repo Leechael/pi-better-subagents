@@ -45,6 +45,27 @@ describe("agent child records", () => {
     );
   });
 
+  it("round-trips provider errors on failed agent records", () => {
+    home = mkdtempSync(join(tmpdir(), "pbs-agent-rec-"));
+    writeAgentChildRecord(home, {
+      v: 1,
+      kind: "agent",
+      child_id: "ch_error001",
+      run_id: "run_error001",
+      session_id: "sess-1",
+      name: "overloaded",
+      agent: "worker",
+      status: "failed",
+      started_at: 1,
+      ended_at: 2,
+      error: "529 overloaded_error",
+    });
+    expect(loadAgentChildRecords(home, { includeTerminal: true })[0]).toMatchObject({
+      status: "failed",
+      error: "529 overloaded_error",
+    });
+  });
+
   it("hides terminal records unless includeTerminal is set", () => {
     home = mkdtempSync(join(tmpdir(), "pbs-agent-rec-"));
     writeAgentChildRecord(home, {

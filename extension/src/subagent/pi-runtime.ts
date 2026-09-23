@@ -167,6 +167,16 @@ function wrapSession(
     abort: () => session.abort(),
     waitForIdle: () => session.waitForIdle(),
     getLastAssistantText: () => session.getLastAssistantText(),
+    getLastAssistantFailure: () => {
+      const lastAssistant = [...session.messages].reverse().find((message) => message.role === "assistant") as
+        | { stopReason?: string; errorMessage?: string }
+        | undefined;
+      if (lastAssistant?.stopReason !== "error" && lastAssistant?.stopReason !== "aborted") return undefined;
+      return {
+        stopReason: lastAssistant.stopReason,
+        ...(lastAssistant.errorMessage ? { errorMessage: lastAssistant.errorMessage } : {}),
+      };
+    },
     getConversation: () => turnsFromMessages(session.messages),
     getActiveToolNames: () => session.getActiveToolNames(),
     getSystemPrompt: () => session.systemPrompt,
