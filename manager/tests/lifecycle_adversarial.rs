@@ -1,0 +1,1145 @@
+//! Adversarial black-box lifecycle tests for pbs-manager.
+//!
+//! Each test targets one cell of the state-transition table in
+//! manager/TESTING.md (ids like `C3`, `T5`, `D7` refer to rows there) and
+//! asserts the customer-visible invariant: which processes are alive, which
+//! files exist, what the wire says. No crate internals are used.
+//!
+//! Tests marked `#[ignore = "bug: ..."]` reproduce real defects found while
+//! writing this suite; they are expected to FAIL until the bug is fixed.
+//! Run them with `cargo test --test lifecycle_adversarial -- --ignored`.
+
+mod common;
+
+use common::*;
+use serde_json::json;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::time::{Duration, Instant};
+
+/// Re-exec entry point for `HelperClient` (a killable stand-in for pi). It is
+/// a no-op unless PBSX_HELPER_HOME is set.
+#[test]
+#[ignore = "helper entry point, re-executed by crash tests; not a test"]
+fn helper_hold_extension_conn() {
+    helper_main();
+}
+
+const S: fn(u64) -> Duration = Duration::from_secs;
+const MS: fn(u64) -> Duration = Duration::from_millis;
+
+fn wait_output_contains(c: &mut Conn, task_id: &str, needle: &str) {
+    let ok = poll_true(S(5), || {
+        let r = c.request_ok(json!({"type":"output","task_id":task_id,"cursor":0,"max_bytes":65536}));
+        r["chunk"].as_str().unwrap_or("").contains(needle)
+    });
+    assert!(ok, "task {task_id} never printed {needle:?}");
+}
+
+// ===========================================================================
+// Daemon: spawn race / singleton (D1, D2, D3)
+// ===========================================================================
+
+/// D1: N clients race to auto-spawn the daemon on an empty home. Invariant:
+/// every client succeeds and they all talk to the same daemon.
+#[test]
+fn d1_concurrent_clients_spawn_exactly_one_daemon() {
+    let home = Home::new("d1");
+    for round in 0..3 {
+        let kids: Vec<_> = (0..12)
+            .map(|_| {
+                std::process::Command::new(BIN)
+                    .arg("--home")
+                    .arg(&home.path)
+                    .arg("status")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let mut pids = std::collections::BTreeSet::new();
+        for k in kids {
+            let out = k.wait_with_output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            assert!(
+                out.status.success(),
+                "round {round}: client failed: {} {}",
+                text,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let pid = text
+                .lines()
+                .find_map(|l| l.strip_prefix("pid:").map(|p| p.trim().parse::<u32>().unwrap()))
+                .expect("status prints pid");
+            pids.insert(pid);
+        }
+        assert_eq!(pids.len(), 1, "round {round}: clients reached different daemons: {pids:?}");
+        // Not asserted: "exactly one daemon *process*". Under heavy load an
+        // extra unreachable daemon was once observed (root cause = bug d3,
+        // whose reproducer fails reliably); asserting it here would flake.
+        // Tear down so the next round races a cold start again.
+        let out = home.cli(&["shutdown"], S(10));
+        assert!(out.status.success());
+        assert!(
+            poll_true(S(5), || daemon_pids_for(&home.path).is_empty()),
+            "daemon did not exit after shutdown"
+        );
+    }
+}
+
+/// CPU burners for race reproducers; killed on drop.
+struct Burners(Vec<std::process::Child>);
+impl Burners {
+    fn start() -> Burners {
+        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) * 2;
+        Burners(
+            (0..n)
+                .map(|_| {
+                    std::process::Command::new("sh")
+                        .args(["-c", "while :; do :; done"])
+                        .spawn()
+                        .unwrap()
+                })
+                .collect(),
+        )
+    }
+}
+impl Drop for Burners {
+    fn drop(&mut self) {
+        for b in self.0.iter_mut() {
+            let _ = b.kill();
+            let _ = b.wait();
+        }
+    }
+}
+
+/// D2: the same race, but starting from stale socket/pid files left by a
+/// SIGKILLed daemon. Every racing client runs the zombie-cleanup step, so a
+/// slow cleaner can unlink the socket of the daemon a faster client just
+/// spawned. Invariant: still exactly one reachable daemon.
+#[test]
+#[ignore = "bug (intermittent race; reproduces within 30 rounds under CPU pressure): client zombie-cleanup races a just-spawned daemon; read_pid_file sees the old dead pid, then cleanup_stale_files unlinks the NEW socket + pid file, every client fails with cannot reach pbs-manager and an unreachable daemon lingers"]
+fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
+    let home = Home::new("d2");
+    // Scheduler pressure widens the microsecond race window the way a busy
+    // laptop does; without it the race needs many rounds to show.
+    let _burn = Burners::start();
+    for round in 0..30 {
+        // Leave stale files behind: start a daemon, SIGKILL it.
+        let out = home.cli(&["status"], S(10));
+        assert!(out.status.success());
+        let old = home.pidfile_pid().expect("pid file");
+        kill_pid(old, libc::SIGKILL);
+        assert!(poll_true(S(3), || !pid_running(old)));
+        assert!(home.sock().exists() && home.pidfile().exists(), "stale files expected");
+
+        let kids: Vec<_> = (0..24)
+            .map(|_| {
+                std::process::Command::new(BIN)
+                    .arg("--home")
+                    .arg(&home.path)
+                    .arg("status")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let mut failures = Vec::new();
+        for k in kids {
+            let out = k.wait_with_output().unwrap();
+            if !out.status.success() {
+                failures.push(String::from_utf8_lossy(&out.stderr).to_string());
+            }
+        }
+        let live = daemon_pids_for(&home.path);
+        assert!(failures.is_empty(), "round {round}: clients failed: {failures:?}");
+        assert_eq!(live.len(), 1, "round {round}: daemons alive: {live:?}");
+        // The survivor must own the well-known socket.
+        let mut c = home.connect();
+        let h = c.hello_cli();
+        assert_eq!(h["pid"].as_u64().map(|p| p as u32), Some(live[0]));
+        drop(c);
+    }
+}
+
+/// D3: several `daemon` processes started at the same instant (bypassing the
+/// client spawn lock). Invariant: exactly one survives and it owns the socket
+/// and the pid file; the others exit 0 ("already running").
+#[test]
+#[ignore = "bug: concurrent `daemon` starts can both claim: claim_pid treats a just-bound socket with no pid file yet as a zombie and unlinks it, leaving an unreachable daemon running"]
+fn d3_concurrent_daemon_processes_leave_one_survivor() {
+    for round in 0..10 {
+        let home = Home::new(&format!("d3r{round}"));
+        let mut kids: Vec<_> = (0..6).map(|_| home.spawn_daemon()).collect();
+        // Losers exit quickly; give the field 3s to settle.
+        std::thread::sleep(MS(1500));
+        let mut running = Vec::new();
+        for k in kids.iter_mut() {
+            if k.try_wait().unwrap().is_none() {
+                running.push(k.id());
+            }
+        }
+        let owner = {
+            let mut c = home.connect();
+            c.hello_cli()["pid"].as_u64().unwrap() as u32
+        };
+        for k in kids.iter_mut() {
+            let _ = k.kill();
+            let _ = k.wait();
+        }
+        assert_eq!(
+            running,
+            vec![owner],
+            "round {round}: running daemons {running:?}, socket owner {owner}"
+        );
+    }
+}
+
+// ===========================================================================
+// Daemon: crash + restart re-adopt (D4, T7, T8)
+// ===========================================================================
+
+/// D4/T7/T8: SIGKILL the daemon while tasks run; one task dies while no
+/// manager is up. The restarted daemon must re-adopt the live pid (running),
+/// mark the dead one orphaned, detect the adopted task's later exit
+/// (completed, exit_code null, task_exited pushed), and still enforce the
+/// zero-connection shutdown on adopted tasks.
+#[test]
+fn d4_crash_restart_readopts_live_and_orphans_dead() {
+    let home = Home::new("d4");
+    let mut d1 = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-crash");
+    let (live_id, live_pid) = c.start("sleep 300");
+    let (dead_id, dead_pid) = c.start("sleep 300");
+    let (late_id, late_pid) = c.start("sleep 300");
+    drop(c);
+
+    d1.kill().unwrap();
+    d1.wait().unwrap();
+    assert!(pid_running(live_pid) && pid_running(dead_pid), "tasks must survive a manager SIGKILL");
+    // A task dies while no manager is watching.
+    kill_group(dead_pid, libc::SIGKILL);
+    assert!(poll_true(S(3), || !pid_running(dead_pid)));
+
+    let mut d2 = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-crash");
+    let live = c.task(&live_id).expect("live task listed after restart");
+    assert_eq!(live["status"], "running", "live pid must be re-adopted: {live}");
+    let dead = c.task(&dead_id).expect("dead task listed after restart");
+    assert_eq!(dead["status"], "orphaned", "dead pid must be orphaned: {dead}");
+    assert!(dead["ended_at"].as_u64().is_some(), "orphaned record needs ended_at: {dead}");
+    assert_eq!(home.record(&dead_id).unwrap()["status"], "orphaned", "orphaned persisted to disk");
+
+    // Adopted task exits on its own -> completed with exit_code null (§3.4),
+    // and the owning (re-connected) session is told.
+    kill_group(late_pid, libc::SIGKILL);
+    let t = c.wait_terminal(&late_id, S(5)).expect("adopted exit detected by polling");
+    assert_eq!(t["status"], "completed", "{t}");
+    assert!(t["exit_code"].is_null(), "{t}");
+    let ev = c.wait_event(S(3), |e| e["event"] == "task_exited" && e["task_id"] == json!(late_id));
+    assert!(ev.is_some(), "task_exited for adopted task must reach the session");
+    // wait on an adopted task that already finished answers done:true.
+    let w = c.request_ok(json!({"type":"wait","task_id":late_id,"budget_ms":1000}));
+    assert_eq!(w["done"], true);
+
+    // Anti-zombie still applies to re-adopted work.
+    drop(c);
+    assert!(wait_child(&mut d2, S(12)).is_some(), "restarted daemon must still idle-exit");
+    assert!(poll_true(S(2), || !pid_running(live_pid)), "adopted task must be killed at shutdown");
+    assert_eq!(home.record(&live_id).unwrap()["status"], "killed");
+}
+
+/// D4b: `stop` on a re-adopted task (no child handle, only a pid) must kill
+/// its whole process group and end as `killed`.
+#[test]
+fn d4b_stop_readopted_task_kills_group() {
+    let home = Home::new("d4b");
+    let mut d1 = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, pid) = c.start("sleep 300 & echo $!; wait");
+    let gc = wait_for_pids(&mut c, &id, 1)[0];
+    drop(c);
+    d1.kill().unwrap();
+    d1.wait().unwrap();
+
+    let _d2 = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    assert_eq!(c.status_of(&id).as_deref(), Some("running"));
+    c.request_ok(json!({"type":"stop","task_id":id}));
+    let t = c.wait_terminal(&id, S(5)).expect("adopted task terminal after stop");
+    assert_eq!(t["status"], "killed", "{t}");
+    assert!(poll_true(S(3), || !pid_running(pid) && !pid_running(gc)), "group must die");
+}
+
+// ===========================================================================
+// Connection loss -> 5s grace -> shutdown (C3, D5, D6, D7)
+// ===========================================================================
+
+/// C3/D5: the only extension client process is SIGKILLed. Invariant: nothing
+/// is killed during the 5s grace; after it, every task (including a
+/// SIGTERM-ignoring one and a grandchild) is dead, records say `killed`, and
+/// manager.sock / manager.pid are removed.
+#[test]
+fn d5_client_crash_grace_then_kill_everything_and_clean_files() {
+    let home = Home::new("d5");
+    let mut daemon = home.start_daemon();
+    let mut helper = HelperClient::spawn(
+        &home.path,
+        "sess-crash",
+        &[
+            "sleep 300",
+            "trap '' TERM; echo armed; sleep 300",
+            "sleep 300 & echo $!; wait",
+        ],
+    );
+    assert_eq!(helper.tasks.len(), 3);
+    let (stub_id, _) = helper.tasks[1].clone();
+    let (gc_id, _) = helper.tasks[2].clone();
+    let gc = {
+        let mut cli = home.connect();
+        cli.hello_cli();
+        wait_output_contains(&mut cli, &stub_id, "armed");
+        wait_for_pids(&mut cli, &gc_id, 1)[0]
+    }; // cli connection closed again: the helper is the only connection
+    let pids: Vec<u32> = helper.tasks.iter().map(|t| t.1).chain([gc]).collect();
+
+    helper.crash();
+    let t0 = Instant::now();
+
+    // During the grace window the daemon and all tasks are untouched.
+    std::thread::sleep(S(3));
+    assert!(daemon.try_wait().unwrap().is_none(), "daemon exited inside the 5s grace");
+    for p in &pids {
+        assert!(pid_running(*p), "pid {p} killed inside the 5s grace");
+    }
+
+    let st = wait_child(&mut daemon, S(12)).expect("daemon must exit after the grace");
+    let elapsed = t0.elapsed();
+    assert!(elapsed >= MS(4500), "daemon exited after {elapsed:?}, before the 5s grace");
+    assert!(st.success(), "graceful exit status: {st:?}");
+    for p in &pids {
+        assert!(poll_true(S(1), || !pid_running(*p)), "pid {p} survived manager shutdown");
+    }
+    assert!(!home.sock().exists(), "manager.sock left behind");
+    assert!(!home.pidfile().exists(), "manager.pid left behind");
+    for (id, _) in &helper.tasks {
+        assert_eq!(home.record(id).unwrap()["status"], "killed", "record {id}");
+    }
+}
+
+/// D6: a new connection inside the grace cancels shutdown, and the grace
+/// restarts from zero when that connection leaves too.
+#[test]
+fn d6_connection_inside_grace_cancels_shutdown() {
+    let home = Home::new("d6");
+    let mut daemon = home.start_daemon();
+    let mut a = home.connect();
+    a.hello_ext("sess-a");
+    let (id, pid) = a.start("sleep 300");
+    drop(a);
+
+    std::thread::sleep(MS(2500));
+    let mut b = home.connect();
+    assert_eq!(b.hello_cli()["ok"], true);
+    // Well past the original deadline (5s) plus the 2s kill grace.
+    std::thread::sleep(S(5));
+    assert!(daemon.try_wait().unwrap().is_none(), "shutdown was not cancelled");
+    assert!(pid_running(pid), "task killed although a client reconnected");
+    assert_eq!(b.status_of(&id).as_deref(), Some("running"));
+
+    drop(b);
+    let t1 = Instant::now();
+    assert!(wait_child(&mut daemon, S(12)).is_some(), "daemon must exit once idle again");
+    assert!(t1.elapsed() >= MS(4500), "grace did not restart: exited after {:?}", t1.elapsed());
+    assert!(poll_true(S(1), || !pid_running(pid)));
+}
+
+/// D6b: a brief reconnect inside the grace must restart the grace from the
+/// moment that client leaves; the first (cancelled) countdown must not fire.
+#[test]
+fn d6b_brief_reconnect_restarts_grace() {
+    let home = Home::new("d6b");
+    let mut daemon = home.start_daemon();
+    let mut a = home.connect();
+    a.hello_ext("sess-a");
+    let (_, pid) = a.start("sleep 300");
+    drop(a);
+    std::thread::sleep(S(1));
+    let mut b = home.connect();
+    b.hello_cli();
+    std::thread::sleep(S(1));
+    drop(b);
+    let t1 = Instant::now();
+    // The original countdown would fire ~3s from here.
+    std::thread::sleep(MS(3800));
+    assert!(daemon.try_wait().unwrap().is_none(), "stale countdown shut the daemon down");
+    assert!(pid_running(pid));
+    assert!(wait_child(&mut daemon, S(10)).is_some());
+    assert!(t1.elapsed() >= MS(4500), "exited {:?} after the last client left", t1.elapsed());
+}
+
+/// C1/D7: a connection that never completes hello does not count as active,
+/// so a stuck or hostile socket peer cannot keep tasks alive forever.
+#[test]
+fn d7_unhelloed_connection_does_not_hold_daemon_alive() {
+    let home = Home::new("d7");
+    let mut daemon = home.start_daemon();
+    let _raw = UnixStream::connect(home.sock()).unwrap();
+    let t0 = Instant::now();
+    assert!(wait_child(&mut daemon, S(9)).is_some(), "daemon kept alive by a silent connection");
+    assert!(t0.elapsed() >= S(4), "exited before the grace");
+}
+
+/// C5/D8: a hello that arrives while shutdown is in progress is refused (it
+/// must neither be accepted nor cancel the shutdown).
+#[test]
+fn d8_hello_during_shutdown_is_refused_and_does_not_cancel() {
+    let home = Home::new("d8");
+    let mut daemon = home.start_daemon();
+    let mut a = home.connect();
+    a.hello_ext("sess-a");
+    let (id, pid) = a.start("trap '' TERM; echo armed; sleep 300");
+    wait_output_contains(&mut a, &id, "armed");
+
+    // Accepted before shutdown, hello after: once shutdown starts the accept
+    // loop is gone, so this is the only way a hello can race shutdown.
+    let mut late = home.connect();
+    std::thread::sleep(MS(200));
+    let out = home.cli(&["shutdown"], S(10));
+    assert!(out.status.success(), "shutdown: {}", out.stderr);
+    assert!(out.stdout.contains("shutting down"));
+    // The SIGTERM-ignoring task holds shutdown in its 2s grace; say hello now.
+    match late.try_request(json!({"type":"hello","client_kind":"extension","session_id":"late","pi_pid":1}), S(3)) {
+        Some(r) => assert_eq!(r["ok"], false, "hello accepted during shutdown: {r}"),
+        None => assert!(late.closed, "hello neither answered nor refused"),
+    }
+    assert!(wait_child(&mut daemon, S(8)).is_some(), "late hello cancelled shutdown");
+    assert!(!pid_running(pid));
+    // The still-open extension connection did not block the explicit shutdown.
+    drop(a);
+}
+
+/// D9: explicit `shutdown` with tasks running and an extension still
+/// connected: tasks killed (SIGKILL escalation included), records `killed`,
+/// files removed.
+#[test]
+fn d9_shutdown_command_kills_tasks_and_cleans_files() {
+    let home = Home::new("d9");
+    let mut daemon = home.start_daemon();
+    let mut a = home.connect();
+    a.hello_ext("sess-a");
+    let (id1, p1) = a.start("sleep 300");
+    let (id2, p2) = a.start("trap '' TERM; echo armed; sleep 300");
+    wait_output_contains(&mut a, &id2, "armed");
+    let out = home.cli(&["shutdown"], S(10));
+    assert!(out.status.success());
+    assert!(wait_child(&mut daemon, S(8)).is_some(), "daemon must exit after shutdown");
+    assert!(!pid_running(p1) && !pid_running(p2));
+    assert!(!home.sock().exists() && !home.pidfile().exists());
+    assert_eq!(home.record(&id1).unwrap()["status"], "killed");
+    assert_eq!(home.record(&id2).unwrap()["status"], "killed");
+    // Extension sees the connection go away (it can then respawn a manager).
+    assert!(a.wait_closed(S(3)));
+}
+
+// ===========================================================================
+// Stale socket / pid files (D10, D11, D12)
+// ===========================================================================
+
+/// D10: stale socket + pid file of a SIGKILLed daemon. A plain CLI call
+/// recovers: cleans up, spawns a new daemon, succeeds.
+#[test]
+fn d10_client_recovers_from_dead_daemon_files() {
+    let home = Home::new("d10");
+    let out = home.cli(&["status"], S(10));
+    assert!(out.status.success());
+    let old = home.pidfile_pid().unwrap();
+    kill_pid(old, libc::SIGKILL);
+    assert!(poll_true(S(3), || !pid_running(old)));
+    assert!(home.sock().exists() && home.pidfile().exists());
+
+    let out = home.cli(&["status"], S(10));
+    assert!(out.status.success(), "{}", out.stderr);
+    let new = home.pidfile_pid().unwrap();
+    assert_ne!(new, old);
+    assert!(out.stdout.contains(&format!("pid:      {new}")) || out.stdout.contains(&new.to_string()));
+}
+
+/// D11: a dead socket file with no pid file (e.g. pid file deleted by hand).
+#[test]
+fn d11_client_recovers_from_socket_without_pidfile() {
+    let home = Home::new("d11");
+    drop(UnixListener::bind(home.sock()).unwrap()); // leaves a dead socket inode
+    assert!(home.sock().exists());
+    let out = home.cli(&["status"], S(10));
+    assert!(out.status.success(), "{}", out.stderr);
+    assert!(home.pidfile_pid().map(pid_running).unwrap_or(false));
+}
+
+/// D11b: garbage in manager.pid is treated as "no pid file".
+#[test]
+fn d11b_client_recovers_from_corrupt_pidfile() {
+    let home = Home::new("d11b");
+    std::fs::write(home.pidfile(), b"{not json").unwrap();
+    let out = home.cli(&["status"], S(10));
+    assert!(out.status.success(), "{}", out.stderr);
+}
+
+/// D12: manager.pid names a pid that is alive but is NOT a pbs-manager (pid
+/// reuse after a crash/reboot). The manager must still come up.
+#[test]
+#[ignore = "bug: pid-file liveness is kill(pid,0) only; a reused pid makes the daemon refuse to start forever (client: 'cannot reach pbs-manager')"]
+fn d12_reused_pid_in_pidfile_does_not_block_startup() {
+    let home = Home::new("d12");
+    let mut impostor = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+    std::fs::write(
+        home.pidfile(),
+        format!(r#"{{"pid":{},"version":"0.1.0","started_at":0}}"#, impostor.id()),
+    )
+    .unwrap();
+    let out = home.cli(&["status"], S(15));
+    let _ = impostor.kill();
+    let _ = impostor.wait();
+    assert!(out.status.success(), "manager blocked by reused pid: {}", out.stderr);
+}
+
+// ===========================================================================
+// Task stop / kill semantics (T3, T4, T5, T6, T9)
+// ===========================================================================
+
+/// T4: `stop` sends SIGTERM first — a task with a TERM handler gets to run it.
+#[test]
+fn t4_stop_sends_sigterm_first() {
+    let home = Home::new("t4");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, _) = c.start("trap 'echo got-term; exit 7' TERM; echo armed; while :; do sleep 0.05; done");
+    wait_output_contains(&mut c, &id, "armed");
+    c.request_ok(json!({"type":"stop","task_id":id}));
+    let t = c.wait_terminal(&id, S(4)).expect("terminal after stop");
+    assert_eq!(t["status"], "killed", "stop always ends as killed: {t}");
+    wait_output_contains(&mut c, &id, "got-term");
+}
+
+/// T5: a task ignoring SIGTERM survives the 2s grace, then is SIGKILLed.
+#[test]
+fn t5_sigterm_ignoring_task_is_sigkilled_after_grace() {
+    let home = Home::new("t5");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, pid) = c.start("trap '' TERM; echo armed; sleep 300");
+    wait_output_contains(&mut c, &id, "armed");
+    let t0 = Instant::now();
+    let r = c.request_ok(json!({"type":"stop","task_id":id}));
+    assert_eq!(r["ok"], true);
+    std::thread::sleep(S(1));
+    assert!(pid_running(pid), "SIGKILL arrived before the 2s grace");
+    assert_eq!(c.status_of(&id).as_deref(), Some("running"));
+    let t = c.wait_terminal(&id, S(5)).expect("SIGKILL escalation");
+    let elapsed = t0.elapsed();
+    assert_eq!(t["status"], "killed");
+    assert!(elapsed >= MS(1500), "killed after {elapsed:?}");
+    assert!(!pid_running(pid));
+    let ev = c
+        .wait_event(S(2), |e| e["event"] == "task_exited" && e["task_id"] == json!(id))
+        .expect("task_exited");
+    assert!(ev["exit_code"].is_null(), "{ev}");
+    assert!(!ev["signal"].is_null(), "killed task_exited must carry the signal: {ev}");
+}
+
+/// T5b: §3.3 says killed task_exited carries `signal:"SIGTERM"|"SIGKILL"`;
+/// the extension types it as `string | null`.
+#[test]
+#[ignore = "bug: task_exited/TaskRecord.signal is an integer (15/9), contract §3.3 and extension type say a string \"SIGTERM\"|\"SIGKILL\""]
+fn t5b_signal_field_is_signal_name() {
+    let home = Home::new("t5b");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, _) = c.start("sleep 300");
+    c.request_ok(json!({"type":"stop","task_id":id}));
+    let ev = c
+        .wait_event(S(5), |e| e["event"] == "task_exited" && e["task_id"] == json!(id))
+        .expect("task_exited");
+    assert!(
+        ev["signal"] == "SIGTERM" || ev["signal"] == "SIGKILL",
+        "signal should be a name: {ev}"
+    );
+}
+
+/// T6: stop reaches grandchildren through the process group.
+#[test]
+fn t6_stop_kills_grandchildren() {
+    let home = Home::new("t6");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, pid) = c.start("sleep 300 & echo $!; (sleep 300 & echo $!; wait) & wait");
+    let gcs = wait_for_pids(&mut c, &id, 2);
+    for g in &gcs {
+        assert!(pid_running(*g));
+    }
+    c.request_ok(json!({"type":"stop","task_id":id}));
+    assert!(
+        poll_true(S(4), || !pid_running(pid) && gcs.iter().all(|g| !pid_running(*g))),
+        "grandchildren {gcs:?} survived stop"
+    );
+    assert_eq!(c.wait_terminal(&id, S(3)).unwrap()["status"], "killed");
+}
+
+/// T6b: leader dies on SIGTERM but a grandchild ignores it. The group must
+/// still be SIGKILLed after the grace.
+#[test]
+#[ignore = "bug: kill escalation only targets tasks whose leader is still running; a SIGTERM-ignoring grandchild outlives stop and manager shutdown"]
+fn t6b_stop_kills_term_ignoring_grandchild_after_leader_exits() {
+    let home = Home::new("t6b");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, _) = c.start("sh -c \"trap '' TERM; echo armed; exec sleep 300\" & echo $!; wait");
+    wait_output_contains(&mut c, &id, "armed");
+    let gc = wait_for_pids(&mut c, &id, 1)[0];
+    c.request_ok(json!({"type":"stop","task_id":id}));
+    assert_eq!(c.wait_terminal(&id, S(3)).unwrap()["status"], "killed");
+    let dead = poll_true(S(5), || !pid_running(gc));
+    kill_pid(gc, libc::SIGKILL);
+    assert!(dead, "grandchild {gc} ignored SIGTERM and was never SIGKILLed");
+}
+
+/// T6c: a task that backgrounds a child and exits. §3.2: background work must
+/// not outlive the last pi, so manager shutdown must reach the leftover group.
+#[test]
+#[ignore = "bug: shutdown only signals groups of tasks still marked running; children left behind by an exited task leader survive the manager"]
+fn t6c_shutdown_kills_leftover_group_of_exited_task() {
+    let home = Home::new("t6c");
+    let mut daemon = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, _) = c.start("sleep 300 >/dev/null 2>&1 & echo $!");
+    let gc = wait_for_pids(&mut c, &id, 1)[0];
+    assert_eq!(c.wait_terminal(&id, S(3)).unwrap()["status"], "completed");
+    assert!(pid_running(gc));
+    drop(c);
+    assert!(wait_child(&mut daemon, S(12)).is_some());
+    let dead = poll_true(S(2), || !pid_running(gc));
+    kill_pid(gc, libc::SIGKILL);
+    assert!(dead, "grandchild {gc} outlived the manager");
+}
+
+/// T3: timeout_ms is a hard ceiling -> killed; a task finishing before its
+/// ceiling is not affected.
+#[test]
+fn t3_timeout_ms_hard_kill() {
+    let home = Home::new("t3");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (slow, pid) = c.start_with(json!({"type":"start","kind":"shell","command":"sleep 300","cwd":"/tmp",
+        "env":{"PATH":PATH_ENV},"timeout_ms":300}));
+    let (fast, _) = c.start_with(json!({"type":"start","kind":"shell","command":"echo ok","cwd":"/tmp",
+        "env":{"PATH":PATH_ENV},"timeout_ms":5000}));
+    let t = c.wait_terminal(&slow, S(3)).expect("timeout must kill");
+    assert_eq!(t["status"], "killed", "{t}");
+    assert!(!pid_running(pid));
+    let f = c.wait_terminal(&fast, S(3)).unwrap();
+    assert_eq!(f["status"], "completed", "{f}");
+    assert_eq!(f["exit_code"], 0);
+}
+
+/// T1/T2: exit mapping observed on the wire: exit 0 -> completed, exit N ->
+/// failed(N), killed by an outside signal -> failed with signal.
+#[test]
+fn t2_exit_status_mapping() {
+    let home = Home::new("t2");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (ok, _) = c.start("true");
+    let (bad, _) = c.start("exit 3");
+    let (sig, _) = c.start("kill -KILL $$");
+    let r = c.wait_terminal(&ok, S(3)).unwrap();
+    assert_eq!((r["status"].as_str(), r["exit_code"].as_i64()), (Some("completed"), Some(0)));
+    let r = c.wait_terminal(&bad, S(3)).unwrap();
+    assert_eq!((r["status"].as_str(), r["exit_code"].as_i64()), (Some("failed"), Some(3)));
+    let r = c.wait_terminal(&sig, S(3)).unwrap();
+    assert_eq!(r["status"], "failed", "{r}");
+    assert!(r["exit_code"].is_null() && r["signal"] == 9, "{r}");
+    let w = c.request_ok(json!({"type":"wait","task_id":bad,"budget_ms":100}));
+    assert_eq!((w["done"].as_bool(), w["exit_code"].as_i64()), (Some(true), Some(3)));
+    // Records on disk agree with the wire.
+    assert_eq!(home.record(&bad).unwrap()["status"], "failed");
+    assert!(home.record(&ok).unwrap()["ended_at"].as_u64().is_some());
+}
+
+// ===========================================================================
+// Sessions: rebind, disconnect, reattach (C4, S2, S3)
+// ===========================================================================
+
+/// C4: duplicate hello for the same session: the old connection gets
+/// `session_rebound` and is closed; the new one owns the session's tasks and
+/// events.
+#[test]
+fn c4_duplicate_hello_rebinds_session() {
+    let home = Home::new("c4");
+    let _d = home.start_daemon();
+    let mut a = home.connect();
+    a.hello_ext("sess-dup");
+    let (id, _) = a.start("sleep 300");
+
+    let mut b = home.connect();
+    assert_eq!(b.hello_ext("sess-dup")["ok"], true);
+    assert!(
+        a.wait_event(S(3), |e| e["event"] == "session_rebound").is_some(),
+        "old connection must get session_rebound"
+    );
+    assert!(a.wait_closed(S(3)), "old connection must be closed by the server");
+
+    assert_eq!(b.status_of(&id).as_deref(), Some("running"));
+    b.request_ok(json!({"type":"stop","task_id":id}));
+    assert!(
+        b.wait_event(S(5), |e| e["event"] == "task_exited" && e["task_id"] == json!(id)).is_some(),
+        "events for the session must follow the new connection"
+    );
+    let mut cli = home.connect();
+    cli.hello_cli();
+    let st = cli.request_ok(json!({"type":"status"}));
+    let sessions: Vec<_> = st["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["session_id"] == "sess-dup")
+        .collect();
+    assert_eq!(sessions.len(), 1, "{st}");
+    assert_eq!(sessions[0]["connected"], true);
+}
+
+/// S2/S3: pi crashes while another pi keeps the manager alive: its tasks keep
+/// running past the grace, the session shows disconnected, and a resumed pi
+/// (same session id) re-attaches and receives the task's events.
+#[test]
+fn s3_session_survives_crash_while_others_connected_and_reattaches() {
+    let home = Home::new("s3");
+    let _d = home.start_daemon();
+    let mut keeper = home.connect();
+    keeper.hello_ext("keeper");
+    let mut helper = HelperClient::spawn(&home.path, "resumable", &["sleep 300"]);
+    let (id, pid) = helper.tasks[0].clone();
+    helper.crash();
+
+    let mut cli = home.connect();
+    cli.hello_cli();
+    assert!(
+        poll_true(S(3), || {
+            let st = cli.request_ok(json!({"type":"status"}));
+            st["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["session_id"] == "resumable" && s["connected"] == false)
+        }),
+        "crashed session must show disconnected"
+    );
+    drop(cli);
+    std::thread::sleep(MS(6000)); // longer than the 5s idle grace
+    assert!(pid_running(pid), "task of a crashed session killed while another pi is connected");
+
+    let mut resumed = home.connect();
+    resumed.hello_ext("resumable");
+    assert_eq!(resumed.status_of(&id).as_deref(), Some("running"));
+    resumed.request_ok(json!({"type":"stop","task_id":id}));
+    assert!(resumed
+        .wait_event(S(5), |e| e["event"] == "task_exited" && e["task_id"] == json!(id))
+        .is_some());
+    // Another session cannot see it.
+    let r = keeper.request(json!({"type":"stop","task_id":id}));
+    assert_eq!(r["ok"], false);
+    assert_eq!(r["error"]["code"], "E_FORBIDDEN");
+}
+
+// ===========================================================================
+// Backpressure, output, framing (C6, O1-O4, F1-F3)
+// ===========================================================================
+
+/// C6: a watcher that never reads its socket must not stall the task, other
+/// clients, or grow the daemon's memory with the output volume.
+#[test]
+fn c6_never_reading_watcher_is_bounded_and_isolated() {
+    let home = Home::new("c6");
+    let d = home.start_daemon();
+    let daemon_pid = d.id();
+    let mut other = home.connect();
+    other.hello_ext("sess-other");
+    let base_rss = rss_bytes(daemon_pid).unwrap();
+
+    const TOTAL: u64 = 256 * 1024 * 1024;
+    let mut slow = home.connect();
+    slow.hello_ext("sess-slow");
+    let (id, _) = slow.start(&format!(
+        "sleep 0.3; yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx | head -c {TOTAL}"
+    ));
+    slow.request_ok(json!({"type":"watch","task_id":id}));
+    // From here on `slow` is never read again.
+
+    let mut peak = base_rss;
+    let mut worst_latency = Duration::ZERO;
+    let deadline = Instant::now() + S(90);
+    loop {
+        let t = Instant::now();
+        let r = other
+            .try_request(json!({"type":"list","all":true}), S(5))
+            .expect("other client starved by a slow watcher");
+        worst_latency = worst_latency.max(t.elapsed());
+        peak = peak.max(rss_bytes(daemon_pid).unwrap_or(0));
+        let _ = r;
+        let mut cli = home.connect();
+        cli.hello_cli();
+        let done = cli.status_of(&id).map(|s| s != "running").unwrap_or(false);
+        if done {
+            break;
+        }
+        assert!(Instant::now() < deadline, "big task stalled behind a slow watcher");
+        std::thread::sleep(MS(100));
+    }
+    let growth = peak.saturating_sub(base_rss);
+    eprintln!(
+        "c6: rss growth {} MiB, worst latency {worst_latency:?}",
+        growth >> 20
+    );
+    assert!(
+        worst_latency < S(2),
+        "other client latency {worst_latency:?} while a watcher was stuck"
+    );
+    assert!(
+        growth < 96 * 1024 * 1024,
+        "daemon RSS grew by {} MiB for {} MiB of output with a stuck watcher",
+        growth >> 20,
+        TOTAL >> 20
+    );
+    // Other clients still get full service.
+    let (e, _) = other.start("echo still-alive");
+    let w = other.request_ok(json!({"type":"wait","task_id":e,"budget_ms":3000}));
+    assert_eq!(w["done"], true);
+    drop(slow);
+}
+
+/// O1: multi-MB output round-trips exactly through cursor reads; server caps
+/// a single read so a response never exceeds the 4 MiB frame.
+#[test]
+fn o1_huge_output_roundtrip() {
+    let home = Home::new("o1");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    const N: u64 = 20_000_000;
+    let (id, _) = c.start(&format!("head -c {N} /dev/zero | tr '\\0' 'a'"));
+    let w = c.request_ok(json!({"type":"wait","task_id":id,"budget_ms":30000}));
+    assert_eq!(w["done"], true);
+    let big = c.request_ok(json!({"type":"output","task_id":id,"cursor":0,"max_bytes":64u64<<20}));
+    let len = big["chunk"].as_str().unwrap().len() as u64;
+    assert!(len > 0 && len <= 1 << 20, "single read returned {len} bytes");
+    let (text, cursor, last) = c.read_all_output(&id, 1 << 20);
+    assert_eq!(text.len() as u64, N);
+    assert!(text.bytes().all(|b| b == b'a'));
+    assert_eq!(cursor, N);
+    assert_eq!(last["total_size"], N);
+    let rec = c.task(&id).unwrap();
+    assert_eq!(rec["output_size"], N, "{rec}");
+    assert_eq!(std::fs::metadata(rec["output_path"].as_str().unwrap()).unwrap().len(), N);
+    // Reading past EOF is empty, not an error.
+    let r = c.request_ok(json!({"type":"output","task_id":id,"cursor":N+10,"max_bytes":100}));
+    assert_eq!(r["chunk"], "");
+    assert_eq!(r["next_cursor"], N + 10);
+}
+
+/// O2: invalid UTF-8 becomes U+FFFD, but cursors stay byte offsets.
+#[test]
+fn o2_invalid_utf8_is_lossy_with_byte_cursors() {
+    let home = Home::new("o2");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, _) = c.start("printf 'ok\\377\\376end\\n'");
+    c.request_ok(json!({"type":"wait","task_id":id,"budget_ms":3000}));
+    let r = c.request_ok(json!({"type":"output","task_id":id,"cursor":0,"max_bytes":65536}));
+    assert_eq!(r["chunk"], "ok\u{FFFD}\u{FFFD}end\n");
+    assert_eq!(r["next_cursor"], 8);
+    assert_eq!(r["total_size"], 8);
+    let r = c.request_ok(json!({"type":"output","task_id":id,"cursor":3,"max_bytes":2}));
+    assert_eq!(r["chunk"], "\u{FFFD}e");
+    assert_eq!(r["next_cursor"], 5);
+}
+
+/// O3: output made of JSON-escaped control bytes expands ~6x when framed; a
+/// max-size read must still produce a response instead of silently killing
+/// the connection's writer.
+#[test]
+#[ignore = "bug: a 1 MiB read of control-byte output serializes to >4 MiB; write_frame fails, the writer task exits and the client never gets a response (connection goes mute)"]
+fn o3_control_byte_output_large_read_still_answers() {
+    let home = Home::new("o3");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, _) = c.start("head -c 1048576 /dev/zero | tr '\\0' '\\001'");
+    c.request_ok(json!({"type":"wait","task_id":id,"budget_ms":10000}));
+    let r = c.try_request(json!({"type":"output","task_id":id,"cursor":0,"max_bytes":1048576}), S(5));
+    assert!(r.is_some(), "no response to a 1 MiB output read of control bytes");
+    let l = c.try_request(json!({"type":"list"}), S(5));
+    assert!(l.is_some(), "connection went mute after an oversized response");
+}
+
+/// O4: valid multi-byte UTF-8 (CJK) must survive chunking: concatenating
+/// cursor reads with the CLI's default max_bytes must give back the text.
+#[test]
+#[ignore = "bug: chunks are lossy-decoded per read; a max_bytes/pipe boundary inside a multi-byte char yields U+FFFD while next_cursor skips the bytes (CJK output corrupted every 64 KiB)"]
+fn o4_multibyte_utf8_survives_chunk_boundaries() {
+    let home = Home::new("o4");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, _) = c.start("yes 中文 | head -n 20000");
+    c.request_ok(json!({"type":"wait","task_id":id,"budget_ms":10000}));
+    let (text, _, _) = c.read_all_output(&id, 65536);
+    assert!(!text.contains('\u{FFFD}'), "replacement chars in valid UTF-8 output");
+    assert_eq!(text, "中文\n".repeat(20000));
+}
+
+/// F1/F2/F3: a frame over 4 MiB closes that connection (before or after
+/// hello) without disturbing the daemon or other clients; exactly 4 MiB is
+/// accepted; a malformed JSON frame gets E_BAD_REQUEST and the connection
+/// stays usable; a truncated frame is harmless.
+#[test]
+fn f1_frame_limits_and_malformed_input() {
+    let home = Home::new("f1");
+    let mut daemon = home.start_daemon();
+    let mut keep = home.connect();
+    keep.hello_ext("sess-keep");
+    let (id, pid) = keep.start("sleep 300");
+
+    // Oversized before hello.
+    let mut x = home.connect();
+    x.send_raw(&((MAX_FRAME as u32) + 1).to_be_bytes()).unwrap();
+    let _ = x.send_raw(b"{}");
+    assert!(x.wait_closed(S(3)), "oversized pre-hello frame must close the connection");
+
+    // Oversized after hello.
+    let mut y = home.connect();
+    y.hello_cli();
+    y.send_raw(&u32::MAX.to_be_bytes()).unwrap();
+    assert!(y.wait_closed(S(3)), "oversized frame must close the connection");
+
+    // Exactly 4 MiB (JSON padded with trailing whitespace) is legal.
+    let mut z = home.connect();
+    z.hello_cli();
+    let mut body = br#"{"v":1,"id":"big","type":"list","all":true}"#.to_vec();
+    body.resize(MAX_FRAME, b' ');
+    let mut frame = (MAX_FRAME as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    z.send_raw(&frame).unwrap();
+    let big = z.wait_id("big", S(10)).expect("no response to an exactly-4MiB frame");
+    assert_eq!(big["ok"], true, "4 MiB frame must be accepted: {big}");
+
+    // Malformed JSON after hello: error response, connection survives.
+    let garbage = b"{nope";
+    let mut f = (garbage.len() as u32).to_be_bytes().to_vec();
+    f.extend_from_slice(garbage);
+    z.send_raw(&f).unwrap();
+    let bad = z.wait_id("", S(3)).expect("malformed frame must get a response");
+    assert_eq!(bad["error"]["code"], "E_BAD_REQUEST", "{bad}");
+    let r = z.request(json!({"type":"list"}));
+    assert_eq!(r["ok"], true, "connection must survive a malformed frame");
+    // First message not hello -> error + close.
+    let mut w = home.connect();
+    let r = w.request(json!({"type":"list"}));
+    assert_eq!(r["error"]["code"], "E_BAD_REQUEST");
+    assert!(w.wait_closed(S(3)));
+
+    // Truncated frame then hang-up.
+    let mut t = home.connect();
+    t.send_raw(&100u32.to_be_bytes()).unwrap();
+    t.send_raw(b"{\"type\"").unwrap();
+    drop(t);
+
+    // Daemon and the long-lived client are unaffected.
+    assert!(daemon.try_wait().unwrap().is_none());
+    assert!(pid_running(pid));
+    assert_eq!(keep.status_of(&id).as_deref(), Some("running"));
+}
+
+/// C2: hello validation. Extension hello without session/pi_pid, a path-like
+/// session id, and a wrong protocol version are refused and never registered.
+#[test]
+fn c2_hello_validation() {
+    let home = Home::new("c2");
+    let _d = home.start_daemon();
+    for bad in [
+        json!({"type":"hello","client_kind":"extension","pi_pid":1}),
+        json!({"type":"hello","client_kind":"extension","session_id":"s"}),
+        json!({"type":"hello","client_kind":"extension","session_id":"../x","pi_pid":1}),
+        json!({"type":"hello","client_kind":"extension","session_id":"","pi_pid":1}),
+    ] {
+        let mut c = home.connect();
+        let r = c.request(bad.clone());
+        assert_eq!(r["ok"], false, "{bad} accepted");
+        assert_eq!(r["error"]["code"], "E_BAD_REQUEST", "{r}");
+        assert!(c.wait_closed(S(3)));
+    }
+    let mut c = home.connect();
+    let mut hello = json!({"type":"hello","client_kind":"cli"});
+    hello["v"] = json!(2);
+    hello["id"] = json!("h");
+    c.send(&hello);
+    let r = c.wait_closed(S(3));
+    assert!(r);
+    assert!(c.pending.iter().any(|f| f["error"]["code"] == "E_VERSION"), "{:?}", c.pending);
+    // A second hello on a live connection is rejected, connection survives.
+    let mut c = home.connect();
+    c.hello_cli();
+    let r = c.hello_cli();
+    assert_eq!(r["ok"], false);
+    assert_eq!(c.request(json!({"type":"list"}))["ok"], true);
+    // After all those refusals no session was registered.
+    let st = c.request_ok(json!({"type":"status"}));
+    assert_eq!(st["sessions"].as_array().unwrap().len(), 0, "{st}");
+}
+
+// ===========================================================================
+// Remaining cells: shutdown_session, idempotent stop, restart of terminal
+// records, SIGTERM to the daemon, cli-only operations (S5, T12, T13, D15, D16)
+// ===========================================================================
+
+/// S5: shutdown_session stops exactly the caller's running tasks.
+#[test]
+fn s5_shutdown_session_stops_only_own_running_tasks() {
+    let home = Home::new("s5");
+    let _d = home.start_daemon();
+    let mut a = home.connect();
+    a.hello_ext("sess-a");
+    let mut b = home.connect();
+    b.hello_ext("sess-b");
+    let (done, _) = a.start("true");
+    a.wait_terminal(&done, S(3)).unwrap();
+    let (r1, p1) = a.start("sleep 300");
+    let (r2, p2) = a.start("sleep 300");
+    let (other, po) = b.start("sleep 300");
+
+    let r = a.request_ok(json!({"type":"shutdown_session"}));
+    let mut stopped: Vec<String> = r["stopped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    stopped.sort();
+    let mut want = vec![r1.clone(), r2.clone()];
+    want.sort();
+    assert_eq!(stopped, want);
+    assert_eq!(a.wait_terminal(&r1, S(4)).unwrap()["status"], "killed");
+    assert_eq!(a.wait_terminal(&r2, S(4)).unwrap()["status"], "killed");
+    assert!(poll_true(S(3), || !pid_running(p1) && !pid_running(p2)));
+    assert_eq!(a.status_of(&done).as_deref(), Some("completed"));
+    assert!(pid_running(po), "other session's task was killed");
+    assert_eq!(b.status_of(&other).as_deref(), Some("running"));
+
+    let mut cli = home.connect();
+    cli.hello_cli();
+    let r = cli.request(json!({"type":"shutdown_session"}));
+    assert_eq!(r["error"]["code"], "E_SESSION_REQUIRED");
+    let r = cli.request(json!({"type":"start","kind":"shell","command":"true"}));
+    assert_eq!(r["error"]["code"], "E_SESSION_REQUIRED");
+}
+
+/// T12: stop on a terminal task is an idempotent no-op; the terminal status
+/// does not change.
+#[test]
+fn t12_stop_terminal_task_is_noop() {
+    let home = Home::new("t12");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, _) = c.start("exit 4");
+    assert_eq!(c.wait_terminal(&id, S(3)).unwrap()["status"], "failed");
+    c.request_ok(json!({"type":"stop","task_id":id}));
+    std::thread::sleep(MS(300));
+    let t = c.task(&id).unwrap();
+    assert_eq!((t["status"].as_str(), t["exit_code"].as_i64()), (Some("failed"), Some(4)));
+    let r = c.request(json!({"type":"stop","task_id":"sh_00000000"}));
+    assert_eq!(r["error"]["code"], "E_NOT_FOUND");
+}
+
+/// T13: terminal records survive a manager restart unchanged and their
+/// output is still readable (served from disk).
+#[test]
+fn t13_terminal_records_survive_restart() {
+    let home = Home::new("t13");
+    let mut d1 = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (ok, _) = c.start("seq 1 3000");
+    let (bad, _) = c.start("echo boom; exit 2");
+    c.wait_terminal(&ok, S(3)).unwrap();
+    c.wait_terminal(&bad, S(3)).unwrap();
+    drop(c);
+    assert!(home.cli(&["shutdown"], S(10)).status.success());
+    assert!(wait_child(&mut d1, S(8)).is_some());
+
+    let _d2 = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let t = c.task(&ok).unwrap();
+    assert_eq!((t["status"].as_str(), t["exit_code"].as_i64()), (Some("completed"), Some(0)));
+    let t = c.task(&bad).unwrap();
+    assert_eq!((t["status"].as_str(), t["exit_code"].as_i64()), (Some("failed"), Some(2)));
+    let (text, _, last) = c.read_all_output(&ok, 1000);
+    let want: String = (1..=3000).map(|i| format!("{i}\n")).collect();
+    assert_eq!(text, want);
+    assert_eq!(last["total_size"], want.len() as u64);
+    let w = c.request_ok(json!({"type":"wait","task_id":bad,"budget_ms":100}));
+    assert_eq!((w["done"].as_bool(), w["exit_code"].as_i64()), (Some(true), Some(2)));
+}
+
+/// D15: SIGTERM/SIGINT to the daemon is the same graceful shutdown.
+#[test]
+fn d15_sigterm_to_daemon_is_graceful() {
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        let home = Home::new(&format!("d15-{sig}"));
+        let mut d = home.start_daemon();
+        let mut c = home.connect();
+        c.hello_ext("sess-a");
+        let (id, pid) = c.start("sleep 300");
+        kill_pid(d.id(), sig);
+        let st = wait_child(&mut d, S(6)).expect("daemon must exit on signal");
+        assert!(st.success(), "{st:?}");
+        assert!(!pid_running(pid));
+        assert!(!home.sock().exists() && !home.pidfile().exists());
+        assert_eq!(home.record(&id).unwrap()["status"], "killed");
+    }
+}
+
+/// D16: shutdown is cli-only, so an extension cannot shut the manager down
+/// for everyone; status is open to extensions and reports the hello cwd.
+#[test]
+fn d16_extension_cannot_shutdown() {
+    let home = Home::new("d16");
+    let mut d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello(json!({"type":"hello","client_kind":"extension","session_id":"sess-a",
+        "pi_pid":std::process::id(),"cwd":"/tmp/d16-cwd"}));
+    let r = c.request(json!({"type":"shutdown"}));
+    assert_eq!(r["error"]["code"], "E_FORBIDDEN");
+    // status is read-only and open to extensions (ghost-agent pruning);
+    // it echoes the session cwd sent on hello.
+    let r = c.request_ok(json!({"type":"status"}));
+    let s = &r["sessions"][0];
+    assert_eq!((s["session_id"].as_str(), s["cwd"].as_str()), (Some("sess-a"), Some("/tmp/d16-cwd")), "{r}");
+    std::thread::sleep(MS(500));
+    assert!(d.try_wait().unwrap().is_none(), "extension shut the manager down");
+}
