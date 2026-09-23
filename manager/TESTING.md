@@ -65,8 +65,10 @@ concurrent copies of the integration suites.
 ## Time in tests
 
 The daemon's own timers are the 5s idle grace, the 2s kill grace (stop
-reaper and graceful shutdown), the 1s re-adopt poll and the 500ms
-leftover-group poll. They go through `src/clock.rs`. In a normal build that
+reaper and graceful shutdown) and the 500ms leftover-group poll (now only a
+fallback, for a runner that died without reporting). The task runner's own
+timers (the 2s lifeline grace and the 100ms guardian poll) run in the
+runner process on real time, not on the daemon's clock. They go through `src/clock.rs`. In a normal build that
 is `tokio::time::sleep`. With the `test-clock` cargo feature **and**
 `PBS_TEST_CLOCK=manual` in the daemon's environment, they run on a manual
 clock instead:
@@ -166,13 +168,13 @@ States: `accepted` (socket open, no hello) → `active(cli|ext)` → `closed`.
 | T5 | running | `stop`, task ignores SIGTERM | killed after ≥2s | SIGKILL after the grace, not before; `signal:"SIGKILL"` | no | `t5` |
 | T6 | running | `stop` with grandchildren | killed | whole process group dies | unit (`signal_group`, not via daemon) | `t6` |
 | T6b | running | `stop`, leader dies on SIGTERM, grandchild ignores it | killed | the group is SIGKILLed after the grace even though the leader is gone | no | **FIXED** `t6b` |
-| T6c | completed, group lingering | manager shutdown | completed | the leftover group dies with the manager (§3.2) | no | **FIXED** `t6c`, `g11` |
+| T6c | completed, group lingering (runner guards it) | manager shutdown | completed | the leftover group dies with the manager (§3.2) | no | **FIXED** `t6c`, `g11` |
 | T6d | completed, group lingering | `stop` / `shutdown_session` | completed | leftover group TERM → 2s → KILL; status unchanged | no | `t6d` |
-| T6e | completed, group lingering | last member exits | completed | group no longer tracked: never signalled again, not counted at shutdown | no | `g11` |
-| T7 | running (on disk) | manager restart, pid alive | running (re-adopted) | exit polled every 1s; output size recovered from the file | `t12` | `d4`, `g6` |
-| T8 | running (on disk) | manager restart, pid dead | orphaned | `ended_at` set, persisted; counted in manager.log | unit only | `d4` |
-| T9 | re-adopted | process exits | completed, `exit_code:null` | `task_exited` to the reconnected session; `wait` done | no | `d4` |
-| T10 | re-adopted | `stop` | killed | whole group dies | no | `d4b` |
+| T6e | completed, group lingering | last member exits | completed | the guardian runner exits, so the group is no longer tracked: never signalled again, not counted at shutdown; the guardian is idle meanwhile | no | `g11`, `g14` |
+| T7 | running / group lingering | manager dies without shutting down (`kill -9`, panic) | — | every runner sees its lifeline break: group SIGTERM → 2s → SIGKILL, grandchildren, SIGTERM-ignoring children and a finished task's leftover included | `t12` asserted the task **survived** | **CHANGED** `d4`, `d4c`, `t12`, `p2` |
+| T8 | running (on disk) | manager restart after a crash | orphaned | `end_reason:manager-crash`, `ended_at` set, persisted, counted in manager.log; output size from the file; **no pid is signalled**; nothing re-adopted | `d4` re-adopted live pids | **CHANGED** `d4`, `d4b`, `g6` |
+| T9 | running | command exits | completed / failed / killed | the runner reports the command's real exit code or signal; the runner's own wait status only when it died without reporting (SIGKILL with its group) | — | `r1` |
+| T10 | running | `stop` arrives before `sh` exists (right after start) | killed | a SIGTERM that reached only the runner is forwarded once `sh` is in the group | — | `p1`, `t5b` (manual clock) |
 | T11 | running | manager shutdown (idle / `shutdown` / SIGTERM / SIGINT) | killed | persisted as killed; "manager_shutdown" in manager.log | pid-dead only (`t09`) | `d5`, `d9`, `d15`, `g3` |
 | T12 | terminal, no group left | `stop` | unchanged | idempotent ok; unknown id → `E_NOT_FOUND` | no | `t12` |
 | T13 | terminal (on disk) | manager restart | unchanged | output served from disk, exact bytes; legacy numeric `signal` still loads | no | `t13`, unit |
@@ -253,7 +255,7 @@ fixtures in the contract's format, because the extension side may land later.
 |---|---|
 | `start.origin` stored; `mark_background` → `backgrounded_at` (first time kept, persisted) | `p1` |
 | `stop.reason` → `end_reason` (`stopped:tui/cli/tool`, `timeout`, `rate-limit`, `session-end`; none = `stopped:tool`; unknown → `E_BAD_REQUEST`); natural exit → `exited`; `timeout_ms` → `timeout`; `shutdown_session` → `session-end`; first reason wins; `task_exited.end_reason` | `p1` |
-| `manager-shutdown`, `orphaned`, `manager-restart` | `p2` |
+| `manager-shutdown`, `manager-crash` | `p2` |
 | hello `extension_version`/`protocol` stored per session; `status.protocol`; `connected_at` kept across reconnects; `last_seen` | `p3` |
 | manager writes `session.connect/disconnect`, `task.start` (command ≤ 200 chars, origin, pid), `task.background`, `task.stop`, `task.exit`, `daemon.start/shutdown` | `e1` |
 | a task event line is on disk before anyone can see the state it records, in causal order (`task.start` < `task.exit`) | `e5` |
@@ -273,8 +275,8 @@ fixtures in the contract's format, because the extension side may land later.
 
 Interpretation decisions where the contract is silent (also in design §3.3
 and docs/cli.md): `PROTOCOL = 2`; a stop without `reason` ends as
-`stopped:tool`; `shutdown_session` maps to `session-end`; a re-adopted
-task whose exit is only seen after a restart ends as `manager-restart`;
+`stopped:tool`; `shutdown_session` maps to `session-end`; a task whose
+manager crashed ends as `orphaned` / `manager-crash` at the next startup;
 `daemon.*` events go to `<home>/events.jsonl`; doctor counts stale
 socket/pid files it removed as `fixed` (exit 0), not failures;
 `status`, `sessions`, `show`, `agent`, `events`, `log`/`tail` and
@@ -423,7 +425,7 @@ below); after that fix it was re-run and is red.
 | lingering-group-tracking | 3/3: t6b, t6c, t6d |
 | shutdown-sigkill-escalation | 3/3: d5, d9, d8 |
 | setsid-process-group (tasks) | 4/4: t6, t5, d5, d4 |
-| group-signal (kill(-pgid) → kill(pid)) | 3/3: t6, d5, d4b |
+| group-signal (kill(-pgid) → kill(pid)) | 3/3: t6, d5, d4 |
 | bounded-conn-queue (1024 → 2^28) | 1/1: c6 |
 | bounded-tee-channel (64 → 2^28) | 1/1: c6 |
 | daemon-lifetime-lock (guard dropped at startup) | 3/3: t10, d3, d1 |
@@ -435,9 +437,6 @@ below); after that fix it was re-run and is red.
 | watch-utf8-carry | 1/1: o4b |
 | oversize-response-fallback | 1/1: o3b |
 | writer-skips-oversize | 1/1: o3c |
-| readopt-liveness | 2/2: d4, t12 |
-| orphan-dead-pids | 1/1: d4 |
-| adopted-exit-poller | 1/1: d4 |
 | session-rebound-close | 1/1: c4 |
 | refuse-hello-while-shutting-down | 1/1: d8 |
 | cleanup-files-on-shutdown | 3/3: d5, d9, d15 |
@@ -492,4 +491,72 @@ No removal turned a test red.
 - deferred: Windows named-pipe path (design §3.1) has no tests; `sys.rs` is unix-only | impact: none until Windows ships | trigger: first Windows build
 - deferred: the extension's own connect path (TypeScript) is not changed to wait out a shutting-down manager the way the Rust client now does; the exact protocol to implement is design §3.1 step 6 | impact: an extension connecting in the ≤ 2s shutdown window gets `manager is shutting down` at once instead of a successor | trigger: extension side of this branch's merge (handed to the extension engineer)
 - deferred: `task_exited.output_size` (live event) is the size at child exit and can be short by what was still in the pipe; the in-memory record catches up and a restart recovers it from the file | impact: the extension's byte count hint can be low for a fast-exiting, high-output task; reads still return every byte | trigger: any consumer that uses `output_size` as a read bound
-- deferred: re-adopted tasks are identified by pid liveness only (`kill(pid,0)`); a task pid reused while no manager ran would be re-adopted, and signalled on stop/shutdown | impact: wrong process signalled after a crash plus a long gap | trigger: persisting process start time in TaskRecord (a contract change)
+- resolved (manager-lifeline): re-adoption by pid liveness is gone. A crashed daemon's tasks die with it (lifeline), and the next startup only marks their records; it never signals a recorded pid (`d4b`).
+
+## Lifeline and runner (manager-lifeline)
+
+Principle: pbs-manager is the parent of every task. When it ends by any
+means, every task and its descendants go with it. There is no crash
+recovery.
+
+Every task runs under `pbs-manager __run` (`src/runner.rs`), the leader of
+its process group. The runner:
+- execs `sh -c` in the same group;
+- holds the lifeline read end at fd 3; the daemon holds the only write end
+  (`task::lifeline()`, close-on-exec);
+- reports the command's status on a status pipe at fd 4;
+- guards leftover children until its group is empty.
+
+The daemon treats "status received" as the task's exit and "runner exited"
+as "group empty". A crash leaves only records to mark (`orphaned`,
+`manager-crash`).
+
+Bugs found while building it (each caught by a test before the fix):
+- `proc_listpgrppids` returns a **pid count**, not bytes; dividing again
+  made every group look empty, so leftovers went unguarded (`t6b`, `t6c`,
+  `t6d` red; unit `sys::group_members_lists_a_real_group`).
+- A SIGTERM **handler** in the runner lost stops that landed between `sh`'s
+  fork and exec. The forked child ran the inherited no-op handler; only the
+  manual clock showed it (`t5b` red), because on real time the 2s SIGKILL
+  masked it. The runner now blocks SIGTERM and the child unblocks it right
+  before exec, so the signal waits as pending instead of being lost.
+- std's `Command` does **not** reset the signal mask for the child here: a
+  blocked SIGTERM is inherited and every stop was ignored (9 tests red).
+  Hence the explicit unblock in `pre_exec`.
+- A stop right after start could reach the runner **before `sh` existed**
+  and stay pending there (`p1` red on the manual clock). The runner
+  forwards a pending SIGTERM to its group once `sh` is in it.
+
+New tests and red-before evidence (run against the `prelaunch-polish`
+manager sources with the new tests):
+
+| Test | On the old code |
+|---|---|
+| `protocol::t12_restart_after_crash_orphans_the_task` | red: `task … survived the daemon's SIGKILL` |
+| `lifecycle_adversarial::d4_daemon_kill9_takes_every_task_down` | red (fixture: a finished task's leader is gone, nothing guards its leftover; after that, the tasks survive the SIGKILL) |
+| `lifecycle_adversarial::d4c_daemon_crash_takes_every_task_down` | test-clock only (`debug_crash`, exit 101 = a panic in the main future) |
+| `lifecycle_adversarial::d4b_startup_orphans_leftover_records_without_signalling` | red: the record comes back `running` (re-adopted a bystander pid) |
+| `mutation_gaps::g6_crashed_task_output_survives_on_the_orphaned_record` | red: `running`, not `orphaned` |
+| `mutation_gaps::g14_guardian_runner_does_not_spin` | red: no runner guards the leftover |
+| `observability::p2_end_reasons_across_manager_lifecycle` | red: `manager-crash` missing |
+| `lifecycle_adversarial::r1_runner_reports_the_commands_real_status` | green (contract continuity); red under ablation `runner-reports-status` |
+| eval `(e2) a manager crash ends a backgrounded command with an orphaned exit wake` | red without the extension's reconnect wake: `expected one exit wake` |
+
+Ablations for this branch (manual clock): all 16 new or changed entries
+behave as declared (red).
+
+| Ablation | Tests red |
+|---|---|
+| lifeline-teardown | 3/3: d4, t12, p2 |
+| lifeline-sigkill-after-grace | 1/1: d4 |
+| lifeline-read-end-to-runner | 1/1: d4 |
+| runner-reports-status | 1/1: r1 |
+| runner-guards-leftovers | 2/2: t6d, d4 |
+| guardian-poll-sleep | 1/1: g14 |
+| runner-blocks-sigterm | 1/1: t5 |
+| runner-fds-cloexec | 1/1: t14 |
+| crash-orphan-mark | 2/2: p2, d4b |
+| lingering-group-tracking (now the `Guarded` arm) | 3/3: t6b, t6c, t6d |
+| setsid-process-group (now in `child_setup`) | 4/4: t6, t5, d5, d4 |
+| timeout-hard-kill (new exit-watch select) | 1/1: t3 |
+

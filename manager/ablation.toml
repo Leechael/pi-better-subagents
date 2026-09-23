@@ -37,7 +37,6 @@ replace = "            let _ = notify;"
 tests = [
   "lifecycle_adversarial::d5_client_crash_grace_then_kill_everything_and_clean_files",
   "lifecycle_adversarial::d7_unhelloed_connection_does_not_hold_daemon_alive",
-  "lifecycle_adversarial::d4_crash_restart_readopts_live_and_orphans_dead",
   "protocol::t09_zero_connections_shutdown_kills_tasks",
 ]
 expect = "red"
@@ -74,10 +73,10 @@ expect = "red"
 
 [[ablation]]
 id = "lingering-group-tracking"
-mechanism = "a task whose leader exited while its process group still has members keeps owning that group, so stop/shutdown_session/shutdown still kill it (§3.2)"
+mechanism = "a task whose command exited while its process group still has members (guarded by the runner) keeps owning that group, so stop/shutdown_session/shutdown still kill it (§3.2)"
 file = "src/daemon.rs"
-find = "            entry.group_lingering = true;"
-replace = ""
+find = "            Leftover::Guarded => entry.group_lingering = true,"
+replace = "            Leftover::Guarded => {}"
 tests = [
   "lifecycle_adversarial::t6b_stop_kills_term_ignoring_grandchild_after_leader_exits",
   "lifecycle_adversarial::t6c_shutdown_kills_leftover_group_of_exited_task",
@@ -100,15 +99,15 @@ expect = "red"
 
 [[ablation]]
 id = "setsid-process-group"
-mechanism = "tasks are spawned as session leaders (setsid) so pgid == pid"
-file = "src/task.rs"
-find = "    crate::sys::apply_new_session_tokio(&mut cmd);"
-replace = ""
+mechanism = "task runners are spawned as session leaders (setsid) so pgid == pid"
+file = "src/sys.rs"
+find = "    if unsafe { libc::setsid() } == -1 {"
+replace = "    if false {"
 tests = [
   "lifecycle_adversarial::t6_stop_kills_grandchildren",
   "lifecycle_adversarial::t5_sigterm_ignoring_task_is_sigkilled_after_grace",
   "lifecycle_adversarial::d5_client_crash_grace_then_kill_everything_and_clean_files",
-  "lifecycle_adversarial::d4_crash_restart_readopts_live_and_orphans_dead",
+  "lifecycle_adversarial::d4_daemon_kill9_takes_every_task_down",
 ]
 expect = "red"
 
@@ -121,7 +120,7 @@ replace = "libc::kill(pid as i32, sig)"
 tests = [
   "lifecycle_adversarial::t6_stop_kills_grandchildren",
   "lifecycle_adversarial::d5_client_crash_grace_then_kill_everything_and_clean_files",
-  "lifecycle_adversarial::d4b_stop_readopted_task_kills_group",
+  "lifecycle_adversarial::d4_daemon_kill9_takes_every_task_down",
 ]
 expect = "red"
 
@@ -168,8 +167,8 @@ replace = '''
             Ok(Claim::Acquired'''
 tests = [
   "lifecycle_adversarial::d10_client_recovers_from_dead_daemon_files",
-  "lifecycle_adversarial::d4_crash_restart_readopts_live_and_orphans_dead",
-  "protocol::t12_restart_readopts_live_task",
+  "lifecycle_adversarial::d4_daemon_kill9_takes_every_task_down",
+  "protocol::t12_restart_after_crash_orphans_the_task",
 ]
 expect = "red"
 
@@ -257,36 +256,6 @@ tests = ["lifecycle_adversarial::o3c_unanswerable_request_does_not_mute_connecti
 expect = "red"
 
 [[ablation]]
-id = "readopt-liveness"
-mechanism = "restart re-adopts running records whose pid is alive (§3.4)"
-file = "src/lifecycle.rs"
-find = "            if task::pid_alive(rec.pid) {"
-replace = "            if false {"
-tests = [
-  "lifecycle_adversarial::d4_crash_restart_readopts_live_and_orphans_dead",
-  "protocol::t12_restart_readopts_live_task",
-]
-expect = "red"
-
-[[ablation]]
-id = "orphan-dead-pids"
-mechanism = "restart marks running records with a dead pid as orphaned (§3.4)"
-file = "src/lifecycle.rs"
-find = "            if task::pid_alive(rec.pid) {"
-replace = "            if true {"
-tests = ["lifecycle_adversarial::d4_crash_restart_readopts_live_and_orphans_dead"]
-expect = "red"
-
-[[ablation]]
-id = "adopted-exit-poller"
-mechanism = "re-adopted tasks are polled with kill(pid,0) to detect exit (§3.4)"
-file = "src/daemon.rs"
-find = "        spawn_adopted_poller(&state, &task_id, pid);"
-replace = ""
-tests = ["lifecycle_adversarial::d4_crash_restart_readopts_live_and_orphans_dead"]
-expect = "red"
-
-[[ablation]]
 id = "session-rebound-close"
 mechanism = "the old connection of a rebound session is closed by the server (§3.3 hello)"
 file = "src/daemon.rs"
@@ -335,8 +304,8 @@ expect = "red"
 id = "timeout-hard-kill"
 mechanism = "timeout_ms is a hard kill ceiling (§3.3 start)"
 file = "src/daemon.rs"
-find = "        let status = match timeout_ms {"
-replace = "        let status = match None::<u64> {"
+find = "                    Some(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,"
+replace = "                    Some(_) => std::future::pending().await,"
 tests = ["lifecycle_adversarial::t3_timeout_ms_hard_kill"]
 expect = "red"
 
@@ -347,6 +316,108 @@ file = "src/client.rs"
 find = "    crate::sys::apply_new_session_std(&mut cmd);"
 replace = ""
 tests = ["mutation_gaps::g2_autospawned_daemon_survives_sigint_to_spawning_group"]
+expect = "red"
+
+# --- Lifeline and runner (no task outlives its manager) ---------------------
+
+[[ablation]]
+id = "lifeline-teardown"
+mechanism = "a runner whose lifeline breaks (the daemon died by any means) takes its process group down (§3.2)"
+file = "src/runner.rs"
+find = """
+    let _ = sys::signal_group(me, sys::SIGTERM);
+    std::thread::sleep(LIFELINE_GRACE);
+    let _ = sys::signal_group(me, sys::SIGKILL);"""
+replace = ""
+tests = [
+  "lifecycle_adversarial::d4_daemon_kill9_takes_every_task_down",
+  "protocol::t12_restart_after_crash_orphans_the_task",
+  "observability::p2_end_reasons_across_manager_lifecycle",
+]
+expect = "red"
+
+[[ablation]]
+id = "lifeline-sigkill-after-grace"
+mechanism = "after the lifeline grace the runner SIGKILLs its group, reaching SIGTERM-ignoring members"
+file = "src/runner.rs"
+find = """
+    std::thread::sleep(LIFELINE_GRACE);
+    let _ = sys::signal_group(me, sys::SIGKILL);"""
+replace = """
+    std::thread::sleep(LIFELINE_GRACE);"""
+tests = ["lifecycle_adversarial::d4_daemon_kill9_takes_every_task_down"]
+expect = "red"
+
+[[ablation]]
+id = "lifeline-read-end-to-runner"
+mechanism = "the lifeline read end is placed at fd 3 in every runner"
+file = "src/sys.rs"
+find = "            if libc::dup2(lifeline, RUNNER_LIFELINE_FD) < 0 || libc::dup2(status, RUNNER_STATUS_FD) < 0 {"
+replace = "            if libc::dup2(status, RUNNER_STATUS_FD) < 0 {"
+tests = ["lifecycle_adversarial::d4_daemon_kill9_takes_every_task_down"]
+expect = "red"
+note = "without fd 3 the runner reads EBADF at once and treats it as a broken lifeline: every task is torn down right after it starts"
+
+[[ablation]]
+id = "runner-reports-status"
+mechanism = "the runner reports the command's real exit code or signal on the status pipe"
+file = "src/runner.rs"
+find = "    report(&what, alone_now);"
+replace = "    report(\"exit 0\", alone_now);"
+tests = ["lifecycle_adversarial::r1_runner_reports_the_commands_real_status"]
+expect = "red"
+
+[[ablation]]
+id = "runner-guards-leftovers"
+mechanism = "a runner whose command left descendants behind stays as their guardian (keeping the group owned and the lifeline held) until the group empties"
+file = "src/runner.rs"
+find = "        while !alone(me) {"
+replace = "        while false && !alone(me) {"
+tests = [
+  "lifecycle_adversarial::t6d_stop_and_shutdown_session_reach_leftover_group",
+  "lifecycle_adversarial::d4_daemon_kill9_takes_every_task_down",
+]
+expect = "red"
+
+[[ablation]]
+id = "guardian-poll-sleep"
+mechanism = "the guardian polls its group with a sleep, not a busy loop"
+file = "src/runner.rs"
+find = "            std::thread::sleep(GUARD_POLL);"
+replace = ""
+tests = ["mutation_gaps::g14_guardian_runner_does_not_spin"]
+expect = "red"
+
+[[ablation]]
+id = "runner-blocks-sigterm"
+mechanism = "the runner blocks SIGTERM so a stop reaches the command while the runner lives to report it"
+file = "src/runner.rs"
+find = "    let _ = sys::block_signal(libc::SIGTERM);"
+replace = ""
+tests = ["lifecycle_adversarial::t5_sigterm_ignoring_task_is_sigkilled_after_grace"]
+expect = "red"
+
+[[ablation]]
+id = "runner-fds-cloexec"
+mechanism = "the runner marks its lifeline and status fds close-on-exec so the command inherits only 0-2"
+file = "src/runner.rs"
+find = """
+    let _ = sys::set_cloexec(RUNNER_LIFELINE_FD);
+    let _ = sys::set_cloexec(RUNNER_STATUS_FD);"""
+replace = ""
+tests = ["lifecycle_adversarial::t14_tasks_inherit_only_stdio"]
+expect = "red"
+
+[[ablation]]
+id = "crash-orphan-mark"
+mechanism = "a record left running by a crashed daemon ends as orphaned with end_reason manager-crash"
+file = "src/lifecycle.rs"
+find = "            rec.end_reason = Some(crate::proto::end_reason::MANAGER_CRASH.to_string());"
+replace = ""
+tests = [
+  "observability::p2_end_reasons_across_manager_lifecycle",
+  "lifecycle_adversarial::d4b_startup_orphans_leftover_records_without_signalling",
+]
 expect = "red"
 
 # --- Observability contract -------------------------------------------------
@@ -377,24 +448,6 @@ file = "src/registry.rs"
 find = "        if self.kill_reason.is_none() {"
 replace = "        if true {"
 tests = ["observability::p1_origin_background_and_end_reasons"]
-expect = "red"
-
-[[ablation]]
-id = "end-reason-manager-restart"
-mechanism = "a re-adopted task whose exit is only seen by polling ends as manager-restart, not exited"
-file = "src/daemon.rs"
-find = "            (None, None) => end_reason::MANAGER_RESTART.to_string(),"
-replace = "            (None, None) => end_reason::EXITED.to_string(),"
-tests = ["observability::p2_end_reasons_across_manager_lifecycle"]
-expect = "red"
-
-[[ablation]]
-id = "end-reason-orphaned"
-mechanism = "a running record whose pid died before the restart ends as orphaned"
-file = "src/lifecycle.rs"
-find = "                rec.end_reason = Some(crate::proto::end_reason::ORPHANED.to_string());"
-replace = ""
-tests = ["observability::p2_end_reasons_across_manager_lifecycle"]
 expect = "red"
 
 [[ablation]]
