@@ -85,7 +85,7 @@ function formatTaskLine(task: TaskRecord, now: number): string {
 
 const taskListParameters = Type.Object({
   all: Type.Optional(
-    Type.Boolean({ description: "Include tasks from all sessions (default: only this session)" }),
+    Type.Boolean({ description: "Also include finished work (default: running only). Always limited to this session." }),
   ),
 });
 
@@ -96,8 +96,8 @@ export function createTaskListTool(
     name: "task_list",
     label: "Task List",
     description:
-      "List background work: pbs-manager shell/monitor tasks plus in-process subagent children. " +
-      "By default only the current session is shown.",
+      "List background work this session started: shell/monitor tasks and subagent children. " +
+      "Work from other pi sessions is never shown.",
     promptSnippet: "List background shell/monitor tasks and subagents",
     parameters: taskListParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -132,21 +132,15 @@ export function createTaskListTool(
       const agentLines: string[] = [];
       const live = deps.getRegistry?.()?.activeChildren() ?? [];
       const liveIds = new Set(live.map((c) => c.childId));
-      let connected: Set<string> | undefined;
-      try {
-        const sessions = await client.sessions();
-        connected = new Set(sessions.filter((s) => s.connected).map((s) => s.session_id));
-        const own = deps.sessionId?.();
-        if (own) connected.add(own);
-      } catch {
-        const own = deps.sessionId?.();
-        connected = own ? new Set([own]) : undefined;
-      }
       if (deps.home) {
-        const disk = loadAgentChildRecords(deps.home, {
-          sessionId: params.all === true ? undefined : deps.sessionId?.(),
+        const own = deps.sessionId?.();
+        // No session id means no scope to apply: show nothing rather than everyone's agents.
+        // Live children are listed from the registry above. A "running" record
+        // it does not hold was left by an earlier pi process of this session.
+        const disk = !own ? [] : loadAgentChildRecords(deps.home, {
+          sessionId: own,
           includeTerminal: params.all === true,
-          ...(connected ? { connectedSessionIds: connected } : {}),
+          connectedSessionIds: new Set<string>(),
         });
         for (const rec of disk) {
           if (liveIds.has(rec.child_id) || seen.has(rec.child_id)) continue;
@@ -165,8 +159,7 @@ export function createTaskListTool(
         };
       }
       const header = `${lines.length + agentLines.length} background item(s):`;
-      const body = [...lines];
-      if (agentLines.length > 0) body.push("## other sessions", ...agentLines);
+      const body = [...lines, ...agentLines];
       return {
         content: [{ type: "text", text: [header, ...body].join("\n") }],
         details: { tasks, agents: agentLines },
