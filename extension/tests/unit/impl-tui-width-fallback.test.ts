@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMonitorTool, MonitorRegistry } from "../../src/monitor";
 import { PBS_WAKE_CUSTOM_TYPE } from "../../src/wake";
 import { registerPbsMessageRenderers } from "../../src/tui/message-renderers";
@@ -12,6 +12,16 @@ const theme = {
 describe("tool rows stay within width without pi-tui", () => {
   afterEach(() => {
     setPiTuiForTests(undefined);
+  });
+
+  it("warns once when the reduced fallback is used", () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    setPiTuiForTests(null);
+    visibleWidth("first");
+    visibleWidth("second");
+    expect(warning).toHaveBeenCalledTimes(1);
+    expect(warning.mock.calls[0]?.[0]).toContain("reduced text fallback");
+    warning.mockRestore();
   });
 
   it("truncates a long monitor description when pi-tui cannot be resolved", () => {

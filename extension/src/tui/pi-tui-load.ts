@@ -2,9 +2,7 @@
  * Resolve `@earendil-works/pi-tui` from the host pi install.
  * Typed structurally so this package does not depend on pi-tui's declarations.
  */
-import { createRequire } from "node:module";
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import * as bundledPiTui from "@earendil-works/pi-tui";
 
 export interface PiTuiText {
   setText(text: string): void;
@@ -61,46 +59,26 @@ export interface PiTuiWidth {
   wrapTextWithAnsi(text: string, width: number): string[];
 }
 
-function candidateIds(require: NodeRequire): string[] {
-  const ids: string[] = [];
-  try {
-    const pkg = require.resolve("@earendil-works/pi-coding-agent/package.json");
-    ids.push(join(dirname(pkg), "node_modules/@earendil-works/pi-tui"));
-  } catch {
-    // host pi may not be resolvable from this file
-  }
-  if (process.argv[1]) {
-    try {
-      const host = createRequire(process.argv[1]);
-      ids.push(host.resolve("@earendil-works/pi-tui"));
-    } catch {
-      // not running under the pi binary
-    }
-  }
-  ids.push("@earendil-works/pi-tui");
-  return ids;
+let fallbackWarningLogged = false;
+
+function warnFallbackOnce(): void {
+  if (fallbackWarningLogged) return;
+  fallbackWarningLogged = true;
+  console.warn(
+    "pi-better-subagents: pi-tui is unavailable; using the reduced text fallback. " +
+      "Load this extension through pi to enable interactive task views and full-width rendering.",
+  );
 }
 
 export function loadPiTui(): PiTuiModule | null {
-  if (forcedTui !== undefined) return forcedTui;
-  try {
-    const require = createRequire(import.meta.url);
-    for (const id of candidateIds(require)) {
-      try {
-        if (id.startsWith("/") || id.includes("node_modules")) {
-          if (!existsSync(id) && !existsSync(`${id}.js`) && !existsSync(join(id, "package.json"))) {
-            // still try require; absolute paths may be the package root
-          }
-        }
-        return require(id) as PiTuiModule;
-      } catch {
-        // next candidate
-      }
-    }
-    return null;
-  } catch {
-    return null;
+  if (forcedTui !== undefined) {
+    if (forcedTui === null) warnFallbackOnce();
+    return forcedTui;
   }
+  // pi's extension loader aliases this static specifier to its bundled TUI in
+  // both jiti and compiled-binary modes. Resolving it relative to argv[1] is
+  // incorrect when pi is launched through a package-manager shim.
+  return bundledPiTui as unknown as PiTuiModule;
 }
 
 let widthFns: PiTuiWidth | null | undefined;
@@ -123,6 +101,7 @@ function widthApi(): PiTuiWidth | null {
     };
     return widthFns;
   }
+  if (!tui) warnFallbackOnce();
   widthFns = null;
   return null;
 }
