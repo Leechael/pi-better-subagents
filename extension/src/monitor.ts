@@ -34,6 +34,7 @@ export interface MonitorDeps {
   /** Optional TUI toast for lifecycle notices (exit / timeout / rate-limit). */
   toast?: (message: string, type?: "info" | "warning" | "error") => void;
   clock?: Clock;
+  logEvent?: (type: string, fields?: Record<string, unknown>) => void;
 }
 
 interface MonitorEntry {
@@ -163,6 +164,7 @@ export class MonitorRegistry {
     const exitCode = event.exit_code ?? null;
     const duration =
       typeof event.duration_ms === "number" ? `${(event.duration_ms / 1000).toFixed(1)}s` : "unknown duration";
+    this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: event.end_reason ?? "exited" });
     this.deps.getNotifyCenter()?.notify(
       formatMonitorEvent(
         entry.description,
@@ -200,7 +202,9 @@ export class MonitorRegistry {
     const accepted = entry.limiter.tryConsume();
     entry.saturation.record(!accepted, now);
     if (!accepted) {
-      entry.droppedLinesPending += text.split("\n").length;
+      const droppedLines = text.split("\n").length;
+      this.deps.logEvent?.("monitor.drop", { id: entry.taskId, lines: droppedLines });
+      entry.droppedLinesPending += droppedLines;
       if (entry.saturation.isSaturated(now)) void this.autoStop(entry);
       return;
     }
@@ -213,6 +217,7 @@ export class MonitorRegistry {
   private async timeout(entry: MonitorEntry): Promise<void> {
     if (entry.stopped) return;
     entry.stopped = true;
+    this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: "timeout" });
     const client = this.deps.getClient();
     await client?.stop(entry.taskId, "timeout").catch(() => {});
     this.deps.getNotifyCenter()?.notify(
@@ -233,6 +238,7 @@ export class MonitorRegistry {
   private async autoStop(entry: MonitorEntry): Promise<void> {
     if (entry.stopped) return;
     entry.stopped = true;
+    this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: "rate-limit" });
     const client = this.deps.getClient();
     await client?.stop(entry.taskId, "rate-limit").catch(() => {});
     this.deps.getNotifyCenter()?.notify(

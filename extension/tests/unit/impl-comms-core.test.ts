@@ -97,7 +97,8 @@ describe("contactSupervisor", () => {
   it("need_decision blocks until reply() resolves it with the reply text", async () => {
     const host = new FakeHost();
     host.add("ch_a", "run_1", "explorer", "running");
-    const comms = createComms(host);
+    const events: { type: string; fields?: Record<string, unknown> }[] = [];
+    const comms = createComms(host, { logEvent: (type, fields) => events.push({ type, fields }) });
 
     let settled = false;
     const p = comms
@@ -121,15 +122,23 @@ describe("contactSupervisor", () => {
     comms.reply("ch_a", "src/index.ts");
     await expect(p).resolves.toBe("src/index.ts");
     expect(settled).toBe(true);
+    expect(events).toContainEqual({ type: "decision.request", fields: { child_id: "ch_a" } });
+    expect(events).toContainEqual({ type: "decision.reply", fields: { child_id: "ch_a" } });
   });
 
   it("need_decision times out after the injected timeout with the contract message", async () => {
     const host = new FakeHost();
     host.add("ch_a", "run_1", "explorer", "running");
-    const comms = createComms(host, { decisionTimeoutMs: 20 });
+    const events: { type: string; fields?: Record<string, unknown> }[] = [];
+    const comms = createComms(host, {
+      decisionTimeoutMs: 20,
+      logEvent: (type, fields) => events.push({ type, fields }),
+    });
 
     const p = comms.contactSupervisor("ch_a", "need_decision", "quick question");
+    expect(events).toContainEqual({ type: "decision.request", fields: { child_id: "ch_a" } });
     await expect(p).resolves.toBe(DECISION_TIMEOUT_MESSAGE);
+    expect(events).toContainEqual({ type: "decision.timeout", fields: { child_id: "ch_a" } });
     expect(comms.pendingRequests()).toEqual([]);
   });
 

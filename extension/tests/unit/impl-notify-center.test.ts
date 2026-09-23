@@ -7,10 +7,12 @@ describe("NotifyCenter monitor batching", () => {
   it("coalesces busy monitor output per monitor and flushes one wake when idle", () => {
     let idle = false;
     const sent: { message: { customType: string; content: string; details?: unknown }; options: unknown }[] = [];
+    const events: { type: string; fields?: Record<string, unknown> }[] = [];
     const center = new NotifyCenter({
       sendMessage: (message, options) => sent.push({ message, options }),
       isIdle: () => idle,
       clock: new ManualClock(),
+      logEvent: (type, fields) => events.push({ type, fields }),
     });
 
     center.notifyMonitorEvent("ticker", "mon_1", "tick 1");
@@ -33,6 +35,26 @@ describe("NotifyCenter monitor batching", () => {
     expect(sent[0].message.customType).toBe(PBS_WAKE_CUSTOM_TYPE);
     expect(sent[0].options).toEqual({ triggerTurn: true });
     expect(sent[1].message.details).toMatchObject({ kind: "monitor", id: "mon_2", event: "ready" });
+    expect(events).toContainEqual({ type: "wake.emit", fields: { kind: "monitor", ids: ["mon_1"], batch: true } });
+    expect(events).toContainEqual({ type: "wake.deliver", fields: { kind: "monitor", mode: "trigger" } });
+    center.dispose();
+  });
+
+  it("logs task wake batches, delivery mode, and deduplicated exits", () => {
+    const events: { type: string; fields?: Record<string, unknown> }[] = [];
+    const center = new NotifyCenter({
+      sendMessage: () => {},
+      isIdle: () => false,
+      clock: new ManualClock(),
+      logEvent: (type, fields) => events.push({ type, fields }),
+    });
+    const exit = { taskId: "sh_1", kind: "shell", command: "true", status: "completed" as const, exitCode: 0, durationMs: 1, outputPath: "", preview: "" };
+    center.notifyTaskExit(exit);
+    center.notifyTaskExit(exit);
+    center.flush();
+    expect(events).toContainEqual({ type: "wake.dedupe", fields: { id: "sh_1" } });
+    expect(events).toContainEqual({ type: "wake.emit", fields: { kind: "task", ids: ["sh_1"], batch: false } });
+    expect(events).toContainEqual({ type: "wake.deliver", fields: { kind: "task", mode: "steer" } });
     center.dispose();
   });
 

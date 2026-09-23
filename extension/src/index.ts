@@ -8,6 +8,7 @@
 import { applyBehaviorGuidelines } from "./behavior-guidelines";
 import { realClock } from "./clock";
 import { ExitNotifyGate } from "./exit-notify-gate";
+import { createExtensionEventLog } from "./events";
 import { readFileTail } from "./file-tail";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -82,6 +83,8 @@ export default function (pi: ExtensionAPI): void {
   const notifyOnExit = new Set<string>();
   const exitGate = new ExitNotifyGate<ManagerEvent>({ clock });
   const workIndex = new WorkIndex({ clock });
+  const eventLog = createExtensionEventLog(home, () => ctx?.sessionManager.getSessionId() ?? "", clock);
+  const logEvent = (type: string, fields?: Record<string, unknown>) => eventLog.write(type, fields);
 
   const trackTask = (taskId: string, meta: { kind: string; command: string; cwd?: string }) => {
     taskMeta.set(taskId, { ...meta, startedAt: taskMeta.get(taskId)?.startedAt });
@@ -178,6 +181,7 @@ export default function (pi: ExtensionAPI): void {
     getNotifyCenter: () => notifyCenter,
     trackTask,
     clock,
+    logEvent,
     toast: (message, type) => {
       if (ctx?.hasUI) ctx.ui.notify(message, type);
     },
@@ -227,6 +231,7 @@ export default function (pi: ExtensionAPI): void {
   const comms: CommsWithOrigin = createComms(commsHost, {
     decisionTimeoutMs: subagentConfig.decisionTimeoutMs,
     clock,
+    logEvent,
   });
   registerReplyCommand(pi, comms);
   pi.registerTool(
@@ -269,6 +274,7 @@ export default function (pi: ExtensionAPI): void {
       sendMessage: (msg, opts) => pi.sendMessage(msg, opts),
       isIdle: () => ctx?.isIdle() ?? true,
       clock,
+      logEvent,
       listStillRunning: () =>
         [...notifyOnExit].map((id) => {
           const command = taskMeta.get(id)?.command;
@@ -424,9 +430,32 @@ export default function (pi: ExtensionAPI): void {
     subagentRegistry = registry;
     // Persist child records so `pbs-manager ls` / task_list can see in-process agents.
     const sessionIdForAgents = () => startCtx.sessionManager.getSessionId();
+    const previousAgentStatus = new Map<string, string>();
     registry.onTransition((run) => {
       const sid = sessionIdForAgents();
       for (const c of run.children) {
+        const previousStatus = previousAgentStatus.get(c.childId);
+        if (c.status === "running" && previousStatus !== "running") {
+          logEvent("agent.start", {
+            child_id: c.childId,
+            run_id: run.runId,
+            name: c.name,
+            agent: c.agent,
+            ...(c.model ? { model: c.model } : {}),
+          });
+        }
+        if (["completed", "failed", "interrupted"].includes(c.status) && previousStatus !== c.status) {
+          const error = c.result?.error;
+          if (error === "stalled") logEvent("agent.stall", { child_id: c.childId });
+          if (error === "timeout") logEvent("agent.timeout", { child_id: c.childId });
+          logEvent("agent.settle", {
+            child_id: c.childId,
+            status: c.status,
+            ...(error ? { error } : {}),
+            duration_ms: c.result?.durationMs ?? Math.max(0, clock.now() - c.startedAt),
+          });
+        }
+        previousAgentStatus.set(c.childId, c.status);
         const rec: AgentChildRecord = {
           v: 1,
           kind: "agent",

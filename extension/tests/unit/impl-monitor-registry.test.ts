@@ -11,6 +11,7 @@ describe("MonitorRegistry saturation", () => {
     const clock = new ManualClock();
     const stopped: string[] = [];
     const sent: { details?: unknown }[] = [];
+    const events: { type: string; fields?: Record<string, unknown> }[] = [];
     const manager = {
       ensureAvailable: async () => true,
       start: async () => ({ task_id: "mon_1", pid: 123 }),
@@ -28,6 +29,7 @@ describe("MonitorRegistry saturation", () => {
       getNotifyCenter: () => center,
       trackTask: () => {},
       clock,
+      logEvent: (type, fields) => events.push({ type, fields }),
     });
 
     const { taskId } = await registry.start(
@@ -48,6 +50,8 @@ describe("MonitorRegistry saturation", () => {
         details?.kind === "monitor" && details.status === "stopped",
     );
     expect(stopWake?.droppedLines).toBeGreaterThan(0);
+    expect(events.some((event) => event.type === "monitor.drop" && event.fields?.id === "mon_1")).toBe(true);
+    expect(events).toContainEqual({ type: "monitor.stop", fields: { id: "mon_1", reason: "rate-limit" } });
     center.dispose();
     registry.disposeAll();
   });

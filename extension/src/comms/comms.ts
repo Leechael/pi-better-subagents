@@ -5,6 +5,7 @@
  * its XML formats; nothing is added to src/format.ts).
  */
 import {
+  DECISION_TIMEOUT_MESSAGE,
   Mailbox,
   type MailboxOptions,
 } from "./mailbox";
@@ -64,6 +65,7 @@ export interface CommsOptions {
   mailbox?: Mailbox;
   decisionTimeoutMs?: MailboxOptions["decisionTimeoutMs"];
   clock?: Clock;
+  logEvent?: (type: string, fields?: Record<string, unknown>) => void;
 }
 
 export function createComms(host: CommsHost, options: CommsOptions = {}): CommsWithOrigin {
@@ -95,11 +97,15 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
       // need_decision: register the per-child waiter BEFORE notifying, so a
       // supervisor that replies synchronously still resolves correctly.
       const wait = mailbox.beginDecision(fromChildId, name, message);
+      options.logEvent?.("decision.request", { child_id: fromChildId });
       const stall = child?.handle as { pauseStall?: () => void; resumeStall?: () => void } | undefined;
       stall?.pauseStall?.();
       host.notifySupervisor(formatSupervisorRequest({ childId: fromChildId, name }, message));
       try {
         const replyText = await wait;
+        if (replyText === DECISION_TIMEOUT_MESSAGE) {
+          options.logEvent?.("decision.timeout", { child_id: fromChildId });
+        }
         entry.reply = replyText;
         return replyText;
       } finally {
@@ -119,6 +125,7 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
         );
       }
       mailbox.append(runIdOf(toChildId), { from, to: toChildId, kind: "reply", message });
+      options.logEvent?.("decision.reply", { child_id: toChildId });
     },
 
     async send(toChildId, message, delivery, from = "supervisor") {

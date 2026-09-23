@@ -33,6 +33,7 @@ export interface NotifyCenterDeps {
    */
   listStillRunning?: () => WakeItem[];
   clock?: Clock;
+  logEvent?: (type: string, fields?: Record<string, unknown>) => void;
 }
 
 
@@ -62,7 +63,10 @@ export class NotifyCenter {
   notifyTaskExit(info: TaskExitInfo): void {
     if (this.disposed) return;
     const key = `exit:${info.taskId}`;
-    if (this.seen.has(key)) return;
+    if (this.seen.has(key)) {
+      this.deps.logEvent?.("wake.dedupe", { id: info.taskId });
+      return;
+    }
     this.seen.add(key);
     this.pendingExits.push(info);
     this.scheduleFlush();
@@ -153,7 +157,22 @@ export class NotifyCenter {
 
   private deliver(message: NotifyMessage): void {
     const msg = { ...message, display: true };
-    if (this.deps.isIdle()) {
+    const details = message.details as { kind?: string; id?: string; taskId?: string; tasks?: { id: string }[]; children?: { childId: string }[]; childId?: string; from?: string; eventCount?: number } | undefined;
+    if (details?.kind) {
+      const ids = details.kind === "task"
+        ? (details.tasks ?? []).map((task) => task.id)
+        : details.kind === "subagent-done"
+          ? (details.children ?? []).map((child) => child.childId)
+          : [details.id ?? details.taskId ?? details.childId ?? details.from].filter((id): id is string => Boolean(id));
+      this.deps.logEvent?.("wake.emit", {
+        kind: details.kind,
+        ids,
+        batch: ids.length > 1 || (details.kind === "monitor" && (details.eventCount ?? 0) > 1),
+      });
+    }
+    const mode = this.deps.isIdle() ? "trigger" : "steer";
+    this.deps.logEvent?.("wake.deliver", { kind: details?.kind ?? "unknown", mode });
+    if (mode === "trigger") {
       this.deps.sendMessage(msg, { triggerTurn: true });
     } else {
       this.deps.sendMessage(msg, { deliverAs: "steer" });
