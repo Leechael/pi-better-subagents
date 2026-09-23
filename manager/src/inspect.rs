@@ -1184,7 +1184,34 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
         a_running,
         a_done
     );
+    if let Some(line) = upgrade_line(&st, now_ms()) {
+        outln!("{line}");
+    }
     Ok(())
+}
+
+/// The `status` line about in-place upgrades: how many this pid went
+/// through and the latest, or why the latest attempt did not happen.
+pub fn upgrade_line(st: &StatusOk, now: u64) -> Option<String> {
+    match &st.last_upgrade {
+        Some(u) if !u.ok => Some(format!(
+            "upgrades: {} (last attempt failed {}, {}: {})",
+            st.generation,
+            fmt::ago(u.at, now),
+            u.trigger,
+            u.error.as_deref().unwrap_or("unknown error")
+        )),
+        Some(u) => Some(format!(
+            "upgrades: {} (last: {} -> {}, {}, {})",
+            st.generation,
+            u.from_version,
+            u.to_version.as_deref().unwrap_or("?"),
+            u.trigger,
+            fmt::ago(u.at, now)
+        )),
+        None if st.generation > 0 => Some(format!("upgrades: {}", st.generation)),
+        None => None,
+    }
 }
 
 /// For `wait` on an agent: poll its record until terminal or the budget ends.
