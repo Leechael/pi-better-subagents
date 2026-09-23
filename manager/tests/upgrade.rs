@@ -380,3 +380,29 @@ fn u10_split_utf8_character_across_an_upgrade() {
     events.extend(c2.events.clone());
     assert_eq!(event_text(&events, &t), "a中b\n", "{events:?}");
 }
+
+/// Upgrades back to back while a monitor streams: nothing lost or repeated.
+#[test]
+fn u11_repeated_upgrades_under_output() {
+    let home = Home::new("u11");
+    let bin = home.install_copy();
+    let _d = home.start_daemon_from(&bin, &[]);
+    let mut c = home.connect();
+    hello(&mut c, "sess-u11");
+    let (t, _) = start(&mut c, "monitor",
+        "i=0; while [ $i -lt 400 ]; do echo r-$i; i=$((i+1)); sleep 0.01; done", json!({}));
+    let mut events = Vec::new();
+    for round in 1..=5u64 {
+        let out = upgrade(&home);
+        assert!(out.status.success(), "round {round}: {} {}", out.stdout, out.stderr);
+        assert!(c.wait_closed(s(5)));
+        events.extend(c.events.clone());
+        c = home.connect();
+        hello(&mut c, "sess-u11");
+        assert_eq!(status(&home)["generation"], round);
+    }
+    c.request_ok(json!({"type":"wait","task_id":t,"budget_ms":15000}));
+    c.drain(Duration::from_millis(300));
+    events.extend(c.events.clone());
+    assert_eq!(assert_sequential(&event_text(&events, &t), "r", "five upgrades"), 400);
+}
