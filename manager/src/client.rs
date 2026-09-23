@@ -563,40 +563,38 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
     println!("lock:   {}", lifecycle::lock_path(home).display());
     let mut problems = 0;
     match lifecycle::read_pid_file(home) {
-        Some(pf) => {
-            println!("pid file: pid={} version={} started_at={}", pf.pid, pf.version, pf.started_at);
-            if task::pid_alive(pf.pid) {
-                println!("process {} is alive", pf.pid);
-                match try_connect_and_hello(home, &HelloMode::Cli).await {
-                    Ok(_) => println!("socket: hello ok"),
-                    Err(e) => {
-                        println!("socket: NOT responding ({e}) — pid is alive, not cleaning");
-                        problems += 1;
-                    }
-                }
-            } else {
-                println!("process {} is DEAD — cleaning stale pid/socket files", pf.pid);
-                if let Err(e) = lifecycle::cleanup_stale_files(home) {
-                    println!("cleanup failed: {e}");
-                } else {
-                    println!("cleaned");
-                }
-                problems += 1;
-            }
-        }
-        None => {
-            println!("pid file: absent");
-            if lifecycle::socket_path(home).exists() {
-                println!("stale socket without pid file — removing");
-                let _ = std::fs::remove_file(lifecycle::socket_path(home));
-                problems += 1;
-            } else {
-                println!("socket: absent (manager not running)");
-            }
-        }
+        Some(pf) => println!(
+            "pid file: pid={} version={} started_at={}",
+            pf.pid, pf.version, pf.started_at
+        ),
+        None => println!("pid file: absent"),
     }
-    if lifecycle::lock_path(home).exists() {
-        println!("lock:   present (held only while a client is spawning)");
+    // Liveness is the daemon's lifetime lock on manager.lock, not the pid
+    // (the pid may have been reused by an unrelated process).
+    match lifecycle::clean_if_no_daemon(home) {
+        Ok(None) => {
+            println!("daemon: running (holds {})", lifecycle::daemon_lock_path(home).display());
+            match try_connect_and_hello(home, &HelloMode::Cli).await {
+                Ok(_) => println!("socket: hello ok"),
+                Err(e) => {
+                    println!("socket: NOT responding ({e}) — daemon holds the lock, not cleaning");
+                    problems += 1;
+                }
+            }
+        }
+        Ok(Some(removed)) if removed.is_empty() => {
+            println!("daemon: not running; no stale files");
+        }
+        Ok(Some(removed)) => {
+            for p in &removed {
+                println!("daemon: not running; removed stale {}", p.display());
+            }
+            problems += 1;
+        }
+        Err(e) => {
+            println!("daemon lock check failed: {e}");
+            problems += 1;
+        }
     }
     if problems == 0 {
         println!("ok");

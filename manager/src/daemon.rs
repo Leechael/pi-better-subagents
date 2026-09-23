@@ -77,18 +77,22 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
         eprintln!("pbs-manager: cannot create {}: {e}", home.display());
         return 1;
     }
-    // §3.1: refuse to start over a live manager; take over from a dead one.
-    match lifecycle::claim_pid(&home) {
-        Ok(Claim::Acquired) => {}
+    // §3.1: the lifetime lock on manager.lock decides who the daemon is; the
+    // holder removes stale socket/pid files before binding. Held until exit.
+    let _daemon_lock = match lifecycle::claim_daemon(&home) {
+        Ok(Claim::Acquired(guard)) => guard,
         Ok(Claim::AlreadyRunning { pid }) => {
-            println!("pbs-manager already running (pid {pid})");
+            match pid {
+                Some(pid) => println!("pbs-manager already running (pid {pid})"),
+                None => println!("pbs-manager already running (starting up)"),
+            }
             return 0;
         }
         Err(e) => {
-            eprintln!("pbs-manager: pid claim failed: {e}");
+            eprintln!("pbs-manager: daemon lock failed: {e}");
             return 1;
         }
-    }
+    };
 
     let mut registry = Registry::new(home.clone());
     let scan = lifecycle::scan_tasks(&home, &mut registry);

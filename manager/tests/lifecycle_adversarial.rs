@@ -169,7 +169,6 @@ fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
 /// client spawn lock). Invariant: exactly one survives and it owns the socket
 /// and the pid file; the others exit 0 ("already running").
 #[test]
-#[ignore = "bug: concurrent `daemon` starts can both claim: claim_pid treats a just-bound socket with no pid file yet as a zombie and unlinks it, leaving an unreachable daemon running"]
 fn d3_concurrent_daemon_processes_leave_one_survivor() {
     for round in 0..10 {
         let home = Home::new(&format!("d3r{round}"));
@@ -495,7 +494,6 @@ fn d11b_client_recovers_from_corrupt_pidfile() {
 /// D12: manager.pid names a pid that is alive but is NOT a pbs-manager (pid
 /// reuse after a crash/reboot). The manager must still come up.
 #[test]
-#[ignore = "bug: pid-file liveness is kill(pid,0) only; a reused pid makes the daemon refuse to start forever (client: 'cannot reach pbs-manager')"]
 fn d12_reused_pid_in_pidfile_does_not_block_startup() {
     let home = Home::new("d12");
     let mut impostor = std::process::Command::new("sleep").arg("300").spawn().unwrap();
