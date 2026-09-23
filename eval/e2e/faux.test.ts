@@ -149,6 +149,57 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.match((ep.items.at(-1) as { text?: string }).text ?? "", /WOKE orphaned/);
   });
 
+  it("(e3) an in-place manager upgrade is invisible to a running command and monitor", async () => {
+    let upgradeOut = "";
+    let before: { pid?: number } = {};
+    const ep = await runFaux({
+      script: "manager-upgrade.ts",
+      pbsConfig: { foregroundBudgetMs: 300 },
+      midway: {
+        when: (items) =>
+          toolResults(items).some((r) => r.toolName === "bash" && r.details?.backgrounded === true) &&
+          toolResults(items).some((r) => r.toolName === "monitor"),
+        act: (sb) => {
+          const m = sb.env.PBS_MANAGER_PATH;
+          before = JSON.parse(spawnSync(m, ["--home", sb.pbsHome, "status", "--json"], { encoding: "utf8" }).stdout);
+          const r = spawnSync(m, ["--home", sb.pbsHome, "upgrade"], { encoding: "utf8", timeout: 40_000 });
+          upgradeOut = `${r.status} ${r.stdout}${r.stderr}`;
+        },
+      },
+      until: (items) =>
+        wakes(items).some((w) => w.wake.kind === "task") &&
+        wakes(items).some((w) => w.wake.kind === "monitor" && w.wake.status === "exited"),
+      untilTimeoutMs: 25_000,
+      quietMs: 1500,
+    });
+    episodes.push(ep);
+    assert.match(upgradeOut, /^0 upgraded in place/, `upgrade: ${upgradeOut}\n${explain(ep)}`);
+    const after = JSON.parse(
+      spawnSync(ep.sandbox.env.PBS_MANAGER_PATH, ["--home", ep.sandbox.pbsHome, "status", "--json"], { encoding: "utf8" }).stdout,
+    );
+    assert.equal(after.pid, before.pid, "same manager pid");
+    assert.equal(after.generation, 1);
+
+    // The command ran through the manager (no local fallback) and ends once,
+    // with its real exit code.
+    const bash = bashResult(ep.items);
+    const taskId = String(bash?.details?.task_id);
+    assert.match(taskId, /^sh_[0-9a-f]{8}$/, `not a manager task\n${explain(ep)}`);
+    const taskWakes = wakes(ep.items).filter((w) => w.wake.kind === "task");
+    assert.equal(taskWakes.length, 1, `exactly one exit wake\n${explain(ep)}`);
+    assert.deepEqual(taskWakes[0].wake.taskIds, [taskId]);
+    assert.equal(taskWakes[0].wake.tasks[0].exitCode, 5, explain(ep));
+
+    // Every monitor line once, in order, across the upgrade.
+    const monitorResult = toolResults(ep.items).find((r) => r.toolName === "monitor");
+    const monId = String(monitorResult?.details?.task_id);
+    const monWakes = wakes(ep.items).filter((w) => w.wake.kind === "monitor" && w.wake.taskIds[0] === monId);
+    const lines = monWakes.filter((w) => w.wake.status === "event").flatMap((w) => w.wake.body.split("\n")).filter(Boolean);
+    const detail = monWakes.map((w) => `${w.seq} ${w.wake.status} ${JSON.stringify(w.wake.body)}`).join("\n");
+    assert.deepEqual(lines, Array.from({ length: 30 }, (_, i) => `m-${i + 1}`), `${detail}\n${explain(ep)}`);
+    assert.equal(monWakes.filter((w) => w.wake.status === "exited").length, 1, explain(ep));
+  });
+
   it("(c2) a monitor that exits at once ends with an exit wake, not a timeout", async () => {
     const ep = await runFaux({
       script: "monitor-fast-exit.ts",
