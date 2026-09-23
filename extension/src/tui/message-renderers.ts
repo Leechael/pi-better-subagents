@@ -61,7 +61,9 @@ function collapsedText(details: PbsWake, theme: Theme): string {
     }
     case "monitor": {
       const preview = details.event.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "(event)";
-      const { color, glyph } = statusGlyph(details.status);
+      const { color, glyph } = details.status
+        ? statusGlyph(details.status)
+        : { color: "accent", glyph: "›" };
       const statusBit = details.status ? ` ${theme.fg("dim", `· ${details.status}`)}` : "";
       const countBit = details.eventCount && details.eventCount > 1
         ? ` ${theme.fg("dim", `· ${details.eventCount} events`)}`

@@ -431,6 +431,8 @@ describe("pbs-wake pill", () => {
       theme,
     ).render(80) as string[];
     const text = monitor.join("\n");
+    expect(text).toContain("›");
+    expect(text).not.toContain("✓");
     expect(text).toContain("line1");
     expect(text).toContain("4 events");
     expect(text).toContain("5 lines dropped");
