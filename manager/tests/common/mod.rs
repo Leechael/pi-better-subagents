@@ -683,6 +683,16 @@ impl Conn {
         }
     }
 
+    /// Read whatever arrives for `d` (events land in `events`).
+    pub fn drain(&mut self, d: Duration) {
+        let deadline = Instant::now() + d;
+        while let Recv::Frame(f) = self.recv(deadline) {
+            if f["type"] != "event" {
+                self.pending.push_back(f);
+            }
+        }
+    }
+
     /// Drain frames until the peer closes; true if it closed before timeout.
     pub fn wait_closed(&mut self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
