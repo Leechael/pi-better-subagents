@@ -27,6 +27,13 @@ function blockText(block: LooseBlock): string {
   return "";
 }
 
+function visibleUserText(text: string): string {
+  let visible = text.replace(/^You are running as model [^\n]+\.\n\n/, "");
+  const separator = visible.indexOf("\n\n---\n\n");
+  if (separator >= 0) visible = visible.slice(separator + "\n\n---\n\n".length);
+  return visible.trim();
+}
+
 function contentText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -38,8 +45,12 @@ function contentText(content: unknown): string {
 
 export function turnsFromMessages(messages: readonly LooseMessage[]): ConversationTurn[] {
   const turns: ConversationTurn[] = [];
+  let firstUserTurn = true;
   for (const message of messages) {
-    const text = contentText(message.content);
+    if (message.role === "system") continue;
+    const rawText = contentText(message.content);
+    const text = message.role === "user" && firstUserTurn ? visibleUserText(rawText) : rawText;
+    if (message.role === "user") firstUserTurn = false;
     if (!text) continue;
     if (message.role === "toolResult") {
       const name = message.toolName ?? "tool";

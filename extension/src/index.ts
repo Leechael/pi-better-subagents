@@ -18,6 +18,7 @@ import { createBashOverride } from "./bash-override";
 import { createComms, type CommsWithOrigin } from "./comms/comms";
 import { createRegistryCommsHost } from "./comms/registry-host";
 import { createAgentMessageTool, createContactSupervisorTool } from "./comms/tools";
+import { registerReplyCommand } from "./comms/reply-command";
 import { getPbsHome, loadConfig, resolveManagerPath, resolveSubagentConfig } from "./config";
 import type { TaskExitInfo } from "./format";
 import { ManagerClient, type ManagerEvent } from "./manager-client";
@@ -218,6 +219,7 @@ export default function (pi: ExtensionAPI): void {
     decisionTimeoutMs: subagentConfig.decisionTimeoutMs,
     clock,
   });
+  registerReplyCommand(pi, comms);
   pi.registerTool(
     createSubagentTool({
       getRegistry: () => subagentRegistry,
@@ -435,6 +437,7 @@ export default function (pi: ExtensionAPI): void {
           name: c.name,
           agent: c.agent,
           ...(c.model !== undefined ? { model: c.model } : {}),
+          ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
           ...(c.result?.text ? { text: c.result.text } : {}),
           ...(c.result?.error ? { error: c.result.error } : {}),
         });
@@ -444,6 +447,7 @@ export default function (pi: ExtensionAPI): void {
       fleetWidget = new FleetWidget({
         index: workIndex,
         getUi: () => (ctx?.hasUI ? (ctx.ui as never) : null),
+        clock,
       });
       fleetWidget.start();
     }

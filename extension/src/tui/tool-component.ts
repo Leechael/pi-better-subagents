@@ -20,6 +20,8 @@ export function statusGlyph(status: string | undefined, isError = false): { colo
   if (isError || status === "failed" || status === "killed" || status === "orphaned" || status === "interrupted") {
     return { color: "error", glyph: "✗" };
   }
+  if (status === "running") return { color: "accent", glyph: "●" };
+  if (status === "pending") return { color: "dim", glyph: "○" };
   if (status === "partial" || status === "timeout" || status === "stopped") {
     return { color: "warning", glyph: "■" };
   }

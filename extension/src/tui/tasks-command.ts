@@ -13,6 +13,7 @@ import { formatAge, type WorkIndex, type WorkItem } from "../work-index";
 import { notifyPlainFallback, showScrollDetail } from "./scroll-detail-view";
 import { readTaskFileTailCached, stderrPathFor } from "./task-output-paths";
 import { loadPiTui, truncateToWidth } from "./pi-tui-load";
+import { statusGlyph } from "./tool-component";
 
 const AGE_TICK_MS = 1000;
 
@@ -84,9 +85,10 @@ export function formatWorkRows(
   const selected = selectedIndex(items, selectedId);
   return items.map((item, i) => {
     const mark = i === selected ? "▸" : " ";
+    const { glyph } = statusGlyph(item.status);
     const age = formatAge(item.startedAt, item.endedAt, now);
     const title = item.error ? `${item.title} · ${item.error}` : item.title;
-    const raw = `${mark} ${item.kind.padEnd(7)} ${item.status.padEnd(11)} ${age.padEnd(6)} ${title}`;
+    const raw = `${mark} ${glyph} ${item.kind.padEnd(7)} ${item.status.padEnd(11)} ${age.padEnd(6)} ${title}`;
     return truncateToWidth(raw, Math.max(1, width), "…");
   });
 }
@@ -197,7 +199,9 @@ async function showTaskList(
           const items = getItems();
           selectedId = items[selectedIndex(items, selectedId)]?.id;
           const inner = Math.max(1, width);
-          const title = truncateToWidth(theme.fg("accent", "Background tasks"), inner, "…");
+          const activeCount = items.filter(isLive).length;
+          const titleText = `Background tasks · ${activeCount} active · ${items.length} total`;
+          const title = truncateToWidth(theme.fg("accent", titleText), inner, "…");
           const hint = truncateToWidth(selectorHint(theme), inner, "…");
           const rows = formatWorkRows(items, selectedId, clock.now(), inner);
           return [...border.render(inner), title, hint, ...rows, ...border.render(inner)];
@@ -259,13 +263,23 @@ async function stopItem(item: WorkItem, deps: TasksCommandDeps): Promise<void> {
   await client.stop(item.id, "tui");
 }
 
+export function taskDetailHeader(item: WorkItem, now: number): string {
+  const lines = [`${item.kind} · ${item.status} · ${formatAge(item.startedAt, item.endedAt, now)}`];
+  if (item.outputPath) lines.push(`Output: ${item.outputPath}`);
+  if (item.error) lines.push(`Error: ${item.error}`);
+  return lines.join("\n");
+}
+
 async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksCommandDeps): Promise<void> {
   if (!ctx.hasUI) return;
+  const clock = deps.clock ?? realClock;
   if (item.kind === "agent") {
     const read = () => {
-      const body =
-        formatConversation(deps.getRegistry()?.handle(item.id)?.conversation() ?? []) || item.text || "(no output)";
-      return item.error ? `${body}\n\nError: ${item.error}` : body;
+      const conversation = deps.getRegistry()?.handle(item.id)?.conversation() ?? [];
+      const body = conversation.length > 0
+        ? formatConversation(conversation)
+        : item.text || (item.prompt ? `Task prompt:\n${item.prompt}` : "(no output)");
+      return `${taskDetailHeader(item, clock.now())}\n\n${body}`;
     };
     try {
       await showScrollDetail(ctx.ui, { title: `subagent ${item.title}`, content: read, pollMs: 500, clock: deps.clock });
@@ -280,8 +294,8 @@ async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksComman
     await showScrollDetail(ctx.ui, {
       title: `${item.kind} ${item.title}`,
       tabs: {
-        output: () => readTaskFileTailCached(outputPath),
-        stderr: () => readTaskFileTailCached(stderrPath),
+        output: () => `${taskDetailHeader(item, clock.now())}\n\n${readTaskFileTailCached(outputPath)}`,
+        stderr: () => `${taskDetailHeader(item, clock.now())}\n\n${readTaskFileTailCached(stderrPath)}`
       },
       pollMs: 500,
       clock: deps.clock,

@@ -43,7 +43,9 @@ export interface ChildRunRequest {
   childId: string; // assigned by the registry: "ch_" + 8
   runId: string; // "run_" + 8
   name: string; // display name (tasks[].name or agent name or ordinal)
-  prompt: string; // already interpolated
+  prompt: string; // actual first prompt sent to the session, including agent preamble
+  /** User-authored task prompt without agent or model preamble. */
+  taskPrompt?: string;
   agent: AgentDefinition; // already resolved
   model?: string; // subagent() parameter-level override
   timeoutMs: number;

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ManualClock } from "../../src/clock";
 import { formatConversation, turnsFromMessages } from "../../src/subagent/conversation";
 import { stderrPathFor } from "../../src/tui/task-output-paths";
-import { formatWorkRows, moveSelection, stopChoice } from "../../src/tui/tasks-command";
+import { formatWorkRows, moveSelection, stopChoice, taskDetailHeader } from "../../src/tui/tasks-command";
 import { wrapLines } from "../../src/tui/scroll-detail-view";
 import { WorkIndex, type WorkItem } from "../../src/work-index";
 
@@ -54,6 +54,11 @@ describe("tasks view", () => {
     expect(formatWorkRows([failed], failed.id, 1000, 100)[0]).toContain("529 overloaded_error");
   });
 
+  it("puts task state and output location at the top of details", () => {
+    const task = { ...item("sh_1", "failed"), outputPath: "/tmp/sh_1.output", error: "exit 3" };
+    expect(taskDetailHeader(task, 5_001)).toBe("shell · failed · 5s\nOutput: /tmp/sh_1.output\nError: exit 3");
+  });
+
   it("shows elapsed time from the task start, not when it was backgrounded", () => {
     const index = new WorkIndex({ clock: new ManualClock(20_000) });
     index.upsert({
@@ -79,6 +84,22 @@ describe("tasks view", () => {
       countsAsWorker: false,
     });
     expect(index.list().map((i) => i.id)).toEqual(["ch_done"]);
+  });
+
+  it("hides injected prompt and model preambles from child transcripts", () => {
+    const turns = turnsFromMessages([
+      { role: "system", content: "CHILD_BEHAVIOR_GUIDELINES hidden" },
+      {
+        role: "user",
+        content: "You are running as model provider/model.\n\nagent preamble\n\n---\n\ninspect the loader",
+      },
+      { role: "assistant", content: "I will inspect it." },
+    ]);
+    const text = formatConversation(turns);
+    expect(text).toContain("inspect the loader");
+    expect(text).not.toContain("CHILD_BEHAVIOR_GUIDELINES");
+    expect(text).not.toContain("agent preamble");
+    expect(text).not.toContain("You are running as model");
   });
 
   it("formats a child transcript and the stderr sibling path", () => {

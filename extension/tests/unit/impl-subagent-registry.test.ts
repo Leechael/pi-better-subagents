@@ -55,8 +55,11 @@ describe("SubagentRegistry", () => {
     });
     const run = registry.createRun("tasks");
     const req = addReq(registry, run.runId, "a");
+    req.prompt = "agent preamble\n\n---\n\ndo a";
+    req.taskPrompt = "do a";
     const handle = await registry.startChild(req);
     expect(handle.status()).toBe("running");
+    expect(factory.sessions[0].prompts).toEqual(["agent preamble\n\n---\n\ndo a"]);
     factory.sessions[0].complete("done");
     await handle.result;
     await tick();
@@ -65,6 +68,7 @@ describe("SubagentRegistry", () => {
     expect(record.status).toBe("completed");
     expect(record.children[0].status).toBe("completed");
     expect(record.children[0].result?.text).toBe("done");
+    expect(record.children[0].prompt).toBe("do a");
     expect(record.children[0].endedAt).toBeTypeOf("number");
     // Transitions observed: run creation, addChild, running, completed.
     expect(seen.some((s) => s.children === "pending")).toBe(true);

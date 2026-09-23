@@ -316,7 +316,7 @@ export class SubagentRegistry implements RunRegistry {
     const child = this.children.get(req.childId);
     if (!child) throw new Error(`unknown child ${req.childId} (addChild first)`);
     child.shouldStart = opts?.shouldStart;
-    child.prompt = req.prompt;
+    child.prompt = req.taskPrompt ?? req.prompt;
     child.model = req.model ?? req.agent.model;
 
     const runner = this.runner;

@@ -357,6 +357,7 @@ export function createSubagentTool(
       runId: run.runId,
       name: resolved[ordinal].name,
       prompt: buildPrompt(resolved[ordinal].agent, prompt),
+      taskPrompt: prompt,
       agent: resolved[ordinal].agent,
       model: params.model,
       timeoutMs,

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { ManualClock } from "../../src/clock";
 import { FleetWidget, FLEET_WIDGET_KEY, summaryLabel, type FleetUi } from "../../src/subagent/fleet-widget";
 import { WorkIndex } from "../../src/work-index";
 
@@ -46,21 +47,22 @@ function lastFactory(ui: ReturnType<typeof fakeUi>): ((w: number) => string[]) |
   return undefined;
 }
 
-describe("FleetWidget (passive counts)", () => {
+describe("FleetWidget", () => {
 
   it("shows workers, subagents, and monitors without a total", () => {
     const ui = fakeUi();
-    const index = new WorkIndex();
+    const clock = new ManualClock(10_000);
+    const index = new WorkIndex({ clock });
     index.upsert({ id: "sh_1", kind: "shell", status: "running", title: "sleep 9", startedAt: 1, countsAsWorker: true });
     index.upsert({ id: "mon_1", kind: "monitor", status: "running", title: "ticker", startedAt: 2, countsAsWorker: false });
-    index.upsert({ id: "ch_1", kind: "agent", status: "running", title: "worker-1", startedAt: 3, countsAsWorker: false });
-    const widget = new FleetWidget({ index, getUi: () => ui });
+    index.upsert({ id: "ch_1", kind: "agent", status: "running", title: "worker-1 (worker)", startedAt: 3, countsAsWorker: false });
+    const widget = new FleetWidget({ index, getUi: () => ui, clock });
     widget.start();
     const lines = lastFactory(ui)!(80);
     expect(lines[0]).toMatch(/1 worker/);
-    expect(lines[0]).toMatch(/1 subagent/);
     expect(lines[0]).toMatch(/1 monitor/);
-    expect(lines[0]).not.toMatch(/\d+ tasks/);
+    expect(lines[1]).toContain("● worker-1 (worker) — 10s");
+    expect(lines.join("\n")).not.toMatch(/\d+ tasks/);
     expect(summaryLabel(1, 1, 1)).toBe("1 worker · 1 subagent · 1 monitor");
     widget.dispose();
   });
@@ -88,19 +90,18 @@ describe("FleetWidget (passive counts)", () => {
     widget.dispose();
   });
 
-  it("re-renders when the index changes, not on a timer", async () => {
+  it("refreshes live subagent ages on the shared clock", () => {
     const ui = fakeUi();
-    const index = new WorkIndex();
-    const widget = new FleetWidget({ index, getUi: () => ui });
+    const clock = new ManualClock(1_000);
+    const index = new WorkIndex({ clock });
+    index.upsert({ id: "ch_1", kind: "agent", status: "running", title: "alpha (worker)", startedAt: 0, countsAsWorker: false });
+    const widget = new FleetWidget({ index, getUi: () => ui, clock });
     widget.start();
-    const before = ui.renders;
-    await Promise.resolve();
-    expect(ui.renders).toBe(before);
-    index.upsert({ id: "mon_1", kind: "monitor", status: "running", title: "tick", startedAt: 1, countsAsWorker: false });
-    expect(lastFactory(ui)?.(80).join("\n")).toMatch(/1 monitor/);
-    const afterRegister = ui.renders;
-    index.patch("mon_1", { title: "tick2" });
-    expect(ui.renders).toBeGreaterThan(afterRegister);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("1s");
+    const renders = ui.renders;
+    clock.advanceBy(5000);
+    expect(ui.renders).toBeGreaterThan(renders);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("6s");
     widget.dispose();
   });
 
