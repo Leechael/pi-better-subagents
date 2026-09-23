@@ -239,8 +239,22 @@ pub fn scan_tasks(home: &Path, registry: &mut Registry) -> ScanResult {
             } else {
                 // §3.4: pid dead -> orphaned.
                 rec.status = TaskStatus::Orphaned;
-                rec.ended_at = Some(now_ms());
+                rec.end_reason = Some(crate::proto::end_reason::ORPHANED.to_string());
+                let now = now_ms();
+                rec.ended_at = Some(now);
                 let _ = registry::persist_record(home, &rec);
+                crate::events::emit(
+                    home,
+                    Some(&rec.session_id),
+                    "task.exit",
+                    Some(&rec.task_id),
+                    serde_json::json!({
+                        "exit_code": null,
+                        "signal": null,
+                        "end_reason": crate::proto::end_reason::ORPHANED,
+                        "duration_ms": now.saturating_sub(rec.started_at),
+                    }),
+                );
                 registry.tasks.insert(rec.task_id.clone(), TaskEntry::terminal(rec));
                 result.orphaned += 1;
             }
@@ -334,6 +348,9 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             output_size: 3,
+            origin: None,
+            backgrounded_at: None,
+            end_reason: None,
         };
         registry::persist_record(&home, &rec).unwrap();
         let mut reg = Registry::new(home.clone());

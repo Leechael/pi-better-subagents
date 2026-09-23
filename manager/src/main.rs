@@ -4,6 +4,7 @@
 
 mod client;
 mod daemon;
+mod events;
 mod lifecycle;
 mod proto;
 mod registry;

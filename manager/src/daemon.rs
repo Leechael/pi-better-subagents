@@ -54,6 +54,10 @@ pub struct SessionEntry {
     pub pi_pid: u32,
     pub conn_id: Option<u64>,
     pub cwd: Option<String>,
+    pub extension_version: Option<String>,
+    pub protocol: Option<u32>,
+    pub connected_at: u64,
+    pub last_seen: u64,
 }
 
 pub struct DaemonState {
@@ -141,6 +145,20 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
             scan.orphaned,
             scan.loaded
         ),
+    );
+    crate::events::emit(
+        &home,
+        None,
+        "daemon.start",
+        None,
+        serde_json::json!({
+            "pid": std::process::id(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "protocol": PROTOCOL,
+            "readopted": scan.readopted.len(),
+            "orphaned": scan.orphaned,
+            "loaded": scan.loaded,
+        }),
     );
     if foreground {
         eprintln!(
@@ -267,13 +285,24 @@ async fn handle_conn(state: Shared, stream: Stream) {
             .await;
         return;
     }
-    let (client_kind, session_id, pi_pid, cwd) = match hello.kind {
+    let (client_kind, session_id, pi_pid, info) = match hello.kind {
         RequestKind::Hello {
             client_kind,
             session_id,
             pi_pid,
             cwd,
-        } => (client_kind, session_id, pi_pid, cwd),
+            extension_version,
+            protocol,
+        } => (
+            client_kind,
+            session_id,
+            pi_pid,
+            HelloInfo {
+                cwd,
+                extension_version,
+                protocol,
+            },
+        ),
         _ => {
             let _ = tx
                 .send(encode_error(&hello.id, E_BAD_REQUEST, "first message must be hello"))
@@ -295,7 +324,7 @@ async fn handle_conn(state: Shared, stream: Stream) {
         }
     }
 
-    let conn_id = match register_conn(&state, &tx, &die, client_kind, session_id, pi_pid, cwd) {
+    let conn_id = match register_conn(&state, &tx, &die, client_kind, session_id, pi_pid, info) {
         Ok(id) => id,
         Err(e) => {
             let _ = tx.send(encode_error(&hello.id, &e.code, &e.message)).await;
@@ -344,9 +373,16 @@ async fn handle_conn(state: Shared, stream: Stream) {
     // ---- disconnect (§3.2: socket close marks the session disconnected) ----
     {
         let mut st = state.lock().unwrap();
-        remove_conn(&mut st, conn_id);
+        remove_conn(&mut st, conn_id, "closed");
     }
     maybe_arm_idle_timer(&state);
+}
+
+/// Optional hello fields stored per session.
+pub struct HelloInfo {
+    pub cwd: Option<String>,
+    pub extension_version: Option<String>,
+    pub protocol: Option<u32>,
 }
 
 /// Register a hello'd connection. Same-session rebind: the new connection
@@ -358,7 +394,7 @@ fn register_conn(
     kind: ClientKind,
     session_id: Option<String>,
     pi_pid: Option<u32>,
-    cwd: Option<String>,
+    info: HelloInfo,
 ) -> Result<u64, ProtoError> {
     let mut st = state.lock().unwrap();
     if st.shutdown {
@@ -378,14 +414,34 @@ fn register_conn(
                 let _ = old_h.tx.try_send(encode_event(&EventKind::SessionRebound {}));
                 old_h.die.notify_one();
             }
-            remove_conn(&mut st, old_id);
+            remove_conn(&mut st, old_id, "rebound");
         }
+        let now = now_ms();
+        // `connected_at` is the first hello this manager saw for the session;
+        // a reconnect (pi --resume, rebind) keeps it.
+        let connected_at = st.sessions.get(&sid).map(|s| s.connected_at).unwrap_or(now);
+        crate::events::emit(
+            &st.home,
+            Some(&sid),
+            "session.connect",
+            None,
+            serde_json::json!({
+                "pi_pid": pi_pid.unwrap_or(0),
+                "cwd": info.cwd,
+                "extension_version": info.extension_version,
+                "protocol": info.protocol,
+            }),
+        );
         st.sessions.insert(
             sid,
             SessionEntry {
                 pi_pid: pi_pid.unwrap_or(0),
                 conn_id: Some(conn_id),
-                cwd,
+                cwd: info.cwd,
+                extension_version: info.extension_version,
+                protocol: info.protocol,
+                connected_at,
+                last_seen: now,
             },
         );
     }
@@ -401,12 +457,21 @@ fn register_conn(
     Ok(conn_id)
 }
 
-fn remove_conn(st: &mut DaemonState, conn_id: u64) {
+fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
     if let Some(h) = st.conns.remove(&conn_id) {
         if let Some(sid) = &h.session_id {
+            let home = st.home.clone();
             if let Some(s) = st.sessions.get_mut(sid) {
                 if s.conn_id == Some(conn_id) {
                     s.conn_id = None; // session now disconnected (§3.2)
+                    s.last_seen = now_ms();
+                    crate::events::emit(
+                        &home,
+                        Some(sid),
+                        "session.disconnect",
+                        None,
+                        serde_json::json!({ "reason": why }),
+                    );
                 }
             }
         }
@@ -446,6 +511,7 @@ fn maybe_arm_idle_timer(state: &Shared) {
 // ---------------------------------------------------------------------------
 
 async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
+    touch_session(&state, conn_id);
     let id = req.id;
     match req.kind {
         RequestKind::Hello { .. } => {
@@ -459,8 +525,22 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             cwd,
             env,
             timeout_ms,
+            origin,
             ..
-        } => respond(&tx, &id, handle_start(&state, conn_id, kind, command, cwd, env, timeout_ms)).await,
+        } => {
+            let spec = StartSpec {
+                kind,
+                command,
+                cwd,
+                env,
+                timeout_ms,
+                origin,
+            };
+            respond(&tx, &id, handle_start(&state, conn_id, spec)).await
+        }
+        RequestKind::MarkBackground { task_id } => {
+            respond(&tx, &id, handle_mark_background(&state, conn_id, &task_id)).await
+        }
         RequestKind::Wait { task_id, budget_ms } => {
             respond(&tx, &id, handle_wait(&state, conn_id, &task_id, budget_ms).await).await
         }
@@ -469,8 +549,8 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
             cursor,
             max_bytes,
         } => respond(&tx, &id, handle_output(&state, conn_id, &task_id, cursor, max_bytes)).await,
-        RequestKind::Stop { task_id } => {
-            respond(&tx, &id, handle_stop(&state, conn_id, &task_id)).await
+        RequestKind::Stop { task_id, reason } => {
+            respond(&tx, &id, handle_stop(&state, conn_id, &task_id, reason.as_deref())).await
         }
         RequestKind::List { all, session_id } => {
             respond(&tx, &id, handle_list(&state, conn_id, all, session_id)).await
@@ -486,6 +566,15 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         }
         RequestKind::Status => respond(&tx, &id, handle_status(&state, conn_id)).await,
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
+    }
+}
+
+/// Record activity for the connection's session (`sessions` LAST_SEEN).
+fn touch_session(state: &Shared, conn_id: u64) {
+    let mut st = state.lock().unwrap();
+    let sid = st.conns.get(&conn_id).and_then(|h| h.session_id.clone());
+    if let Some(s) = sid.and_then(|sid| st.sessions.get_mut(&sid)) {
+        s.last_seen = now_ms();
     }
 }
 
@@ -554,15 +643,24 @@ fn send_event_to_session(state: &Shared, session_id: &str, kind: EventKind) {
 // Message handlers
 // ---------------------------------------------------------------------------
 
-fn handle_start(
-    state: &Shared,
-    conn_id: u64,
-    kind: TaskKind,
-    command: String,
-    cwd: Option<String>,
-    env: HashMap<String, String>,
-    timeout_ms: Option<u64>,
-) -> Result<StartOk, ProtoError> {
+pub struct StartSpec {
+    pub kind: TaskKind,
+    pub command: String,
+    pub cwd: Option<String>,
+    pub env: HashMap<String, String>,
+    pub timeout_ms: Option<u64>,
+    pub origin: Option<Origin>,
+}
+
+fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk, ProtoError> {
+    let StartSpec {
+        kind,
+        command,
+        cwd,
+        env,
+        timeout_ms,
+        origin,
+    } = spec;
     let (session_id, home) = {
         let st = state.lock().unwrap();
         if st.shutdown {
@@ -627,6 +725,9 @@ fn handle_start(
         ended_at: None,
         output_path: out_path.to_string_lossy().into_owned(),
         output_size: 0,
+        origin: origin.clone(),
+        backgrounded_at: None,
+        end_reason: None,
     };
     if let Err(e) = registry::persist_record(&home, &record) {
         let _ = task::signal_group(pid, task::SIGKILL); // don't leak the child
@@ -642,6 +743,18 @@ fn handle_start(
     }
     spawn_output_fanout(state, &task_id);
     spawn_exit_watch(state, &task_id, pid);
+    crate::events::emit(
+        &home,
+        Some(&session_id),
+        "task.start",
+        Some(&task_id),
+        serde_json::json!({
+            "kind": kind,
+            "command": crate::events::clip_chars(&command, crate::events::COMMAND_CHARS),
+            "origin": origin,
+            "pid": pid,
+        }),
+    );
     // §3.3: task_started is always pushed to the owning session.
     send_event_to_session(
         state,
@@ -767,24 +880,70 @@ fn handle_output(
     })
 }
 
-fn handle_stop(state: &Shared, conn_id: u64, task_id: &str) -> Result<UnitOk, ProtoError> {
-    let pid = {
+fn handle_stop(
+    state: &Shared,
+    conn_id: u64,
+    task_id: &str,
+    reason: Option<&str>,
+) -> Result<UnitOk, ProtoError> {
+    if let Some(r) = reason {
+        if !STOP_REASONS.contains(&r) {
+            return Err(ProtoError::new(
+                E_BAD_REQUEST,
+                format!("unknown stop reason {r:?} (expected one of {})", STOP_REASONS.join(", ")),
+            ));
+        }
+    }
+    let (pid, home, sid) = {
         let mut st = state.lock().unwrap();
+        let home = st.home.clone();
         let acc = access_for(&st, conn_id);
         let e = st.registry.visible_mut(task_id, &acc)?;
         if !e.owns_live_group() {
             return Ok(UnitOk {}); // idempotent: terminal and nothing left
         }
-        if e.record.status == TaskStatus::Running {
-            e.kill_requested = true; // exit path maps this to `killed` (§3.4)
-        }
         // A terminal task with a lingering group keeps its status; stop
         // still takes down what it left behind.
-        e.record.pid
+        e.request_kill(&end_reason_for_stop(reason));
+        (e.record.pid, home, e.record.session_id.clone())
     };
+    crate::events::emit(
+        &home,
+        Some(&sid),
+        "task.stop",
+        Some(task_id),
+        serde_json::json!({ "reason": reason.unwrap_or("tool") }),
+    );
     // §3.3 stop: SIGTERM the process group, 2s grace, then SIGKILL.
     let _ = task::signal_group(pid, task::SIGTERM);
     spawn_kill_reaper(state, task_id, pid);
+    Ok(UnitOk {})
+}
+
+/// Observability: record that the extension moved a task to the background.
+/// Idempotent (the first time is kept); a no-op on a finished task.
+fn handle_mark_background(state: &Shared, conn_id: u64, task_id: &str) -> Result<UnitOk, ProtoError> {
+    let (home, rec) = {
+        let mut st = state.lock().unwrap();
+        let home = st.home.clone();
+        let acc = access_for(&st, conn_id);
+        let e = st.registry.visible_mut(task_id, &acc)?;
+        if e.record.status != TaskStatus::Running || e.record.backgrounded_at.is_some() {
+            return Ok(UnitOk {});
+        }
+        e.record.backgrounded_at = Some(now_ms());
+        (home, e.record.clone())
+    };
+    if let Err(e) = registry::persist_record(&home, &rec) {
+        lifecycle::log_line(&home, &format!("persist {} failed: {e}", rec.task_id));
+    }
+    crate::events::emit(
+        &home,
+        Some(&rec.session_id),
+        "task.background",
+        Some(task_id),
+        serde_json::json!({ "after_ms": rec.backgrounded_at.unwrap_or(0).saturating_sub(rec.started_at) }),
+    );
     Ok(UnitOk {})
 }
 
@@ -876,7 +1035,7 @@ fn handle_watch(
 }
 
 fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessionOk, ProtoError> {
-    let victims = {
+    let (victims, home, sid) = {
         let mut st = state.lock().unwrap();
         let h = st
             .conns
@@ -898,14 +1057,23 @@ fn handle_shutdown_session(state: &Shared, conn_id: u64) -> Result<ShutdownSessi
             if e.record.session_id == sid && e.owns_live_group() {
                 let running = e.record.status == TaskStatus::Running;
                 if running {
-                    e.kill_requested = true;
+                    e.request_kill(end_reason::SESSION_END);
                 }
                 v.push((e.record.task_id.clone(), e.record.pid, running));
             }
         }
-        v
+        (v, st.home.clone(), sid)
     };
-    for (tid, pid, _) in &victims {
+    for (tid, pid, running) in &victims {
+        if *running {
+            crate::events::emit(
+                &home,
+                Some(&sid),
+                "task.stop",
+                Some(tid),
+                serde_json::json!({ "reason": "session-end" }),
+            );
+        }
         let _ = task::signal_group(*pid, task::SIGTERM);
         spawn_kill_reaper(state, tid, *pid);
     }
@@ -930,6 +1098,10 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
             pi_pid: s.pi_pid,
             connected: s.conn_id.is_some(),
             cwd: s.cwd.clone(),
+            extension_version: s.extension_version.clone(),
+            protocol: s.protocol,
+            connected_at: s.connected_at,
+            last_seen: if s.conn_id.is_some() { now_ms() } else { s.last_seen },
         })
         .collect();
     let running = st
@@ -945,6 +1117,7 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         uptime_ms: st.started.elapsed().as_millis() as u64,
         sessions,
         task_counts: TaskCounts { running, terminal },
+        protocol: PROTOCOL,
     })
 }
 
@@ -1057,7 +1230,7 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
                             let mut st = state2.lock().unwrap();
                             if let Some(e) = st.registry.tasks.get_mut(&tid) {
                                 if e.record.status == TaskStatus::Running {
-                                    e.kill_requested = true;
+                                    e.request_kill(end_reason::TIMEOUT);
                                 }
                             }
                         }
@@ -1105,7 +1278,7 @@ fn spawn_adopted_poller(state: &Shared, task_id: &str, pid: u32) {
 /// `wait`ers, and push `task_exited` to the owning session (§3.3/§3.4).
 fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::ExitStatus>) {
     let mut lingering = None;
-    let (sid, event) = {
+    let (sid, event, home) = {
         let mut st = state.lock().unwrap();
         let home = st.home.clone();
         let Some(entry) = st.registry.tasks.get_mut(task_id) else {
@@ -1122,6 +1295,13 @@ fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::Exi
         entry.record.ended_at = Some(now);
         entry.record.output_size = entry.output.lock().unwrap().total_size;
         entry.record.status = registry::terminal_status(entry.kill_requested, code, signal);
+        // Why it ended: our kill's reason; otherwise a natural exit. A
+        // re-adopted task (no exit status) ended while we only polled it.
+        entry.record.end_reason = Some(match (&entry.kill_reason, status) {
+            (Some(r), _) => r.clone(),
+            (None, Some(_)) => end_reason::EXITED.to_string(),
+            (None, None) => end_reason::MANAGER_RESTART.to_string(),
+        });
         if let Err(e) = registry::persist_record(&home, &entry.record) {
             lifecycle::log_line(&home, &format!("persist {} failed: {e}", entry.record.task_id));
         }
@@ -1140,13 +1320,41 @@ fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::Exi
             output_path: entry.record.output_path.clone(),
             output_size: entry.record.output_size,
             ts: now,
+            end_reason: entry.record.end_reason.clone(),
         };
-        (entry.record.session_id.clone(), event)
+        (entry.record.session_id.clone(), event, home)
     };
     if let Some(pgid) = lingering {
         spawn_group_watcher(state, task_id, pgid);
     }
+    log_task_exit(&home, &sid, &event);
     send_event_to_session(state, &sid, event);
+}
+
+/// events.jsonl `task.exit` from a task_exited event.
+fn log_task_exit(home: &std::path::Path, sid: &str, ev: &EventKind) {
+    if let EventKind::TaskExited {
+        task_id,
+        exit_code,
+        signal,
+        duration_ms,
+        end_reason,
+        ..
+    } = ev
+    {
+        crate::events::emit(
+            home,
+            Some(sid),
+            "task.exit",
+            Some(task_id),
+            serde_json::json!({
+                "exit_code": exit_code,
+                "signal": signal,
+                "end_reason": end_reason,
+                "duration_ms": duration_ms,
+            }),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,7 +1377,7 @@ async fn graceful_shutdown(state: &Shared) {
             .filter(|e| e.owns_live_group())
             .map(|e| {
                 if e.record.status == TaskStatus::Running {
-                    e.kill_requested = true; // disk state must say `killed` (§3.2)
+                    e.request_kill(end_reason::MANAGER_SHUTDOWN); // disk says `killed` (§3.2)
                     running += 1;
                 }
                 e.record.pid
@@ -1201,9 +1409,8 @@ async fn graceful_shutdown(state: &Shared) {
         // Let exit watchers / adopted pollers observe and persist.
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    // 3) Force-finalize anything still marked running (safety net; the
-    //    kill reason "manager_shutdown" goes to manager.log — TaskRecord's
-    //    field set is contractual, §3.4).
+    // 3) Force-finalize anything still marked running (safety net), with
+    //    end_reason "manager-shutdown" (also in manager.log below).
     {
         let mut st = state.lock().unwrap();
         let home = st.home.clone();
@@ -1213,6 +1420,11 @@ async fn graceful_shutdown(state: &Shared) {
                 e.record.status = TaskStatus::Killed;
                 e.record.ended_at = Some(now);
                 e.record.output_size = e.output.lock().unwrap().total_size;
+                e.record.end_reason = Some(
+                    e.kill_reason
+                        .clone()
+                        .unwrap_or_else(|| end_reason::MANAGER_SHUTDOWN.to_string()),
+                );
                 if let Err(err) = registry::persist_record(&home, &e.record) {
                     lifecycle::log_line(
                         &home,
@@ -1220,6 +1432,17 @@ async fn graceful_shutdown(state: &Shared) {
                     );
                 }
                 let _ = e.status_tx.send(TaskStatus::Killed);
+                let ev = EventKind::TaskExited {
+                    task_id: e.record.task_id.clone(),
+                    exit_code: None,
+                    signal: None,
+                    duration_ms: now.saturating_sub(e.record.started_at),
+                    output_path: e.record.output_path.clone(),
+                    output_size: e.record.output_size,
+                    ts: now,
+                    end_reason: e.record.end_reason.clone(),
+                };
+                log_task_exit(&home, &e.record.session_id, &ev);
             }
         }
     }
@@ -1242,6 +1465,13 @@ async fn graceful_shutdown(state: &Shared) {
     tokio::time::sleep(Duration::from_millis(250)).await;
     // 4) Remove socket/pid files and exit (§3.2).
     let _ = lifecycle::cleanup_stale_files(&home);
+    crate::events::emit(
+        &home,
+        None,
+        "daemon.shutdown",
+        None,
+        serde_json::json!({ "pid": std::process::id(), "killed_tasks": running }),
+    );
     lifecycle::log_line(&home, "shutdown complete");
 }
 

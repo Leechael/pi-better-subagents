@@ -87,12 +87,16 @@ async fn try_connect_and_hello(home: &Path, mode: &HelloMode) -> Result<Conn, St
             session_id: None,
             pi_pid: None,
             cwd: None,
+            extension_version: None,
+            protocol: Some(PROTOCOL),
         },
         HelloMode::Extension { session_id } => RequestKind::Hello {
             client_kind: ClientKind::Extension,
             session_id: Some(session_id.clone()),
             pi_pid: Some(std::process::id()),
             cwd: std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
+            extension_version: Some(format!("pbs-manager-cli/{}", env!("CARGO_PKG_VERSION"))),
+            protocol: Some(PROTOCOL),
         },
     };
     let _: HelloOk = conn.roundtrip(hello).await?;
@@ -439,6 +443,7 @@ pub async fn cmd_stop(home: &Path, task_id: &str) -> Result<(), String> {
     let _: UnitOk = conn
         .roundtrip(RequestKind::Stop {
             task_id: task_id.to_string(),
+            reason: Some("cli".into()),
         })
         .await?;
     println!("stopped {task_id}");
@@ -461,6 +466,7 @@ pub async fn cmd_kill_session(home: &Path, session_id: &str) -> Result<(), Strin
             let _: UnitOk = conn
                 .roundtrip(RequestKind::Stop {
                     task_id: t.task_id.clone(),
+                    reason: Some("cli".into()),
                 })
                 .await?;
             println!("stopped {}", t.task_id);
@@ -518,6 +524,7 @@ pub async fn cmd_start(
             env,
             run_in_background: background,
             timeout_ms,
+            origin: None,
         })
         .await?;
     println!("task_id={} pid={}", res.task_id, res.pid);

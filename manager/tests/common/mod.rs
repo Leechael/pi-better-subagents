@@ -176,20 +176,30 @@ pub fn run_cli(home: &Path, args: &[&str], timeout: Duration) -> CliOut {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn cli");
+    // Drain both pipes while the child runs: output over the pipe buffer
+    // (64 KiB) would otherwise block the child forever.
+    let mut so = child.stdout.take().unwrap();
+    let mut se = child.stderr.take().unwrap();
+    let t_out = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        so.read_to_end(&mut b).ok();
+        b
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        se.read_to_end(&mut b).ok();
+        b
+    });
     let status = wait_child(&mut child, timeout);
     let Some(status) = status else {
         let _ = child.kill();
         let _ = child.wait();
         panic!("cli {args:?} did not finish within {timeout:?}");
     };
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    child.stdout.take().unwrap().read_to_string(&mut stdout).ok();
-    child.stderr.take().unwrap().read_to_string(&mut stderr).ok();
     CliOut {
         status,
-        stdout,
-        stderr,
+        stdout: String::from_utf8_lossy(&t_out.join().unwrap()).into_owned(),
+        stderr: String::from_utf8_lossy(&t_err.join().unwrap()).into_owned(),
     }
 }
 

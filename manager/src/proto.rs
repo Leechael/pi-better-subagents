@@ -13,6 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PROTO_VERSION: u32 = 1;
+/// Feature level of the protocol, exchanged in hello (`protocol`) and
+/// returned by `status`. 1 = original §3.3; 2 = observability contract
+/// (origin, mark_background, stop.reason, end_reason, events.jsonl).
+pub const PROTOCOL: u32 = 2;
 /// §3.3: max frame 4 MiB.
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
 
@@ -119,8 +123,46 @@ impl TaskStatus {
     }
 }
 
+/// Who asked for a task (observability contract): how the extension ran it,
+/// and for shells run by a subagent, which child and run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    /// "bash-fg" | "bash-bg" | "child-bash" | "monitor". Stored as sent, so a
+    /// newer extension adding a value never breaks `start`.
+    pub via: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+/// Why a task ended (TaskRecord.end_reason, task_exited.end_reason).
+pub mod end_reason {
+    pub const EXITED: &str = "exited";
+    pub const TIMEOUT: &str = "timeout";
+    pub const SESSION_END: &str = "session-end";
+    pub const MANAGER_SHUTDOWN: &str = "manager-shutdown";
+    pub const MANAGER_RESTART: &str = "manager-restart";
+    pub const ORPHANED: &str = "orphaned";
+}
+
+/// `stop.reason` values accepted on the wire.
+pub const STOP_REASONS: &[&str] = &["tui", "cli", "tool", "timeout", "rate-limit", "session-end"];
+
+/// Map a `stop.reason` to the task's end_reason: `stopped:<reason>`, except
+/// timeout / rate-limit / session-end, which map to themselves. A stop with
+/// no reason (older clients) is `stopped:tool`.
+pub fn end_reason_for_stop(reason: Option<&str>) -> String {
+    match reason {
+        Some(r @ ("timeout" | "rate-limit" | "session-end")) => r.to_string(),
+        Some(r) => format!("stopped:{r}"),
+        None => "stopped:tool".to_string(),
+    }
+}
+
 /// §3.4: TaskRecord persisted at sessions/<sid>/tasks/<task_id>.json.
-/// Field set is contractual — do not add/remove fields.
+/// Fields after `output_size` were added by the observability contract; they
+/// are optional so records written by older managers still load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub task_id: String,
@@ -139,6 +181,14 @@ pub struct TaskRecord {
     pub ended_at: Option<u64>,
     pub output_path: String,
     pub output_size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
+    /// When the extension moved the task to the background (ms epoch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backgrounded_at: Option<u64>,
+    /// See [`end_reason`]; set when the task reaches a terminal status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +221,12 @@ pub enum RequestKind {
         /// Session working directory. Optional so older clients still hello.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        /// Extension package version, stored per session (doctor, sessions).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension_version: Option<String>,
+        /// Protocol level the client speaks; see [`PROTOCOL`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<u32>,
     },
     /// §3.3 start — env is the child's *complete* environment.
     Start {
@@ -184,6 +240,12 @@ pub enum RequestKind {
         run_in_background: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Origin>,
+    },
+    /// Record that the extension moved a task to the background.
+    MarkBackground {
+        task_id: String,
     },
     Wait {
         task_id: String,
@@ -196,6 +258,9 @@ pub enum RequestKind {
     },
     Stop {
         task_id: String,
+        /// One of [`STOP_REASONS`]; absent = "tool" (older clients).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     List {
         #[serde(default)]
@@ -301,6 +366,17 @@ pub struct SessionInfo {
     /// Present when the extension sent cwd on hello. Omitted otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_version: Option<String>,
+    /// Protocol level the session's client announced (absent: older client).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<u32>,
+    /// First hello of this session seen by this manager (ms epoch).
+    #[serde(default)]
+    pub connected_at: u64,
+    /// Last request or disconnect (ms epoch); "now" while connected.
+    #[serde(default)]
+    pub last_seen: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,6 +392,9 @@ pub struct StatusOk {
     pub uptime_ms: u64,
     pub sessions: Vec<SessionInfo>,
     pub task_counts: TaskCounts,
+    /// The manager's protocol level ([`PROTOCOL`]).
+    #[serde(default)]
+    pub protocol: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +448,9 @@ pub enum EventKind {
         output_path: String,
         output_size: u64,
         ts: u64,
+        /// Why the task ended; see [`end_reason`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_reason: Option<String>,
     },
     /// Pushed to the old connection when a session is rebound (§3.3 hello).
     SessionRebound {},
@@ -498,6 +580,8 @@ mod tests {
                 session_id: Some("sess1".into()),
                 pi_pid: Some(1234),
                 cwd: None,
+                extension_version: None,
+                protocol: None,
             },
         };
         let v: serde_json::Value = serde_json::from_slice(&encode(&req)).unwrap();
@@ -517,6 +601,8 @@ mod tests {
                 session_id: None,
                 pi_pid: None,
                 cwd: None,
+                extension_version: None,
+                protocol: None,
             },
         };
         let v: serde_json::Value = serde_json::from_slice(&encode(&req)).unwrap();
@@ -560,6 +646,7 @@ mod tests {
                 env,
                 run_in_background,
                 timeout_ms,
+                origin,
             } => {
                 assert_eq!(kind, TaskKind::Shell);
                 assert_eq!(command, "ls -la");
@@ -567,6 +654,7 @@ mod tests {
                 assert_eq!(env.get("PATH").unwrap(), "/bin");
                 assert!(!run_in_background);
                 assert_eq!(timeout_ms, None);
+                assert_eq!(origin, None, "origin is optional (older clients)");
             }
             other => panic!("wrong kind: {other:?}"),
         }
@@ -638,6 +726,7 @@ mod tests {
             output_path: "/tmp/x.output".into(),
             output_size: 7,
             ts: 1726000000000,
+            end_reason: None,
         });
         let v: serde_json::Value = serde_json::from_slice(&encode(&ev)).unwrap();
         assert_eq!(v["v"], serde_json::json!(1));
@@ -702,9 +791,39 @@ mod tests {
             output_path: "/x".into(),
             output_size: 0,
             ts: 1,
+            end_reason: None,
         });
         let v: serde_json::Value = serde_json::from_slice(&encode(&ev)).unwrap();
         assert_eq!(v["signal"], serde_json::json!("SIGKILL"));
+    }
+
+    #[test]
+    fn observability_fields_round_trip() {
+        let raw = r#"{"v":1,"id":"a","type":"start","kind":"shell","command":"x",
+            "origin":{"via":"child-bash","child_id":"ch_1","run_id":"run_1"}}"#;
+        let req: Request = serde_json::from_str(raw).unwrap();
+        let RequestKind::Start { origin, .. } = req.kind else { panic!() };
+        let o = origin.unwrap();
+        assert_eq!((o.via.as_str(), o.child_id.as_deref(), o.run_id.as_deref()), ("child-bash", Some("ch_1"), Some("run_1")));
+        let req: Request =
+            serde_json::from_str(r#"{"id":"b","type":"mark_background","task_id":"sh_1"}"#).unwrap();
+        assert!(matches!(req.kind, RequestKind::MarkBackground { ref task_id } if task_id == "sh_1"));
+        let req: Request =
+            serde_json::from_str(r#"{"id":"c","type":"stop","task_id":"sh_1","reason":"cli"}"#).unwrap();
+        assert!(matches!(req.kind, RequestKind::Stop { reason: Some(ref r), .. } if r == "cli"));
+        let req: Request = serde_json::from_str(
+            r#"{"type":"hello","client_kind":"extension","session_id":"s","pi_pid":1,"extension_version":"0.3.0","protocol":2}"#,
+        )
+        .unwrap();
+        assert!(matches!(req.kind, RequestKind::Hello { protocol: Some(2), extension_version: Some(ref v), .. } if v == "0.3.0"));
+        // end_reason mapping
+        assert_eq!(end_reason_for_stop(Some("cli")), "stopped:cli");
+        assert_eq!(end_reason_for_stop(Some("tui")), "stopped:tui");
+        assert_eq!(end_reason_for_stop(Some("tool")), "stopped:tool");
+        assert_eq!(end_reason_for_stop(Some("timeout")), "timeout");
+        assert_eq!(end_reason_for_stop(Some("rate-limit")), "rate-limit");
+        assert_eq!(end_reason_for_stop(Some("session-end")), "session-end");
+        assert_eq!(end_reason_for_stop(None), "stopped:tool");
     }
 
     #[test]
