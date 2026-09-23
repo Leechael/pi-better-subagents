@@ -32,7 +32,28 @@ const CHUNK_JSON_BUDGET: usize = MAX_FRAME_SIZE as usize - 64 * 1024;
 /// only: normally the runner guards its group and its exit says "empty").
 const GROUP_POLL: Duration = Duration::from_millis(500);
 
-type OutTx = mpsc::Sender<Arc<Vec<u8>>>;
+type OutTx = mpsc::Sender<OutFrame>;
+
+/// One frame queued for a connection's writer. Output events say which
+/// task and cursor they carry, so the writer can record how far the client
+/// really got (`ConnHandle::written`).
+pub struct OutFrame {
+    bytes: Arc<Vec<u8>>,
+    output: Option<(String, u64)>,
+}
+
+impl OutFrame {
+    fn plain(bytes: Arc<Vec<u8>>) -> OutFrame {
+        OutFrame { bytes, output: None }
+    }
+    fn output(bytes: Arc<Vec<u8>>, task_id: &str, next_cursor: u64) -> OutFrame {
+        OutFrame { bytes, output: Some((task_id.to_string(), next_cursor)) }
+    }
+}
+
+/// Per connection: the output cursor it has been written up to, per watched
+/// task (set to where the watch started, then advanced by the writer).
+type Written = Arc<Mutex<HashMap<String, u64>>>;
 pub type Shared = Arc<Mutex<DaemonState>>;
 
 // ---------------------------------------------------------------------------
@@ -45,6 +66,9 @@ pub struct ConnHandle {
     pub tx: OutTx,
     /// Fired to make the connection's read loop exit (session rebind).
     pub die: Arc<Notify>,
+    pub written: Written,
+    /// Its writer task, aborted when an upgrade cannot wait for it to flush.
+    pub writer: tokio::task::AbortHandle,
 }
 
 pub struct SessionEntry {
@@ -449,10 +473,12 @@ impl Drop for CountGuard {
 
 async fn writer_task<W: tokio::io::AsyncWrite + Unpin>(
     mut w: W,
-    mut rx: mpsc::Receiver<Arc<Vec<u8>>>,
+    mut rx: mpsc::Receiver<OutFrame>,
+    written: Written,
     _live: CountGuard,
 ) {
-    while let Some(payload) = rx.recv().await {
+    while let Some(frame) = rx.recv().await {
+        let payload = &frame.bytes;
         // An oversized frame is dropped, not written: write_frame would
         // refuse it, and ending the writer here would leave the connection
         // mute for every later response. `respond` already substitutes an
@@ -460,21 +486,27 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin>(
         if payload.len() > MAX_FRAME_SIZE as usize {
             continue;
         }
-        if write_frame(&mut w, &payload).await.is_err() {
+        if write_frame(&mut w, payload).await.is_err() {
             break;
+        }
+        if let Some((task, cursor)) = frame.output {
+            let mut m = written.lock().unwrap();
+            let e = m.entry(task).or_insert(0);
+            *e = (*e).max(cursor);
         }
     }
 }
 
 async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
     let (mut rd, wr) = tokio::io::split(stream);
-    let (tx, rx) = mpsc::channel::<Arc<Vec<u8>>>(1024);
+    let (tx, rx) = mpsc::channel::<OutFrame>(1024);
     let die = Arc::new(Notify::new());
     let (writers, inflight) = {
         let st = state.lock().unwrap();
         (st.writers.clone(), st.inflight.clone())
     };
-    tokio::spawn(writer_task(wr, rx, CountGuard::new(&writers)));
+    let written: Written = Arc::new(Mutex::new(HashMap::new()));
+    let writer = tokio::spawn(writer_task(wr, rx, written.clone(), CountGuard::new(&writers))).abort_handle();
 
     // ---- hello: must be the first message on the connection (§3.3) ----
     let first = match tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut rd)).await {
@@ -544,7 +576,7 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
         }
     }
 
-    let conn_id = match register_conn(&state, &tx, &die, client_kind, session_id, pi_pid, info) {
+    let conn_id = match register_conn(&state, &tx, &die, &written, &writer, client_kind, session_id, pi_pid, info) {
         Ok(id) => id,
         Err(e) => {
             let _ = tx.send(encode_error(&hello.id, &e.code, &e.message)).await;
@@ -562,7 +594,7 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
             },
         ))
         .await;
-    resume_carried_watches(&state, conn_id, &tx).await;
+    resume_carried_watches(&state, conn_id, &tx);
 
     // ---- request loop (requests may be pipelined; each runs in its own task) ----
     loop {
@@ -620,10 +652,13 @@ pub struct HelloInfo {
 
 /// Register a hello'd connection. Same-session rebind: the new connection
 /// wins; the old one gets `session_rebound` and is closed (§3.3).
+#[allow(clippy::too_many_arguments)]
 fn register_conn(
     state: &Shared,
     tx: &OutTx,
     die: &Arc<Notify>,
+    written: &Written,
+    writer: &tokio::task::AbortHandle,
     kind: ClientKind,
     session_id: Option<String>,
     pi_pid: Option<u32>,
@@ -685,6 +720,8 @@ fn register_conn(
             session_id,
             tx: tx.clone(),
             die: die.clone(),
+            written: written.clone(),
+            writer: writer.clone(),
         },
     );
     Ok(conn_id)
@@ -714,23 +751,30 @@ fn remove_conn(st: &mut DaemonState, conn_id: u64, why: &str) {
     }
 }
 
-/// Close every client connection (an in-place upgrade). A session's
-/// output subscriptions are remembered with how far it got
-/// (`delivered_cursor`), to be resumed when it reconnects.
-pub fn close_all_connections(state: &Shared, why: &str) {
+/// A session's subscription to carry over an upgrade, and how far its
+/// connection's writer got (known only once the writers have flushed).
+pub struct Carried {
+    task_id: String,
+    session_id: String,
+    written: Written,
+}
+
+/// Close every client connection (an in-place upgrade). Returns the output
+/// subscriptions to carry over and the connections' writers; call
+/// [`carry_watches`] once the writers flushed or were aborted.
+pub fn close_all_connections(state: &Shared, why: &str) -> (Vec<Carried>, Vec<tokio::task::AbortHandle>) {
     let mut st = state.lock().unwrap();
-    let conn_sessions: HashMap<u64, String> = st
+    let conns: HashMap<u64, (Option<String>, Written)> = st
         .conns
         .iter()
-        .filter_map(|(id, h)| h.session_id.clone().map(|s| (*id, s)))
+        .map(|(id, h)| (*id, (h.session_id.clone(), h.written.clone())))
         .collect();
-    for e in st.registry.tasks.values_mut() {
-        let delivered = e.delivered_cursor;
+    let writers = st.conns.values().map(|h| h.writer.clone()).collect();
+    let mut carried = Vec::new();
+    for (tid, e) in st.registry.tasks.iter_mut() {
         for w in std::mem::take(&mut e.watchers) {
-            if let Some(sid) = conn_sessions.get(&w) {
-                if !e.watch_sessions.iter().any(|(s, _)| s == sid) {
-                    e.watch_sessions.push((sid.clone(), delivered));
-                }
+            if let Some((Some(sid), written)) = conns.get(&w) {
+                carried.push(Carried { task_id: tid.clone(), session_id: sid.clone(), written: written.clone() });
             }
         }
     }
@@ -741,45 +785,71 @@ pub fn close_all_connections(state: &Shared, why: &str) {
         }
         remove_conn(&mut st, id, why);
     }
+    (carried, writers)
 }
+
+/// Remember each carried subscription with the cursor its connection was
+/// really written up to: what it did not receive is replayed when the
+/// session reconnects.
+pub fn carry_watches(state: &Shared, carried: Vec<Carried>) {
+    let mut st = state.lock().unwrap();
+    for c in carried {
+        let Some(e) = st.registry.tasks.get_mut(&c.task_id) else { continue };
+        let cursor = c.written.lock().unwrap().get(&c.task_id).copied().unwrap_or(0);
+        match e.watch_sessions.iter_mut().find(|(s, _)| *s == c.session_id) {
+            Some((_, at)) => *at = (*at).min(cursor),
+            None => e.watch_sessions.push((c.session_id, cursor)),
+        }
+    }
+}
+
+/// Most bytes a reconnecting session is sent as missed output per task
+/// (8 MiB). Beyond that it catches up with `output(cursor)` itself.
+const REPLAY_MAX: u64 = 8 * 1024 * 1024;
 
 /// A session reconnecting after an in-place upgrade gets its output
 /// subscriptions back, plus the output it missed while away (from where
 /// the old image stopped pushing up to what the fanout has pushed since).
-async fn resume_carried_watches(state: &Shared, conn_id: u64, tx: &OutTx) {
-    let backlog: Vec<(String, String, u64, u64)> = {
-        let mut st = state.lock().unwrap();
-        let Some(sid) = st.conns.get(&conn_id).and_then(|h| h.session_id.clone()) else { return };
-        let mut out = Vec::new();
-        for (tid, e) in st.registry.tasks.iter_mut() {
-            if let Some(i) = e.watch_sessions.iter().position(|(s, _)| *s == sid) {
-                let (_, from) = e.watch_sessions.remove(i);
-                e.watchers.insert(conn_id);
-                // Under the state lock, like the fanout: every later chunk
-                // reaches this connection through the fanout, every earlier
-                // one is in [from, delivered_cursor).
-                out.push((tid.clone(), e.record.output_path.clone(), from, e.delivered_cursor));
-            }
+///
+/// All of it happens under the state lock, which the fanout also holds to
+/// pick its targets, and which `close_all_connections` holds: the replayed
+/// events are queued on the connection before any later fanout chunk, and a
+/// second upgrade cannot cut a replay in half (it would record a cursor past
+/// what the connection got).
+fn resume_carried_watches(state: &Shared, conn_id: u64, tx: &OutTx) {
+    let mut st = state.lock().unwrap();
+    let Some(sid) = st.conns.get(&conn_id).and_then(|h| h.session_id.clone()) else { return };
+    let st_conns_written = st.conns.get(&conn_id).map(|h| h.written.clone());
+    for (tid, e) in st.registry.tasks.iter_mut() {
+        let Some(i) = e.watch_sessions.iter().position(|(s, _)| *s == sid) else { continue };
+        let (_, from) = e.watch_sessions.remove(i);
+        e.watchers.insert(conn_id);
+        if let Some(h) = st_conns_written.as_ref() {
+            h.lock().unwrap().insert(tid.clone(), from);
         }
-        out
-    };
-    for (tid, path, from, to) in backlog {
-        let mut cursor = from;
+        let to = e.delivered_cursor;
+        let mut cursor = from.max(to.saturating_sub(REPLAY_MAX));
         while cursor < to {
             let want = ((to - cursor) as usize).min(256 * 1024);
-            let Ok((bytes, _)) = task::read_file_range(std::path::Path::new(&path), cursor, want) else { break };
+            let Ok((bytes, _)) = task::read_file_range(std::path::Path::new(&e.record.output_path), cursor, want) else {
+                break;
+            };
             if bytes.is_empty() {
                 break;
             }
-            let n = task::utf8_chunk_len(&bytes, want, CHUNK_JSON_BUDGET, false).max(1);
+            // `to` is on a character boundary (the fanout never counts a
+            // held-back tail), so only the 256 KiB cut needs care.
+            let n = task::utf8_chunk_len(&bytes, want, CHUNK_JSON_BUDGET, cursor + (bytes.len() as u64) < to).max(1);
             let chunk = &bytes[..n.min(bytes.len())];
             cursor += chunk.len() as u64;
-            let ev = encode_event(&EventKind::Output {
+            let ev = encode_event_bytes(&EventKind::Output {
                 task_id: tid.clone(),
                 chunk: String::from_utf8_lossy(chunk).into_owned(),
                 next_cursor: cursor,
             });
-            let _ = tx.send(ev).await;
+            if tx.try_send(OutFrame::output(ev, tid, cursor)).is_err() {
+                break; // queue full: the client catches up with output(cursor)
+            }
         }
     }
 }
@@ -967,33 +1037,37 @@ async fn respond<T: Serialize>(tx: &OutTx, id: &str, result: Result<T, ProtoErro
     };
     // Every request gets an answer: a response that does not fit a frame
     // becomes an error instead of silently disappearing.
-    if frame.len() > MAX_FRAME_SIZE as usize {
+    if frame.bytes.len() > MAX_FRAME_SIZE as usize {
         frame = encode_error(id, E_INTERNAL, "response exceeds the 4 MiB frame limit");
     }
     let _ = tx.send(frame).await;
 }
 
-fn encode_ok<T: Serialize>(id: &str, body: &T) -> Arc<Vec<u8>> {
-    Arc::new(encode(&Response {
+fn encode_ok<T: Serialize>(id: &str, body: &T) -> OutFrame {
+    OutFrame::plain(Arc::new(encode(&Response {
         v: PROTO_VERSION,
         id: id.to_string(),
         ok: true,
         body,
-    }))
+    })))
 }
 
-fn encode_error(id: &str, code: &str, message: &str) -> Arc<Vec<u8>> {
-    Arc::new(encode(&Response {
+fn encode_error(id: &str, code: &str, message: &str) -> OutFrame {
+    OutFrame::plain(Arc::new(encode(&Response {
         v: PROTO_VERSION,
         id: id.to_string(),
         ok: false,
         body: ErrorBody {
             error: ProtoError::new(code, message),
         },
-    }))
+    })))
 }
 
-fn encode_event(kind: &EventKind) -> Arc<Vec<u8>> {
+fn encode_event(kind: &EventKind) -> OutFrame {
+    OutFrame::plain(encode_event_bytes(kind))
+}
+
+fn encode_event_bytes(kind: &EventKind) -> Arc<Vec<u8>> {
     Arc::new(encode(&Event::new(kind.clone())))
 }
 
@@ -1147,6 +1221,9 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         // command that prints and exits at once loses nothing to a late watch.
         if kind == TaskKind::Monitor {
             entry.watchers.insert(conn_id);
+            if let Some(h) = st.conns.get(&conn_id) {
+                h.written.lock().unwrap().insert(task_id.clone(), 0);
+            }
         }
         st.registry.tasks.insert(task_id.clone(), entry);
         if let Some(k) = &key {
@@ -1469,6 +1546,10 @@ fn handle_watch(
     let e = st.registry.visible_mut(task_id, &acc)?;
     if on {
         e.watchers.insert(conn_id);
+        let base = e.delivered_cursor;
+        if let Some(h) = st.conns.get(&conn_id) {
+            h.written.lock().unwrap().entry(task_id.to_string()).or_insert(base);
+        }
     } else {
         e.watchers.remove(&conn_id);
     }
@@ -1690,13 +1771,13 @@ async fn run_output_fanout(
                 .collect()
         };
         if !targets.is_empty() && !chunk.bytes.is_empty() {
-            let ev = encode_event(&EventKind::Output {
+            let ev = encode_event_bytes(&EventKind::Output {
                 task_id: tid.clone(),
                 chunk: String::from_utf8_lossy(&chunk.bytes).into_owned(),
                 next_cursor: chunk.next_cursor,
             });
             for tx in targets {
-                let _ = tx.try_send(ev.clone());
+                let _ = tx.try_send(OutFrame::output(ev.clone(), &tid, chunk.next_cursor));
             }
         }
     }

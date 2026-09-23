@@ -248,14 +248,29 @@ pub async fn perform(state: &Shared, listener_fd: RawFd, lock_fd: RawFd, ready: 
     }
     // 2. Close every client connection and let the writers flush what the
     //    fanout pushed, so `delivered_cursor` is what clients really got.
-    daemon::close_all_connections(state, "upgrade");
+    let (carried, writer_tasks) = daemon::close_all_connections(state, "upgrade");
     let writers = state.lock().unwrap().writers.clone();
-    let _ = tokio::time::timeout(FLUSH_TIMEOUT, async {
-        while writers.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+    let flushed = |d: Duration| {
+        let writers = writers.clone();
+        async move {
+            tokio::time::timeout(d, async {
+                while writers.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_ok()
         }
-    })
-    .await;
+    };
+    if !flushed(FLUSH_TIMEOUT).await {
+        // A client that stopped reading: stop its writer, so what it was
+        // written up to is final (the rest is replayed on reconnect).
+        for w in &writer_tasks {
+            w.abort();
+        }
+        flushed(Duration::from_millis(500)).await;
+    }
+    daemon::carry_watches(state, carried);
 
     // 3. Snapshot, hand the descriptors over, exec.
     let snap = match snapshot(state, listener_fd, lock_fd, &from_version, &to_version, trigger) {
