@@ -665,7 +665,7 @@ fn t10_second_daemon_refused() {
 
 /// §3.5 CLI smoke: status/sessions/list/doctor against a running daemon.
 /// NOTE: CLI output format is unspecified — we assert exit codes only
-/// (plus non-empty output for `status`).
+/// (plus non-empty output for `status`, and doctor's protocol verdict).
 #[test]
 fn t11_cli_smoke() {
     let d = Daemon::start("cli");
@@ -679,7 +679,6 @@ fn t11_cli_smoke() {
         &["sessions"][..],
         &["list"][..],
         &["list", "--all"][..],
-        &["doctor"][..],
     ] {
         let (status, text) = run_cli(&d.home, args, Duration::from_secs(5));
         assert!(
@@ -692,6 +691,15 @@ fn t11_cli_smoke() {
     assert!(
         !out.trim().is_empty(),
         "status should print something about the running daemon"
+    );
+
+    // This session's hello follows the original §3.3 example, which has no
+    // `protocol` field: doctor must flag it as an older extension and exit 1.
+    let (status, text) = run_cli(&d.home, &["doctor"], Duration::from_secs(5));
+    assert_eq!(status.code(), Some(1), "doctor: {text}");
+    assert!(
+        text.contains("FAIL  protocol: session sess-cli did not announce a protocol"),
+        "doctor must name the session without a protocol: {text}"
     );
 }
 

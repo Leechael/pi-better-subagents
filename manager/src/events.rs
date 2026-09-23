@@ -154,6 +154,65 @@ pub fn emit(home: &Path, session_id: Option<&str>, ty: &str, id: Option<&str>, f
     let _ = append_line(&path, &line);
 }
 
+// ---------------------------------------------------------------------------
+// Reading (CLI)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct EventLine {
+    pub ts: u64,
+    pub src: String,
+    pub ty: String,
+    pub id: Option<String>,
+    /// Session directory the line came from (None for daemon events).
+    pub session: Option<String>,
+    pub raw: Value,
+}
+
+/// Parse one line; `None` for malformed lines (not JSON, not an object, or
+/// missing `ts`/`type`), which readers skip.
+pub fn parse_line(line: &str, session: Option<&str>) -> Option<EventLine> {
+    let raw: Value = serde_json::from_str(line.trim()).ok()?;
+    let o = raw.as_object()?;
+    let ts = o.get("ts")?.as_u64()?;
+    let ty = o.get("type")?.as_str()?.to_string();
+    let src = o.get("src").and_then(|s| s.as_str()).unwrap_or("?").to_string();
+    let id = o.get("id").and_then(|s| s.as_str()).map(|s| s.to_string());
+    Some(EventLine {
+        ts,
+        src,
+        ty,
+        id,
+        session: session.map(|s| s.to_string()),
+        raw,
+    })
+}
+
+/// Every events file under `home`: (path, session id or None for daemon).
+pub fn all_event_files(home: &Path) -> Vec<(PathBuf, Option<String>)> {
+    let mut out = vec![(daemon_events_path(home), None)];
+    if let Ok(dirs) = std::fs::read_dir(home.join("sessions")) {
+        for d in dirs.flatten() {
+            let sid = d.file_name().to_string_lossy().into_owned();
+            out.push((d.path().join("events.jsonl"), Some(sid)));
+        }
+    }
+    out
+}
+
+/// Parse all complete lines of `bytes` (a trailing partial line is ignored).
+pub fn parse_bytes(bytes: &[u8], session: Option<&str>) -> Vec<EventLine> {
+    let text = String::from_utf8_lossy(bytes);
+    let complete = match text.rfind('\n') {
+        Some(i) => &text[..=i],
+        None => "",
+    };
+    complete
+        .lines()
+        .filter_map(|l| parse_line(l, session))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +248,14 @@ mod tests {
         let v: Value = serde_json::from_slice(&l).unwrap();
         assert_eq!(v["truncated"], true);
         assert_eq!(v["id"], "i");
+    }
+
+    #[test]
+    fn malformed_lines_are_skipped() {
+        let text = "{\"ts\":1,\"src\":\"manager\",\"type\":\"a\"}\nnot json\n[1,2]\n{\"ts\":\"x\",\"type\":\"b\"}\n{\"type\":\"c\"}\n{\"ts\":2,\"type\":\"d\"}\n{\"ts\":3,\"type\":\"partial";
+        let evs = parse_bytes(text.as_bytes(), Some("s"));
+        let types: Vec<_> = evs.iter().map(|e| e.ty.as_str()).collect();
+        assert_eq!(types, ["a", "d"]);
+        assert_eq!(evs[1].src, "?");
     }
 }

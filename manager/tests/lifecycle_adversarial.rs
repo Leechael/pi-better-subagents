@@ -46,12 +46,13 @@ fn wait_output_contains(c: &mut Conn, task_id: &str, needle: &str) {
 fn d1_concurrent_clients_spawn_exactly_one_daemon() {
     let home = Home::new("d1");
     for round in 0..3 {
+        // `ls` auto-spawns (`status` never does, by contract).
         let kids: Vec<_> = (0..12)
             .map(|_| {
                 std::process::Command::new(BIN)
                     .arg("--home")
                     .arg(&home.path)
-                    .arg("status")
+                    .arg("ls")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -59,23 +60,15 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
                     .unwrap()
             })
             .collect();
-        let mut pids = std::collections::BTreeSet::new();
         for k in kids {
             let out = k.wait_with_output().unwrap();
-            let text = String::from_utf8_lossy(&out.stdout).to_string();
             assert!(
                 out.status.success(),
                 "round {round}: client failed: {} {}",
-                text,
+                String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
-            let pid = text
-                .lines()
-                .find_map(|l| l.strip_prefix("pid:").map(|p| p.trim().parse::<u32>().unwrap()))
-                .expect("status prints pid");
-            pids.insert(pid);
         }
-        assert_eq!(pids.len(), 1, "round {round}: clients reached different daemons: {pids:?}");
         let live = daemon_pids_for(&home.path);
         if live.len() != 1 {
             let ps = std::process::Command::new("ps").args(["-axww", "-o", "pid=,stat=,command="]).output().unwrap();
@@ -87,11 +80,15 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
                 .collect();
             let pf = home.pidfile_pid();
             panic!(
-                "round {round}: expected one daemon process, found {live:?}; served by {pids:?}; \
+                "round {round}: expected one daemon process, found {live:?}; \
                  pidfile={pf:?} running={:?}; ps lines for home: {lines:#?}",
                 pf.map(pid_running)
             );
         }
+        // Every client talked to that daemon: it is the one on the socket.
+        let mut c = home.connect();
+        assert_eq!(c.hello_cli()["pid"].as_u64(), Some(live[0] as u64), "round {round}");
+        drop(c);
         // Tear down so the next round races a cold start again.
         let out = home.cli(&["shutdown"], S(10));
         assert!(out.status.success());
@@ -141,7 +138,7 @@ fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
     let _burn = Burners::start();
     for round in 0..30 {
         // Leave stale files behind: start a daemon, SIGKILL it.
-        let out = home.cli(&["status"], S(10));
+        let out = home.cli(&["ls"], S(10));
         assert!(out.status.success());
         let old = home.pidfile_pid().expect("pid file");
         kill_pid(old, libc::SIGKILL);
@@ -153,7 +150,7 @@ fn d2_concurrent_clients_over_stale_files_spawn_exactly_one_daemon() {
                 std::process::Command::new(BIN)
                     .arg("--home")
                     .arg(&home.path)
-                    .arg("status")
+                    .arg("ls")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -469,23 +466,24 @@ fn d9_shutdown_command_kills_tasks_and_cleans_files() {
 // Stale socket / pid files (D10, D11, D12)
 // ===========================================================================
 
-/// D10: stale socket + pid file of a SIGKILLed daemon. A plain CLI call
-/// recovers: cleans up, spawns a new daemon, succeeds.
+/// D10: stale socket + pid file of a SIGKILLed daemon. A CLI call that
+/// auto-spawns (`ls`) recovers: a new daemon takes over and serves.
 #[test]
 fn d10_client_recovers_from_dead_daemon_files() {
     let home = Home::new("d10");
-    let out = home.cli(&["status"], S(10));
+    let out = home.cli(&["ls"], S(10));
     assert!(out.status.success());
     let old = home.pidfile_pid().unwrap();
     kill_pid(old, libc::SIGKILL);
     assert!(poll_true(S(3), || !pid_running(old)));
     assert!(home.sock().exists() && home.pidfile().exists());
 
-    let out = home.cli(&["status"], S(10));
+    let out = home.cli(&["ls"], S(10));
     assert!(out.status.success(), "{}", out.stderr);
     let new = home.pidfile_pid().unwrap();
     assert_ne!(new, old);
-    assert!(out.stdout.contains(&format!("pid:      {new}")) || out.stdout.contains(&new.to_string()));
+    let mut c = home.connect();
+    assert_eq!(c.hello_cli()["pid"].as_u64(), Some(new as u64), "new daemon serves the socket");
 }
 
 /// D11: a dead socket file with no pid file (e.g. pid file deleted by hand).
@@ -494,7 +492,7 @@ fn d11_client_recovers_from_socket_without_pidfile() {
     let home = Home::new("d11");
     drop(UnixListener::bind(home.sock()).unwrap()); // leaves a dead socket inode
     assert!(home.sock().exists());
-    let out = home.cli(&["status"], S(10));
+    let out = home.cli(&["ls"], S(10));
     assert!(out.status.success(), "{}", out.stderr);
     assert!(home.pidfile_pid().map(pid_running).unwrap_or(false));
 }
@@ -504,7 +502,7 @@ fn d11_client_recovers_from_socket_without_pidfile() {
 fn d11b_client_recovers_from_corrupt_pidfile() {
     let home = Home::new("d11b");
     std::fs::write(home.pidfile(), b"{not json").unwrap();
-    let out = home.cli(&["status"], S(10));
+    let out = home.cli(&["ls"], S(10));
     assert!(out.status.success(), "{}", out.stderr);
 }
 
@@ -519,7 +517,7 @@ fn d12_reused_pid_in_pidfile_does_not_block_startup() {
         format!(r#"{{"pid":{},"version":"0.1.0","started_at":0}}"#, impostor.id()),
     )
     .unwrap();
-    let out = home.cli(&["status"], S(15));
+    let out = home.cli(&["ls"], S(15));
     let _ = impostor.kill();
     let _ = impostor.wait();
     assert!(out.status.success(), "manager blocked by reused pid: {}", out.stderr);

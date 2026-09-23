@@ -66,6 +66,39 @@ pub fn signal_group(pid: u32, sig: i32) -> io::Result<()> {
     }
 }
 
+/// Local broken-down time for epoch seconds (`localtime_r`).
+///
+/// # Safety boundary
+/// `localtime_r` writes only into the `tm` we own.
+pub fn localtime(secs: i64) -> libc::tm {
+    let t = secs as libc::time_t;
+    // SAFETY: both pointers are valid for the duration of the call.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        tm
+    }
+}
+
+/// Columns of the terminal on stdout, or None when stdout is not a tty.
+///
+/// # Safety boundary
+/// `isatty` and `ioctl(TIOCGWINSZ)` only read fd 1 and fill our `winsize`.
+pub fn stdout_tty_columns() -> Option<usize> {
+    // SAFETY: isatty on a valid fd number has no side effects.
+    if unsafe { libc::isatty(1) } != 1 {
+        return None;
+    }
+    // SAFETY: TIOCGWINSZ fills the winsize we pass.
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            return Some(ws.ws_col as usize);
+        }
+    }
+    Some(80)
+}
+
 /// `kill(-pgid, 0)`: does any process remain in the group led by `pgid`?
 /// POSIX does not reuse a pid while a process group with that id exists, so
 /// a group we have watched continuously is still ours while this is true.

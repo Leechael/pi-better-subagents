@@ -71,7 +71,7 @@ fn g2_autospawned_daemon_survives_sigint_to_spawning_group() {
     let mut cli = std::process::Command::new(BIN)
         .arg("--home")
         .arg(&home.path)
-        .arg("status")
+        .arg("ls")
         .process_group(0)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -323,9 +323,10 @@ fn g13_doctor_cleans_only_without_a_daemon() {
     drop(std::os::unix::net::UnixListener::bind(home.sock()).unwrap());
     std::fs::write(home.pidfile(), br#"{"pid":1,"version":"0","started_at":0}"#).unwrap();
     let out = home.cli(&["doctor"], S(5));
-    assert!(out.status.success());
-    assert!(out.stdout.contains("not running"), "{}", out.stdout);
-    assert!(out.stdout.lines().any(|l| l == "1 problem(s) found"), "{}", out.stdout);
+    // Stale files are fixed, not failures: exit 0, ends "ok".
+    assert!(out.status.success(), "{}", out.stdout);
+    assert_eq!(out.stdout.matches("fixed daemon: not running; removed stale").count(), 2, "{}", out.stdout);
+    assert!(out.stdout.trim_end().ends_with("ok"), "{}", out.stdout);
     assert!(!home.sock().exists() && !home.pidfile().exists(), "stale files kept");
 
     let _d = home.start_daemon();
@@ -340,6 +341,7 @@ fn g13_doctor_cleans_only_without_a_daemon() {
     let out = home.cli(&["doctor"], S(5));
     assert!(out.stdout.contains("NOT responding"), "{}", out.stdout);
     assert!(out.stdout.lines().any(|l| l == "1 problem(s) found"), "{}", out.stdout);
+    assert_eq!(out.status.code(), Some(1), "a failure exits 1");
     assert!(home.pidfile_pid() == Some(pid), "doctor cleaned under a live daemon");
 
     // The lock itself cannot be checked: reported as a problem.
@@ -351,8 +353,9 @@ fn g13_doctor_cleans_only_without_a_daemon() {
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
         let out = home2.cli(&["doctor"], S(5));
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(out.stdout.contains("daemon lock check failed"), "{}", out.stdout);
+        assert!(out.stdout.contains("FAIL  daemon: lock check failed"), "{}", out.stdout);
         assert!(out.stdout.lines().any(|l| l == "1 problem(s) found"), "{}", out.stdout);
+        assert_eq!(out.status.code(), Some(1));
     }
 }
 
