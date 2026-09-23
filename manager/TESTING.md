@@ -12,6 +12,7 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 | `tests/lifecycle_adversarial.rs` | black box | every cell of the lifecycle table below, adversarial conditions |
 | `tests/mutation_gaps.rs` | black box | behaviours found unguarded by cargo-mutants survivors (g1–g14) |
 | `tests/observability.rs` | black box | observability contract: protocol additions, events.jsonl, inspection CLI (p1–p3, e1–e4, c1–c8) |
+| `tests/upgrade.rs` | black box | in-place upgrade: exec handover, rollback, restore failure, carried watches, N−1 hello (u1–u12) |
 | `tests/timing_canary.rs` | black box, real time | the actual 5s idle grace and 2s kill grace (always on the real clock) |
 | `tests/common/mod.rs` | helpers | wire client, isolated `--home`, process probes, crashable helper client, clock stepping (`Home::advance*`) |
 
@@ -587,3 +588,69 @@ the runner's, and a runner that simply exits on EOF passed them while
 `sh` kept running. Both now make the command print its own pid (`echo $$;
 exec sleep …`) and require it gone too; the entry is 3/3 red again.
 
+## In-place upgrade (manager-exec-handover)
+
+Principle: an upgrade is invisible to running work. `pbs-manager upgrade`
+(or replacing the binary file) makes the daemon `exec()` the new binary:
+same pid, so every runner is still its child; the listener, the daemon
+lock, both lifeline ends and every task's stdout / stderr / status pipe are
+inherited. Everything else goes through `handover.json`. See
+`src/handover.rs` and design §3.2 / §3.3.
+
+State-table cells added by this branch (black box, `tests/upgrade.rs`;
+every daemon runs from a private copy of the binary so a test can replace
+it):
+
+| # | State | Event | Next state | Side effects | Test |
+|---|---|---|---|---|---|
+| D19 | serving | `upgrade` (CLI) | serving, same pid, generation + 1 | preflight, then quiesce (pumps park between reads, fanout drains, in-flight requests dropped unanswered, connections closed, writers flushed), exec, restore; every task keeps running | `u1`, `u9`, `u11` |
+| D20 | serving | the file at the daemon's path is replaced and settles | as D19, trigger `binary-changed` | polled every 2 s (dev, inode, size, mtime) | `u7` |
+| D21 | serving | upgrade to a binary that fails `__handover-check` (broken, non-executable, other format) | serving, unchanged | nothing touched: connections, streams and tasks carry on; `last_upgrade.ok = false` | `u4` |
+| D22 | quiescing | exec fails | serving (old image) | descriptors back to close-on-exec, tasks resume with no byte lost, clients reconnect | `u5` |
+| D23 | restoring | the new image cannot restore | exited | the lifeline closes: every task and grandchild cleaned up (= a crash, no recovery) | `u6` |
+| D24 | serving, just restored | no client for longer than the 5 s idle grace | serving | the idle rule is held for the 30 s handover grace, then applies again | `u12` |
+| S7 | connected | the manager upgrades | reconnects to the same pid | in-flight requests unanswered (resent by the client); `start` resent with its `key` returns the task it already started; protocol 1 / no-protocol hellos accepted | `u1`, `u2`, `u3` |
+| T17 | running / stop grace pending / timeout armed | upgrade | unchanged | later exits report the real code and signal; the timeout fires from the original start; a pending kill grace is re-armed with the time it had left | `u1`, `u8` |
+| T18 | running, watched (monitor) | upgrade | unchanged | the session's watch comes back on re-hello with exactly the bytes its connection had not been written; a UTF-8 character split across the handover arrives whole | `u1`, `u10`, `u11` |
+
+**Coverage:** 65 cells (C 10, S 7, T 22, D 26).
+
+Measured client-visible gap (from "quiescing" to the new image accepting,
+in `manager.log`, under the parallel suite): 30–46 ms. Connects during it
+wait in the listener backlog; none is refused.
+
+Bugs found while building it (each red in a test first):
+
+| Bug | Root cause | Fix | Red → green |
+|---|---|---|---|
+| requests silently dropped after a rolled-back exec | `watch::Sender::send` does not store the value when no receiver exists; at rollback every parked task had dropped its receiver, so the park flag stayed `true` and every later request was cancelled as parked | `send_replace` | `u5` hung (`response timed out`), green after |
+| kill grace gone after an upgrade (manual clock) | the SIGKILL due time was wall time; on the manual clock the grace runs in virtual time, and a >2 s (wall) upgrade left 0 ms | due time in the clock's units (`Clock::now_ms`); the handover carries the manual clock's time | `u8` 5/6 red under the parallel test-clock suite, 6/6 green after |
+| a split UTF-8 character became two U+FFFD | the fanout's held-back tail died with the parked fanout | a (re)started fanout seeds its carry from the file (`[delivered, total)`) | `u10` red (`a\u{FFFD}\u{FFFD}b`), green after |
+| monitor lines lost at an upgrade | frames queued for a client that was not reading were counted as delivered; the 2 s flush expired and the exec dropped them | writers record the cursor they actually wrote; the carried watch starts there; writers still blocked after the flush are aborted | `u11` about 1 in 2 red under the parallel suite, 8/8 green after |
+| CLI `wait` failed mid-upgrade | its hello / id-resolving snapshot did not retry a dropped connection | same reconnect-and-resend as the request | `u9` red once in about 15 suite runs before, 0 in 20+ after |
+
+Two test lessons: `task_exited` sent while a session is disconnected is not
+replayed (the extension's sync covers it), so tests wait with `wait`; and a
+test must read its old connection to the end (`wait_closed`) before
+merging events, or it drops frames the daemon did deliver.
+
+Ablations for this branch (manual clock): all 13 new or updated entries behave
+as declared (`scripts/ablate.sh`, exit 0).
+
+| Ablation | Tests red |
+|---|---|
+| upgrade-preflight | 1/1: u4 |
+| upgrade-park-flag-replace | 1/1: u5 |
+| upgrade-watch-carry | 2/2: u1, u11 |
+| upgrade-fanout-carry-seed | 1/1: u10 |
+| upgrade-grace-rearm | 1/1: u8 |
+| upgrade-hold-idle | 1/1: u12 |
+| upgrade-binary-watch | 1/1: u7 |
+| start-key-idempotent | 1/1: u3 |
+| upgrade-written-cursor | green by design (see deferrals) |
+| bounded-conn-queue, watch-utf8-carry, oversize-response-fallback, timeout-hard-kill (find strings updated for the refactor) | 1/1 each: c6, o4b, o3b, t3 |
+
+Deferrals:
+- deferred: the upgrade replays missed output only to a session that reconnects; a session that never comes back loses nothing but also receives nothing (its pi is gone) | impact: none | trigger: multi-client sessions
+- deferred: the `upgrade-written-cursor` ablation is undetectable in isolation (loss needs a client that stops reading with a full queue past the 2 s flush); only the parallel suite / stress catch it | impact: a regression would show as rare missing monitor lines | trigger: a flaky `u11`, or a hook that can stall a connection's reader
+- deferred: preflight runs the new binary once (up to 20 s on a first run under macOS signature assessment) while everything is still served; an upgrade right after `install` can take that long | impact: `pbs-manager upgrade` waits; nothing is interrupted | trigger: user reports of slow upgrades
