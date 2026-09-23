@@ -119,6 +119,31 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.match(lastText, /WOKE: timeout/);
   });
 
+  it("(c2) a monitor that exits at once ends with an exit wake, not a timeout", async () => {
+    const ep = await runFaux({
+      script: "monitor-fast-exit.ts",
+      until: (items) =>
+        toolResults(items).some((r) => r.toolName === "task_list") ||
+        wakes(items).some((w) => w.wake.status === "timeout"),
+      quietMs: 1500,
+    });
+    episodes.push(ep);
+    const monitorResult = toolResults(ep.items).find((r) => r.toolName === "monitor");
+    assert.ok(monitorResult && !monitorResult.isError, explain(ep));
+    const taskId = String(monitorResult.details?.task_id);
+    const ws = wakes(ep.items).filter((w) => w.wake.taskIds[0] === taskId);
+    assert.equal(ws.filter((w) => w.wake.status === "timeout").length, 0, `stuck until timeout\n${explain(ep)}`);
+    const exitedWakes = ws.filter((w) => w.wake.status === "exited");
+    assert.equal(exitedWakes.length, 1, explain(ep));
+    // `echo noop` ends in milliseconds; the exit must not wait on anything.
+    assert.ok(exitedWakes[0].t - monitorResult.t < 2000, `exit wake late\n${explain(ep)}`);
+    const lines = ws.filter((w) => w.wake.status === "event").flatMap((w) => w.wake.body.split("\n"));
+    assert.ok(lines.includes("noop"), `first line lost\n${explain(ep)}`);
+    const listing = toolResults(ep.items).find((r) => r.toolName === "task_list");
+    assert.ok(listing, explain(ep));
+    assert.doesNotMatch(listing.text, new RegExp(`${taskId}[^\n]*running`), `still listed as running\n${explain(ep)}`);
+  });
+
   it(
     "behavior guidelines are in the system prompt of the wake-triggered turn",
     // Regression: guidelines used to be a forced before_agent_start systemPrompt,
