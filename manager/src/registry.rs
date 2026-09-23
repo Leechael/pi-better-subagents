@@ -76,7 +76,9 @@ impl TaskEntry {
     /// can be a tick behind (or, on the manual test clock, never run).
     /// Returns whether the group still lingers.
     pub fn refresh_lingering(&mut self) -> bool {
-        if self.group_lingering && !crate::sys::group_alive(self.record.pid) {
+        // Only members other than the runner count: a guardian that has not
+        // yet noticed its group emptied leaves nothing to kill.
+        if self.group_lingering && !crate::sys::group_has_others(self.record.pid) {
             self.group_lingering = false;
         }
         self.group_lingering

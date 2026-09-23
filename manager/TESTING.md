@@ -527,6 +527,15 @@ Bugs found while building it (each caught by a test before the fix):
   and stay pending there (`p1` red on the manual clock). The runner
   forwards a pending SIGTERM to its group once `sh` is in it.
 
+Found by the stress run (5 iterations x 3 concurrent copies, load average
+~300 on the machine at the time):
+- `t13b` (2 of 15 plain runs): a leftover that had just exited still had
+  its guardian runner alive (≤ 100 ms), and `refresh_lingering` probed
+  `kill(-pgid, 0)`, which counts the runner itself, so shutdown signalled
+  and waited on an "leftover" that was only the runner. Shutdown and the
+  fallback group poll now ask `group_has_others`: members other than the
+  leader (the runner, alive or an unreaped zombie).
+
 New tests and red-before evidence (run against the `prelaunch-polish`
 manager sources with the new tests):
 

@@ -1093,7 +1093,7 @@ fn spawn_group_watcher(state: &Shared, task_id: &str, pgid: u32) {
     tokio::spawn(async move {
         loop {
             clock.sleep("group-poll", GROUP_POLL).await;
-            if task::group_alive(pgid) {
+            if crate::sys::group_has_others(pgid) {
                 continue;
             }
             if let Some(e) = state2.lock().unwrap().registry.tasks.get_mut(&tid) {
@@ -1492,7 +1492,7 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
             Leftover::None => {}
             Leftover::Guarded => entry.group_lingering = true,
             Leftover::Probe => {
-                if task::group_alive(pgid) {
+                if crate::sys::group_has_others(pgid) {
                     entry.group_lingering = true;
                     lingering = Some(pgid);
                 }

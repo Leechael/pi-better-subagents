@@ -262,6 +262,17 @@ pub fn unblock_in_child(cmd: &mut std::process::Command, sig: i32) {
     }
 }
 
+/// Does group `pgid` have a member other than its leader (pid == pgid)?
+/// The leader of a task's group is its runner, which is not a leftover:
+/// neither alive (guarding) nor as an unreaped zombie. Falls back to the
+/// `kill(-pgid, 0)` probe if the group cannot be enumerated.
+pub fn group_has_others(pgid: u32) -> bool {
+    match group_members(pgid) {
+        Ok(pids) => pids.iter().any(|p| *p != pgid),
+        Err(_) => group_alive(pgid),
+    }
+}
+
 /// Upper bound for the fd scan in [`child_setup`], computed in the parent
 /// before fork (the child must not allocate).
 ///

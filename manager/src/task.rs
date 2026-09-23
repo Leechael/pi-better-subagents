@@ -18,7 +18,7 @@ use tokio::net::unix::pipe;
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::mpsc;
 
-pub use crate::sys::{group_alive, pid_alive, signal_group, SIGKILL, SIGTERM};
+pub use crate::sys::{pid_alive, signal_group, SIGKILL, SIGTERM};
 
 /// §3.4: in-memory ring buffer is 64KB; the disk file keeps the full stream.
 pub const RING_CAPACITY: usize = 64 * 1024;
