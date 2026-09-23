@@ -45,6 +45,11 @@ export interface InProcessRunnerOptions {
    * cancels the generation as {status:"interrupted", error}.
    */
   acquire?: (req: ChildRunRequest) => Promise<() => void>;
+  /**
+   * Called after the child's conversation may have changed (a message or
+   * tool finished, or the generation settled). Used to persist transcripts.
+   */
+  onActivity?: (childId: string) => void;
 }
 
 function errorMessage(err: unknown): string {
@@ -71,6 +76,7 @@ class InProcessChildHandle implements DisposableChildHandle {
   private readonly stallMs: number;
   private readonly clock: Clock;
   private readonly acquire?: (req: ChildRunRequest) => Promise<() => void>;
+  private readonly onActivity?: (childId: string) => void;
 
   private session: ChildSessionAdapter | null = null;
   private resolvedModel_: string | undefined;
@@ -98,6 +104,7 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.stallMs = opts.stallMs ?? DEFAULT_STALL_MS;
     this.clock = opts.clock ?? realClock;
     this.acquire = opts.acquire;
+    this.onActivity = opts.onActivity;
     this.startedAt = this.clock.now();
     this.lastEvent = this.startedAt;
     this.resultPromise = new Promise((resolve) => {
@@ -274,6 +281,9 @@ class InProcessChildHandle implements DisposableChildHandle {
         return;
       }
       this.unsubscribe = this.session.subscribe((event) => {
+        if (event.type === "message_end" || event.type === "tool_execution_end" || event.type === "agent_end") {
+          this.notifyActivity();
+        }
         // Track depth even after settle. A late tool_execution_end must not
         // leak into the next resume, and must not rearm a stale generation.
         if (event.type === "tool_execution_start") {
@@ -348,6 +358,7 @@ class InProcessChildHandle implements DisposableChildHandle {
         status: "failed",
         text: this.partialText(),
         error: failure.errorMessage?.trim() || `Model stopped with ${failure.stopReason}`,
+        endReason: "model-error",
         durationMs: this.now() - this.startedAt,
       });
       return;
@@ -385,7 +396,16 @@ class InProcessChildHandle implements DisposableChildHandle {
     }
     this.status_ = result.status;
     this.release();
+    this.notifyActivity();
     this.resolveResult(result);
+  }
+
+  private notifyActivity(): void {
+    try {
+      this.onActivity?.(this.req.childId);
+    } catch {
+      // persistence observers must not break the child lifecycle
+    }
   }
 
   private release(): void {

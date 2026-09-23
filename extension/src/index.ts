@@ -27,9 +27,13 @@ import { createMonitorTool, MonitorRegistry } from "./monitor";
 import { NotifyCenter } from "./notify";
 import { createChildBashTool } from "./subagent/child-bash";
 import {
+  agentEndReason,
+  headOf,
+  tailOf,
   writeAgentChildRecord,
   type AgentChildRecord,
 } from "./subagent/agent-records";
+import { TranscriptWriter } from "./subagent/transcript";
 import { FleetWidget } from "./subagent/fleet-widget";
 import { WorkIndex, type WorkItem } from "./work-index";
 import { createPiSessionFn, modelCandidates } from "./subagent/pi-runtime";
@@ -420,11 +424,20 @@ export default function (pi: ExtensionAPI): void {
         return tools;
       },
     });
+    const transcripts = new TranscriptWriter(home, clock);
+    const syncTranscript = (childId: string): string | undefined => {
+      const handle = registry.handle(childId);
+      if (!handle) return undefined;
+      return transcripts.sync(startCtx.sessionManager.getSessionId(), childId, handle.conversation());
+    };
     const runner = new InProcessRunner({
       createSession,
       clock,
       stallMs: subagentConfig.stallMs,
       acquire: (req) => registry.admitChild(req.childId),
+      onActivity: (childId) => {
+        syncTranscript(childId);
+      },
     });
     registry.setRunner(runner);
     subagentRegistry = registry;
@@ -469,7 +482,16 @@ export default function (pi: ExtensionAPI): void {
           started_at: c.startedAt,
           ...(c.endedAt !== undefined ? { ended_at: c.endedAt } : {}),
           ...(c.result?.error ? { error: c.result.error } : {}),
+          ...(c.prompt !== undefined ? { prompt_head: headOf(c.prompt) } : {}),
+          ...(c.result?.text ? { result_tail: tailOf(c.result.text) } : {}),
         };
+        const endReason = agentEndReason(c.status, c.result);
+        if (endReason) rec.end_reason = endReason;
+        const transcript = syncTranscript(c.childId);
+        if (transcript) {
+          rec.transcript = transcript;
+          rec.tool_calls = transcripts.toolCallCount(c.childId);
+        }
         writeAgentChildRecord(home, rec);
         workIndex.upsert({
           id: c.childId,

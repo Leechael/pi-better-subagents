@@ -21,6 +21,53 @@ export interface AgentChildRecord {
   started_at: number;
   ended_at?: number;
   error?: string;
+  /** Why the child ended (terminal statuses only). */
+  end_reason?: AgentEndReason;
+  /** Task prompt without the agent preamble, capped. */
+  prompt_head?: string;
+  /** Tail of the final result text, capped. */
+  result_tail?: string;
+  /** Tool results seen in the transcript so far. */
+  tool_calls?: number;
+  /** Absolute path of the live `<child_id>.jsonl` transcript. */
+  transcript?: string;
+}
+
+export type AgentEndReason =
+  | "completed"
+  | "failed"
+  | "model-error"
+  | "stalled"
+  | "timeout"
+  | "interrupted"
+  | "disposed";
+
+/** Map a terminal child status + result to the end_reason recorded on disk. */
+export function agentEndReason(
+  status: AgentChildRecord["status"],
+  result: { error?: string; endReason?: "model-error" } | undefined,
+): AgentEndReason | undefined {
+  if (status === "completed") return "completed";
+  if (status === "failed") {
+    if (result?.endReason === "model-error") return "model-error";
+    return result?.error === "stalled" ? "stalled" : "failed";
+  }
+  if (status === "interrupted") {
+    if (result?.error === "timeout") return "timeout";
+    if (result?.error === "disposed") return "disposed";
+    return "interrupted";
+  }
+  return undefined;
+}
+
+const HEAD_TAIL_CHARS = 2000;
+
+export function headOf(text: string): string {
+  return text.length <= HEAD_TAIL_CHARS ? text : `${text.slice(0, HEAD_TAIL_CHARS)}…`;
+}
+
+export function tailOf(text: string): string {
+  return text.length <= HEAD_TAIL_CHARS ? text : `…${text.slice(-HEAD_TAIL_CHARS)}`;
 }
 
 export function agentRecordsDir(home: string, sessionId: string): string {

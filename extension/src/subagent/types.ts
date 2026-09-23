@@ -30,6 +30,8 @@ export interface ChildResult {
   error?: string;
   /** Non-fatal caveat, e.g. agent-definition model fell back to parent model. */
   warning?: string;
+  /** Set when the model itself stopped with an error (provider failure). */
+  endReason?: "model-error";
   durationMs: number;
 }
 
