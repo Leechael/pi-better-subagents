@@ -35,7 +35,7 @@ pi -e /path/to/pi-better-subagents/extension   # local trial (recommended first)
 
 **Conflict**: the legacy `pi-subagents` package also registers a `subagent` tool. Either `pi remove pi-subagents`, or test with `pi -ne -e ./extension` (note `-ne` suppresses your other extensions too).
 
-Degradation when the manager is missing: bash falls back to local execution, task_*/monitor are disabled (a warning shows in the TUI). Point to a binary explicitly via `PBS_MANAGER_PATH` or `managerPath` in config.json.
+**Degraded startup:** if `pbs-manager` is missing or cannot start, the extension warns in the TUI. Bash runs locally (so auto-backgrounding and manager-backed output/history are unavailable); `task_*` and `monitor` report that they are disabled. In-process subagents remain usable. Fix the manager installation or point to a binary with `PBS_MANAGER_PATH` / `managerPath` in config.json. If the extension is loaded outside pi and pi's bundled `pi-tui` cannot be resolved, a one-time console warning explains that interactive `/tasks` views use reduced text fallback; load the extension through pi for the full interactive UI.
 
 ## Tools
 
@@ -122,10 +122,11 @@ Counts sit on one line under the editor. Inspection is `/tasks` (alias `/bashes`
 | Surface | Behavior |
 |---------|----------|
 | Fleet line (below editor) | `2 workers · 1 subagent · 1 monitor` — counts only, no total, no poll |
-| `/tasks` | Live list of shells, monitors, and subagents. ↑↓ select, Enter view, s stop, Esc close |
+| `/tasks` | Live list of shells, monitors, and subagents. Filter by typing; ↑↓ select, Tab switches active/recent vs all, PgUp/PgDn page, Enter view, `s` stop (with confirmation), Esc close |
 | Finished items | Stay viewable for 10 minutes (cap 50). Sync-waited shells are not workers |
-| Monitor / shell view | Two pages: merged output, and stderr. Wheel / PgUp / PgDn scroll; terminal selection copies |
-| Transcript pills | Compact renderers for task / subagent / **monitor** / supervisor notifications |
+| Shell / monitor details | Output, stderr, and info panes; `1`/`2`/`3` select and Tab cycles. `f` toggles follow; wheel / arrows / PgUp / PgDn scroll |
+| Subagent details | Conversation, result, and info panes; prompts and preambles are labelled separately |
+| Transcript pills | Compact, labelled renderers for task / subagent / **monitor** / supervisor notifications. Ctrl+O expands details without exposing the XML envelope |
 | Monitor events | Injected as `Monitor event: "desc"` + `<event>` body (model turn / steer); lifecycle (exit / timeout / rate-limit) also fires a TUI toast |
 | Monitor tool row | `Monitor started · task <id> · timeout 300s` |
 
