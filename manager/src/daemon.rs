@@ -1059,6 +1059,20 @@ fn handle_mark_background(state: &Shared, conn_id: u64, task_id: &str) -> Result
     Ok(UnitOk {})
 }
 
+/// SIGKILL group `pgid` until nothing but (at most) its leader is left.
+/// One `kill(-pgid)` can miss a process that is being forked while the
+/// signal is delivered (seen on macOS: the runner's `sh`, or a child `sh`
+/// forks, right at task start). Bounded: ~200 ms.
+async fn kill_group_hard(pgid: u32) {
+    for _ in 0..40 {
+        let _ = task::signal_group(pgid, task::SIGKILL);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        if !crate::sys::group_has_others(pgid) {
+            break;
+        }
+    }
+}
+
 /// After the grace, SIGKILL the *group* if anything in it may survive: the
 /// leader, or descendants that ignored SIGTERM after the leader died.
 fn spawn_kill_reaper(state: &Shared, task_id: &str, pid: u32) {
@@ -1078,7 +1092,7 @@ fn spawn_kill_reaper(state: &Shared, task_id: &str, pid: u32) {
                 .unwrap_or(false)
         };
         if group_live {
-            let _ = task::signal_group(pid, task::SIGKILL);
+            kill_group_hard(pid).await;
         }
     });
 }
@@ -1417,7 +1431,7 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
                                 }
                             }
                         }
-                        let _ = task::signal_group(pid, task::SIGKILL);
+                        kill_group_hard(pid).await;
                     }
                 }
             }
@@ -1621,7 +1635,7 @@ async fn graceful_shutdown(state: &Shared) {
                 .collect()
         };
         for pid in survivors {
-            let _ = task::signal_group(pid, task::SIGKILL);
+            kill_group_hard(pid).await;
         }
         // Let exit watchers observe and persist.
         tokio::time::sleep(Duration::from_millis(300)).await;

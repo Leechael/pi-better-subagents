@@ -114,10 +114,29 @@ fn watch_lifeline(me: u32) {
             Err(_) => break,
         }
     }
-    // The daemon is gone: take the group down, ourselves included.
+    // The daemon is gone: take the group down. SIGTERM reaches everyone
+    // but us (we block it).
     let _ = sys::signal_group(me, sys::SIGTERM);
     std::thread::sleep(LIFELINE_GRACE);
-    let _ = sys::signal_group(me, sys::SIGKILL);
+    // Then SIGKILL every other member, one by one, until we are alone: a
+    // process forked while a group signal is delivered can miss it.
+    for _ in 0..200 {
+        let others: Vec<u32> = match sys::group_members(me) {
+            Ok(pids) => pids.into_iter().filter(|p| *p != me).collect(),
+            Err(_) => {
+                let _ = sys::signal_group(me, sys::SIGKILL);
+                break;
+            }
+        };
+        if others.is_empty() {
+            break;
+        }
+        for p in others {
+            let _ = sys::kill_pid(p, sys::SIGKILL);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::process::exit(137);
 }
 
 /// Parsed status line. `None` for anything malformed.

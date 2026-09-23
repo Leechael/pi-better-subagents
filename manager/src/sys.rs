@@ -273,6 +273,21 @@ pub fn group_has_others(pgid: u32) -> bool {
     }
 }
 
+/// `kill(pid, sig)`; `ESRCH` (already gone) is success.
+pub fn kill_pid(pid: u32, sig: i32) -> io::Result<()> {
+    // SAFETY: plain integers; a positive pid addresses one process.
+    let rc = unsafe { libc::kill(pid as i32, sig) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(e)
+    }
+}
+
 /// Upper bound for the fd scan in [`child_setup`], computed in the parent
 /// before fork (the child must not allocate).
 ///

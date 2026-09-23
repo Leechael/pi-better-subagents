@@ -532,9 +532,21 @@ Found by the stress run (5 iterations x 3 concurrent copies, load average
 - `t13b` (2 of 15 plain runs): a leftover that had just exited still had
   its guardian runner alive (≤ 100 ms), and `refresh_lingering` probed
   `kill(-pgid, 0)`, which counts the runner itself, so shutdown signalled
-  and waited on an "leftover" that was only the runner. Shutdown and the
+  and waited on a "leftover" that was only the runner. Shutdown and the
   fallback group poll now ask `group_has_others`: members other than the
   leader (the runner, alive or an unreaped zombie).
+
+- `task::tests::repeated_start_stop_stress` (4 of 15 plain runs): a
+  group SIGKILL sent right after spawn can arrive while the runner is
+  forking `sh`. On macOS the half-created child can miss a signal that is
+  delivered to the group during the fork, so `sh` (and its `sleep 30`)
+  survived, holding the output pipe open. The same race existed before
+  with `sh` forking its own children, but a second fork at task start
+  made it common. Every daemon SIGKILL site (timeout, stop reaper after
+  the grace, shutdown survivors) now uses `kill_group_hard`: SIGKILL, then
+  again every 5 ms until only the leader remains (bounded to ~200 ms). The
+  runner's lifeline teardown SIGKILLs the other members pid by pid until
+  it is alone.
 
 New tests and red-before evidence (run against the `prelaunch-polish`
 manager sources with the new tests):

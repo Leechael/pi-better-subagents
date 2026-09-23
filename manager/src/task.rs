@@ -703,7 +703,16 @@ mod tests {
             let mut chunks = std::mem::replace(&mut t.chunks, mpsc::channel(1).1);
             let tee = t.tee_remaining.clone();
             let drain = tokio::spawn(async move { drain_chunks(&mut chunks).await });
-            signal_group(t.pid, SIGKILL).unwrap();
+            // Right after spawn the runner may be forking `sh`, which can
+            // miss a single group signal: kill until only the leader is left
+            // (what the daemon's kill paths do).
+            for _ in 0..40 {
+                signal_group(t.pid, SIGKILL).unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                if !crate::sys::group_has_others(t.pid) {
+                    break;
+                }
+            }
             let status = t.child.wait().await.unwrap();
             assert!(status.signal().is_some() || status.code().is_some());
             let _ = drain.await.unwrap();
