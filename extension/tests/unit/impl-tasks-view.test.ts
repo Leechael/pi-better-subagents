@@ -179,3 +179,30 @@ describe("tasks view", () => {
     for (const line of lines) expect(line).not.toMatch(/\uFFFD/);
   });
 });
+
+// Manual testing (2026-09-24): a monitor view opened while it ran said
+// "running · 57m46s" long after it exited, and a command with no output
+// (`true`) showed a bare "(empty)".
+describe("task detail tabs follow the live item", () => {
+  it("re-reads status from the index and explains empty output", async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { taskDetailTabs } = await import("../../src/tui/tasks-command");
+    const dir = mkdtempSync(join(tmpdir(), "pbs-tabs-"));
+    const out = join(dir, "mon_1.output");
+    writeFileSync(out, "");
+    writeFileSync(join(dir, "mon_1.stderr"), "");
+    let item = { id: "mon_1", kind: "monitor" as const, status: "running" as const, title: "noop watcher", command: "true", startedAt: 0, countsAsWorker: false, outputPath: out } as never as import("../../src/work-index").WorkItem;
+    const tabs = taskDetailTabs(() => item, { outputPath: out, stderrPath: join(dir, "mon_1.stderr") }, () => 1_000);
+    expect(tabs.output()).toContain("running");
+    expect(tabs.output()).toContain("(no output yet)");
+    item = { ...item, status: "completed", exitCode: 0, endedAt: 5, endReason: "exited" } as typeof item;
+    expect(tabs.output()).toContain("exit 0");
+    expect(tabs.output()).not.toContain("running");
+    expect(tabs.output()).toMatch(/no output; the command printed nothing/);
+    expect(tabs.stderr()).toContain("(nothing on stderr)");
+    expect(tabs.info()).toContain("noop watcher");
+    rmSync(dir, { recursive: true, force: true });
+  });
+});

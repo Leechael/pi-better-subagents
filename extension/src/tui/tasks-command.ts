@@ -428,6 +428,8 @@ export function resolveTaskOutputPath(item: WorkItem, home: string | undefined, 
 
 export function taskDetailInfo(item: WorkItem, now: number): string {
   const lines = [taskDetailHeader(item, now)];
+  if (item.kind === "monitor" && item.command && item.title !== item.command) lines.push(`Watching: ${item.title}`);
+  if (item.endReason) lines.push(`Ended: ${item.endReason}`);
   if (item.outputPath) lines.push(`Output: ${item.outputPath}`);
   if (item.stderrPath) lines.push(`Stderr: ${item.stderrPath}`);
   if (item.runId) lines.push(`Run: ${item.runId}`);
@@ -437,6 +439,32 @@ export function taskDetailInfo(item: WorkItem, now: number): string {
   if (item.preamble) lines.push(`Agent preamble (injected):\n${item.preamble}`);
   if (item.error) lines.push(`Error: ${item.error}`);
   return lines.join("\n");
+}
+
+function isLiveStatus(status: string): boolean {
+  return status === "running" || status === "pending";
+}
+
+/**
+ * Tab bodies for a shell or monitor. `getItem` is read on every poll so the
+ * header follows the task (a view opened while it ran must not keep saying
+ * "running"), and an empty file says why it is empty.
+ */
+export function taskDetailTabs(
+  getItem: () => WorkItem,
+  paths: { outputPath: string; stderrPath: string },
+  now: () => number,
+): { output: () => string; stderr: () => string; info: () => string } {
+  const body = (path: string, emptyLive: string, emptyDone: string) => {
+    const text = readTaskFileTailCached(path);
+    if (text !== "(empty)") return text;
+    return isLiveStatus(getItem().status) ? emptyLive : emptyDone;
+  };
+  return {
+    output: () => `${taskDetailHeader(getItem(), now())}\n\n${body(paths.outputPath, "(no output yet)", "(no output; the command printed nothing)")}`,
+    stderr: () => `${taskDetailHeader(getItem(), now())}\n\n${body(paths.stderrPath, "(nothing on stderr yet)", "(nothing on stderr)")}`,
+    info: () => taskDetailInfo({ ...getItem(), ...paths }, now()),
+  };
 }
 
 async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksCommandDeps): Promise<void> {
@@ -453,7 +481,7 @@ async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksComman
       const latest = [...conversation()].reverse().find((turn) => turn.role === "assistant")?.text;
       return latest ?? item.text ?? "(no result yet)";
     };
-    const infoText = () => taskDetailInfo(item, clock.now());
+    const infoText = () => taskDetailInfo(deps.getIndex()?.get(item.id) ?? item, clock.now());
     try {
       await showScrollDetail(ctx.ui, {
         title: `subagent ${item.title}`,
@@ -472,15 +500,12 @@ async function viewItem(ctx: ExtensionContext, item: WorkItem, deps: TasksComman
   }
   const outputPath = resolveTaskOutputPath(item, deps.home, deps.sessionId?.());
   const stderrPath = item.stderrPath || stderrPathFor(outputPath);
-  const infoText = () => taskDetailInfo({ ...item, outputPath, stderrPath }, clock.now());
+  const tabs = taskDetailTabs(() => deps.getIndex()?.get(item.id) ?? item, { outputPath, stderrPath }, () => clock.now());
+  const infoText = tabs.info;
   try {
     await showScrollDetail(ctx.ui, {
       title: `${item.kind} ${item.title}`,
-      tabs: {
-        output: () => `${taskDetailHeader(item, clock.now())}\n\n${readTaskFileTailCached(outputPath)}`,
-        stderr: () => `${taskDetailHeader(item, clock.now())}\n\n${readTaskFileTailCached(stderrPath)}`,
-        info: infoText,
-      },
+      tabs,
       pollMs: 500,
       clock: deps.clock,
     });
