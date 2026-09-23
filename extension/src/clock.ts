@@ -7,6 +7,7 @@ export interface Clock {
   clearTimeout(timer: ClockTimer): void;
   setInterval(callback: () => void, intervalMs: number): ClockTimer;
   clearInterval(timer: ClockTimer): void;
+  unref?(timer: ClockTimer): void;
   sleep(delayMs: number): Promise<void>;
 }
 
@@ -16,6 +17,7 @@ export const realClock: Clock = {
   clearTimeout: (timer) => globalThis.clearTimeout(timer as ReturnType<typeof setTimeout>),
   setInterval: (callback, intervalMs) => globalThis.setInterval(callback, intervalMs),
   clearInterval: (timer) => globalThis.clearInterval(timer as ReturnType<typeof setInterval>),
+  unref: (timer) => (timer as { unref?: () => void }).unref?.(),
   sleep: (delayMs) => new Promise((resolve) => globalThis.setTimeout(resolve, delayMs)),
 };
 

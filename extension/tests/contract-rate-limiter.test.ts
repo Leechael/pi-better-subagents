@@ -16,19 +16,18 @@
  * §4.4: token bucket(容量 10,每 2s +1).
  * ASSUMPTION: the bucket starts full (standard token-bucket semantics).
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
+import { ManualClock } from "../src/clock";
 import { RateLimiter } from "../src/monitor-batching";
 
 describe("RateLimiter (contract: design.md §4.4 + Appendix A)", () => {
+  let clock: ManualClock;
   beforeEach(() => {
-    vi.useFakeTimers();
-  });
-  afterEach(() => {
-    vi.useRealTimers();
+    clock = new ManualClock();
   });
 
   it("allows up to capacity (default 10) then returns false when exhausted", () => {
-    const r = new RateLimiter();
+    const r = new RateLimiter({ clock });
     for (let i = 0; i < 10; i++) {
       expect(r.tryConsume()).toBe(true);
     }
@@ -37,7 +36,7 @@ describe("RateLimiter (contract: design.md §4.4 + Appendix A)", () => {
   });
 
   it("tryConsume() defaults to n=1", () => {
-    const r = new RateLimiter({ capacity: 2 });
+    const r = new RateLimiter({ capacity: 2, clock });
     expect(r.tryConsume()).toBe(true);
     expect(r.tryConsume()).toBe(true);
     expect(r.tryConsume()).toBe(false);
@@ -45,7 +44,7 @@ describe("RateLimiter (contract: design.md §4.4 + Appendix A)", () => {
   });
 
   it("tryConsume(n) consumes exactly n tokens", () => {
-    const r = new RateLimiter(); // capacity 10
+    const r = new RateLimiter({ clock }); // capacity 10
     expect(r.tryConsume(4)).toBe(true); // 6 left
     expect(r.tryConsume(6)).toBe(true); // 0 left
     expect(r.tryConsume(1)).toBe(false);
@@ -53,7 +52,7 @@ describe("RateLimiter (contract: design.md §4.4 + Appendix A)", () => {
   });
 
   it("a failed tryConsume is all-or-nothing (no partial drain)", () => {
-    const r = new RateLimiter(); // capacity 10
+    const r = new RateLimiter({ clock }); // capacity 10
     expect(r.tryConsume(11)).toBe(false); // over capacity — must fail
     expect(r.tryConsume(10)).toBe(true); // bucket untouched by the failure
     expect(r.tryConsume(1)).toBe(false);
@@ -61,15 +60,15 @@ describe("RateLimiter (contract: design.md §4.4 + Appendix A)", () => {
   });
 
   it("refills +1 token every 2s (defaults)", () => {
-    const r = new RateLimiter();
+    const r = new RateLimiter({ clock });
     for (let i = 0; i < 10; i++) r.tryConsume();
     expect(r.tryConsume()).toBe(false);
 
-    vi.advanceTimersByTime(2000); // +1
+    clock.advanceBy(2000); // +1
     expect(r.tryConsume()).toBe(true);
     expect(r.tryConsume()).toBe(false);
 
-    vi.advanceTimersByTime(4000); // +2
+    clock.advanceBy(4000); // +2
     expect(r.tryConsume()).toBe(true);
     expect(r.tryConsume()).toBe(true);
     expect(r.tryConsume()).toBe(false);
@@ -77,9 +76,9 @@ describe("RateLimiter (contract: design.md §4.4 + Appendix A)", () => {
   });
 
   it("refill never exceeds capacity", () => {
-    const r = new RateLimiter();
+    const r = new RateLimiter({ clock });
     expect(r.tryConsume()).toBe(true); // 9 left
-    vi.advanceTimersByTime(60_000); // would be +30 uncapped
+    clock.advanceBy(60_000); // would be +30 uncapped
     for (let i = 0; i < 10; i++) {
       expect(r.tryConsume()).toBe(true);
     }
@@ -92,22 +91,23 @@ describe("RateLimiter (contract: design.md §4.4 + Appendix A)", () => {
       capacity: 3,
       refillIntervalMs: 1000,
       refillAmount: 2,
+      clock,
     });
     expect(r.tryConsume()).toBe(true);
     expect(r.tryConsume()).toBe(true);
     expect(r.tryConsume()).toBe(true);
     expect(r.tryConsume()).toBe(false);
-    vi.advanceTimersByTime(1000); // +2
+    clock.advanceBy(1000); // +2
     expect(r.tryConsume(2)).toBe(true);
     expect(r.tryConsume()).toBe(false);
     r.dispose();
   });
 
   it("dispose() stops refilling", () => {
-    const r = new RateLimiter();
+    const r = new RateLimiter({ clock });
     for (let i = 0; i < 10; i++) r.tryConsume();
     r.dispose();
-    vi.advanceTimersByTime(60_000);
+    clock.advanceBy(60_000);
     expect(r.tryConsume()).toBe(false);
   });
 });

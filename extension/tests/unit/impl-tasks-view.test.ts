@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { ManualClock } from "../../src/clock";
 import { formatConversation, turnsFromMessages } from "../../src/subagent/conversation";
 import { stderrPathFor } from "../../src/tui/task-output-paths";
 import { formatWorkRows, moveSelection, stopChoice } from "../../src/tui/tasks-command";
@@ -33,7 +34,7 @@ describe("tasks view", () => {
   });
 
   it("lists a running monitor in the overlay rows", () => {
-    const index = new WorkIndex({ now: () => 10_000 });
+    const index = new WorkIndex({ clock: new ManualClock(10_000) });
     index.upsert({
       id: "mon_abc",
       kind: "monitor",
@@ -49,7 +50,7 @@ describe("tasks view", () => {
   });
 
   it("keeps a finished item viewable inside the retain window", () => {
-    const index = new WorkIndex({ now: () => 1_000, retainMs: 10_000, finishedCap: 50 });
+    const index = new WorkIndex({ clock: new ManualClock(1_000), retainMs: 10_000, finishedCap: 50 });
     index.upsert({
       id: "ch_done",
       kind: "agent",

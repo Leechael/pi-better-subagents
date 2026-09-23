@@ -3,6 +3,8 @@
  * The exit event is dispatched before markNotifyOnExit runs, so the wake is
  * dropped. Stash that exit and fire it when the mark arrives late.
  */
+import { realClock, type Clock } from "./clock";
+
 export interface StashedExit<T> {
   taskId: string;
   event: T;
@@ -12,12 +14,16 @@ export class ExitNotifyGate<T> {
   private readonly notify = new Set<string>();
   private readonly recent = new Map<string, T>();
   private readonly ttlMs: number;
-  private readonly now: () => number;
+  private readonly clock: Clock;
   private readonly stamped = new Map<string, number>();
 
-  constructor(opts: { ttlMs?: number; now?: () => number } = {}) {
+  constructor(opts: { ttlMs?: number; clock?: Clock } = {}) {
     this.ttlMs = opts.ttlMs ?? 30_000;
-    this.now = opts.now ?? Date.now;
+    this.clock = opts.clock ?? realClock;
+  }
+
+  private now(): number {
+    return this.clock.now();
   }
 
   /**

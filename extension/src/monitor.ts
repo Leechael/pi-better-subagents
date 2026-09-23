@@ -9,6 +9,7 @@
 import { Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { formatMonitorEvent } from "./format";
+import { realClock, type Clock, type ClockTimer } from "./clock";
 
 import type { ManagerClient, ManagerEvent } from "./manager-client";
 import { LineBatcher, RateLimiter } from "./monitor-batching";
@@ -29,6 +30,7 @@ export interface MonitorDeps {
   trackTask: (taskId: string, meta: { kind: string; command: string }) => void;
   /** Optional TUI toast for lifecycle notices (exit / timeout / rate-limit). */
   toast?: (message: string, type?: "info" | "warning" | "error") => void;
+  clock?: Clock;
 }
 
 interface MonitorEntry {
@@ -38,17 +40,19 @@ interface MonitorEntry {
   batcher: LineBatcher;
   limiter: RateLimiter;
   saturatedSince: number | null;
-  timeoutTimer: NodeJS.Timeout | null;
+  timeoutTimer: ClockTimer | null;
   stopped: boolean;
 }
 
 export class MonitorRegistry {
   private readonly deps: MonitorDeps;
+  private readonly clock: Clock;
   private readonly entries = new Map<string, MonitorEntry>();
   private readonly changeListeners = new Set<() => void>();
 
   constructor(deps: MonitorDeps) {
     this.deps = deps;
+    this.clock = deps.clock ?? realClock;
   }
 
   /** Subscribe to start/stop transitions (fleet status refresh). */
@@ -110,21 +114,22 @@ export class MonitorRegistry {
     const entry: MonitorEntry = {
       taskId: task_id,
       description: params.description,
-      startedAt: Date.now(),
+      startedAt: this.clock.now(),
       batcher: null as unknown as LineBatcher, // assigned below (self-reference in callback)
-      limiter: new RateLimiter(),
+      limiter: new RateLimiter({ clock: this.clock }),
       saturatedSince: null,
       timeoutTimer: null,
       stopped: false,
     };
     entry.batcher = new LineBatcher({
       onFlush: (text) => this.onBatch(entry, text),
+      clock: this.clock,
     });
     if (timeoutMs !== null) {
-      entry.timeoutTimer = setTimeout(() => {
+      entry.timeoutTimer = this.clock.setTimeout(() => {
         void this.timeout(entry);
       }, timeoutMs);
-      entry.timeoutTimer.unref?.();
+      this.clock.unref?.(entry.timeoutTimer);
     }
     this.entries.set(task_id, entry);
     this.emitChange();
@@ -183,8 +188,8 @@ export class MonitorRegistry {
     if (!entry.limiter.tryConsume()) {
       // Saturated: drop the batch and track continuous saturation.
       if (entry.saturatedSince === null) {
-        entry.saturatedSince = Date.now();
-      } else if (Date.now() - entry.saturatedSince >= SATURATION_LIMIT_MS) {
+        entry.saturatedSince = this.clock.now();
+      } else if (this.clock.now() - entry.saturatedSince >= SATURATION_LIMIT_MS) {
         void this.autoStop(entry);
       }
       return;
@@ -232,7 +237,7 @@ export class MonitorRegistry {
     entry.batcher.dispose();
     entry.limiter.dispose();
     if (entry.timeoutTimer !== null) {
-      clearTimeout(entry.timeoutTimer);
+      this.clock.clearTimeout(entry.timeoutTimer);
       entry.timeoutTimer = null;
     }
     this.entries.delete(entry.taskId);

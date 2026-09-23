@@ -10,6 +10,7 @@
  */
 import { formatTaskNotification, type TaskExitInfo } from "./format";
 import { PBS_WAKE_CUSTOM_TYPE, type WakeItem } from "./wake";
+import { realClock, type Clock, type ClockTimer } from "./clock";
 
 
 export interface NotifyMessage {
@@ -31,20 +32,23 @@ export interface NotifyCenterDeps {
    * Read at flush time so siblings that exit in the same window are not listed.
    */
   listStillRunning?: () => WakeItem[];
+  clock?: Clock;
 }
 
 
 export class NotifyCenter {
   private readonly deps: NotifyCenterDeps;
   private readonly batchMs: number;
+  private readonly clock: Clock;
   private pendingExits: TaskExitInfo[] = [];
   private readonly seen = new Set<string>();
-  private timer: NodeJS.Timeout | null = null;
+  private timer: ClockTimer | null = null;
   private disposed = false;
 
   constructor(deps: NotifyCenterDeps) {
     this.deps = deps;
     this.batchMs = deps.batchMs ?? 200;
+    this.clock = deps.clock ?? realClock;
   }
 
   /**
@@ -80,16 +84,16 @@ export class NotifyCenter {
 
   private scheduleFlush(): void {
     if (this.timer !== null) return;
-    this.timer = setTimeout(() => {
+    this.timer = this.clock.setTimeout(() => {
       this.timer = null;
       this.flushExits();
     }, this.batchMs);
-    this.timer.unref?.();
+    this.clock.unref?.(this.timer);
   }
 
   private clearTimer(): void {
     if (this.timer !== null) {
-      clearTimeout(this.timer);
+      this.clock.clearTimeout(this.timer);
       this.timer = null;
     }
   }

@@ -17,6 +17,7 @@
  * Zero pi dependency.
  */
 import { randomBytes } from "node:crypto";
+import { realClock, type Clock } from "../clock";
 import type {
   ChildHandle,
   ChildResult,
@@ -69,8 +70,8 @@ export interface SubagentRegistryOptions {
   maxConcurrentChildren?: number;
   /** Max child sessions created per hour (default 32). */
   spawnBudgetPerHour?: number;
-  /** Clock override for tests. */
-  now?: () => number;
+  /** Shared time source. */
+  clock?: Clock;
 }
 
 export interface StartChildOptions {
@@ -177,7 +178,7 @@ class FailedChildHandle implements ChildHandle {
 export class SubagentRegistry implements RunRegistry {
   private readonly maxChildren: number;
   private readonly spawnBudget: number;
-  private readonly now: () => number;
+  private readonly clock: Clock;
 
   private runner: ChildRunner | null = null;
   private readonly runs = new Map<string, InternalRun>();
@@ -190,7 +191,11 @@ export class SubagentRegistry implements RunRegistry {
   constructor(opts: SubagentRegistryOptions = {}) {
     this.maxChildren = opts.maxConcurrentChildren ?? 8;
     this.spawnBudget = opts.spawnBudgetPerHour ?? 32;
-    this.now = opts.now ?? Date.now;
+    this.clock = opts.clock ?? realClock;
+  }
+
+  private now(): number {
+    return this.clock.now();
   }
 
   /** Late-bound to break the registry <-> runner construction cycle. */

@@ -1,39 +1,6 @@
 import { describe, expect, it } from "vitest";
-import {
-  DECISION_TIMEOUT_MESSAGE,
-  Mailbox,
-  type MailboxClock,
-} from "../../src/comms/mailbox";
-
-/** Deterministic clock: manual time + capturable timers. */
-function fakeClock(start = 1_000) {
-  let now = start;
-  const timers: { cb: () => void; ms: number; cancelled: boolean }[] = [];
-  const clock: MailboxClock = {
-    now: () => now,
-    setTimeout: (cb, ms) => {
-      const t = { cb, ms, cancelled: false };
-      timers.push(t);
-      return t;
-    },
-    clearTimeout: (handle) => {
-      (handle as (typeof timers)[number]).cancelled = true;
-    },
-  };
-  return {
-    clock,
-    timers,
-    advance(ms: number) {
-      now += ms;
-    },
-    /** Fire every timer that has not been cancelled. */
-    fireAll() {
-      for (const t of timers) {
-        if (!t.cancelled) t.cb();
-      }
-    },
-  };
-}
+import { ManualClock } from "../../src/clock";
+import { DECISION_TIMEOUT_MESSAGE, Mailbox } from "../../src/comms/mailbox";
 
 describe("Mailbox ring log", () => {
   it("keeps the last 200 entries per run (default capacity)", () => {
@@ -70,7 +37,7 @@ describe("Mailbox ring log", () => {
   });
 
   it("stamps ts from the injected clock and preserves explicit ts", () => {
-    const { clock } = fakeClock(42);
+    const clock = new ManualClock(42);
     const mb = new Mailbox({ clock });
     const stamped = mb.append("run_1", { from: "a", to: "b", kind: "send", message: "x" });
     expect(stamped.ts).toBe(42);
@@ -101,26 +68,28 @@ describe("Mailbox need_decision waiters", () => {
   });
 
   it("times out with the contract message (fake clock)", async () => {
-    const { clock, timers, fireAll } = fakeClock();
+    const clock = new ManualClock();
     const mb = new Mailbox({ clock });
     const p = mb.beginDecision("ch_a", "explorer", "stuck");
-    expect(timers).toHaveLength(1);
-    expect(timers[0].ms).toBe(600_000); // 10 minutes
-    fireAll();
+    clock.advanceBy(599_999);
+    expect(mb.hasPendingDecision("ch_a")).toBe(true);
+    clock.advanceBy(1); // 10 minutes
     await expect(p).resolves.toBe(DECISION_TIMEOUT_MESSAGE);
     expect(mb.pendingRequests()).toEqual([]);
     // a late reply finds no waiter
     expect(mb.resolveDecision("ch_a", "too late")).toBe(false);
   });
 
-  it("times out with a short injected timeout (real timers)", async () => {
-    const mb = new Mailbox({ decisionTimeoutMs: 20 });
+  it("times out with a short injected timeout", async () => {
+    const clock = new ManualClock();
+    const mb = new Mailbox({ decisionTimeoutMs: 20, clock });
     const p = mb.beginDecision("ch_a", "explorer", "stuck");
+    clock.advanceBy(20);
     await expect(p).resolves.toBe(DECISION_TIMEOUT_MESSAGE);
   });
 
   it("per-child waiters are independent (no global lock)", async () => {
-    const { clock, fireAll } = fakeClock();
+    const clock = new ManualClock();
     const mb = new Mailbox({ clock });
     const pa = mb.beginDecision("ch_a", "aaa", "question A");
     const pb = mb.beginDecision("ch_b", "bbb", "question B");
@@ -131,7 +100,7 @@ describe("Mailbox need_decision waiters", () => {
     expect(mb.pendingRequests().map((r) => r.childId)).toEqual(["ch_b"]);
 
     // ch_b times out on its own timer
-    fireAll();
+    clock.advanceBy(600_000);
     await expect(pb).resolves.toBe(DECISION_TIMEOUT_MESSAGE);
     expect(mb.pendingRequests()).toEqual([]);
   });
@@ -143,10 +112,10 @@ describe("Mailbox need_decision waiters", () => {
   });
 
   it("pendingRequests reports childId, name, message and sinceMs", () => {
-    const { clock, advance } = fakeClock(5_000);
+    const clock = new ManualClock(5_000);
     const mb = new Mailbox({ clock });
     void mb.beginDecision("ch_a", "explorer", "q1");
-    advance(1_500);
+    clock.advanceBy(1_500);
     void mb.beginDecision("ch_b", "worker", "q2");
     expect(mb.pendingRequests()).toEqual([
       { childId: "ch_a", name: "explorer", message: "q1", sinceMs: 5_000 },
@@ -155,21 +124,20 @@ describe("Mailbox need_decision waiters", () => {
   });
 
   it("a resolved waiter's timer is cancelled (no late timeout override)", async () => {
-    const { clock, timers, fireAll } = fakeClock();
+    const clock = new ManualClock();
     const mb = new Mailbox({ clock });
     const p = mb.beginDecision("ch_a", "aaa", "q");
     mb.resolveDecision("ch_a", "reply");
-    expect(timers[0].cancelled).toBe(true);
-    fireAll(); // would fire the timeout if it were not cancelled
+    clock.advanceBy(600_000); // would time out if the handle had not been cancelled
     await expect(p).resolves.toBe("reply");
   });
 
   it("dispose resolves outstanding waiters and clears timers", async () => {
-    const { clock, timers } = fakeClock();
+    const clock = new ManualClock();
     const mb = new Mailbox({ clock });
     const p = mb.beginDecision("ch_a", "aaa", "q");
     mb.dispose();
-    expect(timers[0].cancelled).toBe(true);
+    clock.advanceBy(600_000);
     await expect(p).resolves.toBe(DECISION_TIMEOUT_MESSAGE);
     expect(mb.pendingRequests()).toEqual([]);
   });

@@ -19,6 +19,7 @@
  * waitForIdle() is awaited afterwards as belt-and-braces for queued
  * steer/followUp processing.
  */
+import { realClock, TimerScope, type Clock, type ClockTimer } from "../clock";
 import type {
   ChildResult,
   ChildRunRequest,
@@ -36,8 +37,8 @@ export interface InProcessRunnerOptions {
   createSession: CreateSessionFn;
   /** Stall watchdog timeout (ms). Default 10 minutes. */
   stallMs?: number;
-  /** Clock override for tests. */
-  now?: () => number;
+  /** Shared time source and scheduler. */
+  clock?: Clock;
   /**
    * Per-generation admission hook. Awaited before each (re)start; the
    * resolved releaser is called when the generation settles. Rejecting
@@ -68,7 +69,7 @@ class InProcessChildHandle implements DisposableChildHandle {
   private readonly req: ChildRunRequest;
   private readonly createSession: CreateSessionFn;
   private readonly stallMs: number;
-  private readonly now: () => number;
+  private readonly clock: Clock;
   private readonly acquire?: (req: ChildRunRequest) => Promise<() => void>;
 
   private session: ChildSessionAdapter | null = null;
@@ -81,8 +82,9 @@ class InProcessChildHandle implements DisposableChildHandle {
   private settledFlag = false;
   private resolveResult!: (result: ChildResult) => void;
   private resultPromise: Promise<ChildResult>;
-  private timeoutTimer: NodeJS.Timeout | null = null;
-  private stallTimer: NodeJS.Timeout | null = null;
+  private timeoutTimer: ClockTimer | null = null;
+  private stallTimer: ClockTimer | null = null;
+  private timerScope: TimerScope | null = null;
   private releaseSlot: (() => void) | null = null;
   private disposed = false;
   /** Nested tool_execution_start/end. Stall stays paused while > 0. */
@@ -94,9 +96,9 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.req = req;
     this.createSession = opts.createSession;
     this.stallMs = opts.stallMs ?? DEFAULT_STALL_MS;
-    this.now = opts.now ?? Date.now;
+    this.clock = opts.clock ?? realClock;
     this.acquire = opts.acquire;
-    this.startedAt = this.now();
+    this.startedAt = this.clock.now();
     this.lastEvent = this.startedAt;
     this.resultPromise = new Promise((resolve) => {
       this.resolveResult = resolve;
@@ -132,7 +134,7 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   resumeStall(): void {
     this.decisionPaused = false;
-    this.lastEvent = this.now();
+    this.lastEvent = this.clock.now();
     if (this.status_ === "running" && this.toolDepth === 0) this.armStall(this.generation);
   }
 
@@ -223,9 +225,11 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   private async beginGeneration(prompt: string, first: boolean): Promise<void> {
     const gen = ++this.generation;
+    this.timerScope?.dispose();
+    this.timerScope = new TimerScope(this.clock);
     this.settledFlag = false;
     this.status_ = "pending";
-    this.startedAt = this.now();
+    this.startedAt = this.clock.now();
     this.lastEvent = this.startedAt;
     // A tool_execution_end from the previous generation may have been dropped
     // after settle. Don't carry that depth (or a pending decision) into this one.
@@ -349,6 +353,10 @@ class InProcessChildHandle implements DisposableChildHandle {
     return this.session?.getLastAssistantText() || "(no output)";
   }
 
+  private now(): number {
+    return this.clock.now();
+  }
+
   private isSettled(gen: number): boolean {
     return gen !== this.generation || this.settledFlag;
   }
@@ -384,11 +392,11 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   private armTimeout(gen: number): void {
     if (this.timeoutTimer !== null) {
-      clearTimeout(this.timeoutTimer);
+      this.timerScope?.clearTimeout(this.timeoutTimer);
       this.timeoutTimer = null;
     }
     if (!(this.req.timeoutMs > 0)) return;
-    this.timeoutTimer = setTimeout(() => {
+    this.timeoutTimer = this.timerScope?.setTimeout(() => {
       this.timeoutTimer = null;
       if (!this.isCurrent(gen)) return;
       this.settle(gen, {
@@ -398,17 +406,16 @@ class InProcessChildHandle implements DisposableChildHandle {
         durationMs: this.now() - this.startedAt,
       });
       void this.session?.abort().catch(() => {});
-    }, this.req.timeoutMs);
-    this.timeoutTimer.unref?.();
+    }, this.req.timeoutMs) ?? null;
   }
 
   private armStall(gen: number): void {
     if (this.stallTimer !== null) {
-      clearTimeout(this.stallTimer);
+      this.timerScope?.clearTimeout(this.stallTimer);
       this.stallTimer = null;
     }
     if (!(this.stallMs > 0)) return;
-    this.stallTimer = setTimeout(() => {
+    this.stallTimer = this.timerScope?.setTimeout(() => {
       this.stallTimer = null;
       if (!this.isCurrent(gen)) return;
       this.settle(gen, {
@@ -418,22 +425,23 @@ class InProcessChildHandle implements DisposableChildHandle {
         durationMs: this.now() - this.startedAt,
       });
       void this.session?.abort().catch(() => {});
-    }, this.stallMs);
-    this.stallTimer.unref?.();
+    }, this.stallMs) ?? null;
   }
 
   private clearStall(): void {
     if (this.stallTimer !== null) {
-      clearTimeout(this.stallTimer);
+      this.timerScope?.clearTimeout(this.stallTimer);
       this.stallTimer = null;
     }
   }
 
   private clearTimers(): void {
     if (this.timeoutTimer !== null) {
-      clearTimeout(this.timeoutTimer);
+      this.timerScope?.clearTimeout(this.timeoutTimer);
       this.timeoutTimer = null;
     }
     this.clearStall();
+    this.timerScope?.dispose();
+    this.timerScope = null;
   }
 }

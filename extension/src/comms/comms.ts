@@ -6,11 +6,11 @@
  */
 import {
   Mailbox,
-  type MailboxClock,
   type MailboxOptions,
 } from "./mailbox";
 import type { Comms, CommsHost } from "./types";
 import { formatPbsWake, type FormattedWake } from "../wake";
+import type { Clock } from "../clock";
 
 /** Ring bucket used when the host does not know the child (defensive fallback). */
 export const UNKNOWN_RUN_ID = "unknown";
@@ -63,7 +63,7 @@ export interface CommsOptions {
   /** Pre-built mailbox (tests); otherwise one is created from the options below. */
   mailbox?: Mailbox;
   decisionTimeoutMs?: MailboxOptions["decisionTimeoutMs"];
-  clock?: MailboxClock;
+  clock?: Clock;
 }
 
 export function createComms(host: CommsHost, options: CommsOptions = {}): CommsWithOrigin {

@@ -4,6 +4,8 @@
  * Finished items stay for 10 minutes (cap 50). Sync-waited shells are never
  * inserted — only backgrounded shells count as workers.
  */
+import { realClock, type Clock } from "./clock";
+
 export type WorkKind = "shell" | "monitor" | "agent";
 
 export const WORK_RETAIN_MS = 10 * 60 * 1000;
@@ -37,7 +39,7 @@ export interface WorkCounts {
 export interface WorkIndexOptions {
   retainMs?: number;
   finishedCap?: number;
-  now?: () => number;
+  clock?: Clock;
 }
 
 function isActiveStatus(status: string): boolean {
@@ -49,12 +51,16 @@ export class WorkIndex {
   private readonly listeners = new Set<() => void>();
   private readonly retainMs: number;
   private readonly finishedCap: number;
-  private readonly now: () => number;
+  private readonly clock: Clock;
 
   constructor(opts: WorkIndexOptions = {}) {
     this.retainMs = opts.retainMs ?? WORK_RETAIN_MS;
     this.finishedCap = opts.finishedCap ?? WORK_FINISHED_CAP;
-    this.now = opts.now ?? Date.now;
+    this.clock = opts.clock ?? realClock;
+  }
+
+  private now(): number {
+    return this.clock.now();
   }
 
   onChange(cb: () => void): () => void {

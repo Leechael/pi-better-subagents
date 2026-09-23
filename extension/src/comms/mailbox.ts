@@ -6,24 +6,8 @@
  * entry with its own promise and its own timeout timer — children never
  * queue behind each other.
  */
+import { realClock, type Clock, type ClockTimer } from "../clock";
 import type { MailboxEntry } from "./types";
-
-/** Injectable clock so tests can drive time and timers deterministically. */
-export interface MailboxClock {
-  now(): number;
-  setTimeout(callback: () => void, ms: number): unknown;
-  clearTimeout(handle: unknown): void;
-}
-
-export const realClock: MailboxClock = {
-  now: () => Date.now(),
-  setTimeout: (callback, ms) => {
-    const timer = setTimeout(callback, ms);
-    (timer as unknown as { unref?: () => void }).unref?.();
-    return timer;
-  },
-  clearTimeout: (handle) => clearTimeout(handle as NodeJS.Timeout),
-};
 
 export const DEFAULT_MAILBOX_CAPACITY = 200;
 export const DEFAULT_LOG_LIMIT = 20;
@@ -45,7 +29,7 @@ interface Waiter {
   message: string;
   sinceMs: number;
   resolve: (reply: string) => void;
-  timer: unknown;
+  timer: ClockTimer;
 }
 
 export interface MailboxOptions {
@@ -53,13 +37,13 @@ export interface MailboxOptions {
   capacity?: number;
   /** need_decision timeout. Default 600_000 (10 min). */
   decisionTimeoutMs?: number;
-  clock?: MailboxClock;
+  clock?: Clock;
 }
 
 export class Mailbox {
   private readonly capacity: number;
   private readonly decisionTimeoutMs: number;
-  private readonly clock: MailboxClock;
+  private readonly clock: Clock;
   private readonly rings = new Map<string, MailboxEntry[]>();
   private readonly waiters = new Map<string, Waiter>();
 
