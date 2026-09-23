@@ -108,6 +108,9 @@ fn u1_upgrade_keeps_every_task_running() {
     assert_eq!(after["generation"], 1);
     assert_eq!(after["last_upgrade"]["ok"], true);
     assert_eq!(after["last_upgrade"]["trigger"], "cli");
+    let human = home.cli(&["status"], s(10)).stdout;
+    let v = env!("CARGO_PKG_VERSION");
+    assert!(human.contains(&format!("upgrades: 1 (last: {v} -> {v}, cli, ")), "{human}");
     for p in sleeper_group.iter().chain(&leftover_group) {
         assert!(pid_alive(*p), "pid {p} died in the upgrade");
     }
@@ -208,6 +211,8 @@ fn u4_bad_binary_is_refused_before_anything_changes() {
     assert!(out.stderr.contains("upgrade not done") && out.stderr.contains("not an upgrade target"), "{}", out.stderr);
     let st = status(&home);
     assert_eq!((st["generation"].as_u64(), st["last_upgrade"]["ok"].as_bool()), (Some(0), Some(false)), "{st}");
+    let human = home.cli(&["status"], s(10)).stdout;
+    assert!(human.contains("upgrades: 0 (last attempt failed") && human.contains("not an upgrade target"), "{human}");
     // The same connection still works and still streams.
     let before = event_text(&c.events, &t).len();
     c.request_ok(json!({"type":"list"}));
