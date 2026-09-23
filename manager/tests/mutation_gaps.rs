@@ -330,7 +330,7 @@ fn g13_doctor_cleans_only_without_a_daemon() {
     assert!(out.stdout.contains("no stale files"), "{}", out.stdout);
     assert!(out.stdout.trim_end().ends_with("ok"), "{}", out.stdout);
 
-    drop(std::os::unix::net::UnixListener::bind(home.sock()).unwrap());
+    dead_socket(&home.sock());
     std::fs::write(home.pidfile(), br#"{"pid":1,"version":"0","started_at":0}"#).unwrap();
     let out = home.cli(&["doctor"], S(5));
     // Stale files are fixed, not failures: exit 0, ends "ok".

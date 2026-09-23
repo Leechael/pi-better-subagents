@@ -110,18 +110,32 @@ impl Home {
             std::thread::sleep(Duration::from_millis(ms));
             return;
         }
+        self.wait_armed(label, ms);
+        let r = clock_request(&self.path, json!({"type":"clock_advance","ms":ms}));
+        assert_eq!(r["ok"], true, "clock_advance: {r}");
+    }
+    /// Wait for a `label` timer with at least `min_due_ms` left.
+    ///
+    /// "Any timer with that label" is not enough. A cancelled timer (e.g. the
+    /// idle countdown a new hello aborted) is dropped asynchronously, so it
+    /// can still be listed while the daemon has not yet armed the timer the
+    /// test means. Under load, `d6b` once stepped the clock against such a
+    /// leftover. A leftover never has as much time left as a fresh timer,
+    /// because the clock has moved since it was armed.
+    fn wait_armed(&self, label: &str, min_due_ms: u64) {
         let armed = poll_true(Duration::from_secs(10), || {
             clock_request(&self.path, json!({"type":"clock_status"}))["pending"]
                 .as_array()
-                .is_some_and(|p| p.iter().any(|t| t["label"] == label))
+                .is_some_and(|p| {
+                    p.iter()
+                        .any(|t| t["label"] == label && t["due_in_ms"].as_u64().unwrap_or(0) >= min_due_ms)
+                })
         });
         assert!(
             armed,
-            "timer {label:?} never armed; pending: {}",
+            "no {label:?} timer with >= {min_due_ms} ms left; pending: {}",
             clock_request(&self.path, json!({"type":"clock_status"}))
         );
-        let r = clock_request(&self.path, json!({"type":"clock_advance","ms":ms}));
-        assert_eq!(r["ok"], true, "clock_advance: {r}");
     }
     /// Advance time without waiting for a particular timer (e.g. to show a
     /// cancelled countdown does not fire). Real clock: sleep `ms`.
@@ -142,6 +156,8 @@ impl Home {
     /// itself is the timing canaries' job).
     pub fn advance_almost(&self, label: &str, total_ms: u64) {
         if self.manual {
+            // A freshly armed timer: exactly `total_ms` left.
+            self.wait_armed(label, total_ms);
             self.advance(label, total_ms - 1);
             let st = clock_request(&self.path, json!({"type":"clock_status"}));
             let armed = st["pending"]
@@ -301,6 +317,29 @@ pub fn run_cli_env(home: &Path, args: &[&str], timeout: Duration, env: &[(&str, 
 
 pub fn wait_child(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     poll_until(timeout, || child.try_wait().ok().flatten())
+}
+
+/// Leave a socket inode at `path` that nobody listens on (what a SIGKILLed
+/// daemon leaves behind).
+///
+/// `bind` + `drop` alone is not enough in a multi-threaded test binary. On
+/// macOS, std sets FD_CLOEXEC only after `socket()` returns, so a child that
+/// another test thread spawns in that window inherits the socket. Once the
+/// socket is bound and listening, that copy keeps it accepting after we drop
+/// ours: a client then connects, gets no hello answer and waits out its
+/// timeout. A standalone repro leaked 35% of listeners under heavy
+/// concurrent spawning. So check that a connect is refused, and if not,
+/// unlink the path and try a fresh inode (the leaked copy then listens on a
+/// name nobody can reach).
+pub fn dead_socket(path: &Path) {
+    for _ in 0..50 {
+        let _ = fs::remove_file(path);
+        drop(std::os::unix::net::UnixListener::bind(path).expect("bind socket"));
+        if UnixStream::connect(path).is_err() {
+            return;
+        }
+    }
+    panic!("could not create a dead socket at {}", path.display());
 }
 
 /// One manual-clock debug request, sent as the first frame of a fresh

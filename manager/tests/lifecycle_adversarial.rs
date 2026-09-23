@@ -13,7 +13,7 @@ mod common;
 
 use common::*;
 use serde_json::json;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 /// Re-exec entry point for `HelperClient` (a killable stand-in for pi). It is
@@ -548,7 +548,8 @@ fn d10_client_recovers_from_dead_daemon_files() {
 #[test]
 fn d11_client_recovers_from_socket_without_pidfile() {
     let home = Home::new("d11");
-    drop(UnixListener::bind(home.sock()).unwrap()); // leaves a dead socket inode
+    // Not a plain bind+drop: see `dead_socket` (that flaked in the suite).
+    dead_socket(&home.sock()); // what a SIGKILLed daemon leaves behind
     assert!(home.sock().exists());
     let out = home.cli(&["ls"], S(10));
     assert!(out.status.success(), "{}", out.stderr);
