@@ -69,7 +69,11 @@ PY
 }
 
 fresh_copy() {
-  rsync -a --delete --exclude 'target' --exclude 'target-*' --exclude 'mutants.out*' \
+  # No -t: a file that differs from the pristine tree (the previous
+  # ablation's edit) is rewritten with a *new* mtime, so cargo rebuilds.
+  # Preserving the original, older mtime would make cargo keep the ablated
+  # binary, and the next baseline would silently test the wrong code.
+  rsync -rlp --checksum --delete --exclude 'target' --exclude 'target-*' --exclude 'mutants.out*' \
     "$MANAGER_DIR/" "$COPY/"
 }
 
