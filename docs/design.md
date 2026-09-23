@@ -94,6 +94,10 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 - shutdown 期间 manager 仍接受新连接,但立即拒绝其 `hello`(`E_INTERNAL` "manager is shutting down");客户端按 §3.1 第 6 步等该 manager 退出后 spawn 继任者,而不是卡到响应超时
 - 后台任务不允许比最后一个 pi 活得久。`pi --resume` 的 reattach 只在"还有其他 pi 活着"时成立
 - manager **永不自我复活**;只有客户端(扩展/CLI)在需要时 spawn
+- **manager 是所有任务的父进程,它以任何方式结束,任务都随之清理(lifeline)**:每个任务由 `pbs-manager __run <command>`(runner)作为进程组 leader 启动,runner 再在同一进程组里 exec `sh -c <command>`。runner 在 fd 3 持有 lifeline:一条只有 daemon 持有写端的 pipe 的读端。daemon 无论怎样结束(`shutdown`、`kill -9`、panic),内核都会关闭写端,runner 读到 EOF → 对自己的进程组 SIGTERM → 2s → SIGKILL。**没有崩溃恢复**:新 daemon 启动时不接管任何任务(见 §3.4)。
+  - runner 在 fd 4 通过状态 pipe 上报命令的真实退出码/信号(`exit <code> <alone|linger>` 或 `signal <n> <alone|linger>`)。若命令留下了后台子进程(`cmd &`),runner 留下来当守护者(guardian),继续持有 lifeline,直到进程组只剩它自己;daemon 以"收到状态"为任务结束,以"runner 退出"为进程组已空。
+  - runner 屏蔽 SIGTERM(子进程在 exec 前解除屏蔽),所以 stop/shutdown 的组 SIGTERM 只作用于命令,runner 能上报命令是怎么结束的;runner 自身只被 SIGKILL 带走,此时 daemon 退回用 runner 的 wait 状态。
+  - lifeline 写端只有一个持有者(`task::lifeline()`,CLOEXEC),方便后续原地 exec 交接只处理一个 fd。
 - **已断开 session 的保留期**:session 断开后立即从 `ls` / `sessions` 消失;`sessions/<sid>/` 在最后一次写入后保留 `goneSessionRetention`(config.json,默认 24h),期间 `show` / `agent` / `events` 仍可查(事后排查、`pi --resume`),到期由 daemon 删除目录并从内存移除其任务。启动时与每 `min(保留期, 1h)` 清扫一次;已连接、或仍有 running 任务/存活进程组的 session 永不清扫
 
 ### 3.3 传输与协议
@@ -174,8 +178,8 @@ manager 在 TaskRecord 记录 `backgrounded_at`(ms);只记第一次;任务已结
 SIGTERM 进程组 → 2s → SIGKILL(发给进程组,leader 已退出也照发)。终态 `killed`。对已终止但仍有后台子进程残留的任务,`stop` 同样清理其进程组,状态不变。
 
 **end_reason**(TaskRecord 与 `task_exited` 事件):任务为何结束,取值之一
-`exited`(自然退出,任意退出码) | `timeout` | `stopped:tui` | `stopped:cli` | `stopped:tool` | `rate-limit` | `session-end` | `manager-shutdown` | `manager-restart` | `orphaned`。
-映射:stop 带 reason X → `stopped:X`,但 timeout / rate-limit / session-end 映射为自身;`timeout_ms` 到期 → `timeout`;`shutdown_session` → `session-end`;manager 优雅关闭 → `manager-shutdown`;re-adopt 后退出(退出码不可得)→ `manager-restart`;重启时 pid 已死 → `orphaned`。多个原因先到先得(stop 之后的关闭不覆盖 `stopped:cli`)。
+`exited`(自然退出,任意退出码) | `timeout` | `stopped:tui` | `stopped:cli` | `stopped:tool` | `rate-limit` | `session-end` | `manager-shutdown` | `manager-crash`。
+映射:stop 带 reason X → `stopped:X`,但 timeout / rate-limit / session-end 映射为自身;`timeout_ms` 到期 → `timeout`;`shutdown_session` → `session-end`;manager 优雅关闭 → `manager-shutdown`;manager 未经关闭就死掉(kill -9、panic),下一个 daemon 启动时把仍为 running 的记录标为 `orphaned` → `manager-crash`。多个原因先到先得(stop 之后的关闭不覆盖 `stopped:cli`)。
 
 `signal` 字段(`task_exited` 事件与 TaskRecord)为信号名字符串,如 `"SIGTERM"` / `"SIGKILL"`;正常退出为 `null`。旧版本写入的数字仍可读取(按名称转换)。
 
@@ -247,12 +251,12 @@ SIGTERM 进程组 → 2s → SIGKILL(发给进程组,leader 已退出也照发)�
 running ──exit 0──► completed
        ──exit≠0──► failed
        ──stop────► killed
-       ──manager 重启 re-adopt 失败──► orphaned
+       ──manager 崩溃(下次启动时标记)──► orphaned
 ```
 
 - TaskRecord(磁盘 `<task_id>.json`): `{task_id, session_id, kind, command, cwd, pid, status, exit_code, signal, started_at, ended_at, output_path, output_size, origin?, backgrounded_at?, end_reason?}`(后三项为可观测性契约新增,可选,旧记录照常加载)
 - 输出: 内存 ring buffer(64KB)+ 磁盘全量追加;`output_size` 单调增
-- **manager 重启 re-adopt**: 读 state dir,pid 存活 → re-adopt(输出文件不会再增长——任务的 stdout 管道随旧 manager 一起断开——启动扫描时从文件长度恢复 `output_size`;退出检测靠 `kill(pid,0)` 轮询 1s,退出码不可得 → 终态 `completed`, `exit_code:null`, `end_reason:"manager-restart"`);pid 死 → `orphaned`(`end_reason:"orphaned"`)
+- **崩溃后启动(无崩溃恢复)**: 读 state dir。仍为 running 的记录属于一个未经关闭就死掉的 daemon,它的 runner 已经看到 lifeline 断开并清理了进程组(§3.2),没有可接管的东西:记录标为 `orphaned`(`end_reason:"manager-crash"`,`ended_at` 设为启动时刻)并落盘,`output_size` 从文件长度恢复。**不向旧记录里的 pid/pgid 发任何信号**(pid 可能已被复用)。
 
 ### 3.5 CLI(inspection 管理,用户侧)
 
@@ -282,10 +286,11 @@ manager/
     ├── main.rs       # clap 分发: daemon | 客户端子命令
     ├── daemon.rs     # listener、accept loop、连接注册、归零 shutdown
     ├── proto.rs      # 帧 codec + 消息 serde 类型
-    ├── task.rs       # spawn(进程组)、输出 tee、exit watch、stop
+    ├── task.rs       # spawn(经 runner、进程组)、lifeline、输出 tee
+    ├── runner.rs     # `__run`:任务进程组 leader,lifeline、状态上报、残留子进程守护
     ├── sys.rs        # 唯一生产 unsafe 缝: setsid(pre_exec) + kill(pgid)/liveness
     ├── registry.rs   # task registry + session 命名空间 + 磁盘持久化
-    ├── lifecycle.rs  # spawn lock、pid claim、re-adopt、优雅 shutdown
+    ├── lifecycle.rs  # spawn lock、pid claim、崩溃后启动扫描(标记 orphaned)
     ├── client.rs     # CLI: 连接/spawn 流程、作用于 daemon 的命令、log/tail、doctor
     ├── inspect.rs    # CLI: status/sessions/ls/show/agent/events 与数据层
     ├── events.rs     # events.jsonl 写(manager)与读(CLI)
@@ -506,7 +511,7 @@ You are an explorer agent. ... (body = system prompt 追加段)
 - 协议: hello/start/wait/output/stop/list/watch 全消息往返
 - 事件: task_exited 推送、watch 后 output 推送
 - 生命周期: 连接归零 → manager 退出且任务被清算;spawn lock 单例(第二个 daemon 拒绝启动)
-- re-adopt: 杀 manager → 重启 → 活任务 re-adopt / 死任务 orphaned
+- 崩溃: kill -9 / panic manager → 所有任务及其子孙在 grace 内消失 → 重启后记录为 orphaned(manager-crash),不接管、不发信号
 - 输出: 大输出 cursor 增量读、UTF-8 lossy
 
 ### TS(`extension/tests/`)

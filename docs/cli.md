@@ -122,7 +122,7 @@ Work of connected sessions, running and finished, plus anything still running in
 - `REASON` is the task's `end_reason` (see below), or an agent record's `end_reason`.
 - `TITLE` is the command's first line (agents: `name (agent) model`), truncated by **display width** so CJK and emoji keep the table aligned: to the terminal width on a tty, to 60 columns otherwise.
 
-`end_reason` values: `exited` (the process exited on its own, any code) · `timeout` (`timeout_ms` ceiling or a stop with reason timeout) · `stopped:tui` / `stopped:cli` / `stopped:tool` (a stop request, by who) · `rate-limit` · `session-end` · `manager-shutdown` · `manager-restart` (re-adopted after a manager crash; the exit code was lost) · `orphaned` (dead before the manager restarted).
+`end_reason` values: `exited` (the process exited on its own, any code) · `timeout` (`timeout_ms` ceiling or a stop with reason timeout) · `stopped:tui` / `stopped:cli` / `stopped:tool` (a stop request, by who) · `rate-limit` · `session-end` · `manager-shutdown` · `manager-crash` (the manager died without shutting down, e.g. `kill -9`; its task was taken down with it, and the next daemon marked the record `orphaned`).
 
 ### `show`
 
@@ -263,7 +263,7 @@ Runs the manager in the foreground (what auto-spawn uses); `--foreground` also l
 
 Asks the daemon to shut down gracefully: every running task and every leftover process group of a finished task gets SIGTERM, then SIGKILL after 2s; records end as `manager-shutdown`. Prints `manager shutting down`. The daemon also shuts itself down ~5s after its last client disconnects.
 
-After a crash, the next daemon re-adopts tasks whose pid is alive (output continues from the files; the exit code is unavailable, so they end as `completed`, `exit_code: null`, `end_reason: manager-restart`) and marks the dead ones `orphaned`.
+The manager is the parent of every task and there is no crash recovery. Each task runs under a small runner (`pbs-manager __run`) that holds a lifeline to the daemon. If the daemon dies without shutting down (`kill -9`, a panic), every runner sees the lifeline break and takes its process group down: SIGTERM, then SIGKILL after 2s, background children included. The next daemon re-adopts nothing: it marks those records `orphaned` with `end_reason: manager-crash` and signals nothing.
 
 ## Exit codes
 
