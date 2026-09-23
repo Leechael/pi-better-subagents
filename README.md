@@ -27,6 +27,9 @@ mkdir -p ~/.pi/agent/pbs/bin
 # Atomic replace (new inode). In-place `cp` onto an existing binary breaks
 # macOS code-signing and the next run dies with SIGKILL / "killed".
 install -m 755 target/release/pbs-manager ~/.pi/agent/pbs/bin/pbs-manager
+#    Upgrading later: the same `install` line is enough. A running daemon
+#    upgrades itself in place within seconds (same pid, running work kept);
+#    `pbs-manager upgrade` does it now and reports the result.
 
 # 2. Load the extension
 pi -e /path/to/pi-better-subagents/extension   # local trial (recommended first)
