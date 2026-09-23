@@ -20,6 +20,8 @@ interface FakeManager {
   received: Record<string, unknown>[];
   sockets: Set<net.Socket>;
   rejectFirstHelloOnce(): void;
+  dropNext(type: string): void;
+  startCount(): number;
   close(): Promise<void>;
 }
 
@@ -36,6 +38,8 @@ async function startFakeManager(home: string): Promise<FakeManager> {
   const received: Record<string, unknown>[] = [];
   const sockets = new Set<net.Socket>();
   let rejectNextHelloForShutdown = false;
+  const dropTypes = new Set<string>();
+  const startsByKey = new Map<string, { task_id: string; pid: number }>();
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -48,6 +52,15 @@ async function startFakeManager(home: string): Promise<FakeManager> {
         const msg = JSON.parse(buf.subarray(4, 4 + len).toString("utf8")) as Record<string, unknown>;
         buf = buf.subarray(4 + len);
         received.push(msg);
+        if (dropTypes.has(String(msg.type))) {
+          dropTypes.delete(String(msg.type));
+          if (msg.type === "start") {
+            const key = String(msg.key);
+            if (!startsByKey.has(key)) startsByKey.set(key, { task_id: "sh_a1b2c3d4", pid: 5678 });
+          }
+          socket.destroy();
+          return;
+        }
         const reply = handleRequest(msg, socket);
         if (reply) socket.write(encodeFrame(reply));
       }
@@ -67,8 +80,11 @@ async function startFakeManager(home: string): Promise<FakeManager> {
           return { v: 1, id: msg.id, ok: false, error: { code: "E_INTERNAL", message: "manager is shutting down" } };
         }
         return { v: 1, id: msg.id, ok: true, version: "0.1.0", pid: 4321, started_at: 1 };
-      case "start":
-        return { v: 1, id: msg.id, ok: true, task_id: "sh_a1b2c3d4", pid: 5678 };
+      case "start": {
+        const key = String(msg.key ?? "legacy");
+        if (!startsByKey.has(key)) startsByKey.set(key, { task_id: "sh_a1b2c3d4", pid: 5678 });
+        return { v: 1, id: msg.id, ok: true, ...startsByKey.get(key) };
+      }
       case "wait":
         return { v: 1, id: msg.id, ok: true, done: true, exit_code: 0 };
       case "output":
@@ -123,6 +139,8 @@ async function startFakeManager(home: string): Promise<FakeManager> {
     received,
     sockets,
     rejectFirstHelloOnce: () => { rejectNextHelloForShutdown = true; },
+    dropNext: (type) => { dropTypes.add(type); },
+    startCount: () => startsByKey.size,
     close: () =>
       new Promise<void>((resolve) => {
         for (const s of sockets) s.destroy();
@@ -242,6 +260,27 @@ describe("ManagerClient (integration, fake manager)", () => {
     const bad = client.output("nope", 0, 1).catch((err) => err);
     // fake returns ok for output; use an unknown request type via list(all) path instead
     await expect(bad).resolves.toMatchObject({ chunk: "hello output\n" });
+  });
+
+  it("retries a wait after a dropped connection and reconnects immediately", async () => {
+    await client.connect();
+    fake.dropNext("wait");
+    const started = Date.now();
+    await expect(client.wait("sh_existing", 5000)).resolves.toEqual({ done: true, exit_code: 0 });
+    expect(Date.now() - started).toBeLessThan(200);
+    expect(fake.received.filter((m) => m.type === "wait")).toHaveLength(2);
+  });
+
+  it("resends a dropped start with the same idempotency key", async () => {
+    await client.connect();
+    fake.dropNext("start");
+    const result = await client.start({ kind: "shell", command: "echo hi", cwd: "/tmp", env: {} });
+    const requests = fake.received.filter((m) => m.type === "start");
+    expect(requests).toHaveLength(2);
+    expect(requests[0].key).toBeTruthy();
+    expect(requests[1].key).toBe(requests[0].key);
+    expect(fake.startCount()).toBe(1);
+    expect(result.task_id).toBe("sh_a1b2c3d4");
   });
 
   it("reconnects with re-hello after an unexpected disconnect", async () => {
