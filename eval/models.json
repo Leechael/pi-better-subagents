@@ -1,0 +1,4 @@
+{
+  "_comment": "Model specs as accepted by `pi --model` (provider/id[:thinking]). Only models pi can already authenticate work; list them with `pi -ne --list-models`. The first entry is the smoke-tier model.",
+  "models": ["openai-codex/gpt-5.5:low", "xai/grok-4.3", "deepseek/deepseek-flash"]
+}
