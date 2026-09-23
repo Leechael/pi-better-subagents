@@ -49,6 +49,19 @@ describe("tasks view", () => {
     expect(rows.join("\n")).toContain("running");
   });
 
+  it("shows elapsed time from the task start, not when it was backgrounded", () => {
+    const index = new WorkIndex({ clock: new ManualClock(20_000) });
+    index.upsert({
+      id: "sh_old",
+      kind: "shell",
+      status: "running",
+      title: "sleep 14",
+      startedAt: 6_000,
+      countsAsWorker: true,
+    });
+    expect(formatWorkRows(index.list(), "sh_old", 20_000, 80).join("\n")).toContain("14s");
+  });
+
   it("keeps a finished item viewable inside the retain window", () => {
     const index = new WorkIndex({ clock: new ManualClock(1_000), retainMs: 10_000, finishedCap: 50 });
     index.upsert({

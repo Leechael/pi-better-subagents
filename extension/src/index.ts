@@ -70,8 +70,8 @@ export default function (pi: ExtensionAPI): void {
   let subagentRegistry: SubagentRegistry | null = null;
   let fleetWidget: FleetWidget | null = null;
   let agentLoader: AgentLoader | null = null;
-  /** task_id -> metadata, for exit notifications (task_exited carries no command). */
-  const taskMeta = new Map<string, { kind: string; command: string }>();
+  /** task_id -> metadata, for notifications and the original manager task start time. */
+  const taskMeta = new Map<string, { kind: string; command: string; startedAt?: number }>();
   /**
    * task_ids whose task_exited should wake the parent via <pbs-wake kind="task">.
    * Parent bash only adds ids when it actually backgrounded the command.
@@ -83,7 +83,18 @@ export default function (pi: ExtensionAPI): void {
   const workIndex = new WorkIndex({ clock });
 
   const trackTask = (taskId: string, meta: { kind: string; command: string }) => {
-    taskMeta.set(taskId, meta);
+    taskMeta.set(taskId, { ...meta, startedAt: taskMeta.get(taskId)?.startedAt });
+  };
+  const upsertBackgroundTask = (taskId: string, startedAt: number) => {
+    const meta = taskMeta.get(taskId);
+    workIndex.upsert({
+      id: taskId,
+      kind: "shell",
+      status: "running",
+      title: meta?.command?.replace(/\s+/g, " ").trim() || taskId,
+      startedAt,
+      countsAsWorker: true,
+    });
   };
   const deliverExit = (taskId: string, event: ManagerEvent) => {
     notifyOnExit.delete(taskId);
@@ -116,16 +127,22 @@ export default function (pi: ExtensionAPI): void {
       deliverExit(taskId, prior);
       return;
     }
-    const meta = taskMeta.get(taskId);
-    const item: WorkItem = {
-      id: taskId,
-      kind: "shell",
-      status: "running",
-      title: meta?.command?.replace(/\s+/g, " ").trim() || taskId,
-      startedAt: clock.now(),
-      countsAsWorker: true,
-    };
-    workIndex.upsert(item);
+    const startedAt = taskMeta.get(taskId)?.startedAt;
+    if (startedAt !== undefined) {
+      upsertBackgroundTask(taskId, startedAt);
+    } else {
+      // If task_started was missed (e.g. reconnect), recover the daemon's start
+      // time rather than making this task appear younger than it is.
+      void client?.list(true).then((tasks) => {
+        const task = tasks.find((candidate) => candidate.task_id === taskId);
+        const recoveredStart = taskMeta.get(taskId)?.startedAt ?? task?.started_at;
+        if (recoveredStart !== undefined && notifyOnExit.has(taskId)) {
+          const current = taskMeta.get(taskId) ?? { kind: "shell", command: task?.command ?? "" };
+          taskMeta.set(taskId, { ...current, startedAt: recoveredStart });
+          upsertBackgroundTask(taskId, recoveredStart);
+        }
+      }).catch(() => {});
+    }
   };
 
   const sessionEnv = (c: ExtensionContext): Record<string, string> => ({
@@ -263,7 +280,19 @@ export default function (pi: ExtensionAPI): void {
 
     client.onEvent((event) => {
       if (event.event === "task_started" && event.task_id) {
-        trackTask(event.task_id, { kind: event.kind ?? "shell", command: event.command ?? "" });
+        const prior = taskMeta.get(event.task_id);
+        taskMeta.set(event.task_id, {
+          kind: prior?.kind ?? event.kind ?? "shell",
+          command: prior?.command ?? event.command ?? "",
+          ...(typeof event.ts === "number"
+            ? { startedAt: event.ts }
+            : prior?.startedAt !== undefined
+              ? { startedAt: prior.startedAt }
+              : {}),
+        });
+        if (notifyOnExit.has(event.task_id) && typeof event.ts === "number") {
+          upsertBackgroundTask(event.task_id, event.ts);
+        }
         if (event.kind === "monitor" && !workIndex.get(event.task_id)) {
           workIndex.upsert({
             id: event.task_id,
