@@ -93,6 +93,10 @@ pub struct Snapshot {
     /// with the task they already started).
     #[serde(default)]
     pub start_keys: Vec<(String, String)>,
+    /// The daemon clock's `now_ms` (kill-grace deadlines are in its units;
+    /// the manual test clock continues from here).
+    #[serde(default)]
+    pub clock_now_ms: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -459,6 +463,7 @@ fn snapshot(
         sessions,
         tasks,
         start_keys: st.start_keys.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        clock_now_ms: st.clock.now_ms(),
     })
 }
 
@@ -565,9 +570,10 @@ pub fn live_ids(r: &Restored) -> HashSet<String> {
 pub fn rearm_timers(state: &Shared, id: &str) {
     let (grace, lingering_unguarded, pid) = {
         let st = state.lock().unwrap();
+        let now = st.clock.now_ms();
         let Some(e) = st.registry.tasks.get(id) else { return };
         (
-            e.kill_grace_until_ms.map(|d| d.saturating_sub(now_ms())),
+            e.kill_grace_until_ms.map(|d| d.saturating_sub(now)),
             e.group_lingering && e.exit_phase == ExitPhase::Done,
             e.record.pid,
         )

@@ -74,7 +74,8 @@ pub struct TaskEntry {
     pub exit_phase: ExitPhase,
     /// The hard timeout fired and the group was killed for it.
     pub timed_out: bool,
-    /// A stop's SIGKILL escalation is due at this wall-clock time.
+    /// A stop's SIGKILL escalation is due at this time on the daemon's clock
+    /// (`Clock::now_ms`: wall time, or virtual time on the test clock).
     pub kill_grace_until_ms: Option<u64>,
     /// stdout / stderr pipe read ends while no pump reads them (before the
     /// tee starts, and while parked). None once that pipe hit EOF.

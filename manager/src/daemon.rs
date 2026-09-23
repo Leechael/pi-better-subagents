@@ -262,6 +262,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
         st.start_keys.push_back((sid, key));
     }
     let clock = st.clock.clone();
+    clock.resume_at(snap.clock_now_ms);
     let state: Shared = Arc::new(Mutex::new(st));
     for id in &live {
         crate::handover::restart_task(&state, id);
@@ -1372,8 +1373,9 @@ async fn kill_group_hard(pgid: u32) {
 fn spawn_kill_reaper(state: &Shared, task_id: &str, pid: u32) {
     let clock = {
         let mut st = state.lock().unwrap();
+        let due = st.clock.now_ms() + KILL_GRACE.as_millis() as u64;
         if let Some(e) = st.registry.tasks.get_mut(task_id) {
-            e.kill_grace_until_ms = Some(now_ms() + KILL_GRACE.as_millis() as u64);
+            e.kill_grace_until_ms = Some(due);
         }
         st.clock.clone()
     };
