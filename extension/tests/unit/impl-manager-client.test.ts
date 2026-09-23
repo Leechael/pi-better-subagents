@@ -23,6 +23,7 @@ interface FakeManager {
   dropNext(type: string): void;
   startCount(): number;
   setTasks(tasks: Record<string, unknown>[]): void;
+  refuseFor(ms: number): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -149,6 +150,12 @@ async function startFakeManager(home: string): Promise<FakeManager> {
     dropNext: (type) => { dropTypes.add(type); },
     startCount: () => startsByKey.size,
     setTasks: (value) => { tasks = value; },
+    refuseFor: async (ms) => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+    },
     close: () =>
       new Promise<void>((resolve) => {
         for (const s of sockets) s.destroy();
@@ -278,6 +285,19 @@ describe("ManagerClient (integration, fake manager)", () => {
     // fake returns ok for output; use an unknown request type via list(all) path instead
     await expect(bad).resolves.toMatchObject({ chunk: "hello output\n" });
   });
+
+  it("keeps a start queued through a 2s manager restore and starts it once", async () => {
+    await client.connect();
+    const unavailable = fake.refuseFor(2000);
+    await new Promise((resolve) => setTimeout(resolve, 50)); // let the old socket's close reach the client
+    const resultPromise = client.start({ kind: "shell", command: "echo during restore", cwd: "/tmp", env: {} });
+    const result = await resultPromise;
+    await unavailable;
+    expect(result.task_id).toBe("sh_a1b2c3d4");
+    expect(fake.received.filter((message) => message.type === "start")).toHaveLength(1);
+    expect(fake.startCount()).toBe(1);
+    expect(client.isAvailable()).toBe(true);
+  }, 10000);
 
   it("retries a wait after a dropped connection and reconnects immediately", async () => {
     await client.connect();
