@@ -273,7 +273,7 @@ upgraded in place: 0.1.0 -> 0.1.1 (pid 4321, generation 1, 3 running task(s) kep
 - If the switch itself cannot finish (quiesce over 5s, exec failure), the daemon keeps running the old binary and says why.
 - If the new binary cannot restore, it exits and every task is cleaned up, as in a crash (no crash recovery); `upgrade` reports `the manager (pid N) exited during the upgrade`.
 - With no daemon running: `pbs-manager is not running; the next client starts the installed binary` (exit 0).
-- The daemon does the same by itself when the file at its path changes and settles (checked every 2s); `status --json` shows `generation` and `last_upgrade` (`trigger: "cli"` or `"binary-changed"`).
+- The daemon does the same by itself when the file at its path changes and settles (checked every 2s). `status` then shows `upgrades: 2 (last: 0.1.0 -> 0.1.1, binary-changed, 3m ago)`, or `upgrades: 1 (last attempt failed 2m ago, cli: …)`; nothing while there has been no upgrade. `status --json` has `generation` and `last_upgrade` (`trigger: "cli"` or `"binary-changed"`).
 
 ### `shutdown`
 
