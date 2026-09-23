@@ -145,8 +145,10 @@ pub mod end_reason {
     pub const TIMEOUT: &str = "timeout";
     pub const SESSION_END: &str = "session-end";
     pub const MANAGER_SHUTDOWN: &str = "manager-shutdown";
-    pub const MANAGER_RESTART: &str = "manager-restart";
-    pub const ORPHANED: &str = "orphaned";
+    /// A record left "running" by a daemon that died without shutting down
+    /// (kill -9, panic). Its runners took the tasks down (lifeline, §3.2);
+    /// the next daemon only marks the record.
+    pub const MANAGER_CRASH: &str = "manager-crash";
 }
 
 /// `stop.reason` values accepted on the wire.
@@ -288,6 +290,11 @@ pub enum RequestKind {
     /// Test-only (`test-clock` feature): advance the manual clock.
     #[cfg(feature = "test-clock")]
     ClockAdvance { ms: u64 },
+    /// Test-only (`test-clock` feature): end the daemon on the spot the way
+    /// a panic in its main future does (exit status 101, no shutdown path,
+    /// no destructors). Sent without hello.
+    #[cfg(feature = "test-clock")]
+    DebugCrash,
 }
 
 // ---------------------------------------------------------------------------

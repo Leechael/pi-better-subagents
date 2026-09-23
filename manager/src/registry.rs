@@ -37,8 +37,8 @@ pub fn task_output_path(home: &Path, session_id: &str, task_id: &str) -> PathBuf
 
 pub struct TaskEntry {
     pub record: TaskRecord,
-    /// Present only while a locally-spawned child is running; None once
-    /// reaped, and always None for re-adopted tasks (§3.4).
+    /// The task's runner (`pbs-manager __run`), taken by the exit watch at
+    /// spawn time; None for records loaded from disk.
     pub child: Option<Child>,
     pub output: Arc<Mutex<OutputState>>,
     /// Tee channel receiver; taken by the output fanout task at spawn time.
@@ -112,25 +112,6 @@ impl TaskEntry {
         }
     }
 
-    /// Re-adopted after a manager restart: no child handle, output continues
-    /// from the persisted size (§3.4).
-    pub fn adopted(record: TaskRecord) -> Self {
-        let total = record.output_size;
-        let (status_tx, _) = watch::channel(TaskStatus::Running);
-        TaskEntry {
-            record,
-            child: None,
-            output: Arc::new(Mutex::new(OutputState::new(None, total))),
-            chunks_rx: None,
-            status_tx,
-            kill_requested: false,
-            kill_reason: None,
-            watchers: HashSet::new(),
-            timeout_ms: None, // original timeout is not persisted; not re-armed
-            group_lingering: false,
-        }
-    }
-
     /// A terminal record loaded from disk (kept for list/output visibility).
     pub fn terminal(record: TaskRecord) -> Self {
         let total = record.output_size;
@@ -151,8 +132,8 @@ impl TaskEntry {
 }
 
 /// §3.4 state machine: map an observed exit to the terminal status.
-/// (None, None) = re-adopted process vanished; exit code unobtainable ->
-/// completed with exit_code null, per §3.4.
+/// (None, None) = no status was observable (the runner's wait failed) ->
+/// completed with exit_code null.
 pub fn terminal_status(
     kill_requested: bool,
     exit_code: Option<i32>,
@@ -417,7 +398,7 @@ mod tests {
     #[test]
     fn state_machine_mapping() {
         // §3.4: running -> completed (exit 0) / failed (exit!=0 or signal) /
-        // killed (stop) / orphaned (re-adopt failure, set by lifecycle).
+        // killed (stop) / orphaned (after a manager crash, set by lifecycle).
         assert_eq!(
             terminal_status(false, Some(0), None),
             TaskStatus::Completed
@@ -435,7 +416,7 @@ mod tests {
             terminal_status(true, None, Some(9)),
             TaskStatus::Killed
         );
-        // Re-adopted process vanished: exit code unobtainable -> completed.
+        // No observable status -> completed.
         assert_eq!(terminal_status(false, None, None), TaskStatus::Completed);
     }
 }

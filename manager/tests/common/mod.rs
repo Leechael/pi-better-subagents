@@ -9,9 +9,10 @@
 //! Determinism rules used throughout:
 //! - every wait is a poll against a deadline (`poll_until`), never a bare sleep
 //!   that the assertion depends on;
-//! - the daemon's own timers (5s idle grace, 2s kill grace, re-adopt and
-//!   leftover-group polls) are stepped with `Home::advance*`: on the manual
-//!   clock under `--features test-clock`, as real sleeps otherwise;
+//! - the daemon's own timers (5s idle grace, 2s kill grace, the fallback
+//!   leftover-group poll) are stepped with `Home::advance*`: on the manual
+//!   clock under `--features test-clock`, as real sleeps otherwise (a task
+//!   runner's lifeline grace is real time in the runner process);
 //! - the remaining fixed sleeps are short "let the effect happen" pauses.
 
 #![allow(dead_code)]

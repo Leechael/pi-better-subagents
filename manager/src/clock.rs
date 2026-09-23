@@ -1,6 +1,6 @@
 //! The daemon's time source for its own timers: the 5s idle grace, the 2s
-//! SIGKILL escalation (stop reaper and graceful shutdown), and the re-adopt
-//! and leftover-group polls.
+//! SIGKILL escalation (stop reaper and graceful shutdown), and the fallback
+//! leftover-group poll.
 //!
 //! Normal builds: a thin wrapper over `tokio::time::sleep`.
 //!

@@ -183,33 +183,26 @@ fn p1_origin_background_and_end_reasons() {
     assert_eq!(c.wait_terminal(&y, S(6)).unwrap()["end_reason"], "stopped:cli");
 }
 
-/// manager-shutdown, orphaned and manager-restart end reasons.
+/// manager-crash and manager-shutdown end reasons.
 #[test]
 fn p2_end_reasons_across_manager_lifecycle() {
     let home = Home::new("p2");
     let mut d1 = home.start_daemon();
     let mut c = home.connect();
     hello_v2(&mut c, "sess-p2", "/tmp");
-    let (dead, dead_pid) = start(&mut c, "sleep 300", json!({}));
-    let (late, late_pid) = start(&mut c, "sleep 300", json!({}));
-    let (keep, _) = start(&mut c, "sleep 300", json!({}));
+    let (crashed, crashed_pid) = start(&mut c, "sleep 300", json!({}));
     drop(c);
     d1.kill().unwrap();
     d1.wait().unwrap();
-    kill_group(dead_pid, libc::SIGKILL);
-    assert!(poll_true(S(3), || !pid_running(dead_pid)));
+    assert!(poll_true(S(4), || !pid_running(crashed_pid)), "the lifeline takes the task down");
 
     let mut d2 = home.start_daemon();
     let mut c = home.connect();
     hello_v2(&mut c, "sess-p2", "/tmp");
-    assert_eq!(c.task(&dead).unwrap()["end_reason"], "orphaned");
-    let ev = wait_event(&home, "sess-p2", "task.exit", Some(&dead));
-    assert_eq!(ev["end_reason"], "orphaned");
-    kill_group(late_pid, libc::SIGKILL);
-    assert!(poll_true(S(3), || !pid_running(late_pid)));
-    home.advance("adopt-poll", 1000);
-    let t = c.wait_terminal(&late, S(5)).unwrap();
-    assert_eq!(t["end_reason"], "manager-restart", "{t}");
+    assert_eq!(c.task(&crashed).unwrap()["end_reason"], "manager-crash");
+    let ev = wait_event(&home, "sess-p2", "task.exit", Some(&crashed));
+    assert_eq!(ev["end_reason"], "manager-crash");
+    let (keep, _) = start(&mut c, "sleep 300", json!({}));
     drop(c);
     assert!(home.cli(&["shutdown"], S(10)).status.success());
     home.advance("shutdown-grace", 2000);

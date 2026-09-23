@@ -292,94 +292,140 @@ fn d3_concurrent_daemon_processes_leave_one_survivor() {
 }
 
 // ===========================================================================
-// Daemon: crash + restart re-adopt (D4, T7, T8)
+// Daemon: crash takes every task down; no re-adoption (D4, T7, T8)
 // ===========================================================================
 
-/// D4/T7/T8: SIGKILL the daemon while tasks run; one task dies while no
-/// manager is up. The restarted daemon must re-adopt the live pid (running),
-/// mark the dead one orphaned, detect the adopted task's later exit
-/// (completed, exit_code null, task_exited pushed), and still enforce the
-/// zero-connection shutdown on adopted tasks.
+/// Tasks for the crash tests: every shape a crash must clean up.
+struct CrashFixture {
+    /// (task id, runner pid) of the tasks still running at the crash.
+    running: Vec<(String, u32)>,
+    /// A finished task (loaded as history after the restart).
+    finished: String,
+    /// Every process that must be gone after the crash: runners and the
+    /// shells' children.
+    all_pids: Vec<u32>,
+    /// A grandchild that ignores SIGTERM: only the SIGKILL after the grace
+    /// takes it down.
+    term_ignoring: u32,
+}
+
+fn start_crash_fixture(c: &mut Conn) -> CrashFixture {
+    let (plain, p_plain) = c.start("sleep 300");
+    let (stubborn, p_stubborn) = c.start("trap '' TERM; sleep 300 & echo $!; wait");
+    let (with_bg, p_with_bg) = c.start("sleep 300 >/dev/null 2>&1 & echo $!; sleep 300");
+    let (finished, _) = c.start("true");
+    let g_stubborn = wait_for_pids(c, &stubborn, 1)[0];
+    let g_with_bg = wait_for_pids(c, &with_bg, 1)[0];
+    assert_eq!(c.wait_terminal(&finished, S(3)).unwrap()["status"], "completed");
+    let all_pids = vec![p_plain, p_stubborn, p_with_bg, g_stubborn, g_with_bg];
+    assert!(all_pids.iter().all(|p| pid_running(*p)), "fixture not running: {all_pids:?}");
+    CrashFixture {
+        running: vec![(plain, p_plain), (stubborn, p_stubborn), (with_bg, p_with_bg)],
+        finished,
+        all_pids,
+        term_ignoring: g_stubborn,
+    }
+}
+
+/// After the daemon died without shutting down: everything is gone within
+/// the runners' 2s grace (plus slack), the SIGTERM-ignoring grandchild only
+/// after the grace, and the next daemon re-adopts nothing.
+fn assert_crash_cleaned_up(home: &Home, f: &CrashFixture, crashed_at: Instant) {
+    assert!(
+        poll_true(MS(1500), || !pid_running(f.running[0].1)),
+        "the lifeline did not take the plain task down"
+    );
+    if crashed_at.elapsed() < MS(1500) {
+        assert!(pid_running(f.term_ignoring), "SIGTERM-ignoring grandchild died before the grace");
+    }
+    let gone = poll_true(S(6), || f.all_pids.iter().all(|p| !pid_running(*p)));
+    let alive: Vec<u32> = f.all_pids.iter().copied().filter(|p| pid_running(*p)).collect();
+    for p in &alive {
+        kill_group(*p, libc::SIGKILL);
+    }
+    assert!(gone, "outlived the crashed manager: {alive:?}");
+
+    let _d2 = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-crash");
+    for (id, _) in &f.running {
+        let t = c.task(id).expect("listed after restart");
+        assert_eq!((t["status"].as_str(), t["end_reason"].as_str()), (Some("orphaned"), Some("manager-crash")), "{t}");
+        assert_eq!(home.record(id).unwrap()["status"], "orphaned", "persisted");
+    }
+    assert_eq!(c.task(&f.finished).unwrap()["status"], "completed");
+    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap();
+    assert!(log.contains("orphaned=3 loaded=1"), "{log}");
+}
+
+/// D4/T7/T8: SIGKILL the daemon while tasks run. The manager is every
+/// task's parent: when it ends by any means, every runner sees its lifeline
+/// break and takes its process group down (SIGTERM, 2s, SIGKILL). There is
+/// no crash recovery: the next daemon marks the running records orphaned
+/// (manager-crash) and re-adopts nothing. (Not yet covered: a finished
+/// task's leftover child, whose runner has already exited.)
 #[test]
-fn d4_crash_restart_readopts_live_and_orphans_dead() {
+fn d4_daemon_kill9_takes_every_task_down() {
     let home = Home::new("d4");
     let mut d1 = home.start_daemon();
     let mut c = home.connect();
     c.hello_ext("sess-crash");
-    let (live_id, live_pid) = c.start("sleep 300");
-    let (dead_id, dead_pid) = c.start("sleep 300");
-    let (late_id, late_pid) = c.start("sleep 300");
-    drop(c);
-
+    let f = start_crash_fixture(&mut c);
     d1.kill().unwrap();
+    let crashed_at = Instant::now();
     d1.wait().unwrap();
-    assert!(pid_running(live_pid) && pid_running(dead_pid), "tasks must survive a manager SIGKILL");
-    // A task dies while no manager is watching.
-    kill_group(dead_pid, libc::SIGKILL);
-    assert!(poll_true(S(3), || !pid_running(dead_pid)));
-
-    let mut d2 = home.start_daemon();
-    let mut c = home.connect();
-    c.hello_ext("sess-crash");
-    let live = c.task(&live_id).expect("live task listed after restart");
-    assert_eq!(live["status"], "running", "live pid must be re-adopted: {live}");
-    let dead = c.task(&dead_id).expect("dead task listed after restart");
-    assert_eq!(dead["status"], "orphaned", "dead pid must be orphaned: {dead}");
-    assert!(dead["ended_at"].as_u64().is_some(), "orphaned record needs ended_at: {dead}");
-    assert_eq!(home.record(&dead_id).unwrap()["status"], "orphaned", "orphaned persisted to disk");
-
-    // Adopted task exits on its own -> completed with exit_code null (§3.4),
-    // and the owning (re-connected) session is told. The poller only looks
-    // once per adopt-poll tick.
-    kill_group(late_pid, libc::SIGKILL);
-    assert!(poll_true(S(3), || !pid_running(late_pid)));
-    home.advance("adopt-poll", 1000);
-    let t = c.wait_terminal(&late_id, S(5)).expect("adopted exit detected by polling");
-    assert_eq!(t["status"], "completed", "{t}");
-    assert!(t["exit_code"].is_null(), "{t}");
-    let ev = c.wait_event(S(3), |e| e["event"] == "task_exited" && e["task_id"] == json!(late_id));
-    assert!(ev.is_some(), "task_exited for adopted task must reach the session");
-    // wait on an adopted task that already finished answers done:true.
-    let w = c.request_ok(json!({"type":"wait","task_id":late_id,"budget_ms":1000}));
-    assert_eq!(w["done"], true);
-
-    // Anti-zombie still applies to re-adopted work.
     drop(c);
-    home.advance("idle", 5000);
-    home.advance("shutdown-grace", 2000);
-    assert!(wait_child(&mut d2, S(12)).is_some(), "restarted daemon must still idle-exit");
-    assert!(poll_true(S(2), || !pid_running(live_pid)), "adopted task must be killed at shutdown");
-    assert_eq!(home.record(&live_id).unwrap()["status"], "killed");
-    // The restart is accounted for in manager.log.
-    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap();
-    assert!(log.contains("readopted=2 orphaned=1"), "{log}");
+    assert_crash_cleaned_up(&home, &f, crashed_at);
 }
 
-/// D4b: `stop` on a re-adopted task (no child handle, only a pid) must kill
-/// its whole process group and end as `killed`.
+/// D4c: the same when the daemon dies the way a panic in its main future
+/// ends it (exit 101, no shutdown path). Test-clock builds only: the crash
+/// is triggered by the `debug_crash` request.
+#[cfg(feature = "test-clock")]
 #[test]
-fn d4b_stop_readopted_task_kills_group() {
-    let home = Home::new("d4b");
+fn d4c_daemon_crash_takes_every_task_down() {
+    let home = Home::new("d4c");
     let mut d1 = home.start_daemon();
     let mut c = home.connect();
-    c.hello_ext("sess-a");
-    let (id, pid) = c.start("sleep 300 & echo $!; wait");
-    let gc = wait_for_pids(&mut c, &id, 1)[0];
+    c.hello_ext("sess-crash");
+    let f = start_crash_fixture(&mut c);
+    let mut k = Conn::new(UnixStream::connect(home.sock()).unwrap());
+    k.send(&json!({"v":1,"id":"crash","type":"debug_crash"}));
+    let crashed_at = Instant::now();
+    let status = wait_child(&mut d1, S(5)).expect("daemon did not crash");
+    assert_eq!(status.code(), Some(101), "{status:?}");
     drop(c);
-    d1.kill().unwrap();
-    d1.wait().unwrap();
+    assert_crash_cleaned_up(&home, &f, crashed_at);
+}
 
-    let _d2 = home.start_daemon();
+/// D4b: a record left "running" is marked orphaned (manager-crash) at the
+/// next startup, and its recorded pid is never signalled: pids are reused,
+/// and here it names a live process the daemon never started.
+#[test]
+fn d4b_startup_orphans_leftover_records_without_signalling() {
+    let home = Home::new("d4b");
+    let mut bystander = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let pid = bystander.id();
+    let dir = home.path.join("sessions/sess-a/tasks");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("sh_0000d4b1.output");
+    std::fs::write(&out, "partial\n").unwrap();
+    let rec = json!({"task_id":"sh_0000d4b1","session_id":"sess-a","kind":"shell","command":"sleep 30",
+        "cwd":"/tmp","pid":pid,"status":"running","exit_code":null,"signal":null,
+        "started_at":1,"ended_at":null,"output_path":out,"output_size":0});
+    std::fs::write(dir.join("sh_0000d4b1.json"), serde_json::to_vec(&rec).unwrap()).unwrap();
+
+    let _d = home.start_daemon();
     let mut c = home.connect();
     c.hello_ext("sess-a");
-    assert_eq!(c.status_of(&id).as_deref(), Some("running"));
-    c.request_ok(json!({"type":"stop","task_id":id}));
-    // A re-adopted task has no child handle: its exit is seen by the poller.
-    assert!(poll_true(S(3), || !pid_running(pid)), "SIGTERM must reach the adopted leader");
-    home.advance("adopt-poll", 1000);
-    let t = c.wait_terminal(&id, S(5)).expect("adopted task terminal after stop");
-    assert_eq!(t["status"], "killed", "{t}");
-    assert!(poll_true(S(3), || !pid_running(pid) && !pid_running(gc)), "group must die");
+    let t = c.task("sh_0000d4b1").expect("listed");
+    assert_eq!((t["status"].as_str(), t["end_reason"].as_str()), (Some("orphaned"), Some("manager-crash")), "{t}");
+    assert_eq!(t["output_size"], 8, "output size recovered from the file");
+    std::thread::sleep(MS(300));
+    let alive = bystander.try_wait().unwrap().is_none();
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+    assert!(alive, "the daemon signalled a pid from an old record");
 }
 
 // ===========================================================================
@@ -724,6 +770,32 @@ fn t5b_signal_field_is_signal_name() {
     assert!(
         ev["signal"] == "SIGTERM" || ev["signal"] == "SIGKILL",
         "signal should be a name: {ev}"
+    );
+}
+
+/// R1: tasks run under `pbs-manager __run`, and the record still carries
+/// the command's own status: its exit code, the signal it died of, and for
+/// a stop the SIGTERM that ended it (not anything about the runner).
+#[test]
+fn r1_runner_reports_the_commands_real_status() {
+    let home = Home::new("r1");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (three, _) = c.start("exit 3");
+    let t = c.wait_terminal(&three, S(3)).unwrap();
+    assert_eq!((t["status"].as_str(), t["exit_code"].as_i64(), t["signal"].as_str()), (Some("failed"), Some(3), None), "{t}");
+    let (killed, _) = c.start("kill -KILL $$");
+    let t = c.wait_terminal(&killed, S(3)).unwrap();
+    assert_eq!((t["status"].as_str(), t["exit_code"].as_i64(), t["signal"].as_str()), (Some("failed"), None, Some("SIGKILL")), "{t}");
+    let (stopped, _) = c.start("echo armed; sleep 300");
+    wait_output_contains(&mut c, &stopped, "armed");
+    c.request_ok(json!({"type":"stop","task_id":stopped}));
+    let t = c.wait_terminal(&stopped, S(3)).unwrap();
+    assert_eq!(
+        (t["status"].as_str(), t["signal"].as_str(), t["end_reason"].as_str()),
+        (Some("killed"), Some("SIGTERM"), Some("stopped:tool")),
+        "{t}"
     );
 }
 
@@ -1461,7 +1533,7 @@ fn t13_terminal_records_survive_restart() {
     let w = c.request_ok(json!({"type":"wait","task_id":bad,"budget_ms":100}));
     assert_eq!((w["done"].as_bool(), w["exit_code"].as_i64()), (Some(true), Some(2)));
     let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap();
-    assert!(log.contains("readopted=0 orphaned=0 loaded=2"), "{log}");
+    assert!(log.contains("orphaned=0 loaded=2"), "{log}");
 }
 
 /// T13b: shutdown looks at leftover groups as they are now. A finished task

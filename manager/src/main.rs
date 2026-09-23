@@ -14,6 +14,7 @@ mod inspect;
 mod lifecycle;
 mod proto;
 mod registry;
+mod runner;
 mod sys;
 mod task;
 
@@ -182,8 +183,22 @@ enum Sub {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // `__run` is every task's process-group leader (`runner`): plain
+    // threads, no async runtime, and not a user-facing subcommand.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("__run") {
+        let command = args.next().unwrap_or_default();
+        std::process::exit(runner::main(&command));
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async_main());
+}
+
+async fn async_main() {
     let cli = Cli::parse();
     let home = lifecycle::resolve_home(cli.home.as_deref());
     let code = match cli.cmd {

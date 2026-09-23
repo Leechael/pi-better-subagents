@@ -30,8 +30,6 @@ const MAX_OUTPUT_READ: u64 = 1024 * 1024;
 /// Cap on a chunk's JSON-escaped size (control bytes escape to 6 bytes each),
 /// leaving room for the response envelope inside the 4 MiB frame.
 const CHUNK_JSON_BUDGET: usize = MAX_FRAME_SIZE as usize - 64 * 1024;
-/// §3.4: re-adopted tasks are polled with kill(pid, 0) every second.
-const ADOPT_POLL: Duration = Duration::from_secs(1);
 /// Poll interval for a process group that outlived its leader.
 const GROUP_POLL: Duration = Duration::from_millis(500);
 
@@ -141,10 +139,9 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
     lifecycle::log_line(
         &home,
         &format!(
-            "daemon started pid={} version={} readopted={} orphaned={} loaded={}",
+            "daemon started pid={} version={} orphaned={} loaded={}",
             std::process::id(),
             env!("CARGO_PKG_VERSION"),
-            scan.readopted.len(),
             scan.orphaned,
             scan.loaded
         ),
@@ -158,7 +155,6 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
             "pid": std::process::id(),
             "version": env!("CARGO_PKG_VERSION"),
             "protocol": PROTOCOL,
-            "readopted": scan.readopted.len(),
             "orphaned": scan.orphaned,
             "loaded": scan.loaded,
         }),
@@ -170,11 +166,6 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
             sock.display(),
             std::process::id()
         );
-    }
-
-    // §3.4: re-adopted tasks get a kill(pid,0) exit poller.
-    for (task_id, pid) in scan.readopted {
-        spawn_adopted_poller(&state, &task_id, pid);
     }
 
     // §3.2: forget gone sessions past their retention, now and periodically.
@@ -309,6 +300,10 @@ async fn handle_conn(state: Shared, stream: Stream) {
     if matches!(hello.kind, RequestKind::ClockStatus | RequestKind::ClockAdvance { .. }) {
         respond(&tx, &hello.id, handle_clock(&state, &hello.kind)).await;
         return;
+    }
+    #[cfg(feature = "test-clock")]
+    if matches!(hello.kind, RequestKind::DebugCrash) {
+        std::process::exit(101);
     }
     if matches!(hello.v, Some(v) if v != PROTO_VERSION) {
         let _ = tx
@@ -664,6 +659,8 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         ref k @ (RequestKind::ClockStatus | RequestKind::ClockAdvance { .. }) => {
             respond(&tx, &id, handle_clock(&state, k)).await
         }
+        #[cfg(feature = "test-clock")]
+        RequestKind::DebugCrash => std::process::exit(101),
     }
 }
 
@@ -1251,7 +1248,7 @@ fn handle_shutdown(state: &Shared, conn_id: u64) -> Result<UnitOk, ProtoError> {
 }
 
 // ---------------------------------------------------------------------------
-// Background tasks: output fanout, exit watch, re-adopt poller
+// Background tasks: output fanout, exit watch
 // ---------------------------------------------------------------------------
 
 /// Forward tee'd output chunks to watching connections as `output` events
@@ -1360,39 +1357,6 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
     });
 }
 
-/// §3.4 re-adopt: poll kill(pid, 0) every second. Exit code is unobtainable
-/// -> completed/null. No output tailing: the task's stdout pipe died with the
-/// old manager, so the output file cannot grow; `scan_tasks` already
-/// recovered its final size.
-fn spawn_adopted_poller(state: &Shared, task_id: &str, pid: u32) {
-    let state2 = state.clone();
-    let tid = task_id.to_string();
-    let clock = state.lock().unwrap().clock.clone();
-    tokio::spawn(async move {
-        let mut first = true;
-        loop {
-            if !first {
-                clock.sleep("adopt-poll", ADOPT_POLL).await;
-            }
-            first = false;
-            let running = state2
-                .lock()
-                .unwrap()
-                .registry
-                .tasks
-                .get(&tid)
-                .is_some_and(|e| e.record.status == TaskStatus::Running);
-            if !running {
-                break; // finalized elsewhere (stop/shutdown)
-            }
-            if !task::pid_alive(pid) {
-                finalize_exit(&state2, &tid, None);
-                break;
-            }
-        }
-    });
-}
-
 /// Map an observed exit to a terminal status, persist the record, wake
 /// `wait`ers, and push `task_exited` to the owning session (§3.3/§3.4).
 fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::ExitStatus>) {
@@ -1414,13 +1378,13 @@ fn finalize_exit(state: &Shared, task_id: &str, status: Option<std::process::Exi
         entry.record.ended_at = Some(now);
         entry.record.output_size = entry.output.lock().unwrap().total_size;
         entry.record.status = registry::terminal_status(entry.kill_requested, code, signal);
-        // Why it ended: our kill's reason; otherwise a natural exit. A
-        // re-adopted task (no exit status) ended while we only polled it.
-        entry.record.end_reason = Some(match (&entry.kill_reason, status) {
-            (Some(r), _) => r.clone(),
-            (None, Some(_)) => end_reason::EXITED.to_string(),
-            (None, None) => end_reason::MANAGER_RESTART.to_string(),
-        });
+        // Why it ended: our kill's reason; otherwise a natural exit.
+        entry.record.end_reason = Some(
+            entry
+                .kill_reason
+                .clone()
+                .unwrap_or_else(|| end_reason::EXITED.to_string()),
+        );
         if let Err(e) = registry::persist_record(&home, &entry.record) {
             lifecycle::log_line(&home, &format!("persist {} failed: {e}", entry.record.task_id));
         }
@@ -1555,7 +1519,7 @@ async fn graceful_shutdown(state: &Shared) {
         for pid in survivors {
             let _ = task::signal_group(pid, task::SIGKILL);
         }
-        // Let exit watchers / adopted pollers observe and persist.
+        // Let exit watchers observe and persist.
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     // 3) Force-finalize anything still marked running (safety net), with

@@ -10,8 +10,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::mpsc;
@@ -75,8 +76,7 @@ impl RingBuffer {
 }
 
 /// Shared output state for a task: ring tail + full disk file + total size.
-/// `file` is None for re-adopted/loaded tasks (writes are done by the old
-/// manager's pipe, which is gone; the file is only read/tailed then).
+/// `file` is None for records loaded from disk (the file is only read then).
 pub struct OutputState {
     pub ring: RingBuffer,
     pub total_size: u64,
@@ -115,6 +115,7 @@ pub struct OutputChunk {
 // ---------------------------------------------------------------------------
 
 pub struct SpawnedTask {
+    /// The task's runner (`pbs-manager __run`), leader of its process group.
     pub child: Child,
     pub pid: u32,
     pub output: Arc<Mutex<OutputState>>,
@@ -135,8 +136,49 @@ pub fn stderr_path_for(output_path: &Path) -> PathBuf {
     }
 }
 
-/// Spawn `sh -c <command>` as a session leader (setsid in pre_exec, §3.4) so
-/// the whole process tree can be signalled as one group.
+/// The daemon's lifeline (§3.2): every runner holds a copy of the read end;
+/// only this process holds the write end, so any end of the daemon (even
+/// `kill -9`) is an EOF every runner sees. A single owner, so an in-place
+/// exec handover has exactly one descriptor to carry across.
+pub struct Lifeline {
+    /// Read end, numbered >= 10, close-on-exec (placed at fd 3 in runners).
+    pub read: OwnedFd,
+    /// Write end, close-on-exec: it must never reach a task. Never written;
+    /// only its closing matters.
+    #[allow(dead_code)]
+    pub write: OwnedFd,
+}
+
+static LIFELINE: OnceLock<Lifeline> = OnceLock::new();
+
+pub fn lifeline() -> io::Result<&'static Lifeline> {
+    if let Some(l) = LIFELINE.get() {
+        return Ok(l);
+    }
+    let (r, w) = crate::sys::pipe_cloexec()?;
+    let read = crate::sys::dup_cloexec_high(&r)?;
+    // A racing initializer wins; our pipe is simply dropped.
+    Ok(LIFELINE.get_or_init(|| Lifeline { read, write: w }))
+}
+
+/// Path of the binary that provides `__run`: this executable. Unit tests
+/// run inside the test harness, so they use the `pbs-manager` binary cargo
+/// builds next to it.
+pub fn runner_exe() -> io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    if cfg!(test) {
+        // target/<profile>/deps/pbs_manager-<hash> -> target/<profile>/pbs-manager
+        if let Some(profile_dir) = exe.parent().and_then(|d| d.parent()) {
+            return Ok(profile_dir.join("pbs-manager"));
+        }
+    }
+    Ok(exe)
+}
+
+/// Spawn `<runner> __run <command>` as a session leader (setsid in
+/// pre_exec, §3.4) so the whole process tree can be signalled as one group.
+/// The runner execs `sh -c <command>` in that group, holds the lifeline,
+/// and ends the way the command did (see `crate::runner`).
 ///
 /// stdout and stderr are read on separate pipes (`Stdio::piped`). Both are
 /// appended to the merged `.output` file + ring (protocol / agent view stays
@@ -150,8 +192,9 @@ pub fn spawn(
     env: &HashMap<String, String>,
     output_path: &Path,
 ) -> io::Result<SpawnedTask> {
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg(command);
+    let lifeline = lifeline()?;
+    let mut cmd = Command::new(runner_exe()?);
+    cmd.arg("__run").arg(command);
     cmd.current_dir(cwd);
     // §3.3: env is the complete environment; the client builds it.
     cmd.env_clear().envs(env);
@@ -160,7 +203,7 @@ pub fn spawn(
     cmd.stderr(Stdio::piped());
     // Safety net only — explicit group kills (stop/shutdown/timeout) are primary.
     cmd.kill_on_drop(true);
-    crate::sys::apply_new_session_tokio(&mut cmd);
+    crate::sys::apply_runner_setup_tokio(&mut cmd, lifeline.read.as_raw_fd());
 
     let mut child = cmd.spawn()?;
     let stdout = child.stdout.take().ok_or_else(|| {

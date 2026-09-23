@@ -749,7 +749,7 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
                 continue;
             }
             if task::pid_alive(t.pid) {
-                r.fail("orphan pid", format!("{} (pid {}) still runs with no manager; start one to re-adopt it, or kill it", t.task_id, t.pid));
+                r.fail("orphan pid", format!("{} (pid {}) still runs with no manager: its runner should have taken it down, or the pid now belongs to another process. The next manager marks it orphaned without signalling it; check `ps -p {}` and kill it if it is the task", t.task_id, t.pid, t.pid));
             } else {
                 r.ok("dead task", format!("{} will be marked orphaned when the manager starts", t.task_id));
             }

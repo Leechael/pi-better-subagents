@@ -1,9 +1,9 @@
 //! Singleton & startup lifecycle (design doc §3.1, §3.2): base dir resolution,
-//! pid claim, spawn lock, zombie cleanup, and re-adopt scanning on restart.
+//! pid claim, spawn lock, zombie cleanup, and the startup scan that marks a
+//! crashed daemon's records orphaned.
 
 use crate::proto::{now_ms, TaskStatus};
 use crate::registry::{self, Registry, TaskEntry};
-use crate::task;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -206,59 +206,51 @@ pub fn try_acquire_spawn_lock(home: &Path) -> io::Result<Option<SpawnLockGuard>>
 }
 
 // ---------------------------------------------------------------------------
-// Re-adopt scan on manager restart (§3.4)
+// Startup scan (§3.4): no crash recovery
 // ---------------------------------------------------------------------------
 
 pub struct ScanResult {
-    /// (task_id, pid) of tasks whose process is still alive -> re-adopt.
-    pub readopted: Vec<(String, u32)>,
-    /// Running tasks whose process is dead -> marked orphaned.
+    /// Records left "running" by a daemon that died without shutting down,
+    /// now marked orphaned (end_reason manager-crash).
     pub orphaned: usize,
     /// Already-terminal records loaded for list/output visibility.
     pub loaded: usize,
 }
 
+/// Load every record. A record still "running" belonged to a daemon that
+/// died without shutting down; its runners saw the lifeline break and took
+/// their process groups down (§3.2), so there is nothing to re-adopt. The
+/// record is marked orphaned. Nothing is signalled: the recorded pid may
+/// already belong to an unrelated process.
 pub fn scan_tasks(home: &Path, registry: &mut Registry) -> ScanResult {
-    let mut result = ScanResult {
-        readopted: Vec::new(),
-        orphaned: 0,
-        loaded: 0,
-    };
+    let mut result = ScanResult { orphaned: 0, loaded: 0 };
     for mut rec in registry::load_all_records(home) {
         // The persisted output_size lags the output file: a running task's
-        // is only written at exit, and the exit snapshot can precede the tee
-        // draining the pipe. The file is append-only and can no longer grow
-        // (the stdout pipe died with the old manager), so it is the truth.
+        // is only written at exit. The file can no longer grow, so it is
+        // the truth.
         if let Ok(m) = fs::metadata(&rec.output_path) {
             rec.output_size = rec.output_size.max(m.len());
         }
         if rec.status == TaskStatus::Running {
-            if task::pid_alive(rec.pid) {
-                // §3.4: pid alive -> re-adopt.
-                result.readopted.push((rec.task_id.clone(), rec.pid));
-                registry.tasks.insert(rec.task_id.clone(), TaskEntry::adopted(rec));
-            } else {
-                // §3.4: pid dead -> orphaned.
-                rec.status = TaskStatus::Orphaned;
-                rec.end_reason = Some(crate::proto::end_reason::ORPHANED.to_string());
-                let now = now_ms();
-                rec.ended_at = Some(now);
-                let _ = registry::persist_record(home, &rec);
-                crate::events::emit(
-                    home,
-                    Some(&rec.session_id),
-                    "task.exit",
-                    Some(&rec.task_id),
-                    serde_json::json!({
-                        "exit_code": null,
-                        "signal": null,
-                        "end_reason": crate::proto::end_reason::ORPHANED,
-                        "duration_ms": now.saturating_sub(rec.started_at),
-                    }),
-                );
-                registry.tasks.insert(rec.task_id.clone(), TaskEntry::terminal(rec));
-                result.orphaned += 1;
-            }
+            rec.status = TaskStatus::Orphaned;
+            rec.end_reason = Some(crate::proto::end_reason::MANAGER_CRASH.to_string());
+            let now = now_ms();
+            rec.ended_at = Some(now);
+            let _ = registry::persist_record(home, &rec);
+            crate::events::emit(
+                home,
+                Some(&rec.session_id),
+                "task.exit",
+                Some(&rec.task_id),
+                serde_json::json!({
+                    "exit_code": null,
+                    "signal": null,
+                    "end_reason": crate::proto::end_reason::MANAGER_CRASH,
+                    "duration_ms": now.saturating_sub(rec.started_at),
+                }),
+            );
+            registry.tasks.insert(rec.task_id.clone(), TaskEntry::terminal(rec));
+            result.orphaned += 1;
         } else {
             registry.tasks.insert(rec.task_id.clone(), TaskEntry::terminal(rec));
             result.loaded += 1;
@@ -330,8 +322,11 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// A record left "running" is marked orphaned (manager-crash) whether or
+    /// not its pid is alive, and nothing is signalled: here the recorded pid
+    /// is this very test process, which must survive the scan.
     #[test]
-    fn scan_marks_dead_running_tasks_orphaned() {
+    fn scan_marks_leftover_running_tasks_orphaned_without_signalling() {
         let home = temp_home("scan");
         let rec = crate::proto::TaskRecord {
             task_id: "sh_0000000a".into(),
@@ -339,7 +334,7 @@ mod tests {
             kind: crate::proto::TaskKind::Shell,
             command: "sleep 1".into(),
             cwd: "/tmp".into(),
-            pid: 99_999_999, // dead
+            pid: std::process::id(), // alive, and not ours to signal
             status: TaskStatus::Running,
             exit_code: None,
             signal: None,
@@ -357,9 +352,9 @@ mod tests {
         let mut reg = Registry::new(home.clone());
         let res = scan_tasks(&home, &mut reg);
         assert_eq!(res.orphaned, 1);
-        assert!(res.readopted.is_empty());
         let e = &reg.tasks["sh_0000000a"];
         assert_eq!(e.record.status, TaskStatus::Orphaned);
+        assert_eq!(e.record.end_reason.as_deref(), Some("manager-crash"));
         assert!(e.record.ended_at.is_some());
         // Persisted too.
         let loaded = registry::load_all_records(&home);

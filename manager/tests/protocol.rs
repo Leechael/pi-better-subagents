@@ -725,18 +725,19 @@ fn t11_cli_smoke() {
     );
 }
 
-/// §3.1 step 5 + §3.4 re-adopt: SIGKILL the daemon (stale socket/pid files
-/// remain), restart with the same PBS_HOME — the new daemon must clean the
-/// stale files, take over, and re-adopt the still-live task (pid alive →
-/// status running; exit detection via kill(pid,0) polling).
+/// §3.1 step 5 + §3.2 lifeline: SIGKILL the daemon (stale socket/pid files
+/// remain). Its task dies with it: the runner sees the lifeline break. A
+/// restart with the same PBS_HOME cleans the stale files, takes over, and
+/// lists the task as orphaned (end_reason manager-crash) without
+/// re-adopting anything.
 #[test]
-fn t12_restart_readopts_live_task() {
-    let home = test_home("readopt");
+fn t12_restart_after_crash_orphans_the_task() {
+    let home = test_home("crash");
     let mut d1 = spawn_daemon(&home);
     wait_for_socket(&home, Duration::from_secs(2));
 
     let mut c1 = connect(&home, CONNECT_TIMEOUT);
-    hello_ext(&mut c1, "sess-readopt");
+    hello_ext(&mut c1, "sess-crash");
     let resp = c1.request(&start_req("r12-start", "sleep 30", true), "r12-start");
     let task_id = extract_str(&resp, "task_id").expect("task_id").to_string();
     let task_pid = extract_num(&resp, "pid").expect("pid");
@@ -744,44 +745,25 @@ fn t12_restart_readopts_live_task() {
 
     d1.kill().expect("SIGKILL daemon");
     d1.wait().expect("reap daemon");
-    assert!(
-        pid_alive(task_pid),
-        "orphaned task should survive daemon SIGKILL"
-    );
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while pid_alive(task_pid) {
+        assert!(Instant::now() < deadline, "task {task_pid} survived the daemon's SIGKILL");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     let mut d2 = spawn_daemon(&home);
     // Stale socket file still exists; retry connect while the new daemon
     // clears it and rebinds (§3.1 zombie-socket path).
     let mut c2 = connect(&home, Duration::from_secs(5));
-    hello_ext(&mut c2, "sess-readopt");
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut last: String;
-    let mut i = 0;
-    loop {
-        let id = format!("r12-list-{i}");
-        last = c2.request(&list_req(&id), &id);
-        if last.contains(&task_id) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "restarted daemon must list the re-adopted task {task_id}; last list: {last}"
-        );
-        i += 1;
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    hello_ext(&mut c2, "sess-crash");
+    let last = c2.request(&list_req("r12-list"), "r12-list");
+    assert!(last.contains(&task_id), "restarted daemon lists the task: {last}");
+    let flat = compact(&last);
     assert!(
-        compact(&last).contains("\"status\":\"running\""),
-        "re-adopted live task should be running (§3.4): {last}"
+        flat.contains("\"status\":\"orphaned\"") && flat.contains("\"end_reason\":\"manager-crash\""),
+        "crashed task is orphaned, not re-adopted: {last}"
     );
 
-    // cleanup: stop the task so no `sleep 30` leaks past the test
-    let s = c2.request(&stop_req("r12-stop", &task_id), "r12-stop");
-    assert!(compact(&s).contains("\"ok\":true"), "stop: {s}");
-    let _ = Command::new("kill")
-        .args(["-9", &task_pid.to_string()])
-        .status();
     drop(c2);
     let _ = d2.kill();
     let _ = d2.wait();

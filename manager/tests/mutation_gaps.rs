@@ -389,10 +389,11 @@ fn g12_tiny_max_bytes_over_wide_chars() {
     assert_eq!((r["chunk"].as_str(), r["next_cursor"].as_u64()), (Some("😀"), Some(5)));
 }
 
-/// Kills: daemon.rs spawn_adopted_poller output catch-up. Output written
-/// before a manager crash is visible (and sized correctly) after restart.
+/// Kills: lifecycle.rs scan_tasks output-size recovery. Output written
+/// before a manager crash stays readable, and correctly sized, on the
+/// orphaned record the next daemon keeps.
 #[test]
-fn g6_readopted_task_output_is_caught_up() {
+fn g6_crashed_task_output_survives_on_the_orphaned_record() {
     let home = Home::new("g6");
     let mut d1 = home.start_daemon();
     let mut c = home.connect();
@@ -406,43 +407,10 @@ fn g6_readopted_task_output_is_caught_up() {
     let _d2 = home.start_daemon();
     let mut c = home.connect();
     c.hello_ext("sess-a");
-    let mut w = home.connect();
-    w.hello_ext("sess-a-watch");
-    assert!(
-        poll_true(S(4), || c.task(&id).unwrap()["output_size"] == 13),
-        "re-adopted task lost its pre-crash output size: {:?}",
-        c.task(&id)
-    );
+    let t = c.task(&id).unwrap();
+    assert_eq!((t["status"].as_str(), t["output_size"].as_u64()), (Some("orphaned"), Some(13)), "{t}");
     let r = c.request_ok(json!({"type":"output","task_id":id,"cursor":0,"max_bytes":100}));
     assert_eq!(r["chunk"], "before-crash\n");
     assert_eq!(r["total_size"], 13);
-    assert_eq!(r["status"], "running");
-}
-
-/// Kills: daemon.rs spawn_adopted_poller's first-iteration guard (without it
-/// the poller never sleeps after the first check: a busy loop per re-adopted
-/// task). A daemon that re-adopted a live task must be idle.
-#[test]
-fn g14_readopted_task_poller_does_not_spin() {
-    let home = Home::new("g14");
-    let mut d1 = home.start_daemon();
-    let mut c = home.connect();
-    c.hello_ext("sess-a");
-    let (id, _) = c.start("sleep 300");
-    drop(c);
-    d1.kill().unwrap();
-    d1.wait().unwrap();
-    let d2 = home.start_daemon();
-    let mut c = home.connect();
-    c.hello_ext("sess-a");
-    assert_eq!(c.status_of(&id).as_deref(), Some("running"), "re-adopted");
-    // Let the poller get past its first tick and check a few times.
-    for _ in 0..3 {
-        home.advance("adopt-poll", 1000);
-    }
-    std::thread::sleep(Duration::from_millis(300));
-    let before = cpu_ms(d2.id());
-    std::thread::sleep(Duration::from_millis(1500));
-    let used = cpu_ms(d2.id()) - before;
-    assert!(used < 300, "daemon with one re-adopted task used {used}ms CPU in 1.5s");
+    assert_eq!(r["status"], "orphaned");
 }

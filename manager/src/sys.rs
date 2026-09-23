@@ -8,6 +8,7 @@
 //! Invariants documented per function.
 
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 
 /// POSIX SIGTERM — process-group stop (§3.2 / §3.4).
@@ -17,26 +18,17 @@ pub const SIGKILL: i32 = libc::SIGKILL;
 
 /// Make the child a session leader (`setsid`) so `pgid == pid` and
 /// [`signal_group`] can address the whole tree with `kill(-pgid, …)`, and
-/// let it inherit only fds 0, 1 and 2 (see [`child_setup`]).
+/// let it inherit only fds 0, 1 and 2 (see [`child_setup`]). Used when
+/// detaching the daemon itself from a short-lived CLI.
 ///
 /// # Safety boundary
 /// `pre_exec` is the only `unsafe` call site. The closure calls only
 /// `setsid`, `fcntl` and (Linux) the `close_range` syscall, all
 /// async-signal-safe, and allocates nothing: the fd bound is computed here,
 /// before fork.
-pub fn apply_new_session_tokio(cmd: &mut tokio::process::Command) {
-    let limit = fd_scan_limit();
-    // SAFETY: see above; `limit` is a captured integer.
-    unsafe {
-        cmd.pre_exec(move || child_setup(limit));
-    }
-}
-
-/// Same as [`apply_new_session_tokio`] for `std::process::Command`
-/// (used when detaching the daemon itself from a short-lived CLI).
 pub fn apply_new_session_std(cmd: &mut std::process::Command) {
     let limit = fd_scan_limit();
-    // SAFETY: as for `apply_new_session_tokio`.
+    // SAFETY: see above; `limit` is a captured integer.
     unsafe {
         cmd.pre_exec(move || child_setup(limit));
     }
@@ -74,6 +66,154 @@ fn child_setup(limit: i32) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Fixed descriptor number a task runner (`pbs-manager __run`) finds the read
+/// end of the daemon's lifeline at (see `crate::runner`).
+pub const RUNNER_LIFELINE_FD: i32 = 3;
+
+/// Spawn setup for a task runner: session leader and stdio-only fds as in
+/// [`apply_new_session_std`], and then `lifeline` at [`RUNNER_LIFELINE_FD`]
+/// without close-on-exec. The source must be ≥ 4 (see [`dup_cloexec_high`])
+/// so the `dup2` is a real copy.
+///
+/// # Safety boundary
+/// As for [`apply_new_session_std`]; the closure adds one `dup2` call,
+/// which is async-signal-safe.
+pub fn apply_runner_setup_tokio(cmd: &mut tokio::process::Command, lifeline: i32) {
+    let limit = fd_scan_limit();
+    // SAFETY: see above; only integers are captured.
+    unsafe {
+        cmd.pre_exec(move || {
+            child_setup(limit)?;
+            if libc::dup2(lifeline, RUNNER_LIFELINE_FD) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// A pipe with close-on-exec on both ends: (read, write).
+pub fn pipe_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `pipe` fills the two-element array we own.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both fds were just created and are owned by nobody else.
+    let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    set_cloexec(r.as_raw_fd())?;
+    set_cloexec(w.as_raw_fd())?;
+    Ok((r, w))
+}
+
+/// A close-on-exec duplicate of `fd` numbered ≥ 10, clear of the fixed
+/// runner slot 3.
+pub fn dup_cloexec_high(fd: &OwnedFd) -> io::Result<OwnedFd> {
+    // SAFETY: F_DUPFD_CLOEXEC on a valid fd returns a new fd we then own.
+    let n = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `n` is a fresh descriptor owned by nobody else.
+    Ok(unsafe { OwnedFd::from_raw_fd(n) })
+}
+
+/// Set FD_CLOEXEC on a raw descriptor.
+pub fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fcntl on an fd number; an invalid fd yields EBADF.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Block `sig` in the calling thread (threads spawned later inherit the
+/// mask). A blocked signal stays pending instead of acting. Children inherit
+/// the mask too; see [`unblock_in_child`].
+pub fn block_signal(sig: i32) -> io::Result<()> {
+    // SAFETY: builds a signal set we own and changes only this thread's mask.
+    let rc = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, sig);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut())
+    };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    Ok(())
+}
+
+/// Blocking `read` on a raw fd, retrying EINTR. 0 = EOF.
+pub fn read_raw(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        // SAFETY: reads into the buffer we own, at most its length.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+pub fn getpid() -> u32 {
+    std::process::id()
+}
+
+/// End this process with `sig`, as the command it ran ended: default
+/// action, unblocked, raised on ourselves. Returns an exit code to use if
+/// the signal did not end us (it cannot be caught or ignored here).
+pub fn die_by_signal(sig: i32) -> i32 {
+    // SAFETY: resets one disposition, edits this thread's mask, and signals
+    // ourselves; no memory is shared.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, sig);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::kill(libc::getpid(), sig);
+    }
+    128 + sig
+}
+
+/// Is `sig` pending (blocked and delivered) for this process?
+pub fn signal_pending(sig: i32) -> bool {
+    // SAFETY: fills a signal set we own.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigpending(&mut set) == 0 && libc::sigismember(&set, sig) == 1
+    }
+}
+
+/// Unblock `sig` in `cmd`'s child just before exec. A `sig` that reached
+/// the child while blocked (between fork and exec) was kept pending and is
+/// delivered at this point, with the default action.
+///
+/// # Safety boundary
+/// `pre_exec` closure calls only `sigemptyset`/`sigaddset`/`pthread_sigmask`
+/// on a stack set: async-signal-safe, no allocation.
+pub fn unblock_in_child(cmd: &mut std::process::Command, sig: i32) {
+    // SAFETY: see above.
+    unsafe {
+        cmd.pre_exec(move || {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, sig);
+            let rc = libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            if rc != 0 {
+                return Err(io::Error::from_raw_os_error(rc));
+            }
+            Ok(())
+        });
+    }
 }
 
 /// Upper bound for the fd scan in [`child_setup`], computed in the parent
@@ -202,3 +342,4 @@ pub fn max_rss_bytes() -> u64 {
         raw.saturating_mul(1024) // Linux: kilobytes
     }
 }
+
