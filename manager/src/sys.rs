@@ -273,6 +273,33 @@ pub fn group_has_others(pgid: u32) -> bool {
     }
 }
 
+/// Non-blocking `waitpid` on one child: `Ok(None)` while it runs,
+/// `Ok(Some(status))` once reaped. Used for runners the process did not
+/// spawn itself in this image (after an in-place upgrade they are still its
+/// children, but no tokio `Child` exists for them).
+///
+/// # Safety boundary
+/// `waitpid` writes only into the `status` integer we own.
+pub fn waitpid_nohang(pid: u32) -> io::Result<Option<std::process::ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+    let mut status: libc::c_int = 0;
+    loop {
+        // SAFETY: plain pid, pointer to a local integer.
+        let rc = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if rc == 0 {
+            return Ok(None);
+        }
+        if rc > 0 {
+            return Ok(Some(std::process::ExitStatus::from_raw(status)));
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(e);
+    }
+}
+
 /// `kill(pid, sig)`; `ESRCH` (already gone) is success.
 pub fn kill_pid(pid: u32, sig: i32) -> io::Result<()> {
     // SAFETY: plain integers; a positive pid addresses one process.

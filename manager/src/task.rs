@@ -11,11 +11,12 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::AsyncReadExt;
 use tokio::net::unix::pipe;
-use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 pub use crate::sys::{pid_alive, signal_group, SIGKILL, SIGTERM};
@@ -115,6 +116,7 @@ pub struct OutputChunk {
 // Spawn
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 pub struct SpawnedTask {
     /// The task's runner (`pbs-manager __run`), leader of its process group.
     pub child: Child,
@@ -125,8 +127,33 @@ pub struct SpawnedTask {
     pub chunks: mpsc::Receiver<OutputChunk>,
     /// Strong count of active tee pumps (stdout + stderr). Starts at 2;
     /// each pump drops its token on EOF. Tests wait until this hits 0.
-    #[allow(dead_code)] // observed by unit tests after spawn
     pub tee_remaining: Arc<AtomicUsize>,
+}
+
+/// A task's runner process, as the daemon waits for it: the tokio `Child`
+/// it spawned, or a bare pid inherited across an in-place upgrade (still
+/// our child, so `waitpid` works, but tokio cannot adopt it).
+pub enum RunnerProc {
+    Child(Child),
+    #[allow(dead_code)] // built by the in-place upgrade's restore
+    Pid(u32),
+}
+
+impl RunnerProc {
+    /// Wait for the runner to exit. Cancel-safe: dropping the future before
+    /// it completes never loses a reaped status.
+    pub async fn wait(&mut self) -> Option<std::process::ExitStatus> {
+        match self {
+            RunnerProc::Child(c) => c.wait().await.ok(),
+            RunnerProc::Pid(pid) => loop {
+                match crate::sys::waitpid_nohang(*pid) {
+                    Ok(Some(s)) => return Some(s),
+                    Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+                    Err(_) => return None,
+                }
+            },
+        }
+    }
 }
 
 /// Sibling path for the stderr-only inspection file next to `<id>.output`.
@@ -178,23 +205,26 @@ pub fn runner_exe() -> io::Result<PathBuf> {
     Ok(exe)
 }
 
+/// The runner process and the descriptors the daemon reads it through.
+pub struct ProcessParts {
+    pub child: Child,
+    /// Read end of the runner's status pipe (see `crate::runner`).
+    pub status: pipe::Receiver,
+    pub pid: u32,
+    /// Read ends of the task's stdout / stderr pipes.
+    pub stdout: OwnedFd,
+    pub stderr: OwnedFd,
+}
+
 /// Spawn `<runner> __run <command>` as a session leader (setsid in
 /// pre_exec, §3.4) so the whole process tree can be signalled as one group.
 /// The runner execs `sh -c <command>` in that group, holds the lifeline,
 /// and reports the command's real status (see `crate::runner`).
 ///
-/// stdout and stderr are read on separate pipes (`Stdio::piped`). Both are
-/// appended to the merged `.output` file + ring (protocol / agent view stays
-/// merged). stderr is additionally written to a sibling `.stderr` file for
-/// CLI inspection (`pbs-manager log -f --stderr <task_id>`).
-///
-/// Must be called from inside a Tokio runtime (tee pumps are `tokio::spawn`ed).
-pub fn spawn(
-    command: &str,
-    cwd: &str,
-    env: &HashMap<String, String>,
-    output_path: &Path,
-) -> io::Result<SpawnedTask> {
+/// stdout and stderr come back as raw pipe descriptors; [`start_tee`] reads
+/// them. Keeping them as descriptors lets the daemon park the readers and
+/// carry the pipes across an in-place upgrade.
+pub fn spawn_process(command: &str, cwd: &str, env: &HashMap<String, String>) -> io::Result<ProcessParts> {
     let lifeline = lifeline()?;
     let (status_read, status_write) = crate::sys::pipe_cloexec()?;
     let status_write = crate::sys::dup_cloexec_high(&status_write)?;
@@ -206,106 +236,146 @@ pub fn spawn(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    // Safety net only — explicit group kills (stop/shutdown/timeout) are primary.
-    cmd.kill_on_drop(true);
     crate::sys::apply_runner_setup_tokio(&mut cmd, lifeline.read.as_raw_fd(), status_write.as_raw_fd());
 
     let mut child = cmd.spawn()?;
     drop(status_write); // the runner has its copy at fd 4
     let status = pipe::Receiver::from_owned_fd(status_read)?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "child stdout pipe missing")
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "child stderr pipe missing")
-    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "child stdout pipe missing"))?
+        .into_owned_fd()?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "child stderr pipe missing"))?
+        .into_owned_fd()?;
     let pid = child.id().unwrap_or(0);
+    Ok(ProcessParts { child, status, pid, stdout, stderr })
+}
 
-    let out_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(output_path)?;
-    let stderr_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(stderr_path_for(output_path))?;
+/// Open (append) the merged output file and its `.stderr` sibling.
+pub fn open_output_files(output_path: &Path) -> io::Result<(File, File)> {
+    let out = OpenOptions::new().create(true).append(true).open(output_path)?;
+    let err = OpenOptions::new().create(true).append(true).open(stderr_path_for(output_path))?;
+    Ok((out, err))
+}
+
+/// The two tee pumps of one task. Each returns its pipe's descriptor when it
+/// was parked, or None once the pipe hit EOF.
+#[allow(dead_code)] // awaited when the tee is parked (in-place upgrade)
+pub struct Tee {
+    pub stdout: tokio::task::JoinHandle<Option<OwnedFd>>,
+    pub stderr: tokio::task::JoinHandle<Option<OwnedFd>>,
+}
+
+/// Start reading a task's stdout / stderr descriptors: both append to the
+/// merged `.output` file + ring (protocol / agent view stays merged), and
+/// stderr is mirrored into `stderr_mirror` for CLI inspection
+/// (`pbs-manager log -f --stderr <task_id>`). Either may be None when that
+/// pipe already reached EOF.
+///
+/// When `park` turns true, each pump stops between two reads, so every
+/// byte taken from a pipe is already on disk and in the ring, and hands its
+/// descriptor back. Bytes still in the pipe stay there for whoever reads it
+/// next. Must be called inside a Tokio runtime.
+pub fn start_tee(
+    stdout: Option<OwnedFd>,
+    stderr: Option<OwnedFd>,
+    output: Arc<Mutex<OutputState>>,
+    stderr_mirror: Option<File>,
+    tx: mpsc::Sender<OutputChunk>,
+    park: tokio::sync::watch::Receiver<bool>,
+) -> io::Result<Tee> {
+    let out_rx = stdout.map(pipe::Receiver::from_owned_fd).transpose()?;
+    let err_rx = stderr.map(pipe::Receiver::from_owned_fd).transpose()?;
+    let (o, t, p) = (output.clone(), tx.clone(), park.clone());
+    let stdout = tokio::spawn(async move {
+        match out_rx {
+            Some(r) => pump(r, o, t, None, p).await,
+            None => None,
+        }
+    });
+    let stderr = tokio::spawn(async move {
+        match err_rx {
+            Some(r) => pump(r, output, tx, stderr_mirror, park).await,
+            None => None,
+        }
+    });
+    Ok(Tee { stdout, stderr })
+}
+
+/// Spawn a task and start its tee (unit tests and simple callers): the
+/// runner, the output state over `output_path`, and the chunk channel.
+/// Must be called from inside a Tokio runtime.
+#[cfg(test)]
+pub fn spawn(
+    command: &str,
+    cwd: &str,
+    env: &HashMap<String, String>,
+    output_path: &Path,
+) -> io::Result<SpawnedTask> {
+    let parts = spawn_process(command, cwd, env)?;
+    let (out_file, err_file) = open_output_files(output_path)?;
     let output = Arc::new(Mutex::new(OutputState::new(Some(out_file), 0)));
     let (tx, rx) = mpsc::channel(CHUNK_CHANNEL_CAP);
-
+    let (_park_tx, park) = tokio::sync::watch::channel(false);
+    let tee = start_tee(Some(parts.stdout), Some(parts.stderr), output.clone(), Some(err_file), tx, park)?;
     let tee_remaining = Arc::new(AtomicUsize::new(2));
-
-    // Fan-in: both readers append to the same OutputState + chunk channel.
-    // stderr additionally mirrors into the .stderr inspection file.
-    let out_for_stdout = output.clone();
-    let tx_stdout = tx.clone();
-    let tee_stdout = tee_remaining.clone();
-    tokio::spawn(async move {
-        pump_stdout(stdout, out_for_stdout, tx_stdout).await;
-        tee_stdout.fetch_sub(1, Ordering::SeqCst);
-    });
-    let out_for_stderr = output.clone();
-    let tee_stderr = tee_remaining.clone();
-    tokio::spawn(async move {
-        pump_stderr(stderr, out_for_stderr, tx, Some(stderr_file)).await;
-        tee_stderr.fetch_sub(1, Ordering::SeqCst);
-    });
-
+    for h in [tee.stdout, tee.stderr] {
+        let t = tee_remaining.clone();
+        tokio::spawn(async move {
+            let _ = h.await;
+            t.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+    // Keep the park sender alive for the test's lifetime: dropping it would
+    // end `changed()` waits, not park the pumps (they wait for `true`).
+    std::mem::forget(_park_tx);
     Ok(SpawnedTask {
-        child,
-        status,
-        pid,
+        child: parts.child,
+        status: parts.status,
+        pid: parts.pid,
         output,
         chunks: rx,
         tee_remaining,
     })
 }
 
-async fn pump_stdout(
-    reader: ChildStdout,
-    out: Arc<Mutex<OutputState>>,
-    tx: mpsc::Sender<OutputChunk>,
-) {
-    pump_async(reader, out, tx, None).await;
+/// Resolves once `park` is true (immediately if it already is).
+pub async fn parked(park: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = park.wait_for(|p| *p).await;
 }
 
-async fn pump_stderr(
-    reader: ChildStderr,
-    out: Arc<Mutex<OutputState>>,
-    tx: mpsc::Sender<OutputChunk>,
-    mirror: Option<File>,
-) {
-    pump_async(reader, out, tx, mirror).await;
-}
-
-async fn pump_async<R: AsyncReadExt + Unpin>(
-    mut reader: R,
+async fn pump(
+    mut reader: pipe::Receiver,
     out: Arc<Mutex<OutputState>>,
     tx: mpsc::Sender<OutputChunk>,
     mut mirror: Option<File>,
-) {
+    mut park: tokio::sync::watch::Receiver<bool>,
+) -> Option<OwnedFd> {
     let mut buf = [0u8; READ_CHUNK];
     loop {
-        match reader.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                let chunk = buf[..n].to_vec();
-                if let Some(f) = mirror.as_mut() {
-                    let _ = f.write_all(&chunk);
-                }
-                let next_cursor = out.lock().unwrap().append(&chunk);
-                if tx
-                    .send(OutputChunk {
-                        bytes: chunk,
-                        next_cursor,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            // tokio retries EINTR internally, so any error here is terminal.
-            Err(_) => break,
+        let n = tokio::select! {
+            biased;
+            // Checked before every read: parking happens only between reads.
+            _ = parked(&mut park) => return reader.into_nonblocking_fd().ok(),
+            // Cancel-safe: bytes leave the pipe only when this completes.
+            r = reader.read(&mut buf) => match r {
+                Ok(0) => return None,
+                Ok(n) => n,
+                // tokio retries EINTR internally, so any error here is terminal.
+                Err(_) => return None,
+            },
+        };
+        let chunk = buf[..n].to_vec();
+        if let Some(f) = mirror.as_mut() {
+            let _ = f.write_all(&chunk);
+        }
+        let next_cursor = out.lock().unwrap().append(&chunk);
+        if tx.send(OutputChunk { bytes: chunk, next_cursor }).await.is_err() {
+            return None;
         }
     }
 }

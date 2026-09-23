@@ -6,7 +6,7 @@
 use crate::lifecycle::{self, Claim};
 use crate::proto::*;
 use crate::registry::{self, Access, Registry, TaskEntry};
-use crate::task::{self, SpawnedTask};
+use crate::task;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::process::ExitStatusExt;
@@ -71,6 +71,9 @@ pub struct DaemonState {
     pub shutdown_notify: Arc<Notify>,
     /// Time source for the daemon's own timers (see `clock.rs`).
     pub clock: crate::clock::Clock,
+    /// Turned true to park every task's pumps and exit watch between two
+    /// reads, so their state sits in the entries (an in-place upgrade).
+    pub park_tx: tokio::sync::watch::Sender<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +116,7 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
         shutdown: false,
         shutdown_notify: Arc::new(Notify::new()),
         clock: crate::clock::Clock::from_env(),
+        park_tx: tokio::sync::watch::channel(false).0,
     }));
 
     // Bind the well-known socket (§3.1). A plain tokio UnixListener: the
@@ -795,16 +799,12 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
     if let Some(parent) = out_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let spawned = task::spawn(&command, &cwd, &env, &out_path)
+    let (out_file, _) = task::open_output_files(&out_path)
+        .map_err(|e| ProtoError::new(E_INTERNAL, format!("open output: {e}")))?;
+    let parts = task::spawn_process(&command, &cwd, &env)
         .map_err(|e| ProtoError::new(E_INTERNAL, format!("spawn failed: {e}")))?;
-    let SpawnedTask {
-        child,
-        status,
-        pid,
-        output,
-        chunks,
-        tee_remaining,
-    } = spawned;
+    let pid = parts.pid;
+    let output = Arc::new(Mutex::new(task::OutputState::new(Some(out_file), 0)));
 
     let now = now_ms();
     let record = TaskRecord {
@@ -846,15 +846,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
                 "pid": pid,
             }),
         );
-        let mut entry = TaskEntry::new_running(
-            record,
-            child,
-            status,
-            output,
-            chunks,
-            timeout_ms,
-            tee_remaining,
-        );
+        let mut entry = TaskEntry::new_running(record, parts, output, timeout_ms);
         // A monitor exists to stream: its starter watches from spawn on, so a
         // command that prints and exits at once loses nothing to a late watch.
         if kind == TaskKind::Monitor {
@@ -862,8 +854,8 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         }
         st.registry.tasks.insert(task_id.clone(), entry);
     }
-    spawn_output_fanout(state, &task_id);
-    spawn_exit_watch(state, &task_id, pid);
+    start_task_io(state, &task_id);
+    spawn_exit_watch(state, &task_id);
     // §3.3: task_started is always pushed to the owning session.
     send_event_to_session(
         state,
@@ -1074,22 +1066,34 @@ async fn kill_group_hard(pgid: u32) {
 }
 
 /// After the grace, SIGKILL the *group* if anything in it may survive: the
-/// leader, or descendants that ignored SIGTERM after the leader died.
+/// leader, or descendants that ignored SIGTERM after the leader died. The
+/// due time is kept in the entry (`kill_grace_until_ms`) so an in-place
+/// upgrade re-arms the rest of the grace.
 fn spawn_kill_reaper(state: &Shared, task_id: &str, pid: u32) {
+    let clock = {
+        let mut st = state.lock().unwrap();
+        if let Some(e) = st.registry.tasks.get_mut(task_id) {
+            e.kill_grace_until_ms = Some(now_ms() + KILL_GRACE.as_millis() as u64);
+        }
+        st.clock.clone()
+    };
+    arm_kill_reaper(state, task_id, pid, clock, KILL_GRACE);
+}
+
+fn arm_kill_reaper(state: &Shared, task_id: &str, pid: u32, clock: crate::clock::Clock, grace: Duration) {
     let state2 = state.clone();
     let tid = task_id.to_string();
-    let clock = state.lock().unwrap().clock.clone();
     tokio::spawn(async move {
-        clock.sleep("kill-grace", KILL_GRACE).await;
+        clock.sleep("kill-grace", grace).await;
         let group_live = {
-            state2
-                .lock()
-                .unwrap()
-                .registry
-                .tasks
-                .get(&tid)
-                .map(|e| e.owns_live_group())
-                .unwrap_or(false)
+            let mut st = state2.lock().unwrap();
+            match st.registry.tasks.get_mut(&tid) {
+                Some(e) => {
+                    e.kill_grace_until_ms = None;
+                    e.owns_live_group()
+                }
+                None => false,
+            }
         };
         if group_live {
             kill_group_hard(pid).await;
@@ -1269,68 +1273,88 @@ fn handle_shutdown(state: &Shared, conn_id: u64) -> Result<UnitOk, ProtoError> {
 
 /// Forward tee'd output chunks to watching connections as `output` events
 /// (§3.3: output events only after watch).
-fn spawn_output_fanout(state: &Shared, task_id: &str) {
-    let mut rx = {
-        let mut st = state.lock().unwrap();
-        match st
-            .registry
-            .tasks
-            .get_mut(task_id)
-            .and_then(|e| e.chunks_rx.take())
-        {
-            Some(rx) => rx,
-            None => return,
+/// Start (or restart) a task's tee pumps and output fanout from the
+/// descriptors in its entry. A pipe already at EOF (None) is skipped.
+fn start_task_io(state: &Shared, task_id: &str) {
+    let mut st = state.lock().unwrap();
+    let park = st.park_tx.subscribe();
+    let Some(e) = st.registry.tasks.get_mut(task_id) else { return };
+    let (stdout, stderr) = (e.stdout_fd.take(), e.stderr_fd.take());
+    let mirror = task::open_output_files(std::path::Path::new(&e.record.output_path))
+        .ok()
+        .map(|(_, err)| err);
+    let (tx, rx) = tokio::sync::mpsc::channel(task::CHUNK_CHANNEL_CAP);
+    match task::start_tee(stdout, stderr, e.output.clone(), mirror, tx, park.clone()) {
+        Ok(tee) => e.tee = Some(tee),
+        Err(err) => {
+            let home = st.home.clone();
+            lifecycle::log_line(&home, &format!("tee {task_id}: {err}"));
+            return;
         }
-    };
-    let state2 = state.clone();
+    }
+    let delivered = e.delivered_cursor;
     let tid = task_id.to_string();
-    tokio::spawn(async move {
-        // Pipe reads split UTF-8 sequences arbitrarily. Hold an incomplete
-        // trailing sequence back and prepend it to the next read, so events
-        // never carry U+FFFD for valid text; `next_cursor` points at the
-        // first byte not yet sent. The remainder is flushed at EOF.
-        let mut carry: Vec<u8> = Vec::new();
-        let mut last_cursor = 0u64;
-        loop {
-            let (bytes, next_cursor) = match rx.recv().await {
-                Some(c) => {
-                    last_cursor = c.next_cursor;
-                    let mut data = std::mem::take(&mut carry);
-                    data.extend_from_slice(&c.bytes);
-                    let n = task::utf8_chunk_len(&data, usize::MAX, CHUNK_JSON_BUDGET, true);
-                    carry = data.split_off(n);
-                    (data, c.next_cursor - carry.len() as u64)
+    let state2 = state.clone();
+    e.fanout = Some(tokio::spawn(run_output_fanout(state2, tid, rx, delivered, park)));
+}
+
+/// Push a task's output chunks to its watchers as `output` events.
+///
+/// Pipe reads split UTF-8 sequences arbitrarily. An incomplete trailing
+/// sequence is held back and prepended to the next read, so events never
+/// carry U+FFFD for valid text; `next_cursor` points at the first byte not
+/// yet sent (`delivered_cursor`). The remainder is flushed at EOF, but kept
+/// back when the pumps were parked: it is completed by the bytes that
+/// follow once reading resumes.
+async fn run_output_fanout(
+    state: Shared,
+    tid: String,
+    mut rx: tokio::sync::mpsc::Receiver<task::OutputChunk>,
+    delivered: u64,
+    park: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut carry: Vec<u8> = Vec::new();
+    let mut last_cursor = delivered;
+    loop {
+        let (bytes, next_cursor) = match rx.recv().await {
+            Some(c) => {
+                last_cursor = c.next_cursor;
+                let mut data = std::mem::take(&mut carry);
+                data.extend_from_slice(&c.bytes);
+                let n = task::utf8_chunk_len(&data, usize::MAX, CHUNK_JSON_BUDGET, true);
+                carry = data.split_off(n);
+                (data, c.next_cursor - carry.len() as u64)
+            }
+            None if !carry.is_empty() && !*park.borrow() => (std::mem::take(&mut carry), last_cursor),
+            None => break,
+        };
+        let chunk = task::OutputChunk { bytes, next_cursor };
+        let targets: Vec<OutTx> = {
+            let mut st = state.lock().unwrap();
+            let watcher_ids: Vec<u64> = match st.registry.tasks.get_mut(&tid) {
+                Some(e) => {
+                    e.record.output_size = last_cursor; // monotonic (§3.4)
+                    e.delivered_cursor = chunk.next_cursor;
+                    e.watchers.iter().copied().collect()
                 }
-                None if !carry.is_empty() => (std::mem::take(&mut carry), last_cursor),
                 None => break,
             };
-            let chunk = task::OutputChunk { bytes, next_cursor };
-            let targets: Vec<OutTx> = {
-                let mut st = state2.lock().unwrap();
-                let watcher_ids: Vec<u64> = match st.registry.tasks.get_mut(&tid) {
-                    Some(e) => {
-                        e.record.output_size = last_cursor; // monotonic (§3.4)
-                        e.watchers.iter().copied().collect()
-                    }
-                    None => break,
-                };
-                watcher_ids
-                    .iter()
-                    .filter_map(|cid| st.conns.get(cid).map(|h| h.tx.clone()))
-                    .collect()
-            };
-            if !targets.is_empty() && !chunk.bytes.is_empty() {
-                let ev = encode_event(&EventKind::Output {
-                    task_id: tid.clone(),
-                    chunk: String::from_utf8_lossy(&chunk.bytes).into_owned(),
-                    next_cursor: chunk.next_cursor,
-                });
-                for tx in targets {
-                    let _ = tx.try_send(ev.clone());
-                }
+            watcher_ids
+                .iter()
+                .filter_map(|cid| st.conns.get(cid).map(|h| h.tx.clone()))
+                .collect()
+        };
+        if !targets.is_empty() && !chunk.bytes.is_empty() {
+            let ev = encode_event(&EventKind::Output {
+                task_id: tid.clone(),
+                chunk: String::from_utf8_lossy(&chunk.bytes).into_owned(),
+                next_cursor: chunk.next_cursor,
+            });
+            for tx in targets {
+                let _ = tx.try_send(ev.clone());
             }
         }
-    });
+    }
 }
 
 /// How a task's process ended, as far as we could observe it.
@@ -1390,50 +1414,77 @@ async fn read_status_line(
 /// runner was SIGKILLed with its group, e.g. after a stop grace or the
 /// timeout), the runner's wait status stands in: it died of the same
 /// signal as the group.
-fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
-    let state2 = state.clone();
-    let tid = task_id.to_string();
-    tokio::spawn(async move {
-        let (child, status_rx, timeout_ms, output, tee) = {
-            let mut st = state2.lock().unwrap();
-            match st.registry.tasks.get_mut(&tid) {
-                Some(e) => (
-                    e.child.take(),
-                    e.status_rx.take(),
-                    e.timeout_ms,
-                    Some(e.output.clone()),
-                    e.tee_remaining.take(),
-                ),
-                None => (None, None, None, None, None),
-            }
-        };
-        let (Some(mut child), Some(mut status_rx), Some(output)) = (child, status_rx, output) else {
-            return;
-        };
-        let mut line = Vec::new();
+///
+/// The watch resumes from the entry (`exit_phase`, runner, status pipe,
+/// partial status line) and, when parked, puts all of it back there.
+fn spawn_exit_watch(state: &Shared, task_id: &str) {
+    let handle = tokio::spawn(run_exit_watch(state.clone(), task_id.to_string()));
+    if let Some(e) = state.lock().unwrap().registry.tasks.get_mut(task_id) {
+        e.exit_watch = Some(handle);
+    }
+}
+
+enum Parked {
+    Yes,
+}
+
+async fn run_exit_watch(state: Shared, tid: String) {
+    let (runner, status_rx, line, phase, pid, deadline, timed_out, mut park) = {
+        let mut st = state.lock().unwrap();
+        let park = st.park_tx.subscribe();
+        match st.registry.tasks.get_mut(&tid) {
+            Some(e) => (
+                e.child.take(),
+                e.status_rx.take(),
+                std::mem::take(&mut e.status_partial),
+                e.exit_phase,
+                e.record.pid,
+                e.timeout_deadline_ms,
+                e.timed_out,
+                park,
+            ),
+            None => return,
+        }
+    };
+    let Some(mut runner) = runner else { return };
+    let mut line = line;
+    // Put everything back for whoever resumes the watch.
+    let put_back = |runner: task::RunnerProc, status_rx: Option<tokio::net::unix::pipe::Receiver>, line: Vec<u8>| {
+        if let Some(e) = state.lock().unwrap().registry.tasks.get_mut(&tid) {
+            e.child = Some(runner);
+            e.status_rx = status_rx;
+            e.status_partial = line;
+        }
+    };
+    if phase == registry::ExitPhase::AwaitReport {
+        let Some(mut status_rx) = status_rx else { return };
         let first = {
-            let wait = child.wait();
-            tokio::pin!(wait);
-            let report = read_status_line(&mut status_rx, &mut line);
-            tokio::pin!(report);
+            let timeout_left = deadline.map(|d| d.saturating_sub(now_ms()));
             let timeout = async {
-                match timeout_ms {
-                    Some(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
-                    None => std::future::pending().await,
+                match (timeout_left, timed_out) {
+                    (Some(ms), false) => tokio::time::sleep(Duration::from_millis(ms)).await,
+                    _ => std::future::pending().await,
                 }
             };
             tokio::pin!(timeout);
-            let mut timed_out = false;
+            let mut timed_out = timed_out;
             loop {
+                let wait = runner.wait();
+                tokio::pin!(wait);
+                let report = read_status_line(&mut status_rx, &mut line);
+                tokio::pin!(report);
                 tokio::select! {
-                    r = &mut report => break FirstSeen::Report(r),
-                    s = &mut wait => break FirstSeen::RunnerExit(s.ok()),
+                    biased;
+                    _ = task::parked(&mut park) => break Err(Parked::Yes),
+                    r = &mut report => break Ok(FirstSeen::Report(r)),
+                    s = &mut wait => break Ok(FirstSeen::RunnerExit(s)),
                     _ = &mut timeout, if !timed_out => {
                         // §3.3: timeout_ms is a hard kill ceiling.
                         timed_out = true;
                         {
-                            let mut st = state2.lock().unwrap();
+                            let mut st = state.lock().unwrap();
                             if let Some(e) = st.registry.tasks.get_mut(&tid) {
+                                e.timed_out = true;
                                 if e.record.status == TaskStatus::Running {
                                     e.request_kill(end_reason::TIMEOUT);
                                 }
@@ -1444,43 +1495,25 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
                 }
             }
         };
+        let first = match first {
+            Ok(f) => f,
+            Err(Parked::Yes) => {
+                put_back(runner, Some(status_rx), line);
+                return;
+            }
+        };
         match first {
             FirstSeen::Report(Some(r)) => {
                 let outcome = Outcome { code: r.code, signal: r.signal };
-                if let Some(tee) = &tee {
-                    wait_tee_drained(tee, &output).await;
-                }
-                if r.linger {
-                    finalize_exit(&state2, &tid, outcome, Leftover::Guarded);
-                    // The runner exits once the group is empty.
-                    let _ = child.wait().await;
-                    // A runner that died abnormally (e.g. SIGKILLed) may
-                    // leave descendants behind: the group is still ours to
-                    // kill (§3.2). Probe before clearing the flag; kill any
-                    // survivors and track the group until it empties.
-                    let survivors = crate::sys::group_has_others(pid);
-                    if survivors {
-                        kill_group_hard(pid).await;
-                    }
-                    let mut lingering = false;
-                    if let Some(e) = state2.lock().unwrap().registry.tasks.get_mut(&tid) {
-                        e.group_lingering = survivors;
-                        lingering = survivors;
-                    }
-                    if lingering {
-                        spawn_group_watcher(&state2, &tid, pid);
-                    }
-                } else {
-                    finalize_exit(&state2, &tid, outcome, Leftover::None);
-                    let _ = child.wait().await; // reap the runner
-                }
+                let leftover = if r.linger { Leftover::Guarded } else { Leftover::None };
+                finalize_exit(&state, &tid, outcome, leftover);
+                set_exit_phase(&state, &tid, registry::ExitPhase::AwaitRunnerExit);
             }
             FirstSeen::Report(None) => {
-                let s = child.wait().await.ok();
-                if let Some(tee) = &tee {
-                    wait_tee_drained(tee, &output).await;
-                }
-                finalize_exit(&state2, &tid, Outcome::of(s), Leftover::Probe);
+                let s = runner.wait().await;
+                finalize_exit(&state, &tid, Outcome::of(s), Leftover::Probe);
+                set_exit_phase(&state, &tid, registry::ExitPhase::Done);
+                return;
             }
             FirstSeen::RunnerExit(s) => {
                 // A report written just before the runner exited may still
@@ -1489,19 +1522,37 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
                     wait_tee_drained(tee, &output).await;
                 }
                 match read_status_line(&mut status_rx, &mut line).await {
-                    // Probe even when the report said "alone": the group
-                    // may have been unenumerable for the runner.
-                    Some(r) => finalize_exit(
-                        &state2,
-                        &tid,
-                        Outcome { code: r.code, signal: r.signal },
-                        Leftover::Probe,
-                    ),
-                    None => finalize_exit(&state2, &tid, Outcome::of(s), Leftover::Probe),
+                    Some(r) => {
+                        let leftover = if r.linger { Leftover::Probe } else { Leftover::None };
+                        finalize_exit(&state, &tid, Outcome { code: r.code, signal: r.signal }, leftover);
+                    }
+                    None => finalize_exit(&state, &tid, Outcome::of(s), Leftover::Probe),
                 }
+                set_exit_phase(&state, &tid, registry::ExitPhase::Done);
+                return;
             }
         }
-    });
+    }
+    // AwaitRunnerExit: the runner exits once its group is empty (a guardian)
+    // or right away; either way it is reaped here.
+    tokio::select! {
+        biased;
+        _ = task::parked(&mut park) => {
+            put_back(runner, None, Vec::new());
+            return;
+        }
+        _ = runner.wait() => {}
+    }
+    if let Some(e) = state.lock().unwrap().registry.tasks.get_mut(&tid) {
+        e.group_lingering = false;
+        e.exit_phase = registry::ExitPhase::Done;
+    }
+}
+
+fn set_exit_phase(state: &Shared, tid: &str, phase: registry::ExitPhase) {
+    if let Some(e) = state.lock().unwrap().registry.tasks.get_mut(tid) {
+        e.exit_phase = phase;
+    }
 }
 
 /// The record's terminal `output_size` is snapshotted at finalize, so the
