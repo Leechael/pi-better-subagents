@@ -182,6 +182,9 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
 
+    // Keep accepting while shutting down: a new client then gets a prompt
+    // "manager is shutting down" instead of hanging until its hello timeout.
+    let mut shutdown_task: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         tokio::select! {
             res = listener.accept() => match res {
@@ -194,30 +197,44 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             },
-            _ = shutdown_notify.notified() => break,
+            _ = shutdown_notify.notified(), if shutdown_task.is_none() => {
+                shutdown_task = Some(begin_shutdown(&state));
+            }
             _ = async {
                 match sigterm.as_mut() {
                     Some(s) => { s.recv().await; }
                     None => std::future::pending::<()>().await,
                 }
-            } => {
+            }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, "received SIGTERM");
-                break;
+                shutdown_task = Some(begin_shutdown(&state));
             }
             _ = async {
                 match sigint.as_mut() {
                     Some(s) => { s.recv().await; }
                     None => std::future::pending::<()>().await,
                 }
-            } => {
+            }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, "received SIGINT");
-                break;
+                shutdown_task = Some(begin_shutdown(&state));
             }
+            _ = async {
+                match shutdown_task.as_mut() {
+                    Some(t) => { let _ = t.await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => break,
         }
     }
-
-    graceful_shutdown(&state).await;
     0
+}
+
+/// Mark the manager as shutting down (new hellos are refused) and run the
+/// graceful shutdown as its own task.
+fn begin_shutdown(state: &Shared) -> tokio::task::JoinHandle<()> {
+    state.lock().unwrap().shutdown = true;
+    let s = state.clone();
+    tokio::spawn(async move { graceful_shutdown(&s).await })
 }
 
 // ---------------------------------------------------------------------------
@@ -398,7 +415,7 @@ fn register_conn(
 ) -> Result<u64, ProtoError> {
     let mut st = state.lock().unwrap();
     if st.shutdown {
-        return Err(ProtoError::new(E_INTERNAL, "manager is shutting down"));
+        return Err(ProtoError::new(E_INTERNAL, SHUTTING_DOWN));
     }
     // A fresh active connection cancels any pending idle shutdown (§3.2).
     if let Some(t) = st.idle_timer.take() {
@@ -664,7 +681,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
     let (session_id, home) = {
         let st = state.lock().unwrap();
         if st.shutdown {
-            return Err(ProtoError::new(E_INTERNAL, "manager is shutting down"));
+            return Err(ProtoError::new(E_INTERNAL, SHUTTING_DOWN));
         }
         let h = st
             .conns

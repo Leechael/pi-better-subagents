@@ -109,6 +109,17 @@ pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, Str
     Ok(conn)
 }
 
+/// Wait until the manager named in manager.pid has exited.
+async fn wait_for_manager_exit(home: &Path, timeout: Duration) {
+    let Some(pid) = lifecycle::read_pid_file(home).map(|p| p.pid) else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    while task::pid_alive(pid) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn wait_for_socket(home: &Path, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
@@ -155,6 +166,11 @@ pub async fn connect(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
         match connect_existing(home, mode).await {
             Ok(c) => return Ok(c),
             Err(e) => last_err = e,
+        }
+        if last_err.contains(SHUTTING_DOWN) {
+            // A graceful shutdown takes at most the 2s kill grace. A
+            // successor can only claim manager.lock once this one is gone.
+            wait_for_manager_exit(home, Duration::from_secs(5)).await;
         }
         if attempt > 0 {
             break;

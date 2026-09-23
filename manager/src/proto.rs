@@ -27,6 +27,9 @@ pub const E_VERSION: &str = "E_VERSION";
 pub const E_SESSION_REQUIRED: &str = "E_SESSION_REQUIRED";
 pub const E_FORBIDDEN: &str = "E_FORBIDDEN";
 pub const E_INTERNAL: &str = "E_INTERNAL";
+/// `E_INTERNAL` message for requests (hello included) during graceful
+/// shutdown. Clients wait for that manager to exit, then spawn a successor.
+pub const SHUTTING_DOWN: &str = "manager is shutting down";
 
 /// §3.3: signals travel as names ("SIGTERM", "SIGKILL"). Unknown numbers
 /// render as "SIG<n>".

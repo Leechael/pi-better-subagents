@@ -421,21 +421,55 @@ fn d8_hello_during_shutdown_is_refused_and_does_not_cancel() {
     let (id, pid) = a.start("trap '' TERM; echo armed; sleep 300");
     wait_output_contains(&mut a, &id, "armed");
 
-    // Accepted before shutdown, hello after: once shutdown starts the accept
-    // loop is gone, so this is the only way a hello can race shutdown.
+    // Accepted before shutdown, hello after.
     let mut late = home.connect();
     std::thread::sleep(MS(200));
     let out = home.cli(&["shutdown"], S(10));
     assert!(out.status.success(), "shutdown: {}", out.stderr);
     assert!(out.stdout.contains("shutting down"));
     // The SIGTERM-ignoring task holds shutdown in its 2s grace; say hello now.
-    match late.try_request(json!({"type":"hello","client_kind":"extension","session_id":"late","pi_pid":1}), S(3)) {
+    let hello = json!({"type":"hello","client_kind":"extension","session_id":"late","pi_pid":1});
+    match late.try_request(hello.clone(), S(3)) {
         Some(r) => assert_eq!(r["ok"], false, "hello accepted during shutdown: {r}"),
         None => assert!(late.closed, "hello neither answered nor refused"),
     }
+    // A connection made after shutdown began is still accepted, and its
+    // hello is refused at once (not left to hang until the client gives up).
+    let mut fresh = home.connect();
+    let r = fresh
+        .try_request(hello, S(2))
+        .expect("a hello during shutdown must be answered promptly");
+    assert_eq!(r["ok"], false, "hello accepted during shutdown: {r}");
+    assert!(r["error"]["message"].as_str().unwrap_or("").contains("shutting down"), "{r}");
     assert!(wait_child(&mut daemon, S(8)).is_some(), "late hello cancelled shutdown");
     assert!(!pid_running(pid));
     // The still-open extension connection did not block the explicit shutdown.
+    drop(a);
+}
+
+/// D8b: a CLI command issued while the manager is shutting down does not
+/// stall and does not fail: its hello is refused at once, it waits for the
+/// old manager to exit, then spawns a successor.
+#[test]
+fn d8b_cli_during_shutdown_reaches_a_successor() {
+    let home = Home::new("d8b");
+    let mut daemon = home.start_daemon();
+    let old = daemon.id();
+    let mut a = home.connect();
+    a.hello_ext("sess-a");
+    let (id, _) = a.start("trap '' TERM; echo armed; sleep 300");
+    wait_output_contains(&mut a, &id, "armed");
+    assert!(home.cli(&["shutdown"], S(10)).status.success());
+    // The TERM-ignoring task holds shutdown in its 2s kill grace. (The
+    // pause lets the daemon act on the shutdown it just acknowledged.)
+    std::thread::sleep(MS(200));
+    let path = home.path.clone();
+    let ls = std::thread::spawn(move || run_cli(&path, &["ls"], S(20)));
+    assert!(wait_child(&mut daemon, S(8)).is_some());
+    let out = ls.join().unwrap();
+    assert!(out.status.success(), "ls during shutdown failed: {}", out.stderr);
+    let new = home.pidfile_pid().expect("a successor manager");
+    assert_ne!(new, old);
     drop(a);
 }
 

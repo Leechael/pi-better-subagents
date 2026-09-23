@@ -300,7 +300,7 @@ mechanism = "hello during shutdown is refused and cannot resurrect the daemon"
 file = "src/daemon.rs"
 find = '''
     if st.shutdown {
-        return Err(ProtoError::new(E_INTERNAL, "manager is shutting down"));
+        return Err(ProtoError::new(E_INTERNAL, SHUTTING_DOWN));
     }
     // A fresh'''
 replace = '''
@@ -472,4 +472,25 @@ tests = [
   "observability::c8_doctor_checks_and_exit_status",
   "mutation_gaps::g13_doctor_cleans_only_without_a_daemon",
 ]
+expect = "red"
+
+[[ablation]]
+id = "accept-during-shutdown"
+mechanism = "the daemon keeps accepting during graceful shutdown and refuses hello at once (no client stalls until its response timeout)"
+file = "src/daemon.rs"
+find = "            _ = shutdown_notify.notified(), if shutdown_task.is_none() => {\n                shutdown_task = Some(begin_shutdown(&state));\n            }"
+replace = "            _ = shutdown_notify.notified(), if shutdown_task.is_none() => {\n                let _ = begin_shutdown(&state).await;\n                break;\n            }"
+tests = [
+  "lifecycle_adversarial::d8_hello_during_shutdown_is_refused_and_does_not_cancel",
+  "lifecycle_adversarial::d8b_cli_during_shutdown_reaches_a_successor",
+]
+expect = "red"
+
+[[ablation]]
+id = "client-waits-out-shutdown"
+mechanism = "a client refused with 'manager is shutting down' waits for that manager to exit, then spawns a successor"
+file = "src/client.rs"
+find = "            wait_for_manager_exit(home, Duration::from_secs(5)).await;"
+replace = ""
+tests = ["lifecycle_adversarial::d8b_cli_during_shutdown_reaches_a_successor"]
 expect = "red"

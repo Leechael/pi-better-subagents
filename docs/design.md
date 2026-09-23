@@ -87,6 +87,7 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
   2. 2s grace → 对仍可能有成员的**进程组**发 SIGKILL(即使 leader 已死,忽略 SIGTERM 的子孙也会被杀)
   3. 任务状态落盘标记 `killed`(reason: "manager_shutdown")
   4. 删除 socket/pid 文件,退出
+- shutdown 期间 manager 仍接受新连接,但立即拒绝其 `hello`(`E_INTERNAL` "manager is shutting down");客户端等该 manager 退出(最多 2s kill grace)后 spawn 继任者,而不是卡到响应超时
 - 后台任务不允许比最后一个 pi 活得久。`pi --resume` 的 reattach 只在"还有其他 pi 活着"时成立
 - manager **永不自我复活**;只有客户端(扩展/CLI)在需要时 spawn
 
