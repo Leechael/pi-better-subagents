@@ -421,7 +421,8 @@ export function taskDetailInfo(item: WorkItem, now: number): string {
   if (item.runId) lines.push(`Run: ${item.runId}`);
   if (item.agent) lines.push(`Agent: ${item.agent}`);
   if (item.model) lines.push(`Model: ${item.model}`);
-  if (item.prompt) lines.push(`Task prompt:\n${item.prompt}`);
+  if (item.prompt) lines.push(`Task prompt (user-authored):\n${item.prompt}`);
+  if (item.preamble) lines.push(`Agent preamble (injected):\n${item.preamble}`);
   if (item.error) lines.push(`Error: ${item.error}`);
   return lines.join("\n");
 }

@@ -33,6 +33,8 @@ export interface WorkItem {
   model?: string;
   /** User-authored prompt, excluding injected agent/model preamble. */
   prompt?: string;
+  /** Agent-authored preamble, shown separately from the user task prompt. */
+  preamble?: string;
   /** Last assistant text, for task_output on ch_ ids. */
   text?: string;
   /** Failure reason for failed agents (shown in /tasks and task_list). */

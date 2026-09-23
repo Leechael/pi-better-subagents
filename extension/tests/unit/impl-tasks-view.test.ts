@@ -98,10 +98,14 @@ describe("tasks view", () => {
       cwd: "/tmp/project",
       exitCode: 3,
       outputPath: "/tmp/sh_1.output",
+      prompt: "Build the release binary",
+      preamble: "Use the project's release checklist",
       error: "exit 3",
     };
     expect(taskDetailHeader(task, 5_001)).toBe("sh_1 · shell · exit 3 · 5s · /tmp/project\n$ make build");
     expect(taskDetailInfo(task, 5_001)).toContain("Output: /tmp/sh_1.output");
+    expect(taskDetailInfo(task, 5_001)).toContain("Task prompt (user-authored):\nBuild the release binary");
+    expect(taskDetailInfo(task, 5_001)).toContain("Agent preamble (injected):\nUse the project's release checklist");
     expect(taskDetailInfo(task, 5_001)).toContain("Error: exit 3");
   });
 

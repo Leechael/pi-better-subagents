@@ -40,8 +40,10 @@ export interface RunRecord {
     agent: string;
     model?: string;
     status: ChildStatus;
-    /** Prompt actually sent to the child (after chain interpolation). */
+    /** User-authored prompt (after chain interpolation), without injected preamble. */
     prompt?: string;
+    /** Agent-authored instructions prepended to the task prompt. */
+    preamble?: string;
     result?: ChildResult;
     startedAt: number;
     endedAt?: number;
@@ -103,6 +105,7 @@ interface InternalChild {
   model?: string;
   status: ChildStatus;
   prompt?: string;
+  preamble?: string;
   result?: ChildResult;
   startedAt: number;
   endedAt?: number;
@@ -317,6 +320,7 @@ export class SubagentRegistry implements RunRegistry {
     if (!child) throw new Error(`unknown child ${req.childId} (addChild first)`);
     child.shouldStart = opts?.shouldStart;
     child.prompt = req.taskPrompt ?? req.prompt;
+    child.preamble = req.agent.systemPrompt || undefined;
     child.model = req.model ?? req.agent.model;
 
     const runner = this.runner;
@@ -562,6 +566,7 @@ function snapshot(run: InternalRun): RunRecord {
       ...(c.model !== undefined ? { model: c.model } : {}),
       status: c.status,
       ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
+      ...(c.preamble !== undefined ? { preamble: c.preamble } : {}),
       result: c.result,
       startedAt: c.startedAt,
       endedAt: c.endedAt,

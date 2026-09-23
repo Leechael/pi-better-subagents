@@ -456,6 +456,7 @@ export default function (pi: ExtensionAPI): void {
           ...(c.model !== undefined ? { model: c.model } : {}),
           cwd: startCtx.cwd,
           ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
+          ...(c.preamble !== undefined ? { preamble: c.preamble } : {}),
           ...(c.result?.text ? { text: c.result.text } : {}),
           ...(c.result?.error ? { error: c.result.error } : {}),
         });

@@ -55,6 +55,7 @@ describe("SubagentRegistry", () => {
     });
     const run = registry.createRun("tasks");
     const req = addReq(registry, run.runId, "a");
+    req.agent = { ...WORKER_AGENT, systemPrompt: "agent preamble" };
     req.prompt = "agent preamble\n\n---\n\ndo a";
     req.taskPrompt = "do a";
     const handle = await registry.startChild(req);
@@ -69,6 +70,7 @@ describe("SubagentRegistry", () => {
     expect(record.children[0].status).toBe("completed");
     expect(record.children[0].result?.text).toBe("done");
     expect(record.children[0].prompt).toBe("do a");
+    expect(record.children[0].preamble).toBe("agent preamble");
     expect(record.children[0].endedAt).toBeTypeOf("number");
     // Transitions observed: run creation, addChild, running, completed.
     expect(seen.some((s) => s.children === "pending")).toBe(true);
