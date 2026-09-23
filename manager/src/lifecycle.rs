@@ -227,7 +227,13 @@ pub fn scan_tasks(home: &Path, registry: &mut Registry) -> ScanResult {
     for mut rec in registry::load_all_records(home) {
         if rec.status == TaskStatus::Running {
             if task::pid_alive(rec.pid) {
-                // §3.4: pid alive -> re-adopt; output file keeps being tailed.
+                // §3.4: pid alive -> re-adopt. The persisted output_size lags
+                // (it is only written at exit), so recover it from the file.
+                // The file cannot grow any more: the task's stdout pipe died
+                // with the old manager.
+                if let Ok(m) = fs::metadata(&rec.output_path) {
+                    rec.output_size = rec.output_size.max(m.len());
+                }
                 result.readopted.push((rec.task_id.clone(), rec.pid));
                 registry.tasks.insert(rec.task_id.clone(), TaskEntry::adopted(rec));
             } else {

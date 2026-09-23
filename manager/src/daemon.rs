@@ -151,7 +151,7 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
         );
     }
 
-    // §3.4: re-adopted tasks get a kill(pid,0) poller + output tailer.
+    // §3.4: re-adopted tasks get a kill(pid,0) exit poller.
     for (task_id, pid) in scan.readopted {
         spawn_adopted_poller(&state, &task_id, pid);
     }
@@ -1072,8 +1072,10 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
     });
 }
 
-/// §3.4 re-adopt: poll kill(pid, 0) every second; keep tailing the output
-/// file for late writes. Exit code is unobtainable -> completed/null.
+/// §3.4 re-adopt: poll kill(pid, 0) every second. Exit code is unobtainable
+/// -> completed/null. No output tailing: the task's stdout pipe died with the
+/// old manager, so the output file cannot grow; `scan_tasks` already
+/// recovered its final size.
 fn spawn_adopted_poller(state: &Shared, task_id: &str, pid: u32) {
     let state2 = state.clone();
     let tid = task_id.to_string();
@@ -1081,46 +1083,15 @@ fn spawn_adopted_poller(state: &Shared, task_id: &str, pid: u32) {
         let mut tick = tokio::time::interval(ADOPT_POLL);
         loop {
             tick.tick().await;
-            let (path, known) = {
-                let st = state2.lock().unwrap();
-                match st.registry.tasks.get(&tid) {
-                    Some(e) if e.record.status == TaskStatus::Running => {
-                        let total = e.output.lock().unwrap().total_size;
-                        (e.record.output_path.clone(), total)
-                    }
-                    _ => break, // finalized elsewhere (stop/shutdown)
-                }
-            };
-            if let Ok((bytes, next)) =
-                task::read_file_range(std::path::Path::new(&path), known, MAX_OUTPUT_READ as usize)
-            {
-                if !bytes.is_empty() {
-                    let targets: Vec<OutTx> = {
-                        let mut st = state2.lock().unwrap();
-                        let watcher_ids: Vec<u64> = match st.registry.tasks.get_mut(&tid) {
-                            Some(e) => {
-                                e.output.lock().unwrap().append(&bytes);
-                                e.record.output_size = next;
-                                e.watchers.iter().copied().collect()
-                            }
-                            None => break,
-                        };
-                        watcher_ids
-                            .iter()
-                            .filter_map(|cid| st.conns.get(cid).map(|h| h.tx.clone()))
-                            .collect()
-                    };
-                    if !targets.is_empty() {
-                        let ev = encode_event(&EventKind::Output {
-                            task_id: tid.clone(),
-                            chunk: String::from_utf8_lossy(&bytes).into_owned(),
-                            next_cursor: next,
-                        });
-                        for tx in targets {
-                            let _ = tx.try_send(ev.clone());
-                        }
-                    }
-                }
+            let running = state2
+                .lock()
+                .unwrap()
+                .registry
+                .tasks
+                .get(&tid)
+                .is_some_and(|e| e.record.status == TaskStatus::Running);
+            if !running {
+                break; // finalized elsewhere (stop/shutdown)
             }
             if !task::pid_alive(pid) {
                 finalize_exit(&state2, &tid, None);
