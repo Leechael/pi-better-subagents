@@ -58,6 +58,48 @@ describe("MonitorRegistry saturation", () => {
 });
 
 describe("MonitorRegistry reconnect output recovery", () => {
+  it("slices a replayed UTF-8 byte overlap after the backfill cursor", async () => {
+    const clock = new ManualClock();
+    const delivered: string[] = [];
+    let registry!: MonitorRegistry;
+    let watchCount = 0;
+    const backfill = `${"中\n".repeat(200)}${"字\n".repeat(50)}`;
+    const replay = `${"字\n".repeat(25)}${"N".repeat(96)}\n`;
+    const manager = {
+      ensureAvailable: async () => true,
+      isAvailable: () => true,
+      start: async () => ({ task_id: "mon_utf8", pid: 13 }),
+      watch: async () => { watchCount++; },
+      output: async (_id: string, cursor: number) => {
+        if (cursor === 0) {
+          registry.handleOutput("mon_utf8", replay, 1097);
+          return { chunk: backfill, next_cursor: 1000, status: "running", exit_code: null, total_size: 1097 };
+        }
+        return { chunk: "", next_cursor: cursor, status: "running", exit_code: null, total_size: 1097 };
+      },
+      stop: async () => {},
+    } as unknown as ManagerClient;
+    const center = {
+      notifyMonitorEvent: (_description: string, _taskId: string, text: string) => delivered.push(text),
+      notify: () => {},
+    } as unknown as NotifyCenter;
+    registry = new MonitorRegistry({
+      getClient: () => manager,
+      sessionEnv: () => ({}),
+      getNotifyCenter: () => center,
+      trackTask: () => {},
+      clock,
+    });
+    await registry.start({ command: "ticker", description: "ticker", persistent: true }, { cwd: "/tmp" } as ExtensionContext);
+    await registry.rewatchAll();
+    clock.advanceBy(200);
+    expect(watchCount).toBe(2);
+    expect(delivered.join("\n")).toBe(`${backfill.slice(0, -1)}\n${"N".repeat(96)}`);
+    expect(delivered.join("\n").match(/字/g)).toHaveLength(50);
+    expect(delivered.join("\n").match(/N/g)).toHaveLength(96);
+    registry.disposeAll();
+  });
+
   it("fetches the gap before queued events and dedupes overlapping cursors", async () => {
     const clock = new ManualClock();
     const sent: { details?: unknown; content?: string }[] = [];
