@@ -192,9 +192,16 @@ describe("ManagerClient (integration, fake manager)", () => {
   it("dispatches server-pushed events to onEvent handlers", async () => {
     await client.connect();
     const events: ManagerEvent[] = [];
-    client.onEvent((e) => events.push(e));
+    let resolveEvents!: () => void;
+    const eventsReady = new Promise<void>((resolve) => {
+      resolveEvents = resolve;
+    });
+    client.onEvent((e) => {
+      events.push(e);
+      if (events.length === 2) resolveEvents();
+    });
     await client.watch("mon_x");
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await eventsReady;
     expect(events.map((e) => e.event)).toEqual(["output", "task_exited"]);
     expect(events[0]).toMatchObject({ task_id: "mon_x", chunk: "tick\n" });
     expect(events[1]).toMatchObject({ task_id: "mon_x", exit_code: 0, duration_ms: 100 });
