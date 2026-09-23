@@ -60,7 +60,8 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 ~/.pi/agent/pbs/
 ├── manager.sock          # unix domain socket
 ├── manager.pid           # {pid, version, started_at} JSON
-├── manager.spawn.lock    # fd-lock 占用即有效
+├── manager.lock          # daemon 生命周期锁(flock,daemon 存活期间一直持有)
+├── manager.spawn.lock    # 客户端 spawn 锁(fd-lock 占用即有效)
 ├── manager.log           # manager 自身日志
 ├── config.json           # 可选用户配置
 └── sessions/<session_id>/tasks/<task_id>.json    # 任务状态
@@ -73,17 +74,17 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 2. 失败 → 抢 `manager.spawn.lock`(fd-lock,非阻塞 trylock)
 3. 抢到 → spawn `pbs-manager daemon`(detached)→ 轮询等 socket 就绪(2s 超时)→ 释放锁
 4. 没抢到 → 说明别人正在 spawn,轮询等 socket 就绪
-5. socket 存在但 hello 失败(僵尸 socket)→ 检查 manager.pid 的 pid 存活;死则清理 socket/pid 文件后重试一次
+5. socket 存在但连不上(僵尸 socket)→ 同 2–4:spawn 一个 daemon,由它清理。**客户端从不删除 socket/pid 文件**(否则可能删掉另一个客户端刚 spawn 出的 daemon 的 socket)
 
-`manager.pid` 与 socket 所有权: daemon 启动时先检查 pid 文件,pid 存活则拒绝启动(打印 "already running" 退出码 0);pid 死则清理后接管。
+`manager.pid` 与 socket 所有权: daemon 身份 = 持有 `manager.lock` 的独占 flock,从启动持有到退出(崩溃时由 OS 释放;fd 为 CLOEXEC,任务进程不继承)。daemon 启动时 trylock:失败 → 已有 daemon,打印 "already running" 退出码 0;成功 → 此时 socket/pid 文件必然陈旧,删除后 bind 并写 pid。不以 pid 存活判断身份(pid 可能被无关进程复用)。`doctor` 同理:只在拿到锁时清理陈旧文件。
 
 ### 3.2 生命周期(反僵尸硬语义)
 
 - 每个扩展连接在 `hello` 时注册 `{session_id, pi_pid}`;该连接即此 session 的控制通道
 - 连接断开(unix socket 下进程死亡必然触发,含 kill -9)→ 该 session 标记 disconnected
 - **活跃连接数归零持续 5s → graceful shutdown**:
-  1. 对所有 running 任务发 SIGTERM(进程组)
-  2. 2s grace → 未死的 SIGKILL
+  1. 对所有 running 任务发 SIGTERM(进程组);leader 已退出但进程组仍有成员(后台子进程)的任务也包括在内
+  2. 2s grace → 对仍可能有成员的**进程组**发 SIGKILL(即使 leader 已死,忽略 SIGTERM 的子孙也会被杀)
   3. 任务状态落盘标记 `killed`(reason: "manager_shutdown")
   4. 删除 socket/pid 文件,退出
 - 后台任务不允许比最后一个 pi 活得久。`pi --resume` 的 reattach 只在"还有其他 pi 活着"时成立
@@ -143,13 +144,18 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 ```
 - cursor 是字节偏移;`next_cursor` 供下次增量读
 - chunk 为 UTF-8 lossy 字符串;v1 不支持二进制保真
+- chunk 边界永不切断 UTF-8 字符:切点回退到字符边界,不会为合法文本产生 U+FFFD,也不会跳过字节(`next_cursor` 指向第一个未发送字节)。末尾不完整的序列在任务仍在运行时暂缓发送。若首个字符本身超过 `max_bytes`,整字符发出(chunk 最多超出 3 字节);`max_bytes:0` 返回空 chunk
+- chunk 经 JSON 转义后的大小受帧上限约束(控制字符转义为 6 字节),响应不会超过 4 MiB;任何放不进一帧的响应改为 `E_INTERNAL` 错误,连接保持可用
+- `watch` 的 `output` 事件同样遵守字符边界
 
 **stop**:
 ```json
 → {"type":"stop", "task_id":"sh_a1b2c3d4"}
 ← {"ok":true}
 ```
-SIGTERM 进程组 → 2s → SIGKILL。终态 `killed`。
+SIGTERM 进程组 → 2s → SIGKILL(发给进程组,leader 已退出也照发)。终态 `killed`。对已终止但仍有后台子进程残留的任务,`stop` 同样清理其进程组,状态不变。
+
+`signal` 字段(`task_exited` 事件与 TaskRecord)为信号名字符串,如 `"SIGTERM"` / `"SIGKILL"`;正常退出为 `null`。旧版本写入的数字仍可读取(按名称转换)。
 
 **list**:
 ```json
@@ -206,7 +212,7 @@ running ──exit 0──► completed
 
 - TaskRecord(磁盘 `<task_id>.json`): `{task_id, session_id, kind, command, cwd, pid, status, exit_code, signal, started_at, ended_at, output_path, output_size}`
 - 输出: 内存 ring buffer(64KB)+ 磁盘全量追加;`output_size` 单调增
-- **manager 重启 re-adopt**: 读 state dir,pid 存活 → re-adopt(继续 tail 输出文件;退出检测靠 `kill(pid,0)` 轮询 1s,退出码不可得 → 终态 `completed`, `exit_code:null`);pid 死 → `orphaned`
+- **manager 重启 re-adopt**: 读 state dir,pid 存活 → re-adopt(输出文件不会再增长——任务的 stdout 管道随旧 manager 一起断开——启动扫描时从文件长度恢复 `output_size`;退出检测靠 `kill(pid,0)` 轮询 1s,退出码不可得 → 终态 `completed`, `exit_code:null`);pid 死 → `orphaned`
 
 ### 3.5 CLI(inspection 管理,用户侧)
 

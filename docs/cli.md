@@ -35,7 +35,8 @@ Layout under home:
 ```
 manager.sock
 manager.pid
-manager.lock
+manager.lock          # held by the running daemon for its whole lifetime
+manager.spawn.lock    # held by a client while it spawns the daemon
 manager.log
 sessions/<session_id>/tasks/<task_id>.{json,output,stderr}
 ```
@@ -109,7 +110,7 @@ Columns: `TASK_ID KIND SESSION STATUS PID EXIT SIZE COMMAND`.
 `KIND` is `shell`, `monitor`, or `agent`. Running monitors are ordinary manager tasks (`mon_…`) and appear in the default running list. Agent rows whose session is not connected are not shown as running.
 
 - `COMMAND` is the **first line only**, then truncated (~60 chars).
-- `EXIT` is an exit code, `sigN`, or `-` while running.
+- `EXIT` is an exit code, a signal name such as `SIGTERM` / `SIGKILL`, or `-` while running.
 
 ### `start`
 
@@ -217,7 +218,7 @@ pbs-manager kill-session <session_id>
 
 ### `doctor`
 
-Filesystem consistency check: prints home / socket / pid / lock paths. If the pid file points at a dead process, removes stale pid/socket files. If the process is alive, probes the socket with a hello.
+Filesystem consistency check: prints home / socket / pid / lock paths and the pid file contents. A daemon is running exactly when it holds `manager.lock`; the recorded pid is not trusted, because it may belong to an unrelated process after a crash. If the lock is held, doctor probes the socket with a hello. If the lock is free, doctor takes it briefly and removes any stale socket/pid files while holding it, so a daemon cannot start mid-cleanup.
 
 ```bash
 pbs-manager doctor
