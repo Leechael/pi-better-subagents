@@ -253,7 +253,7 @@ async fn pump_async<R: AsyncReadExt + Unpin>(
                     break;
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // tokio retries EINTR internally, so any error here is terminal.
             Err(_) => break,
         }
     }
@@ -328,7 +328,7 @@ pub fn utf8_chunk_len(buf: &[u8], max: usize, budget: usize, more_may_follow: bo
 }
 
 // ---------------------------------------------------------------------------
-// File reading (output requests & re-adopt tailing)
+// File reading (output requests)
 // ---------------------------------------------------------------------------
 
 /// Read up to `max` bytes starting at byte `offset`. Missing file or an
@@ -339,24 +339,13 @@ pub fn read_file_range(path: &Path, offset: u64, max: usize) -> io::Result<(Vec<
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), offset)),
         Err(e) => return Err(e),
     };
-    let len = f.metadata()?.len();
-    if offset >= len {
-        return Ok((Vec::new(), offset));
-    }
+    // Seeking past EOF is fine for a regular file; the read is then empty.
+    // read_to_end retries EINTR itself.
     f.seek(SeekFrom::Start(offset))?;
-    let want = (len - offset).min(max as u64) as usize;
-    let mut buf = vec![0u8; want];
-    let mut read = 0usize;
-    while read < want {
-        match f.read(&mut buf[read..]) {
-            Ok(0) => break,
-            Ok(n) => read += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    buf.truncate(read);
-    Ok((buf, offset + read as u64))
+    let mut buf = Vec::new();
+    f.take(max as u64).read_to_end(&mut buf)?;
+    let next = offset + buf.len() as u64;
+    Ok((buf, next))
 }
 
 // ---------------------------------------------------------------------------
