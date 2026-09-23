@@ -109,6 +109,7 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
                     .unwrap()
             })
             .collect();
+        let mut task_ids = Vec::with_capacity(kids.len());
         for k in kids {
             let out = k.wait_with_output().unwrap();
             assert!(
@@ -118,6 +119,12 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
                 String::from_utf8_lossy(&out.stderr),
                 d1_diagnostics(&home)
             );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let task_id = stdout
+                .strip_prefix("task_id=")
+                .and_then(|line| line.split_whitespace().next())
+                .unwrap_or_else(|| panic!("round {round}: start output had no task id: {stdout:?}"));
+            task_ids.push(task_id.to_owned());
         }
 
         // (c) Redundant daemons exit on their own, promptly (no timer is
@@ -154,6 +161,13 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
                 "round {round}: client {sid} was not served by the surviving daemon {daemon}: {st}\n{}",
                 d1_diagnostics(&home)
             );
+        }
+        // All clients have returned from `start`, not necessarily from their
+        // `true` tasks. Under the test clock, shutting down with even one task
+        // still running waits on the unadvanced 2s kill grace.
+        for task_id in &task_ids {
+            let done = c.request_ok(json!({ "type": "wait", "task_id": task_id, "budget_ms": 10_000 }));
+            assert_eq!(done["done"], true, "round {round}: task {task_id} did not finish: {done}");
         }
         drop(c);
 
