@@ -98,6 +98,15 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
   - runner 在 fd 4 通过状态 pipe 上报命令的真实退出码/信号(`exit <code> <alone|linger>` 或 `signal <n> <alone|linger>`)。若命令留下了后台子进程(`cmd &`),runner 留下来当守护者(guardian),继续持有 lifeline,直到进程组只剩它自己;daemon 以"收到状态"为任务结束,以"runner 退出"为进程组已空。
   - runner 屏蔽 SIGTERM(子进程在 exec 前解除屏蔽),所以 stop/shutdown 的组 SIGTERM 只作用于命令,runner 能上报命令是怎么结束的;runner 自身只被 SIGKILL 带走,此时 daemon 退回用 runner 的 wait 状态。
   - lifeline 写端只有一个持有者(`task::lifeline()`,CLOEXEC),方便后续原地 exec 交接只处理一个 fd。
+- **原地升级(exec 交接,对运行中的工作透明)**:替换二进制后,daemon `exec()` 新二进制,**pid 不变**,所有 runner 仍是它的子进程(`waitpid` 照常,退出码真实),任务不中断、不需要用户判断"现在能不能升级"。
+  - 触发:`pbs-manager upgrade`;或 daemon 每 2s 检查自身可执行文件(dev/inode/size/mtime),文件变化且再稳定一个周期后自动升级(`trigger: "binary-changed"`)。安装仍用 `install`(新 inode,macOS 签名缓存)。
+  - 步骤:① preflight:运行 `<新二进制> __handover-check`,必须回答同一交接格式版本;不兼容/损坏的二进制在此止步,什么都不动(换同一文件前不再重试)。② quiesce:各任务的输出泵只在两次读之间停下、退出等待挂起,fanout 推完已读内容,关闭所有客户端连接并让写端 flush;上限 quiesce 5s + flush 2s,超时则放弃升级、旧映像恢复。③ 写 `<home>/handover.json`(版本化:任务记录、kill 请求/原因、**绝对**超时截止与 kill grace 截止、守护者状态、各 fd 号),对要继承的 fd 清 CLOEXEC,exec。④ exec 失败:fd 恢复 CLOEXEC、任务继续、结果记入 `status.last_upgrade`,旧映像照常服务。
+  - 跨 exec 继承的 fd:监听 socket(**不重新 bind**,交接中的新连接在 backlog 里等,不会被拒)、`manager.lock`、lifeline 两端(写端若关闭所有任务都会被清理)、每个任务的 stdout/stderr/状态 pipe 读端。
+  - 新映像以 `daemon --handover <file>` 恢复;恢复失败即退出,lifeline 断开,所有任务被清理——与崩溃同一语义(无崩溃恢复,不做抢救)。
+  - 恢复后先有 **30s 交接宽限期**(`handover-grace`),期间不适用"零连接 5s 关机",等客户端重连。
+  - 客户端可见的断连窗口实测 30–46 ms(并行测试负载下);交接中在途请求**得不到响应**,连接直接关闭,客户端重连 + 重新 hello 后重发:幂等请求(wait/output/list/watch/status/stop/mark_background)直接重发,`start` 以同一个 `key` 重发(见 §3.3)。
+  - 会话在交接前的 watch 在重新 hello 时自动恢复,并补发它漏掉的输出区间 `[交接前已送达的 cursor, 当前)`,不缺不重。
+  - `status` 增加 `generation`(本 pid 经历的原地升级次数)与 `last_upgrade`(`at, ok, from_version, to_version?, error?, trigger: "cli"|"binary-changed"`)。
 - **已断开 session 的保留期**:session 断开后立即从 `ls` / `sessions` 消失;`sessions/<sid>/` 在最后一次写入后保留 `goneSessionRetention`(config.json,默认 24h),期间 `show` / `agent` / `events` 仍可查(事后排查、`pi --resume`),到期由 daemon 删除目录并从内存移除其任务。启动时与每 `min(保留期, 1h)` 清扫一次;已连接、或仍有 running 任务/存活进程组的 session 永不清扫
 
 ### 3.3 传输与协议
@@ -107,6 +116,15 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 - 请求: `{"v":1, "id":"<uuid>", "type":"...", ...}`(**所有请求含 hello 都带 v+id**;下文示例为简洁省略 v/id)
 - 响应: `{"v":1, "id":"<uuid>", "ok":true, ...}` 或 `{"v":1, "id":"...", "ok":false, "error":{"code":"E_*","message":"..."}}`
 - 事件(服务端推送,无 id): `{"v":1, "type":"event", "event":"...", ...}`
+
+**版本兼容(N−1,原地升级的前提)**:升级后,仍在运行的 pi 里加载的是旧扩展,会立刻以旧协议重连。规则:
+- 帧版本 `v` 固定为 1,仅它不匹配才回 `E_VERSION`;hello 里的 `protocol` 级别只作信息,旧级别照常接受。
+- 新字段一律可选(`#[serde(default)]`),旧客户端不发即取默认;新增请求/事件不得改变已有请求/事件的语义。
+- 测试守住:交接后用旧协议 hello 连接仍可正常工作。
+
+**输出游标契约**:输出事件的 `next_cursor` 与 `output` 请求的 `cursor`/`next_cursor` 是同一个**单调递增的字节偏移**(合并输出 `.output` 内)。一个输出事件覆盖 `[next_cursor − bytes(chunk), next_cursor)`。块边界 UTF-8 安全(事件会扣住不完整的尾部字节,交接时一并带过)。在末尾调用 `output` 返回空 chunk 且 `next_cursor == cursor`(已追平)。客户端据此对自身的 `output(cursor)` 补读与交接后的补发按字节范围去重/裁剪。
+
+**`start` 幂等**:`start` 可带可选的 `key`(客户端生成);同一会话内以同一 key 重发返回第一次启动的任务,不会再启动一次;key 跨原地升级保留。
 
 **补充裁决(2026-09-17)**:
 - `kind:"shell"` 的命令经 shell 解释: unix 用 `env.SHELL -c`(env 未给 SHELL 则 `/bin/sh -c`);Windows 用 `cmd /c`
