@@ -20,10 +20,16 @@ const BUILT_MANAGER = join(CACHE_TARGET, "release", "pbs-manager");
  * pbs-manager binary: $PBS_MANAGER_PATH, else built from this repo's manager/
  * into eval/.cache/target (never writes inside manager/).
  */
+let managerBuilt = false;
+
 export function managerPath(): string {
   const explicit = process.env.PBS_MANAGER_PATH;
   if (explicit) return explicit;
-  if (!existsSync(BUILT_MANAGER)) {
+  // Always run an incremental cargo build once per process: a cached binary
+  // from older sources silently tests the wrong manager (it once masked a
+  // `sessions` output change). A no-op rebuild takes well under a second.
+  if (!managerBuilt) {
+    managerBuilt = true;
     const r = spawnSync(
       "cargo",
       ["build", "--release", "--manifest-path", join(REPO_ROOT, "manager", "Cargo.toml"), "--target-dir", CACHE_TARGET],

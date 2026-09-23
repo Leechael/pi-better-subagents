@@ -32,12 +32,22 @@ export interface Sandbox {
  * and a tool call racing that connect loses the connection (see
  * e2e/faux.test.ts "cold start" — known bug).
  */
+/** `sessions --json` lists live sessions with state "connected" (older managers: connected: true). */
+function hasConnectedSession(stdout: string): boolean {
+  try {
+    const rows = JSON.parse(stdout) as Array<{ state?: string; connected?: boolean }>;
+    return rows.some((row) => row.state === "connected" || row.connected === true);
+  } catch {
+    return false;
+  }
+}
+
 export async function waitManagerReady(sb: Sandbox, timeoutMs = 10_000): Promise<void> {
   const mgr = sb.env.PBS_MANAGER_PATH;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const r = spawnSync(mgr, ["--home", sb.pbsHome, "sessions"], { encoding: "utf8", timeout: 3000 });
-    if (r.status === 0 && /\btrue\b/.test(r.stdout)) return;
+    const r = spawnSync(mgr, ["--home", sb.pbsHome, "sessions", "--json"], { encoding: "utf8", timeout: 3000 });
+    if (r.status === 0 && hasConnectedSession(r.stdout)) return;
     if (Date.now() > deadline) throw new Error(`pbs-manager not ready: ${r.stdout}${r.stderr}`);
     await new Promise((res) => setTimeout(res, 100));
   }
