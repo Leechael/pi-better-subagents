@@ -411,3 +411,32 @@ fn u11_repeated_upgrades_under_output() {
     events.extend(c.events.clone());
     assert_eq!(assert_sequential(&event_text(&events, &t), "r", "five upgrades"), 400);
 }
+
+/// Right after the exec nobody is connected yet: the zero-connection idle
+/// rule (5 s) is held for the handover grace (30 s) so the reconnecting
+/// clients find their tasks alive. After the grace the rule applies again
+/// (checked on the manual clock only: real time would take 35 s).
+#[test]
+fn u12_idle_rule_waits_for_clients_after_an_upgrade() {
+    let home = Home::new("u12");
+    let bin = home.install_copy();
+    let mut d = home.start_daemon_from(&bin, &[]);
+    let mut c = home.connect();
+    hello(&mut c, "sess-u12");
+    let (_t, pid) = start(&mut c, "shell", "sleep 300", json!({}));
+    assert!(upgrade(&home).status.success());
+    assert!(c.wait_closed(s(5)));
+    drop(c);
+    // No client for longer than the idle grace.
+    home.advance_now(6_000);
+    settle();
+    assert!(pid_alive(pid), "task killed by the idle rule during the handover grace");
+    assert!(wait_child(&mut d, Duration::from_millis(10)).is_none(), "daemon exited during the handover grace");
+    if home.manual {
+        home.advance_partial("handover-grace", 30_000);
+        home.advance("idle", 5_000);
+        home.advance("shutdown-grace", 2_000);
+        assert!(wait_child(&mut d, s(10)).is_some(), "idle rule applies again after the grace");
+        assert!(poll_true(s(5), || !pid_running(pid)), "shutdown killed the task");
+    }
+}

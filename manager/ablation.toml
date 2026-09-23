@@ -128,8 +128,8 @@ expect = "red"
 id = "bounded-conn-queue"
 mechanism = "per-connection outbound queue is bounded (1024 frames) and events use try_send, so a stuck reader cannot grow memory"
 file = "src/daemon.rs"
-find = "mpsc::channel::<Arc<Vec<u8>>>(1024)"
-replace = "mpsc::channel::<Arc<Vec<u8>>>(1 << 28)"
+find = "mpsc::channel::<OutFrame>(1024)"
+replace = "mpsc::channel::<OutFrame>(1 << 28)"
 tests = ["lifecycle_adversarial::c6_never_reading_watcher_is_bounded_and_isolated"]
 expect = "red"
 
@@ -229,8 +229,8 @@ expect = "red"
 id = "watch-utf8-carry"
 mechanism = "watch events hold back an incomplete trailing UTF-8 sequence until the next pipe read"
 file = "src/daemon.rs"
-find = "                    let n = task::utf8_chunk_len(&data, usize::MAX, CHUNK_JSON_BUDGET, true);"
-replace = "                    let n = data.len();"
+find = "                let n = task::utf8_chunk_len(&data, usize::MAX, CHUNK_JSON_BUDGET, true);"
+replace = "                let n = data.len();"
 tests = ["lifecycle_adversarial::o4b_watch_events_never_split_utf8"]
 expect = "red"
 
@@ -238,7 +238,7 @@ expect = "red"
 id = "oversize-response-fallback"
 mechanism = "a response that does not fit a frame is replaced by an E_INTERNAL error for the same id"
 file = "src/daemon.rs"
-find = "    if frame.len() > MAX_FRAME_SIZE as usize {"
+find = "    if frame.bytes.len() > MAX_FRAME_SIZE as usize {"
 replace = "    if false {"
 tests = ["lifecycle_adversarial::o3b_oversized_response_does_not_mute_connection"]
 expect = "red"
@@ -304,8 +304,8 @@ expect = "red"
 id = "timeout-hard-kill"
 mechanism = "timeout_ms is a hard kill ceiling (§3.3 start)"
 file = "src/daemon.rs"
-find = "                    Some(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,"
-replace = "                    Some(_) => std::future::pending().await,"
+find = "                    (Some(ms), false) => tokio::time::sleep(Duration::from_millis(ms)).await,"
+replace = "                    (Some(_), false) => std::future::pending().await,"
 tests = ["lifecycle_adversarial::t3_timeout_ms_hard_kill"]
 expect = "red"
 
@@ -553,4 +553,91 @@ file = "src/sys.rs"
 find = "fn child_setup(limit: i32) -> io::Result<()> {"
 replace = "fn child_setup(_limit: i32) -> io::Result<()> {\n    let limit = 3;"
 tests = ["lifecycle_adversarial::t14_tasks_inherit_only_stdio"]
+expect = "red"
+
+# --- In-place upgrade (PR #3, tests/upgrade.rs) ---------------------------
+
+[[ablation]]
+id = "upgrade-preflight"
+mechanism = "the new binary must pass __handover-check before anything is touched"
+file = "src/handover.rs"
+find = "            Ok(exe) => preflight(&exe).await.map(|v| (exe, v)),"
+replace = "            Ok(exe) => Ok((exe, String::from(\"?\"))),"
+tests = ["upgrade::u4_bad_binary_is_refused_before_anything_changes"]
+expect = "red"
+
+[[ablation]]
+id = "upgrade-park-flag-replace"
+mechanism = "a rolled-back upgrade clears the park flag even with no receiver left (send_replace)"
+file = "src/handover.rs"
+find = "        st.park_tx.send_replace(false);"
+replace = "        let _ = st.park_tx.send(false);"
+tests = ["upgrade::u5_failed_exec_rolls_back"]
+expect = "red"
+
+[[ablation]]
+id = "upgrade-watch-carry"
+mechanism = "a reconnecting session gets its watches back plus the output it missed"
+file = "src/daemon.rs"
+find = "    resume_carried_watches(&state, conn_id, &tx);"
+replace = "    let _ = &tx;"
+tests = [
+  "upgrade::u1_upgrade_keeps_every_task_running",
+  "upgrade::u11_repeated_upgrades_under_output",
+]
+expect = "red"
+
+[[ablation]]
+id = "upgrade-fanout-carry-seed"
+mechanism = "a restarted fanout begins with the incomplete UTF-8 tail it held back when parked"
+file = "src/daemon.rs"
+find = "    let carry = if total > delivered {"
+replace = "    let carry: Vec<u8> = if false {"
+tests = ["upgrade::u10_split_utf8_character_across_an_upgrade"]
+expect = "red"
+
+[[ablation]]
+id = "upgrade-written-cursor"
+mechanism = "a carried watch starts from what the connection's writer really wrote, not what was queued"
+file = "src/daemon.rs"
+find = "        let cursor = c.written.lock().unwrap().get(&c.task_id).copied().unwrap_or(0);"
+replace = "        let cursor = e.delivered_cursor;"
+tests = ["upgrade::u11_repeated_upgrades_under_output"]
+expect = "green"
+note = "Undetectable in isolation: frames are lost only when a client stops reading while its queue is full and the 2 s flush expires. u11 catches it under the parallel suite (about one run in two before the fix); the stress run covers it."
+
+[[ablation]]
+id = "upgrade-grace-rearm"
+mechanism = "a stop's kill grace pending across the upgrade is re-armed with the time it had left"
+file = "src/handover.rs"
+find = "        daemon::rearm_kill_reaper(state, id, pid, Duration::from_millis(left));"
+replace = "        let _ = (left, pid);"
+tests = ["upgrade::u8_kill_grace_carries_over"]
+expect = "red"
+
+[[ablation]]
+id = "upgrade-hold-idle"
+mechanism = "the zero-connection idle rule waits for the handover grace after the exec"
+file = "src/daemon.rs"
+find = "    st.hold_idle = true;"
+replace = "    st.hold_idle = false;"
+tests = ["upgrade::u12_idle_rule_waits_for_clients_after_an_upgrade"]
+expect = "red"
+
+[[ablation]]
+id = "upgrade-binary-watch"
+mechanism = "replacing the binary file triggers the upgrade without the CLI"
+file = "src/daemon.rs"
+find = "            crate::handover::request(&state2, \"binary-changed\");"
+replace = "            let _ = &state2;"
+tests = ["upgrade::u7_replacing_the_binary_upgrades_by_itself"]
+expect = "red"
+
+[[ablation]]
+id = "start-key-idempotent"
+mechanism = "a start resent with the same key returns the task it already started"
+file = "src/daemon.rs"
+find = "        if let Some(tid) = prior {"
+replace = "        if let Some(tid) = prior.filter(|_| false) {"
+tests = ["upgrade::u3_start_key_makes_a_resent_start_idempotent"]
 expect = "red"
