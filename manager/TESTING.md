@@ -10,6 +10,7 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 | `src/**` `#[cfg(test)]` | unit | ring buffer, record persistence, state mapping, claim_pid, id format |
 | `tests/protocol.rs` | black box | message round-trips, basic lifecycle (t01–t13) |
 | `tests/lifecycle_adversarial.rs` | black box | every cell of the lifecycle table below, adversarial conditions |
+| `tests/mutation_gaps.rs` | black box | behaviours found unguarded by cargo-mutants survivors |
 | `tests/common/mod.rs` | helpers | wire client, isolated `--home`, process probes, crashable helper client |
 
 All black-box tests start the compiled binary with an isolated `--home`
@@ -34,15 +35,14 @@ cd manager
 cargo test                                               # everything (~40s wall, warm build)
 cargo test --test lifecycle_adversarial                  # adversarial suite
 cargo test --test lifecycle_adversarial -- --ignored --skip helper_   # known-bug reproducers (all FAIL)
+cargo mutants -j 3 --timeout 150 -f src/lifecycle.rs -f src/task.rs \
+  -f src/registry.rs -f src/daemon.rs -f src/sys.rs      # mutation score (~20 min)
 ```
 
 Most of the wall time goes to the contract's own timers (5s idle grace,
 2s kill grace); tests inside a binary run in parallel.
 
 ## Lifecycle state-transition table
-
-(`g*` tests referenced below live in `tests/mutation_gaps.rs`, added in the
-commit after this one.)
 
 Columns: **Before** = covered by the tests that existed before this work
 (`protocol.rs` + unit tests); **After** = test that now covers the cell.
@@ -147,6 +147,48 @@ All reproduced by tests that fail today; run them with
 | `o3` | `handle_output` caps a read at 1 MiB of *raw* bytes, but JSON escaping of control bytes expands up to 6x. The >4 MiB response makes `write_frame` fail, the connection's writer task exits, and the connection goes mute. | A `task_output` on binary / ANSI-heavy output hangs the extension's request, and every later request on that connection. |
 | `o4` | Chunks are UTF-8-lossy decoded per read; a `max_bytes` or pipe boundary inside a multi-byte character yields U+FFFD and `next_cursor` skips the bytes. | CJK / emoji output is corrupted every 64 KiB (CLI default) and in `watch` events. |
 | `t5b` | `signal` is an integer (15/9) on the wire; §3.3 and the extension type (`signal: string \| null`) say `"SIGTERM"`/`"SIGKILL"`. | Extension renders `9`; typed consumers are wrong. The fix is either the doc or the wire. |
+
+## Mutation score
+
+`cargo mutants 27.1.0`, scoped with `-f` to `lifecycle.rs task.rs
+registry.rs daemon.rs sys.rs` (216 mutants, 25 unviable, so 191 viable).
+"After" = the full run with the new suites, plus targeted reruns for g7/g8,
+which were written from that run's survivors. A timeout is an infinite loop
+the tests detect by hanging, so it counts as killed.
+
+| File | Viable | Before: caught / timeout / missed | After: caught / timeout / missed |
+|---|---|---|---|
+| daemon.rs | 90 | 54 / 0 / 36 | 82 / 0 / 8 |
+| lifecycle.rs | 22 | 12 / 0 / 10 | 20 / 0 / 2 |
+| registry.rs | 15 | 13 / 1 / 1 | 14 / 1 / 0 |
+| sys.rs | 15 | 10 / 0 / 5 | 13 / 0 / 2 |
+| task.rs | 49 | 38 / 1 / 10 | 39 / 1 / 9 |
+| **total** | **191** | **127 / 2 / 62 (67.5%)** | **168 / 2 / 21 (89.0%)** |
+
+The 21 survivors, classified as (a) missing test, (b) equivalent (no
+observable difference under the contract), or (c) dead or unneeded code:
+
+| Mutant | Class | Why |
+|---|---|---|
+| daemon.rs:403:44 `\|\|`→`&&` in maybe_arm_idle_timer | b | The 403 and 411 guards make each other redundant, and every disconnect re-arms anyway. (The sibling 403:20 was a real gap, now killed by `g7`.) |
+| daemon.rs:411:36 `&&`→`\|\|` in the idle timer body | b | The timer is aborted on every hello; this guard only covers an abort-vs-wakeup race of microseconds. |
+| daemon.rs:507:20 access_for guard → true | b | Differs only for a cli hello that carries a session_id, which the contract never sends (hello does not reject it either). |
+| daemon.rs:711:53 `<`→`==`, `<`→`<=`; 713:40 `-`→`+` in handle_output | b | The 64 KB ring is a pure cache of `.output`: taking the disk path, or an over-long `avail` that `slice()` clamps, returns identical bytes (proven by `g1`'s byte-exact sweep). |
+| daemon.rs:1004:32 poller guard → true | b | The poller still stops on the next `pid_alive` miss; the guard saves one file read. |
+| daemon.rs:1030:24 delete `!` (adopted-poller watcher fanout) | **c** | Unreachable. The catch-up read happens on the interval's immediate first tick, at boot, before any client can `watch`. After that the file never grows, because the task's stdout pipe died with the old manager. Slop candidate: the event fanout block in `spawn_adopted_poller` (lines ~1015–1039); keep the catch-up append. |
+| lifecycle.rs:88:23 NotFound guard → true in cleanup_stale_files | b | Only a non-NotFound unlink error (read-only home) behaves differently, and then startup fails either way with a different message. |
+| lifecycle.rs:136:19 WouldBlock guard → true | b | Same: only other lock errors differ, and only in the error message. |
+| sys.rs:28:34, 42:34 `setsid() == -1` → `== 1` | b | `setsid` cannot fail in a freshly forked non-leader child and never returns 1; the error branch is unreachable but correct. |
+| task.rs:22:37 RING_CAPACITY `64*1024`→`64+1024` | b | Ring is cache-only (see 711); a smaller ring only changes performance. Note: no test can tell the ring exists. |
+| task.rs:256:23 ×2, 256:32 Interrupted arm in pump_async | **c** | tokio's `AsyncRead` retries EINTR internally and never surfaces `Interrupted`. Slop candidate. |
+| task.rs:279:21 `len - offset` → `len + offset` | b | The read loop stops at EOF and `truncate`s, so an oversized `want` is harmless. |
+| task.rs:282:16 `<`→`<=` | b | The extra iteration reads into an empty slice and gets `Ok(0)`. (A targeted rerun "caught" it only via a load flake of d1's since-removed process-count assertion.) |
+| task.rs:286:23 ×2, 286:32 Interrupted arm in read_file_range | **c** | Regular-file `read` does not return EINTR in practice. Slop candidate: the hand-rolled loop could be `take(max).read_to_end`. |
+
+No (a) remains: the gaps found were closed by `g1`–`g8` (ring and disk
+ranges, daemon detach, manager.log reason, CLI session filter, status
+counts, re-adopted output catch-up, staggered disconnects, unreadable
+output).
 
 ## Deferrals
 

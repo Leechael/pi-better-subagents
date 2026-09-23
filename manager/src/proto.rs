@@ -615,6 +615,13 @@ mod tests {
         assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
         assert_ne!(new_request_id(), id);
+        // RFC 4122 v4: version nibble 4, variant 10xx, on every id.
+        for _ in 0..200 {
+            let id = new_request_id();
+            let c: Vec<char> = id.chars().collect();
+            assert_eq!(c[14], '4', "{id}");
+            assert!(matches!(c[19], '8' | '9' | 'a' | 'b'), "{id}");
+        }
     }
 
     #[test]
