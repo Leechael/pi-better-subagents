@@ -329,3 +329,28 @@ fn u8_kill_grace_carries_over() {
     let r = c2.wait_terminal(&t, s(5)).unwrap();
     assert_eq!((r["status"].as_str(), r["end_reason"].as_str()), (Some("killed"), Some("stopped:tool")), "{r}");
 }
+
+/// CLI commands in progress (`wait`, `output -f`) ride through an upgrade:
+/// their request is resent on a new connection.
+#[test]
+fn u9_cli_wait_and_follow_survive_an_upgrade() {
+    let home = Home::new("u9");
+    let bin = home.install_copy();
+    let _d = home.start_daemon_from(&bin, &[]);
+    let mut c = home.connect();
+    hello(&mut c, "sess-u9");
+    let (t, _) = start(&mut c, "shell",
+        "i=0; while [ $i -lt 60 ]; do echo f-$i; i=$((i+1)); sleep 0.05; done; exit 3", json!({}));
+    let (h1, h2) = (home.path.clone(), home.path.clone());
+    let (t1, t2) = (t.clone(), t.clone());
+    let wait = std::thread::spawn(move || run_cli(&h1, &["wait", &t1, "--budget-ms", "20000"], s(30)));
+    let follow = std::thread::spawn(move || run_cli(&h2, &["output", &t2, "-f"], s(30)));
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(upgrade(&home).status.success());
+    let w = wait.join().unwrap();
+    assert!(w.status.success() && w.stdout.contains("done exit_code=3"), "wait: {} {}", w.stdout, w.stderr);
+    let f = follow.join().unwrap();
+    assert!(f.status.success(), "output -f: {}", f.stderr);
+    assert_eq!(assert_sequential(&f.stdout, "f", "output -f across the upgrade"), 60);
+    assert_eq!(status(&home)["generation"], 1);
+}
