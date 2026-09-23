@@ -440,6 +440,42 @@ describe("pbs-wake pill", () => {
     expect(text).not.toContain("before other work");
   });
 
+  it("renders expanded wake details as labelled plain text, never XML", () => {
+    setPiTuiForTests(null);
+    const map = new Map<string, Function>();
+    registerPbsMessageRenderers({ registerMessageRenderer(type: string, fn: unknown) { map.set(type, fn as never); } } as never);
+    const component = map.get(PBS_WAKE_CUSTOM_TYPE)!({
+      content: `${PBS_WAKE_LEAD_IN}\\n\\n<pbs-wake><task id="sh_1" /></pbs-wake>`,
+      details: {
+        kind: "task",
+        stillRunning: [{ id: "sh_2", title: "compile" }],
+        tasks: [{ id: "sh_1", taskKind: "shell", status: "completed", summary: "done", command: "make test", outputPath: "/tmp/out", preview: "42 passed", durationMs: 1200, exitCode: 0 }],
+      },
+    }, { expanded: true, outputPad: 0 }, { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text }).render(120) as string[];
+    const text = component.join("\\n");
+    expect(text).toContain("Tasks (1)");
+    expect(text).toContain("$ make test");
+    expect(text).toContain("Still running (1): sh_2 compile");
+    expect(text).toContain("42 passed");
+    expect(text).not.toContain("<pbs-wake");
+    expect(text).not.toContain("<task");
+  });
+
+  it("shows task duration, exit, still-running count, handover result, and /reply hint", () => {
+    setPiTuiForTests(null);
+    const map = new Map<string, Function>();
+    registerPbsMessageRenderers({ registerMessageRenderer(type: string, fn: unknown) { map.set(type, fn as never); } } as never);
+    const theme = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text };
+    const render = (details: unknown) => map.get(PBS_WAKE_CUSTOM_TYPE)!({ content: "", details }, { expanded: false, outputPad: 0 }, theme).render(120).join("\\n");
+    const task = render({ kind: "task", stillRunning: [{ id: "sh_2", title: "compile" }], tasks: [{ id: "sh_1", taskKind: "shell", status: "completed", summary: "done", command: "true", outputPath: "", preview: "", durationMs: 1200, exitCode: 0 }] });
+    expect(task).toContain("1.2s · exit 0");
+    expect(task).toContain("1 still running");
+    expect(render({ kind: "subagent-handover", runId: "run_1", childId: "ch_1", name: "alpha", status: "completed", stillRunning: [], summary: "done", prompt: "inspect", result: "Found the root cause" })).toContain("Found the root cause");
+    const request = render({ kind: "supervisor-request", from: "ch_1", name: "alpha", message: "Which option?" });
+    expect(request).toContain("decision for alpha");
+    expect(request).toContain("/reply ch_1 <decision>");
+  });
+
   it("keeps a wide pill inside the terminal width", () => {
     setPiTuiForTests(null);
     const map = new Map<string, Function>();

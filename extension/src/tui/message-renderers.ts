@@ -6,7 +6,7 @@
  * custom-message boxes which use `new Box(1, 1, bg)`.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { PBS_WAKE_CUSTOM_TYPE, type PbsWake, type TaskWake } from "../wake";
+import { PBS_WAKE_CUSTOM_TYPE, PBS_WAKE_LEAD_IN, type PbsWake, type TaskWake } from "../wake";
 import { fitLines, loadPiTui } from "./pi-tui-load";
 import { statusGlyph } from "./tool-component";
 
@@ -47,9 +47,24 @@ function badExit(status: string | undefined, exitCode?: number | null): boolean 
   return status === "failed" || status === "killed" || status === "orphaned" || status === "interrupted";
 }
 
-function taskHead(tasks: TaskWake[]): string {
-  if (tasks.length <= 1) return tasks[0]?.summary || "Background task finished";
-  return `${tasks.length} tasks · ${countStatuses(tasks.map((task) => task.status))}`;
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
+}
+
+function taskExit(task: TaskWake): string {
+  if (task.exitCode !== null) return `exit ${task.exitCode}`;
+  return task.signal ?? task.status;
+}
+
+function taskHead(details: Extract<PbsWake, { kind: "task" }>): string {
+  const taskInfo = details.tasks.length === 1
+    ? `${formatDuration(details.tasks[0].durationMs)} · ${taskExit(details.tasks[0])}`
+    : `${details.tasks.length} tasks · ${countStatuses(details.tasks.map((task) => task.status))}`;
+  const still = details.stillRunning.length > 0 ? ` · ${details.stillRunning.length} still running` : "";
+  const summary = details.tasks.length === 1 ? details.tasks[0].summary : "Background work";
+  return `${summary} · ${taskInfo}${still}`;
 }
 
 function collapsedText(details: PbsWake, theme: Theme): string {
@@ -57,7 +72,7 @@ function collapsedText(details: PbsWake, theme: Theme): string {
     case "task": {
       const bad = details.tasks.some((task) => badExit(task.status, task.exitCode));
       const { color, glyph } = statusGlyph(bad ? "failed" : "completed");
-      return `${theme.fg(color, glyph)} ${theme.fg("muted", "task")} ${taskHead(details.tasks)}`;
+      return `${theme.fg(color, glyph)} ${theme.fg("muted", "task")} ${taskHead(details)}`;
     }
     case "monitor": {
       const preview = details.event.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "(event)";
@@ -75,7 +90,8 @@ function collapsedText(details: PbsWake, theme: Theme): string {
     }
     case "subagent-handover": {
       const { color, glyph } = statusGlyph(details.status);
-      return `${theme.fg(color, glyph)} ${theme.fg("muted", "handover")} ${details.name} ${details.status}`;
+      const snippet = details.result.replace(/\s+/g, " ").trim().slice(0, 72);
+      return `${theme.fg(color, glyph)} ${theme.fg("muted", "handover")} ${details.name} ${details.status}${snippet ? ` · ${snippet}` : ""}`;
     }
     case "subagent-done": {
       const bad = details.children.some((child) => badExit(child.status));
@@ -84,11 +100,46 @@ function collapsedText(details: PbsWake, theme: Theme): string {
     }
     case "supervisor-request":
       return [
-        `${theme.fg("warning", "?")} ${theme.fg("muted", "supervisor request")} ${details.message.slice(0, 100)}`,
-        theme.fg("dim", 'reply with agent_message { action:"reply", to, message }'),
+        `${theme.fg("warning", "?")} ${theme.fg("muted", `decision for ${details.name}`)} ${details.message.slice(0, 100)}`,
+        theme.fg("dim", `/reply ${details.from} <decision>`),
       ].join("\n");
     case "supervisor-update":
       return `${theme.fg("muted", "↑")} ${theme.fg("muted", "supervisor update")} ${details.message.slice(0, 100)}`;
+  }
+}
+
+export function expandedWakeText(details: PbsWake | undefined, content: string): string {
+  if (!details) {
+    return content
+      .replace(PBS_WAKE_LEAD_IN, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&amp;/g, "&")
+      .trim();
+  }
+  switch (details.kind) {
+    case "task":
+      return [
+        `Tasks (${details.tasks.length})`,
+        ...details.tasks.map((task) => [
+          `${task.id} · ${task.taskKind} · ${task.status} · ${formatDuration(task.durationMs)} · ${taskExit(task)}`,
+          `$ ${task.command}`,
+          `Output: ${task.outputPath}`,
+          ...(task.preview ? [`Preview: ${task.preview}`] : []),
+        ].join("\n")),
+        ...(details.stillRunning.length ? [`Still running (${details.stillRunning.length}): ${details.stillRunning.map((item) => `${item.id} ${item.title}`).join(", ")}`] : []),
+      ].join("\n\n");
+    case "monitor":
+      return [`Monitor: ${details.description}`, `Task: ${details.id}`, ...(details.status ? [`Status: ${details.status}`] : []), `Event: ${details.event}`, ...(details.eventCount ? [`Events: ${details.eventCount}`] : []), ...(details.droppedLines ? [`Dropped lines: ${details.droppedLines}`] : [])].join("\n");
+    case "subagent-handover":
+      return [`Subagent handover: ${details.name} (${details.status})`, `Run: ${details.runId}`, `Child: ${details.childId}`, `Task prompt: ${details.prompt}`, `Result: ${details.result}`, ...(details.error ? [`Error: ${details.error}`] : []), ...(details.stillRunning.length ? [`Still running: ${details.stillRunning.map((item) => `${item.id} ${item.title}`).join(", ")}`] : [])].join("\n\n");
+    case "subagent-done":
+      return [`Subagent run: ${details.runId} (${details.status})`, `Duration: ${formatDuration(details.durationMs)}`, ...details.children.map((child) => [`${child.name} (${child.childId}) · ${child.status}`, `Task prompt: ${child.prompt}`, `Result: ${child.result}`, ...(child.error ? [`Error: ${child.error}`] : [])].join("\n"))].join("\n\n");
+    case "supervisor-request":
+      return [`Decision requested by ${details.name} (${details.from})`, `Request: ${details.message}`, `Reply with /reply ${details.from} <decision>`].join("\n");
+    case "supervisor-update":
+      return [`Update from ${details.name} (${details.from})`, details.message].join("\n");
   }
 }
 
@@ -125,7 +176,7 @@ export function registerPbsMessageRenderers(pi: ExtensionAPI): void {
     const details = wakeDetails(message);
     const content = typeof message.content === "string" ? message.content : "";
     const head = details ? collapsedText(details, theme) : theme.fg("muted", "wake");
-    const body = expanded && content ? `\n${theme.fg("dim", content)}` : "";
+    const body = expanded && content ? `\n${theme.fg("dim", expandedWakeText(details, content))}` : "";
     return makeComponent(outputPad, theme, head + body) as never;
   });
 }
