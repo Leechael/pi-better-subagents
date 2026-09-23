@@ -72,6 +72,8 @@ pub struct DaemonState {
     pub idle_timer: Option<tokio::task::JoinHandle<()>>,
     pub shutdown: bool,
     pub shutdown_notify: Arc<Notify>,
+    /// Time source for the daemon's own timers (see `clock.rs`).
+    pub clock: crate::clock::Clock,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +115,7 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
         idle_timer: None,
         shutdown: false,
         shutdown_notify: Arc::new(Notify::new()),
+        clock: crate::clock::Clock::from_env(),
     }));
 
     // Bind the well-known socket (§3.1).
@@ -183,7 +186,8 @@ pub async fn run(home: PathBuf, foreground: bool) -> i32 {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
 
     // Keep accepting while shutting down: a new client then gets a prompt
-    // "manager is shutting down" instead of hanging until its hello timeout.
+    // "manager is shutting down" instead of hanging until its hello timeout
+    // (and, under `test-clock`, can still step the manual clock).
     let mut shutdown_task: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         tokio::select! {
@@ -296,6 +300,13 @@ async fn handle_conn(state: Shared, stream: Stream) {
             return;
         }
     };
+    // Test-only manual-clock requests: answered before (instead of) hello,
+    // so they never count as an active connection or cancel the idle timer.
+    #[cfg(feature = "test-clock")]
+    if matches!(hello.kind, RequestKind::ClockStatus | RequestKind::ClockAdvance { .. }) {
+        respond(&tx, &hello.id, handle_clock(&state, &hello.kind)).await;
+        return;
+    }
     if matches!(hello.v, Some(v) if v != PROTO_VERSION) {
         let _ = tx
             .send(encode_error(&hello.id, E_VERSION, "unsupported protocol version"))
@@ -505,8 +516,9 @@ fn maybe_arm_idle_timer(state: &Shared) {
         return;
     }
     let state2 = state.clone();
+    let clock = st.clock.clone();
     st.idle_timer = Some(tokio::spawn(async move {
-        tokio::time::sleep(IDLE_SHUTDOWN).await;
+        clock.sleep("idle", IDLE_SHUTDOWN).await;
         let fired = {
             let mut st = state2.lock().unwrap();
             if st.conns.is_empty() && !st.shutdown {
@@ -583,7 +595,27 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         }
         RequestKind::Status => respond(&tx, &id, handle_status(&state, conn_id)).await,
         RequestKind::Shutdown => respond(&tx, &id, handle_shutdown(&state, conn_id)).await,
+        #[cfg(feature = "test-clock")]
+        ref k @ (RequestKind::ClockStatus | RequestKind::ClockAdvance { .. }) => {
+            respond(&tx, &id, handle_clock(&state, k)).await
+        }
     }
+}
+
+/// Test-only: inspect or advance the manual clock (`test-clock` feature).
+#[cfg(feature = "test-clock")]
+fn handle_clock(state: &Shared, req: &RequestKind) -> Result<crate::clock::ClockStatus, ProtoError> {
+    let clock = state.lock().unwrap().clock.clone();
+    let Some(m) = clock.manual() else {
+        return Err(ProtoError::new(
+            E_BAD_REQUEST,
+            "manual clock not enabled (start the daemon with PBS_TEST_CLOCK=manual)",
+        ));
+    };
+    Ok(match req {
+        RequestKind::ClockAdvance { ms } => m.advance(*ms),
+        _ => m.status(),
+    })
 }
 
 /// Record activity for the connection's session (`sessions` LAST_SEEN).
@@ -969,8 +1001,9 @@ fn handle_mark_background(state: &Shared, conn_id: u64, task_id: &str) -> Result
 fn spawn_kill_reaper(state: &Shared, task_id: &str, pid: u32) {
     let state2 = state.clone();
     let tid = task_id.to_string();
+    let clock = state.lock().unwrap().clock.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(KILL_GRACE).await;
+        clock.sleep("kill-grace", KILL_GRACE).await;
         let group_live = {
             state2
                 .lock()
@@ -993,9 +1026,10 @@ fn spawn_kill_reaper(state: &Shared, task_id: &str, pid: u32) {
 fn spawn_group_watcher(state: &Shared, task_id: &str, pgid: u32) {
     let state2 = state.clone();
     let tid = task_id.to_string();
+    let clock = state.lock().unwrap().clock.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(GROUP_POLL).await;
+            clock.sleep("group-poll", GROUP_POLL).await;
             if task::group_alive(pgid) {
                 continue;
             }
@@ -1269,10 +1303,14 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
 fn spawn_adopted_poller(state: &Shared, task_id: &str, pid: u32) {
     let state2 = state.clone();
     let tid = task_id.to_string();
+    let clock = state.lock().unwrap().clock.clone();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(ADOPT_POLL);
+        let mut first = true;
         loop {
-            tick.tick().await;
+            if !first {
+                clock.sleep("adopt-poll", ADOPT_POLL).await;
+            }
+            first = false;
             let running = state2
                 .lock()
                 .unwrap()
@@ -1408,7 +1446,8 @@ async fn graceful_shutdown(state: &Shared) {
     if !pids.is_empty() {
         // 2) 2s grace, then SIGKILL every group that may still have members,
         //    even if its leader already died (SIGTERM-ignoring descendants).
-        tokio::time::sleep(KILL_GRACE).await;
+        let clock = state.lock().unwrap().clock.clone();
+        clock.sleep("shutdown-grace", KILL_GRACE).await;
         let survivors: Vec<u32> = {
             state
                 .lock()

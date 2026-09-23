@@ -9,8 +9,10 @@
 //! Determinism rules used throughout:
 //! - every wait is a poll against a deadline (`poll_until`), never a bare sleep
 //!   that the assertion depends on;
-//! - the only fixed sleeps are "hold still for N seconds, then assert nothing
-//!   happened" checks, where the passage of time *is* the thing under test.
+//! - the daemon's own timers (5s idle grace, 2s kill grace, re-adopt and
+//!   leftover-group polls) are stepped with `Home::advance*`: on the manual
+//!   clock under `--features test-clock`, as real sleeps otherwise;
+//! - the remaining fixed sleeps are short "let the effect happen" pauses.
 
 #![allow(dead_code)]
 
@@ -45,6 +47,13 @@ pub fn poll_until<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Opt
     }
 }
 
+/// A short real pause after a manual-clock step: timers that fired have
+/// their effects (signals, exits, records) under way by the time it returns,
+/// so a negative assertion that follows is meaningful.
+pub fn settle() {
+    std::thread::sleep(Duration::from_millis(150));
+}
+
 pub fn poll_true(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
     poll_until(timeout, || if f() { Some(()) } else { None }).is_some()
 }
@@ -60,7 +69,14 @@ pub struct Home {
     pub path: PathBuf,
     /// Extra pids (e.g. grandchildren) the test learned about.
     pub extra_pids: Vec<u32>,
+    /// Daemons of this home run on the manual clock (see `advance`).
+    pub manual: bool,
 }
+
+/// True when the suite runs with `--features test-clock`: daemons started
+/// through `Home` then use the manual clock, and `Home::advance` steps it
+/// instead of sleeping. Without the feature every wait is real time.
+pub const MANUAL_CLOCK: bool = cfg!(feature = "test-clock");
 
 impl Home {
     pub fn new(name: &str) -> Home {
@@ -70,6 +86,79 @@ impl Home {
         Home {
             path,
             extra_pids: Vec::new(),
+            manual: MANUAL_CLOCK,
+        }
+    }
+    /// A home whose daemons always use real time (timing canaries).
+    pub fn new_real(name: &str) -> Home {
+        let mut h = Home::new(name);
+        h.manual = false;
+        h
+    }
+    fn clock_env(&self) -> &'static str {
+        if self.manual {
+            "manual"
+        } else {
+            ""
+        }
+    }
+    /// Advance the daemon's `label` timer by `ms`. Manual clock: wait until
+    /// a timer with that label is armed (so the step cannot race ahead of
+    /// the daemon), then advance. Real clock: just sleep `ms`.
+    pub fn advance(&self, label: &str, ms: u64) {
+        if !self.manual {
+            std::thread::sleep(Duration::from_millis(ms));
+            return;
+        }
+        let armed = poll_true(Duration::from_secs(10), || {
+            clock_request(&self.path, json!({"type":"clock_status"}))["pending"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|t| t["label"] == label))
+        });
+        assert!(
+            armed,
+            "timer {label:?} never armed; pending: {}",
+            clock_request(&self.path, json!({"type":"clock_status"}))
+        );
+        let r = clock_request(&self.path, json!({"type":"clock_advance","ms":ms}));
+        assert_eq!(r["ok"], true, "clock_advance: {r}");
+    }
+    /// Advance time without waiting for a particular timer (e.g. to show a
+    /// cancelled countdown does not fire). Real clock: sleep `ms`.
+    pub fn advance_now(&self, ms: u64) {
+        if !self.manual {
+            std::thread::sleep(Duration::from_millis(ms));
+            return;
+        }
+        let r = clock_request(&self.path, json!({"type":"clock_advance","ms":ms}));
+        assert_eq!(r["ok"], true, "clock_advance: {r}");
+    }
+    /// Bring the armed `label` timer of `total_ms` to just short of its
+    /// deadline, so the caller can assert nothing has fired yet.
+    /// Manual clock: exactly 1 ms short; the timer must still be pending
+    /// with 1 ms left (a shorter constant fails here, deterministically),
+    /// then a short real pause so a wrongly early effect would show. Real
+    /// clock: 60% of `total_ms`, leaving margin for scheduling (the boundary
+    /// itself is the timing canaries' job).
+    pub fn advance_almost(&self, label: &str, total_ms: u64) {
+        if self.manual {
+            self.advance(label, total_ms - 1);
+            let st = clock_request(&self.path, json!({"type":"clock_status"}));
+            let armed = st["pending"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|t| t["label"] == label && t["due_in_ms"] == 1));
+            assert!(armed, "{label:?} timer is not {total_ms} ms long: {st}");
+            settle();
+        } else {
+            std::thread::sleep(Duration::from_millis(total_ms * 6 / 10));
+        }
+    }
+    /// Take a timer brought to `advance_almost` over its deadline. Manual
+    /// clock: the last millisecond. Real clock: nothing; the caller then
+    /// waits for the effect with a real timeout.
+    pub fn advance_past(&self) {
+        if self.manual {
+            self.advance_now(1);
         }
     }
     pub fn sock(&self) -> PathBuf {
@@ -113,6 +202,7 @@ impl Home {
         Command::new(BIN)
             .arg("--home")
             .arg(&self.path)
+            .env("PBS_TEST_CLOCK", self.clock_env())
             .arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -135,8 +225,9 @@ impl Home {
         Conn::new(s)
     }
     /// Run a CLI subcommand with a hard deadline.
+    /// Run a CLI subcommand; a daemon it auto-spawns uses this home's clock.
     pub fn cli(&self, args: &[&str], timeout: Duration) -> CliOut {
-        run_cli(&self.path, args, timeout)
+        run_cli_env(&self.path, args, timeout, &[("PBS_TEST_CLOCK", self.clock_env())])
     }
 }
 
@@ -167,10 +258,15 @@ pub struct CliOut {
 }
 
 pub fn run_cli(home: &Path, args: &[&str], timeout: Duration) -> CliOut {
+    run_cli_env(home, args, timeout, &[])
+}
+
+pub fn run_cli_env(home: &Path, args: &[&str], timeout: Duration, env: &[(&str, &str)]) -> CliOut {
     let mut child = Command::new(BIN)
         .arg("--home")
         .arg(home)
         .args(args)
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -205,6 +301,15 @@ pub fn run_cli(home: &Path, args: &[&str], timeout: Duration) -> CliOut {
 
 pub fn wait_child(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     poll_until(timeout, || child.try_wait().ok().flatten())
+}
+
+/// One manual-clock debug request, sent as the first frame of a fresh
+/// connection (no hello), so it never counts as an active client.
+pub fn clock_request(home: &Path, req: Value) -> Value {
+    let s = poll_until(Duration::from_secs(3), || UnixStream::connect(home.join("manager.sock")).ok())
+        .expect("connect for clock request");
+    let mut c = Conn::new(s);
+    c.request(req)
 }
 
 // ---------------------------------------------------------------------------

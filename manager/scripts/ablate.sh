@@ -18,6 +18,9 @@
 # Env:
 #   ABLATE_WORK          scratch dir (default: mktemp); reused build cache
 #   ABLATE_TEST_TIMEOUT  per-test timeout in seconds (default 180)
+#   ABLATE_FEATURES      cargo features for the build and tests (default
+#                        test-clock: lifecycle timers run on the manual
+#                        clock; set it empty for real time)
 #
 # Per-test output is kept in $ABLATE_WORK/logs/<ablation-id|baseline>--<test>.log.
 # Requires: cargo, python3 (>= 3.11, for tomllib), perl, rsync.
@@ -29,6 +32,9 @@ MANAGER_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MANIFEST="$MANAGER_DIR/ablation.toml"
 WORK="${ABLATE_WORK:-$(mktemp -d "${TMPDIR:-/tmp}/pbs-ablate.XXXXXX")}"
 TEST_TIMEOUT="${ABLATE_TEST_TIMEOUT:-180}"
+FEATURES="${ABLATE_FEATURES-test-clock}"
+FEATURE_ARGS=(--features "$FEATURES")
+[ -n "$FEATURES" ] || FEATURE_ARGS=()
 COPY="$WORK/manager"
 export CARGO_TARGET_DIR="$WORK/target"
 mkdir -p "$WORK/logs"
@@ -78,14 +84,14 @@ fresh_copy() {
 }
 
 build() {
-  (cd "$COPY" && cargo test --no-run -q >"$WORK/build.log" 2>&1)
+  (cd "$COPY" && cargo test --no-run -q ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"} >"$WORK/build.log" 2>&1)
 }
 
 # run_test <target::name> -> prints PASS | FAIL | TIMEOUT
 run_test() {
   local target="${1%%::*}" name="${1##*::}" rc=0 log="$WORK/logs/${2:-run}--${1##*::}.log"
   (cd "$COPY" && perl -e 'alarm shift; exec @ARGV' "$TEST_TIMEOUT" \
-    cargo test -q --test "$target" -- --exact "$name" >"$log" 2>&1) || rc=$?
+    cargo test -q ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"} --test "$target" -- --exact "$name" >"$log" 2>&1) || rc=$?
   if [ "$rc" -eq 0 ]; then
     if grep -q "1 passed" "$log"; then echo PASS; else echo "NOTRUN"; fi
   elif [ "$rc" -eq 142 ] || [ "$rc" -eq 14 ]; then

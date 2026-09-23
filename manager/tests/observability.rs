@@ -179,6 +179,7 @@ fn p1_origin_background_and_end_reasons() {
     assert!(poll_true(S(3), || c.task(&y).unwrap()["output_size"].as_u64().unwrap_or(0) > 0));
     c.request_ok(json!({"type":"stop","task_id":y,"reason":"cli"}));
     c.request_ok(json!({"type":"shutdown_session"}));
+    home.advance("kill-grace", 2000);
     assert_eq!(c.wait_terminal(&y, S(6)).unwrap()["end_reason"], "stopped:cli");
 }
 
@@ -205,10 +206,13 @@ fn p2_end_reasons_across_manager_lifecycle() {
     let ev = wait_event(&home, "sess-p2", "task.exit", Some(&dead));
     assert_eq!(ev["end_reason"], "orphaned");
     kill_group(late_pid, libc::SIGKILL);
+    assert!(poll_true(S(3), || !pid_running(late_pid)));
+    home.advance("adopt-poll", 1000);
     let t = c.wait_terminal(&late, S(5)).unwrap();
     assert_eq!(t["end_reason"], "manager-restart", "{t}");
     drop(c);
     assert!(home.cli(&["shutdown"], S(10)).status.success());
+    home.advance("shutdown-grace", 2000);
     assert!(wait_child(&mut d2, S(10)).is_some());
     assert_eq!(home.record(&keep).unwrap()["end_reason"], "manager-shutdown");
     let ev = wait_event(&home, "sess-p2", "task.exit", Some(&keep));
@@ -263,6 +267,7 @@ fn e1_manager_writes_session_and_task_events() {
     c.request_ok(json!({"type":"stop","task_id":a,"reason":"tui"}));
     c.wait_terminal(&a, S(5)).unwrap();
     drop(c);
+    home.advance("idle", 5000);
     assert!(wait_child(&mut d, S(12)).is_some());
 
     let evs = events_of(&home, "sess-e1");

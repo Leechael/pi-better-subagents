@@ -280,6 +280,14 @@ pub enum RequestKind {
     ShutdownSession,
     Status,
     Shutdown,
+    /// Test-only (`test-clock` feature): pending manual-clock timers. Sent
+    /// as the first frame of a connection, without hello, so it never counts
+    /// as an active connection.
+    #[cfg(feature = "test-clock")]
+    ClockStatus,
+    /// Test-only (`test-clock` feature): advance the manual clock.
+    #[cfg(feature = "test-clock")]
+    ClockAdvance { ms: u64 },
 }
 
 // ---------------------------------------------------------------------------

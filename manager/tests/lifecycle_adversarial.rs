@@ -184,14 +184,15 @@ fn d3_concurrent_daemon_processes_leave_one_survivor() {
     for round in 0..10 {
         let home = Home::new(&format!("d3r{round}"));
         let mut kids: Vec<_> = (0..6).map(|_| home.spawn_daemon()).collect();
-        // Losers exit quickly; give the field 3s to settle.
-        std::thread::sleep(MS(1500));
+        // Losers exit quickly; wait until at most one process is left.
         let mut running = Vec::new();
-        for k in kids.iter_mut() {
-            if k.try_wait().unwrap().is_none() {
-                running.push(k.id());
-            }
-        }
+        poll_true(S(5), || {
+            running = kids
+                .iter_mut()
+                .filter_map(|k| k.try_wait().unwrap().is_none().then(|| k.id()))
+                .collect();
+            running.len() <= 1
+        });
         let owner = {
             let mut c = home.connect();
             c.hello_cli()["pid"].as_u64().unwrap() as u32
@@ -246,8 +247,11 @@ fn d4_crash_restart_readopts_live_and_orphans_dead() {
     assert_eq!(home.record(&dead_id).unwrap()["status"], "orphaned", "orphaned persisted to disk");
 
     // Adopted task exits on its own -> completed with exit_code null (§3.4),
-    // and the owning (re-connected) session is told.
+    // and the owning (re-connected) session is told. The poller only looks
+    // once per adopt-poll tick.
     kill_group(late_pid, libc::SIGKILL);
+    assert!(poll_true(S(3), || !pid_running(late_pid)));
+    home.advance("adopt-poll", 1000);
     let t = c.wait_terminal(&late_id, S(5)).expect("adopted exit detected by polling");
     assert_eq!(t["status"], "completed", "{t}");
     assert!(t["exit_code"].is_null(), "{t}");
@@ -259,6 +263,8 @@ fn d4_crash_restart_readopts_live_and_orphans_dead() {
 
     // Anti-zombie still applies to re-adopted work.
     drop(c);
+    home.advance("idle", 5000);
+    home.advance("shutdown-grace", 2000);
     assert!(wait_child(&mut d2, S(12)).is_some(), "restarted daemon must still idle-exit");
     assert!(poll_true(S(2), || !pid_running(live_pid)), "adopted task must be killed at shutdown");
     assert_eq!(home.record(&live_id).unwrap()["status"], "killed");
@@ -286,6 +292,9 @@ fn d4b_stop_readopted_task_kills_group() {
     c.hello_ext("sess-a");
     assert_eq!(c.status_of(&id).as_deref(), Some("running"));
     c.request_ok(json!({"type":"stop","task_id":id}));
+    // A re-adopted task has no child handle: its exit is seen by the poller.
+    assert!(poll_true(S(3), || !pid_running(pid)), "SIGTERM must reach the adopted leader");
+    home.advance("adopt-poll", 1000);
     let t = c.wait_terminal(&id, S(5)).expect("adopted task terminal after stop");
     assert_eq!(t["status"], "killed", "{t}");
     assert!(poll_true(S(3), || !pid_running(pid) && !pid_running(gc)), "group must die");
@@ -324,18 +333,21 @@ fn d5_client_crash_grace_then_kill_everything_and_clean_files() {
     let pids: Vec<u32> = helper.tasks.iter().map(|t| t.1).chain([gc]).collect();
 
     helper.crash();
-    let t0 = Instant::now();
 
     // During the grace window the daemon and all tasks are untouched.
-    std::thread::sleep(S(3));
+    home.advance_almost("idle", 5000);
     assert!(daemon.try_wait().unwrap().is_none(), "daemon exited inside the 5s grace");
     for p in &pids {
         assert!(pid_running(*p), "pid {p} killed inside the 5s grace");
     }
+    home.advance_past();
+    // Shutdown: SIGTERM, then the TERM-ignoring task holds it for the 2s
+    // kill grace.
+    home.advance_almost("shutdown-grace", 2000);
+    assert!(daemon.try_wait().unwrap().is_none(), "shutdown skipped the kill grace");
+    home.advance_past();
 
     let st = wait_child(&mut daemon, S(12)).expect("daemon must exit after the grace");
-    let elapsed = t0.elapsed();
-    assert!(elapsed >= MS(4500), "daemon exited after {elapsed:?}, before the 5s grace");
     assert!(st.success(), "graceful exit status: {st:?}");
     for p in &pids {
         assert!(poll_true(S(1), || !pid_running(*p)), "pid {p} survived manager shutdown");
@@ -358,19 +370,24 @@ fn d6_connection_inside_grace_cancels_shutdown() {
     let (id, pid) = a.start("sleep 300");
     drop(a);
 
-    std::thread::sleep(MS(2500));
+    home.advance("idle", 2500);
     let mut b = home.connect();
     assert_eq!(b.hello_cli()["ok"], true);
     // Well past the original deadline (5s) plus the 2s kill grace.
-    std::thread::sleep(S(5));
+    home.advance_now(5000);
+    settle();
     assert!(daemon.try_wait().unwrap().is_none(), "shutdown was not cancelled");
     assert!(pid_running(pid), "task killed although a client reconnected");
     assert_eq!(b.status_of(&id).as_deref(), Some("running"));
 
+    // The grace restarts from zero when b leaves.
     drop(b);
-    let t1 = Instant::now();
+    home.advance_almost("idle", 5000);
+    assert!(daemon.try_wait().unwrap().is_none(), "grace did not restart from zero");
+    assert!(pid_running(pid));
+    home.advance_past();
+    home.advance("shutdown-grace", 2000);
     assert!(wait_child(&mut daemon, S(12)).is_some(), "daemon must exit once idle again");
-    assert!(t1.elapsed() >= MS(4500), "grace did not restart: exited after {:?}", t1.elapsed());
     assert!(poll_true(S(1), || !pid_running(pid)));
 }
 
@@ -384,18 +401,18 @@ fn d6b_brief_reconnect_restarts_grace() {
     a.hello_ext("sess-a");
     let (_, pid) = a.start("sleep 300");
     drop(a);
-    std::thread::sleep(S(1));
+    home.advance("idle", 1000);
     let mut b = home.connect();
     b.hello_cli();
-    std::thread::sleep(S(1));
+    home.advance_now(1000);
     drop(b);
-    let t1 = Instant::now();
-    // The original countdown would fire ~3s from here.
-    std::thread::sleep(MS(3800));
+    // The original countdown would fire 3s from here; the new one at 5s.
+    home.advance_almost("idle", 5000);
     assert!(daemon.try_wait().unwrap().is_none(), "stale countdown shut the daemon down");
     assert!(pid_running(pid));
+    home.advance_past();
+    home.advance("shutdown-grace", 2000);
     assert!(wait_child(&mut daemon, S(10)).is_some());
-    assert!(t1.elapsed() >= MS(4500), "exited {:?} after the last client left", t1.elapsed());
 }
 
 /// C1/D7: a connection that never completes hello does not count as active,
@@ -405,9 +422,10 @@ fn d7_unhelloed_connection_does_not_hold_daemon_alive() {
     let home = Home::new("d7");
     let mut daemon = home.start_daemon();
     let _raw = UnixStream::connect(home.sock()).unwrap();
-    let t0 = Instant::now();
+    home.advance_almost("idle", 5000);
+    assert!(daemon.try_wait().unwrap().is_none(), "exited before the grace");
+    home.advance_past();
     assert!(wait_child(&mut daemon, S(9)).is_some(), "daemon kept alive by a silent connection");
-    assert!(t0.elapsed() >= S(4), "exited before the grace");
 }
 
 /// C5/D8: a hello that arrives while shutdown is in progress is refused (it
@@ -441,6 +459,7 @@ fn d8_hello_during_shutdown_is_refused_and_does_not_cancel() {
         .expect("a hello during shutdown must be answered promptly");
     assert_eq!(r["ok"], false, "hello accepted during shutdown: {r}");
     assert!(r["error"]["message"].as_str().unwrap_or("").contains("shutting down"), "{r}");
+    home.advance("shutdown-grace", 2000);
     assert!(wait_child(&mut daemon, S(8)).is_some(), "late hello cancelled shutdown");
     assert!(!pid_running(pid));
     // The still-open extension connection did not block the explicit shutdown.
@@ -464,7 +483,11 @@ fn d8b_cli_during_shutdown_reaches_a_successor() {
     // pause lets the daemon act on the shutdown it just acknowledged.)
     std::thread::sleep(MS(200));
     let path = home.path.clone();
-    let ls = std::thread::spawn(move || run_cli(&path, &["ls"], S(20)));
+    let clock = if home.manual { "manual" } else { "" };
+    let ls = std::thread::spawn(move || run_cli_env(&path, &["ls"], S(20), &[("PBS_TEST_CLOCK", clock)]));
+    // Let `ls` meet the shutting-down manager before the grace ends.
+    std::thread::sleep(MS(500));
+    home.advance("shutdown-grace", 2000);
     assert!(wait_child(&mut daemon, S(8)).is_some());
     let out = ls.join().unwrap();
     assert!(out.status.success(), "ls during shutdown failed: {}", out.stderr);
@@ -487,6 +510,7 @@ fn d9_shutdown_command_kills_tasks_and_cleans_files() {
     wait_output_contains(&mut a, &id2, "armed");
     let out = home.cli(&["shutdown"], S(10));
     assert!(out.status.success());
+    home.advance("shutdown-grace", 2000);
     assert!(wait_child(&mut daemon, S(8)).is_some(), "daemon must exit after shutdown");
     assert!(!pid_running(p1) && !pid_running(p2));
     assert!(!home.sock().exists() && !home.pidfile().exists());
@@ -585,16 +609,14 @@ fn t5_sigterm_ignoring_task_is_sigkilled_after_grace() {
     c.hello_ext("sess-a");
     let (id, pid) = c.start("trap '' TERM; echo armed; sleep 300");
     wait_output_contains(&mut c, &id, "armed");
-    let t0 = Instant::now();
     let r = c.request_ok(json!({"type":"stop","task_id":id}));
     assert_eq!(r["ok"], true);
-    std::thread::sleep(S(1));
+    home.advance_almost("kill-grace", 2000);
     assert!(pid_running(pid), "SIGKILL arrived before the 2s grace");
     assert_eq!(c.status_of(&id).as_deref(), Some("running"));
+    home.advance_past();
     let t = c.wait_terminal(&id, S(5)).expect("SIGKILL escalation");
-    let elapsed = t0.elapsed();
     assert_eq!(t["status"], "killed");
-    assert!(elapsed >= MS(1500), "killed after {elapsed:?}");
     assert!(!pid_running(pid));
     let ev = c
         .wait_event(S(2), |e| e["event"] == "task_exited" && e["task_id"] == json!(id))
@@ -655,6 +677,9 @@ fn t6b_stop_kills_term_ignoring_grandchild_after_leader_exits() {
     let gc = wait_for_pids(&mut c, &id, 1)[0];
     c.request_ok(json!({"type":"stop","task_id":id}));
     assert_eq!(c.wait_terminal(&id, S(3)).unwrap()["status"], "killed");
+    home.advance_almost("kill-grace", 2000);
+    assert!(pid_running(gc), "grandchild SIGKILLed before the grace");
+    home.advance_past();
     let dead = poll_true(S(5), || !pid_running(gc));
     kill_pid(gc, libc::SIGKILL);
     assert!(dead, "grandchild {gc} ignored SIGTERM and was never SIGKILLed");
@@ -673,6 +698,8 @@ fn t6c_shutdown_kills_leftover_group_of_exited_task() {
     assert_eq!(c.wait_terminal(&id, S(3)).unwrap()["status"], "completed");
     assert!(pid_running(gc));
     drop(c);
+    home.advance("idle", 5000);
+    home.advance("shutdown-grace", 2000);
     assert!(wait_child(&mut daemon, S(12)).is_some());
     let dead = poll_true(S(2), || !pid_running(gc));
     kill_pid(gc, libc::SIGKILL);
@@ -698,8 +725,9 @@ fn t6d_stop_and_shutdown_session_reach_leftover_group() {
     assert!(pid_running(ga) && pid_running(gb));
 
     c.request_ok(json!({"type":"stop","task_id":a}));
-    std::thread::sleep(S(1));
+    home.advance_almost("kill-grace", 2000);
     assert!(pid_running(ga), "TERM-ignoring leftover killed before the grace");
+    home.advance_past();
     let dead = poll_true(S(4), || !pid_running(ga));
     kill_pid(ga, libc::SIGKILL);
     assert!(dead, "leftover child {ga} survived stop");
@@ -834,7 +862,8 @@ fn s3_session_survives_crash_while_others_connected_and_reattaches() {
         "crashed session must show disconnected"
     );
     drop(cli);
-    std::thread::sleep(MS(6000)); // longer than the 5s idle grace
+    home.advance_now(6000); // longer than the 5s idle grace
+    settle();
     assert!(pid_running(pid), "task of a crashed session killed while another pi is connected");
 
     let mut resumed = home.connect();
@@ -1357,6 +1386,7 @@ fn d15_sigterm_to_daemon_is_graceful() {
         c.hello_ext("sess-a");
         let (id, pid) = c.start("sleep 300");
         kill_pid(d.id(), sig);
+        home.advance("shutdown-grace", 2000);
         let st = wait_child(&mut d, S(6)).expect("daemon must exit on signal");
         assert!(st.success(), "{st:?}");
         assert!(!pid_running(pid));

@@ -5,6 +5,7 @@
 mod out;
 
 mod client;
+mod clock;
 mod daemon;
 mod events;
 mod fmt;

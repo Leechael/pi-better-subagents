@@ -98,6 +98,8 @@ fn g3_manager_log_records_shutdown_reason() {
     c.hello_ext("sess-a");
     c.start("sleep 300");
     drop(c);
+    home.advance("idle", 5000);
+    home.advance("shutdown-grace", 2000);
     assert!(wait_child(&mut d, S(12)).is_some());
     let out = home.cli(&["log", "-n", "50"], S(5));
     assert!(out.status.success(), "{}", out.stderr);
@@ -188,9 +190,12 @@ fn g7_staggered_disconnects_still_reach_idle_shutdown() {
     let (_, pid) = b.start("sleep 300");
     drop(a);
     // Longer than the 5s grace while b is still connected.
-    std::thread::sleep(Duration::from_millis(6000));
+    home.advance_now(6000);
+    settle();
     assert!(d.try_wait().unwrap().is_none(), "shut down while a client was connected");
     drop(b);
+    home.advance("idle", 5000);
+    home.advance("shutdown-grace", 2000);
     assert!(
         wait_child(&mut d, S(10)).is_some(),
         "daemon never idle-exited after the last client left"
@@ -291,14 +296,19 @@ fn g11_shutdown_counts_only_live_leftover_groups() {
     let mut d = home.start_daemon();
     let mut c = home.connect();
     c.hello_ext("sess-a");
-    let (gone, _) = c.start("sleep 0.3 >/dev/null 2>&1 &");
+    let (gone, _) = c.start("sleep 0.3 >/dev/null 2>&1 & echo $!");
     let (live, _) = c.start("sleep 300 >/dev/null 2>&1 & echo $!");
     c.wait_terminal(&gone, S(3)).unwrap();
     c.wait_terminal(&live, S(3)).unwrap();
+    let gone_gc = wait_for_pids(&mut c, &gone, 1)[0];
     let gc = wait_for_pids(&mut c, &live, 1)[0];
-    std::thread::sleep(Duration::from_millis(1500)); // first group has emptied
+    // The first group empties; the leftover-group poll notices on its next tick.
+    assert!(poll_true(S(3), || !pid_running(gone_gc)));
+    home.advance("group-poll", 500);
+    settle();
     drop(c);
     assert!(home.cli(&["shutdown"], S(10)).status.success());
+    home.advance("shutdown-grace", 2000);
     assert!(wait_child(&mut d, S(10)).is_some());
     assert!(poll_true(S(2), || !pid_running(gc)), "live leftover survived");
     let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap();
