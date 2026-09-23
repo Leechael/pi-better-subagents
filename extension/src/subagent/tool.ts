@@ -19,6 +19,8 @@ import { formatSubagentHandover, formatSubagentNotification, truncateTail } from
 import { realClock, type Clock, type ClockTimer } from "../clock";
 
 import type { NotifyCenter } from "../notify";
+import { statusGlyph, toolComponent } from "../tui/tool-component";
+import type { WorkIndex } from "../work-index";
 import { runChain, runTasks, validateChainSteps } from "./pool";
 import type { RunRecord, SubagentRegistry } from "./registry";
 import type { AgentDefinition, ChildHandle, ChildResult, ChildRunRequest } from "./types";
@@ -128,6 +130,8 @@ export interface SubagentToolDeps {
   /** Default tasks worker-pool concurrency. */
   defaultConcurrency: number;
   clock?: Clock;
+  /** Live background work; lets a backgrounded run's row redraw as children finish. */
+  getIndex?: () => WorkIndex | null;
   /** Agent definition resolver (M5 wires the real loader; default: worker). */
   resolveAgent?: (name: string | undefined) => AgentDefinition;
   /** Selectable models for action:"models" (§4.6); absent → action errors. */
@@ -631,6 +635,45 @@ export function createSubagentTool(
       "<pbs-wake> is a system wake, not a user reply. kind=subagent-handover is one child; kind=subagent-done is the whole run.",
     ],
     parameters: subagentParameters,
+    renderResult(result, { expanded }, theme, context) {
+      const details = result.details as { run_id?: string; status?: string } | undefined;
+      const record = details?.run_id ? deps.getRegistry()?.get(details.run_id) : undefined;
+      if (details?.status === "backgrounded" && record) {
+        // UI row only: one line per child with live status. The model-facing
+        // instructions stay in result.content.
+        const index = deps.getIndex?.() ?? null;
+        const state = context.state as { unsubscribe?: () => void };
+        const active = record.children.some((c) => c.status === "pending" || c.status === "running");
+        if (index && !state.unsubscribe && active) {
+          state.unsubscribe = index.onChange(() => {
+            const now = deps.getRegistry()?.get(record.runId);
+            if (!now || now.children.every((c) => c.status !== "pending" && c.status !== "running")) {
+              state.unsubscribe?.();
+              state.unsubscribe = () => {};
+            }
+            context.invalidate();
+          });
+        }
+        const now = clock.now();
+        const lines = [theme.fg("muted", `run ${record.runId} · ${record.status} · /tasks`)];
+        for (const c of record.children) {
+          const g = statusGlyph(c.status);
+          const age = formatDurationMs((c.endedAt ?? now) - c.startedAt);
+          const err = c.result?.error ? ` · ${c.result.error}` : "";
+          lines.push(`  ${theme.fg(g.color as never, g.glyph)} ${c.name} ${theme.fg("dim", `${c.status} ${age}${err}`)}`);
+        }
+        return toolComponent(lines) as never;
+      }
+      const text = result.content
+        .filter((c): c is { type: "text"; text: string } => c.type === "text")
+        .map((c) => c.text)
+        .join("\n");
+      const all = text.split("\n");
+      const shown = expanded ? all : all.slice(0, 10);
+      const out = shown.map((l) => theme.fg("toolOutput", l));
+      if (shown.length < all.length) out.push(theme.fg("muted", `... (${all.length - shown.length} more lines, ctrl+o to expand)`));
+      return toolComponent(out) as never;
+    },
     async execute(_toolCallId, rawParams, signal, _onUpdate, _ctx) {
       const params = rawParams as SubagentParams;
       const hasTasks = params.tasks !== undefined;

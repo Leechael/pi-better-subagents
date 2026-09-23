@@ -243,6 +243,7 @@ export default function (pi: ExtensionAPI): void {
     createSubagentTool({
       getRegistry: () => subagentRegistry,
       getNotifyCenter: () => notifyCenter,
+      getIndex: () => workIndex,
       budgetMs: () => subagentConfig.budgetMs,
       defaultTimeoutMs: subagentConfig.timeoutMs,
       defaultConcurrency: subagentConfig.concurrency,
