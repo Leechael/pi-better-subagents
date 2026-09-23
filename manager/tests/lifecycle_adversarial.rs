@@ -1440,7 +1440,12 @@ fn t13_terminal_records_survive_restart() {
     c.wait_terminal(&bad, S(3)).unwrap();
     drop(c);
     assert!(home.cli(&["shutdown"], S(10)).status.success());
-    assert!(wait_child(&mut d1, S(8)).is_some());
+    // Nothing is left to kill, so no clock step: shutdown must not wait on
+    // the manual clock (see t13b).
+    if wait_child(&mut d1, S(8)).is_none() {
+        let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
+        panic!("daemon did not exit after shutdown\n{log}");
+    }
 
     let _d2 = home.start_daemon();
     let mut c = home.connect();
@@ -1457,6 +1462,36 @@ fn t13_terminal_records_survive_restart() {
     assert_eq!((w["done"].as_bool(), w["exit_code"].as_i64()), (Some(true), Some(2)));
     let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap();
     assert!(log.contains("readopted=0 orphaned=0 loaded=2"), "{log}");
+}
+
+/// T13b: shutdown looks at leftover groups as they are now. A finished task
+/// whose group was non-empty when its leader exited, but has emptied since,
+/// gets no SIGTERM and no 2s grace: nothing of it is left to kill.
+///
+/// The leftover-group flag is only refreshed by the 500ms `group-poll`,
+/// which under the manual clock never runs unless a test steps it. Before
+/// the fix, shutdown trusted the stale flag and waited on `shutdown-grace`
+/// forever. The same stale flag, set by a transient EPERM from
+/// `kill(-pgid, 0)` just after the leader was reaped (macOS, under load),
+/// was what hung `t13`.
+#[test]
+fn t13b_shutdown_skips_leftover_group_that_has_emptied() {
+    let home = Home::new("t13b");
+    let mut d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    let (id, _) = c.start("sleep 0.3 >/dev/null 2>&1 & echo $!");
+    let gc = wait_for_pids(&mut c, &id, 1)[0];
+    c.wait_terminal(&id, S(3)).unwrap();
+    // The group outlived its leader, then emptied. No clock step, so the
+    // leftover-group poll (manual clock) has not seen it empty.
+    assert!(poll_true(S(3), || !pid_running(gc)));
+    drop(c);
+    assert!(home.cli(&["shutdown"], S(10)).status.success());
+    let exited = wait_child(&mut d, S(3));
+    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
+    assert!(exited.is_some(), "shutdown waited on an emptied group\n{log}");
+    assert!(!log.contains("leftover process group"), "{log}");
 }
 
 /// D15: SIGTERM/SIGINT to the daemon is the same graceful shutdown.
