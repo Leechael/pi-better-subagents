@@ -266,7 +266,7 @@ impl Home {
         // The first run of a freshly copied binary is slow on macOS (code
         // signature assessment), hence the longer wait.
         assert!(
-            poll_true(Duration::from_secs(20), || UnixStream::connect(self.sock()).is_ok()),
+            poll_true(Duration::from_secs(20), || UnixStream::connect(self.sock()).is_ok() && self.pidfile_pid().is_some()),
             "daemon did not start listening within 20s"
         );
         child
@@ -275,7 +275,8 @@ impl Home {
     pub fn start_daemon(&self) -> Child {
         let child = self.spawn_daemon();
         assert!(
-            poll_true(Duration::from_secs(3), || UnixStream::connect(self.sock()).is_ok()),
+            // The daemon binds, then writes manager.pid: ready means both.
+            poll_true(Duration::from_secs(3), || UnixStream::connect(self.sock()).is_ok() && self.pidfile_pid().is_some()),
             "daemon did not start listening within 3s"
         );
         child
