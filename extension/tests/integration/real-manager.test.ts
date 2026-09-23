@@ -177,7 +177,7 @@ describe.skipIf(!RUN || !existsSync(BIN))("real pbs-manager integration", () => 
     }
   }, 20000);
 
-  it("cold restart re-adopts history (tasks survive daemon restart)", async () => {
+  it("cold restart keeps finished history (records survive a daemon restart)", async () => {
     // Daemon is down now; a fresh client respawns it and sees prior tasks.
     const client2 = new ManagerClient({ home, sessionId: "integ", managerPath: BIN });
     const ok = await client2.connect();

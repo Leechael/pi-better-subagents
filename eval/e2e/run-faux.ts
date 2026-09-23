@@ -38,6 +38,8 @@ export interface FauxRunOptions {
   untilTimeoutMs?: number;
   /** Quiet window after settling. */
   quietMs?: number;
+  /** Do something to the environment once `when` holds (before `until`). */
+  midway?: { when: (items: Item[]) => boolean; act: (sandbox: Sandbox) => void };
 }
 
 export function readTrace(path: string): FauxCall[] {
@@ -64,6 +66,11 @@ export async function runFaux(opts: FauxRunOptions): Promise<FauxEpisode> {
   try {
     if (opts.warm !== false) await waitManagerReady(sandbox);
     await pi.prompt(opts.prompt ?? "go");
+    if (opts.midway) {
+      const { when, act } = opts.midway;
+      await pi.waitFor((evs) => when(itemsFromEvents(evs)), 15_000, "midway condition");
+      act(sandbox);
+    }
     if (opts.until) {
       const until = opts.until;
       await pi.waitFor((evs) => until(itemsFromEvents(evs)), opts.untilTimeoutMs ?? 15_000, "scenario condition").catch(

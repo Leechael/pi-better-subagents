@@ -91,7 +91,7 @@ function statusPhrase(info: TaskExitInfo): string {
     case "killed":
       return "was killed";
     case "orphaned":
-      return "was orphaned (manager restarted)";
+      return "ended when pbs-manager crashed";
   }
 }
 

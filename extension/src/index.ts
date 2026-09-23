@@ -55,6 +55,8 @@ export function readPreview(outputPath: string | undefined, maxChars: number): s
 }
 
 function toExitStatus(event: ManagerEvent): TaskExitInfo["status"] {
+  // The manager died without shutting down; its runner took the task down.
+  if (event.end_reason === "manager-crash") return "orphaned";
   if (event.signal) return "killed";
   if (event.exit_code === 0) return "completed";
   return "failed";
@@ -103,7 +105,10 @@ export default function (pi: ExtensionAPI): void {
    * Settle everything the manager reports as ended that we still show live:
    * monitors in the registry and shell/monitor rows in the index. Runs when
    * the user or model looks (task_list, /tasks), after task_stop, after a
-   * monitor timeout, and after a reconnect.
+   * monitor timeout, and after a reconnect. A backgrounded command the model
+   * is waiting on gets its exit wake here: after a manager crash no
+   * task_exited ever comes (the task ended orphaned), and without the wake
+   * the model would wait forever.
    */
   const syncWithManager = async (): Promise<void> => {
     const c = client;
@@ -115,7 +120,11 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
     monitorRegistry?.reconcile(tasks);
-    for (const task of workIndex.staleLive(tasks)) patchExited(task.task_id, exitEventFromRecord(task));
+    for (const task of workIndex.staleLive(tasks)) {
+      const event = exitEventFromRecord(task);
+      if (notifyOnExit.has(task.task_id)) deliverExit(task.task_id, event);
+      else patchExited(task.task_id, event);
+    }
   };
   const eventLog = createExtensionEventLog(home, () => ctx?.sessionManager.getSessionId() ?? "", clock);
   const logEvent = (type: string, fields?: Record<string, unknown>) => eventLog.write(type, fields);

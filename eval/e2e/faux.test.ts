@@ -5,6 +5,7 @@
  *   node --test e2e/faux.test.ts
  */
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { after, describe, it } from "node:test";
 import { type FauxEpisode, runFaux } from "./run-faux.ts";
 import { followedByAssistant, type Item, toolResults, wakes } from "../lib/transcript.ts";
@@ -117,6 +118,35 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.ok(followedByAssistant(ep.items, timeouts[0].seq), `timeout did not wake the agent\n${explain(ep)}`);
     const lastText = (ep.items.at(-1) as { text?: string }).text ?? "";
     assert.match(lastText, /WOKE: timeout/);
+  });
+
+  it("(e2) a manager crash ends a backgrounded command with an orphaned exit wake", async () => {
+    let managerPid = 0;
+    const ep = await runFaux({
+      script: "manager-crash.ts",
+      pbsConfig: { foregroundBudgetMs: 300 },
+      midway: {
+        when: (items) => toolResults(items).some((r) => r.toolName === "bash" && r.details?.backgrounded === true),
+        act: (sb) => {
+          const st = spawnSync(sb.env.PBS_MANAGER_PATH, ["--home", sb.pbsHome, "status", "--json"], { encoding: "utf8" });
+          managerPid = Number(JSON.parse(st.stdout).pid);
+          process.kill(managerPid, "SIGKILL");
+        },
+      },
+      until: (items) => wakes(items).some((w) => w.wake.kind === "task") && /WOKE/.test(JSON.stringify(items.at(-1) ?? {})),
+      untilTimeoutMs: 20_000,
+      quietMs: 1500,
+    });
+    episodes.push(ep);
+    assert.ok(managerPid > 0, explain(ep));
+    const bash = bashResult(ep.items);
+    const taskId = String(bash?.details?.task_id);
+    const ws = wakes(ep.items).filter((w) => w.wake.kind === "task");
+    assert.equal(ws.length, 1, `expected one exit wake\n${explain(ep)}`);
+    assert.deepEqual(ws[0].wake.taskIds, [taskId], explain(ep));
+    assert.equal(ws[0].wake.status, "orphaned", explain(ep));
+    assert.ok(followedByAssistant(ep.items, ws[0].seq), `the wake did not start a turn\n${explain(ep)}`);
+    assert.match((ep.items.at(-1) as { text?: string }).text ?? "", /WOKE orphaned/);
   });
 
   it("(c2) a monitor that exits at once ends with an exit wake, not a timeout", async () => {
