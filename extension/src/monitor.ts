@@ -331,14 +331,14 @@ export function createMonitorTool(
         `${theme.fg("toolTitle", "Monitor")} ${theme.fg("muted", desc)}`,
       ]) as never;
     },
-    renderResult(result, { expanded }, theme) {
+    renderResult(result, { expanded }, theme, context) {
       const text = result.content
         .filter((c): c is { type: "text"; text: string } => c.type === "text")
         .map((c) => c.text)
         .join("\n");
-      const failed = /\b(failed|killed|orphaned|error)\b/i.test(text);
+      const failed = context.isError || /\b(failed|killed|orphaned|error)\b/i.test(text);
       const { color, glyph } = statusGlyph(failed ? "failed" : "completed", failed);
-      const line = `${theme.fg(color as "error", glyph)} ${text}${expanded ? "" : theme.fg("dim", "  · ↓ manage via /tasks")}`;
+      const line = `${theme.fg(color as "error", glyph)} ${text}${expanded ? "" : theme.fg("dim", "  · manage via /tasks")}`;
       return toolComponent([line]) as never;
     },
   };
