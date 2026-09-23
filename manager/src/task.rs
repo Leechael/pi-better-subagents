@@ -786,8 +786,8 @@ mod tests {
             // miss a single group signal: kill until only the leader is left
             // (what the daemon's kill paths do).
             for _ in 0..40 {
-                // Result ignored: with only unreaped zombies left the group
-                // kill can fail with EPERM (macOS); the probe below decides.
+                // Once only the unreaped leader is left, macOS answers EPERM
+                // (not ESRCH) for the group: ignored, as the daemon does.
                 let _ = signal_group(t.pid, SIGKILL);
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 if !crate::sys::group_has_others(t.pid) {
