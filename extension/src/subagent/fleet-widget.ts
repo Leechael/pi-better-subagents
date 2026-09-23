@@ -175,8 +175,9 @@ export class FleetWidget {
     if (failed > 0) parts.push(theme.fg("error", `✗ ${failed} failed`));
     if (parts.length === 0) return [];
     const running = counts.workers + counts.subagents + counts.monitors > 0;
-    const glyph = running ? theme.fg("accent", "●") : theme.fg("error", "✗");
-    const line = `  ${glyph} ${parts.join(theme.fg("dim", " · "))}   ${theme.fg("dim", "/tasks")}`;
+    // Lead with ● only while something runs; a failures-only row already starts with ✗.
+    const lead = running ? `${theme.fg("accent", "●")} ` : "";
+    const line = `  ${lead}${parts.join(theme.fg("dim", " · "))}   ${theme.fg("dim", "/tasks")}`;
     return [truncateToWidth(line, Math.max(1, width), "…")];
   }
 }

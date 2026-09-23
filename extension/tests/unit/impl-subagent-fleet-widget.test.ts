@@ -116,6 +116,7 @@ describe("FleetWidget", () => {
     index.patch("sh_1", { status: "failed", endedAt: 900 });
     const line = lastFactory(ui)?.(80).join("\n") ?? "";
     expect(line).toContain("✗ 1 failed");
+    expect(line).not.toContain("✗ ✗");
     widget.dispose();
   });
 
