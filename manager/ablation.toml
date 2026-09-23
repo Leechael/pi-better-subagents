@@ -153,6 +153,7 @@ replace = "        Ok(Claim::Acquired(guard)) => drop(guard),"
 tests = [
   "protocol::t10_second_daemon_refused",
   "lifecycle_adversarial::d3_concurrent_daemon_processes_leave_one_survivor",
+  "lifecycle_adversarial::d1_concurrent_clients_spawn_exactly_one_daemon",
 ]
 expect = "red"
 
