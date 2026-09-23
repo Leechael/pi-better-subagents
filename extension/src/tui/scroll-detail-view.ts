@@ -171,11 +171,9 @@ export async function showScrollDetail(ui: ExtensionUIContext, options: ScrollDe
     {
       overlay: true,
       overlayOptions: {
-        anchor: "top-left",
+        anchor: "bottom-left",
         width: "100%",
         maxHeight: "100%",
-        row: 0,
-        col: 0,
         margin: 0,
       },
     },

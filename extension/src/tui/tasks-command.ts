@@ -395,7 +395,9 @@ async function showTaskList(
         dispose() { clock.clearInterval(ageTimer); unsub(); },
       };
     },
-    { overlay: true, overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%", row: 0, col: 0, margin: 0 } },
+    // Bottom sheet over the editor, where the user typed /tasks; the list is
+    // content-sized, so a top anchor left it at the far end of the screen.
+    { overlay: true, overlayOptions: { anchor: "bottom-left", width: "100%", maxHeight: "100%", margin: 0 } },
   );
 }
 

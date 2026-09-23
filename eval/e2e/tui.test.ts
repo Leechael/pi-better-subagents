@@ -128,6 +128,22 @@ describe("TUI screenshot", { skip: ENABLED ? false : "set PBS_E2E_TUI=1 to run" 
         [],
         `lines wider than the ${WIDTH}-column pane`,
       );
+
+      // /tasks opens as a bottom sheet over the editor, not at the top of the
+      // screen far from where the user is typing (manual testing, 2026-09-24).
+      if (!c.longDesc) {
+        tmux("send-keys", "-t", session, "-l", "/tasks");
+        tmux("send-keys", "-t", session, "Enter");
+        const open = await waitForPane(session, (t) => /Enter view/.test(t), 5_000);
+        const rows = tmux("capture-pane", "-p", "-J", "-t", session).split("\n");
+        while (rows.length > 0 && rows.at(-1) === "") rows.pop();
+        const footer = rows.findIndex((l) => l.includes("Enter view"));
+        const titleRow = rows.findIndex((l) => /^\s*Tasks \d+\/\d+/.test(l));
+        tmux("send-keys", "-t", session, "Escape");
+        assert.ok(footer >= 0 && titleRow >= 0, `/tasks did not open:\n${open}`);
+        assert.ok(titleRow > HEIGHT / 2, `/tasks title at row ${titleRow} of ${HEIGHT}; expected the lower half:\n${rows.join("\n")}`);
+        assert.ok(footer >= HEIGHT - 3, `/tasks footer at row ${footer} of ${HEIGHT}; expected at the bottom:\n${rows.join("\n")}`);
+      }
     });
   }
 });
