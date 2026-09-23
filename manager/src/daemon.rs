@@ -297,6 +297,8 @@ async fn serve(state: Shared, listener: tokio::net::UnixListener, daemon_lock: l
 
     // §3.2: forget gone sessions past their retention, now and periodically.
     spawn_session_gc(&state);
+    // In-place upgrade when the binary on disk changes.
+    spawn_exe_watch(&state);
 
     // §3.2: the idle rule applies from boot (clients connect within 2s of
     // spawn per §3.1, so this never fires for a healthy startup).
@@ -363,6 +365,38 @@ async fn serve(state: Shared, listener: tokio::net::UnixListener, daemon_lock: l
     }
     drop(daemon_lock);
     0
+}
+
+/// Poll this daemon's executable. When the file at its path is replaced
+/// (another inode, size or mtime) and stays unchanged for one more poll,
+/// upgrade in place. A binary that fails the handover check is not retried
+/// until the file changes again.
+fn spawn_exe_watch(state: &Shared) {
+    const POLL: Duration = Duration::from_secs(2);
+    let Ok(exe) = crate::handover::exe_path() else { return };
+    let ident = |p: &std::path::Path| {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec()))
+    };
+    let state2 = state.clone();
+    tokio::spawn(async move {
+        let mut running = ident(&exe);
+        let mut seen = running;
+        loop {
+            tokio::time::sleep(POLL).await;
+            let now = ident(&exe);
+            if now.is_none() || now == running {
+                seen = now;
+                continue;
+            }
+            if now != seen {
+                seen = now; // changed since the last poll: wait until it settles
+                continue;
+            }
+            running = now;
+            crate::handover::request(&state2, "binary-changed");
+        }
+    });
 }
 
 /// Mark the manager as shutting down (new hellos are refused) and run the
