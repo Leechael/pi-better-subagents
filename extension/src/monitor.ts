@@ -12,7 +12,7 @@ import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding
 import { formatMonitorEvent } from "./format";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
-import type { ManagerClient, ManagerEvent } from "./manager-client";
+import type { ManagerClient, ManagerEvent, TaskRecord } from "./manager-client";
 import { LineBatcher, RateLimiter, SaturationWindow } from "./monitor-batching";
 import type { NotifyCenter } from "./notify";
 import { statusGlyph, toolComponent } from "./tui/tool-component";
@@ -25,6 +25,14 @@ const MAX_TIMEOUT_MS = 3_600_000;
 const SATURATION_WINDOW_MS = 30_000;
 const SATURATION_DROP_RATIO = 0.5;
 const SATURATION_MIN_BATCHES = 10;
+/**
+ * Events for ids the registry does not know yet. The manager streams a monitor
+ * from spawn, so output and even the exit can arrive before `start()` has the
+ * task id (same socket read as the start response). Bounded: unrelated shell
+ * exits land here too and age out.
+ */
+const EARLY_MAX_IDS = 32;
+const EARLY_MAX_CHARS = 64 * 1024;
 
 export interface MonitorDeps {
   getClient: () => ManagerClient | null;
@@ -35,6 +43,13 @@ export interface MonitorDeps {
   toast?: (message: string, type?: "info" | "warning" | "error") => void;
   clock?: Clock;
   logEvent?: (type: string, fields?: Record<string, unknown>) => void;
+  /** A known monitor ended (event, replayed early exit, or reconcile). */
+  onExited?: (taskId: string, event: ManagerEvent) => void;
+  /**
+   * After a timeout or rate-limit stop. The process may already have exited
+   * with its exit event lost, in which case no further event will settle it.
+   */
+  afterStop?: () => void;
 }
 
 interface MonitorEntry {
@@ -54,6 +69,7 @@ export class MonitorRegistry {
   private readonly clock: Clock;
   private readonly entries = new Map<string, MonitorEntry>();
   private readonly changeListeners = new Set<() => void>();
+  private readonly early = new Map<string, { chunks: string[]; chars: number; exit?: ManagerEvent }>();
 
   constructor(deps: MonitorDeps) {
     this.deps = deps;
@@ -114,7 +130,6 @@ export class MonitorRegistry {
       timeout_ms: null, // timeout is enforced extension-side to control the notice
       origin: { via: "monitor" },
     });
-    await client.watch(task_id);
     this.deps.trackTask(task_id, { kind: "monitor", command: params.command, cwd: ctx.cwd });
 
     const entry: MonitorEntry = {
@@ -144,23 +159,46 @@ export class MonitorRegistry {
     }
     this.entries.set(task_id, entry);
     this.emitChange();
+    // Replay what arrived before we knew the id: lines first, then the exit.
+    const early = this.early.get(task_id);
+    this.early.delete(task_id);
+    for (const chunk of early?.chunks ?? []) entry.batcher.push(chunk);
+    if (early?.exit) this.handleExit(task_id, early.exit);
+    // Older managers only stream after an explicit watch; newer ones already do.
+    else await client.watch(task_id).catch(() => {});
     return { taskId: task_id, timeoutMs };
   }
 
   /** Handle a watched output event from the manager. */
   handleOutput(taskId: string, chunk: string): void {
-    this.entries.get(taskId)?.batcher.push(chunk);
+    const entry = this.entries.get(taskId);
+    if (entry) {
+      entry.batcher.push(chunk);
+      return;
+    }
+    const early = this.earlyFor(taskId);
+    if (early.chars + chunk.length > EARLY_MAX_CHARS) return;
+    early.chunks.push(chunk);
+    early.chars += chunk.length;
   }
 
-  /** Handle the manager's task_exited event for a monitored task. */
-  handleExit(taskId: string, event: ManagerEvent): void {
+  /**
+   * Handle the manager's task_exited event. Returns true when it closed a
+   * known monitor; an unknown id is kept briefly in case `start()` is about to
+   * register it.
+   */
+  handleExit(taskId: string, event: ManagerEvent): boolean {
     const entry = this.entries.get(taskId);
-    if (!entry) return;
+    if (!entry) {
+      this.earlyFor(taskId).exit = event;
+      return false;
+    }
     // Drain remaining buffered lines before closing out.
     entry.batcher.flush();
     const alreadyStopped = entry.stopped;
     this.cleanup(entry);
-    if (alreadyStopped) return; // timeout/saturation notice already sent
+    this.deps.onExited?.(taskId, event);
+    if (alreadyStopped) return true; // timeout/saturation notice already sent
     const exitCode = event.exit_code ?? null;
     const duration =
       typeof event.duration_ms === "number" ? `${(event.duration_ms / 1000).toFixed(1)}s` : "unknown duration";
@@ -178,9 +216,35 @@ export class MonitorRegistry {
       `Monitor "${entry.description}" exited (code ${exitCode === null ? "?" : exitCode})`,
       exitCode === 0 || exitCode === null ? "info" : "warning",
     );
+    return true;
   }
 
-  /** Re-subscribe watches after a manager reconnect. */
+  /**
+   * Close monitors the manager already reports as finished: the safety net for
+   * an exit event that never reached us (reconnect, older manager). Returns the
+   * ids it closed.
+   */
+  reconcile(tasks: readonly TaskRecord[]): string[] {
+    const closed: string[] = [];
+    for (const task of tasks) {
+      if (task.status === "running" || !this.entries.has(task.task_id)) continue;
+      this.handleExit(task.task_id, exitEventFromRecord(task));
+      closed.push(task.task_id);
+    }
+    return closed;
+  }
+
+  private earlyFor(taskId: string): { chunks: string[]; chars: number; exit?: ManagerEvent } {
+    let early = this.early.get(taskId);
+    if (!early) {
+      early = { chunks: [], chars: 0 };
+      this.early.set(taskId, early);
+      while (this.early.size > EARLY_MAX_IDS) this.early.delete(this.early.keys().next().value as string);
+    }
+    return early;
+  }
+
+  /** Re-subscribe watches after a manager reconnect, then drop monitors that ended meanwhile. */
   async rewatchAll(): Promise<void> {
     const client = this.deps.getClient();
     if (!client || !client.isAvailable()) return;
@@ -194,6 +258,7 @@ export class MonitorRegistry {
       this.cleanup(entry);
     }
     this.entries.clear();
+    this.early.clear();
   }
 
   private onBatch(entry: MonitorEntry, text: string): void {
@@ -232,6 +297,7 @@ export class MonitorRegistry {
     );
     this.deps.toast?.(`Monitor "${entry.description}" timed out — re-arm if needed.`, "warning");
     this.cleanup(entry);
+    this.deps.afterStop?.();
   }
 
   /** Rate limiter saturated for too long: stop and notify (§4.4). */
@@ -256,6 +322,7 @@ export class MonitorRegistry {
       "warning",
     );
     this.cleanup(entry);
+    this.deps.afterStop?.();
   }
 
   private cleanup(entry: MonitorEntry): void {
@@ -269,6 +336,19 @@ export class MonitorRegistry {
     this.entries.delete(entry.taskId);
     this.emitChange();
   }
+}
+
+/** A task_exited-shaped event rebuilt from a manager record (reconcile). */
+export function exitEventFromRecord(task: TaskRecord): ManagerEvent {
+  return {
+    event: "task_exited",
+    task_id: task.task_id,
+    exit_code: task.exit_code,
+    signal: task.signal,
+    ...(task.ended_at !== null ? { duration_ms: task.ended_at - task.started_at } : {}),
+    output_path: task.output_path,
+    ...(task.end_reason ? { end_reason: task.end_reason } : {}),
+  };
 }
 
 function fullEnv(ctx: ExtensionContext, deps: MonitorDeps): Record<string, string> {

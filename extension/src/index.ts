@@ -23,7 +23,7 @@ import { registerReplyCommand } from "./comms/reply-command";
 import { describeManagerSearch, getPbsHome, loadConfig, resolveManagerPath, resolveSubagentConfig } from "./config";
 import type { TaskExitInfo } from "./format";
 import { ManagerClient, type ManagerEvent } from "./manager-client";
-import { createMonitorTool, MonitorRegistry } from "./monitor";
+import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
 import { NotifyCenter } from "./notify";
 import { createChildBashTool } from "./subagent/child-bash";
 import {
@@ -87,6 +87,36 @@ export default function (pi: ExtensionAPI): void {
   const notifyOnExit = new Set<string>();
   const exitGate = new ExitNotifyGate<ManagerEvent>({ clock });
   const workIndex = new WorkIndex({ clock });
+  const patchExited = (taskId: string, event: ManagerEvent): void => {
+    workIndex.patch(taskId, {
+      status: toExitStatus(event),
+      endedAt: clock.now(),
+      exitCode: event.exit_code ?? null,
+      ...(event.signal ? { signal: event.signal } : {}),
+      ...(event.end_reason ? { endReason: event.end_reason } : {}),
+      ...(event.output_path
+        ? { outputPath: event.output_path, stderrPath: stderrPathFor(event.output_path) }
+        : {}),
+    });
+  };
+  /**
+   * Settle everything the manager reports as ended that we still show live:
+   * monitors in the registry and shell/monitor rows in the index. Runs when
+   * the user or model looks (task_list, /tasks), after task_stop, after a
+   * monitor timeout, and after a reconnect.
+   */
+  const syncWithManager = async (): Promise<void> => {
+    const c = client;
+    if (!c || !c.isAvailable()) return;
+    let tasks;
+    try {
+      tasks = await c.list(true);
+    } catch {
+      return;
+    }
+    monitorRegistry?.reconcile(tasks);
+    for (const task of workIndex.staleLive(tasks)) patchExited(task.task_id, exitEventFromRecord(task));
+  };
   const eventLog = createExtensionEventLog(home, () => ctx?.sessionManager.getSessionId() ?? "", clock);
   const logEvent = (type: string, fields?: Record<string, unknown>) => eventLog.write(type, fields);
 
@@ -178,6 +208,7 @@ export default function (pi: ExtensionAPI): void {
     clock,
     getRegistry: () => subagentRegistry,
     getIndex: () => workIndex,
+    syncWithManager: () => syncWithManager(),
   };
 
   monitorRegistry = new MonitorRegistry({
@@ -190,6 +221,8 @@ export default function (pi: ExtensionAPI): void {
     toast: (message, type) => {
       if (ctx?.hasUI) ctx.ui.notify(message, type);
     },
+    onExited: (taskId, event) => patchExited(taskId, event),
+    afterStop: () => void syncWithManager(),
   });
 
   pi.registerTool(createBashOverride(deps));
@@ -204,10 +237,13 @@ export default function (pi: ExtensionAPI): void {
     home,
     sessionId: () => ctx?.sessionManager.getSessionId() ?? "",
     clock,
+    syncWithManager: deps.syncWithManager,
   });
   monitorRegistry.onChange(() => {
     for (const mon of monitorRegistry.listActive()) {
       const existing = workIndex.get(mon.taskId);
+      // Never revive a row that already ended (an exit can beat registration).
+      if (existing && existing.status !== "running" && existing.status !== "pending") continue;
       workIndex.upsert({
         id: mon.taskId,
         kind: "monitor",
@@ -336,30 +372,10 @@ export default function (pi: ExtensionAPI): void {
         return;
       }
       if (event.event === "task_exited" && event.task_id) {
-        if (monitorRegistry?.has(event.task_id)) {
-          monitorRegistry.handleExit(event.task_id, event);
-          workIndex.patch(event.task_id, {
-            status: toExitStatus(event),
-            endedAt: clock.now(),
-            exitCode: event.exit_code ?? null,
-            ...(event.signal ? { signal: event.signal } : {}),
-            ...(event.end_reason ? { endReason: event.end_reason } : {}),
-            ...(event.output_path
-            ? { outputPath: event.output_path, stderrPath: stderrPathFor(event.output_path) }
-            : {}),
-          });
-          return;
-        }
-        workIndex.patch(event.task_id, {
-          status: toExitStatus(event),
-          endedAt: clock.now(),
-          exitCode: event.exit_code ?? null,
-          ...(event.signal ? { signal: event.signal } : {}),
-          ...(event.end_reason ? { endReason: event.end_reason } : {}),
-          ...(event.output_path
-            ? { outputPath: event.output_path, stderrPath: stderrPathFor(event.output_path) }
-            : {}),
-        });
+        // A known monitor closes (and patches the index via onExited); an
+        // unknown id is buffered in case a monitor start is about to claim it.
+        if (monitorRegistry?.handleExit(event.task_id, event)) return;
+        patchExited(event.task_id, event);
         // Exit may share a socket read with wait done:false, before bash marks
         // the id. Stash and fire on the late mark. Sync waits never mark.
         if (exitGate.onExit(event.task_id, event, false) !== "notify") return;
@@ -367,7 +383,7 @@ export default function (pi: ExtensionAPI): void {
       }
     });
     client.onReconnect(() => {
-      void monitorRegistry?.rewatchAll();
+      void monitorRegistry?.rewatchAll().then(() => syncWithManager());
     });
 
     // M3: subagent registry + in-process runner + fleet widget. The runner's

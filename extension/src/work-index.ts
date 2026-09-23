@@ -116,6 +116,19 @@ export class WorkIndex {
     return [...active, ...finished.slice(0, this.finishedCap)];
   }
 
+  /**
+   * Shell/monitor rows still shown as live although the manager reports the
+   * task ended: their exit event was lost (reconnect, a race, an older
+   * manager). The caller settles them; nothing else ever would.
+   */
+  staleLive<T extends { task_id: string; status: string }>(tasks: readonly T[]): T[] {
+    return tasks.filter((task) => {
+      if (task.status === "running") return false;
+      const row = this.items.get(task.task_id);
+      return row !== undefined && row.kind !== "agent" && isActiveStatus(row.status);
+    });
+  }
+
   /** Running background shells, subagents, and monitors. No total. */
   counts(now = this.now()): WorkCounts {
     let workers = 0;

@@ -57,6 +57,7 @@ export interface TasksCommandDeps {
   home?: string;
   sessionId?: () => string;
   clock?: Clock;
+  syncWithManager?: () => Promise<unknown>;
 }
 
 export function registerTasksCommand(pi: ExtensionAPI, deps: TasksCommandDeps): void {
@@ -174,6 +175,7 @@ export interface TaskListChoice {
 }
 
 async function openTasksUi(ctx: ExtensionContext, deps: TasksCommandDeps): Promise<void> {
+  await deps.syncWithManager?.();
   const index = deps.getIndex();
   const clock = deps.clock ?? realClock;
   const currentItems = () => index?.list(clock.now()) ?? [];

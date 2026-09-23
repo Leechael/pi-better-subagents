@@ -23,6 +23,8 @@ export interface TaskToolsDeps {
   home?: string;
   sessionId?: () => string;
   clock?: Clock;
+  /** Settle work the manager reports as ended (lost exit events). */
+  syncWithManager?: () => Promise<unknown>;
 }
 
 function requireClient(deps: TaskToolsDeps): Promise<ManagerClient> {
@@ -100,6 +102,7 @@ export function createTaskListTool(
     parameters: taskListParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const client = await requireClient(deps);
+      await deps.syncWithManager?.();
       const tasks = await client.list(params.all === true);
       const index = deps.getIndex?.() ?? null;
       const now = (deps.clock ?? realClock).now();
@@ -282,7 +285,12 @@ export function createTaskStopTool(
         };
       }
       const client = await requireClient(deps);
-      await client.stop(params.task_id, "tool");
+      try {
+        await client.stop(params.task_id, "tool");
+      } finally {
+        // Stopping a task that already ended emits no new exit event.
+        await deps.syncWithManager?.();
+      }
       return {
         content: [
           {
