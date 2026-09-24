@@ -43,8 +43,61 @@ fn upgrade(home: &Home) -> CliOut {
 
 /// Pids in process group `pgid` (the runner and what it started).
 fn group(pgid: u32) -> Vec<u32> {
-    let out = std::process::Command::new("pgrep").arg("-g").arg(pgid.to_string()).output().unwrap();
-    String::from_utf8_lossy(&out.stdout).split_whitespace().filter_map(|p| p.parse().ok()).collect()
+    // pgrep's process enumeration can fail on macOS when sysmond is
+    // unavailable, silently hiding live groups behind a nonzero status.
+    // ps has the same group information and works independently of sysmond.
+    let out = std::process::Command::new("ps")
+        .args(["-axo", "pid=,pgid="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let group = fields.next()?.parse::<u32>().ok()?;
+            (group == pgid).then_some(pid)
+        })
+        .collect()
+}
+
+fn group_diagnostics(home: &Home, task_id: &str, pgid: u32) -> String {
+    let ps = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid=,state=,command="])
+        .output()
+        .unwrap();
+    let home_path = home.path.clone();
+    let home_text = home_path.to_string_lossy();
+    let processes: Vec<_> = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|line| {
+            let mut fields = line.split_whitespace();
+            let _pid = fields.next();
+            let _ppid = fields.next();
+            let group = fields.next().and_then(|p| p.parse::<u32>().ok());
+            group == Some(pgid) || line.contains(home_text.as_ref())
+        })
+        .map(str::to_string)
+        .collect();
+    let task = run_cli(&home_path, &["show", task_id, "--json"], s(5));
+    #[cfg(target_os = "macos")]
+    let sample = if pid_alive(pgid) {
+        let pid_arg = pgid.to_string();
+        std::process::Command::new("sample")
+            .args([pid_arg.as_str(), "1"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_else(|e| e.to_string())
+    } else {
+        "runner pid is no longer alive".to_string()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let sample = "sample unavailable on this platform";
+    let log = std::fs::read_to_string(home_path.join("manager.log")).unwrap_or_default();
+    format!(
+        "pgid={pgid}; group probe={:?}; ps={processes:#?}; show={} {}; sample:\n{sample}\nmanager.log:\n{log}",
+        group(pgid), task.stdout, task.stderr
+    )
 }
 
 /// Every `output` event's text for `task_id`, in arrival order.
@@ -89,7 +142,11 @@ fn u1_upgrade_keeps_every_task_running() {
     c.wait_event(s(5), |e| e["event"] == "task_exited" && e["task_id"] == leftover).expect("leftover task exits");
     let sleeper_group = group(sleeper_pid);
     let leftover_group = group(leftover_pid);
-    assert!(leftover_group.len() >= 2, "runner + grandchild: {leftover_group:?}");
+    assert!(
+        leftover_group.len() >= 2,
+        "runner + grandchild: {leftover_group:?}\n{}",
+        group_diagnostics(&home, &leftover, leftover_pid)
+    );
     // A wait in flight when the upgrade starts.
     c.send(&json!({"v":1,"id":"inflight-wait","type":"wait","task_id":sleeper,"budget_ms":20000}));
     std::thread::sleep(Duration::from_millis(300));
@@ -268,10 +325,14 @@ fn u6_failed_restore_cleans_up_like_a_crash() {
     let d = home.start_daemon_from(&bin, &[("PBS_TEST_FAIL_RESTORE", "1")]);
     let mut c = home.connect();
     hello(&mut c, "sess-u6");
-    let (_t, pid) = start(&mut c, "shell", "sleep 300 & sleep 300", json!({}));
+    let (task_id, pid) = start(&mut c, "shell", "sleep 300 & sleep 300", json!({}));
     std::thread::sleep(Duration::from_millis(300));
     let members = group(pid);
-    assert!(members.len() >= 3, "runner, sh, sleeps: {members:?}");
+    assert!(
+        members.len() >= 3,
+        "runner, sh, sleeps: {members:?}\n{}",
+        group_diagnostics(&home, &task_id, pid)
+    );
     let out = upgrade(&home);
     assert!(!out.status.success(), "{}", out.stdout);
     assert!(out.stderr.contains("exited during the upgrade"), "{}", out.stderr);
@@ -324,8 +385,11 @@ fn u8_kill_grace_carries_over() {
     // real time a slow upgrade (parallel load) may outlast the 2 s; the
     // outcome below must hold either way.
     if home.manual {
-        assert!(!members.is_empty(), "SIGTERM-ignoring group still there after the upgrade\nmanager.log:\n{}",
-            std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default());
+        assert!(
+            !members.is_empty(),
+            "SIGTERM-ignoring group still there after the upgrade\n{}",
+            group_diagnostics(&home, &t, pid)
+        );
     }
     // The new image re-armed the grace with what was left of it.
     home.advance_partial("kill-grace", 2_000);
