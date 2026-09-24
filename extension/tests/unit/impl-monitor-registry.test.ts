@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ManualClock } from "../../src/clock";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ManagerClient } from "../../src/manager-client";
@@ -58,25 +58,34 @@ describe("MonitorRegistry saturation", () => {
 });
 
 describe("MonitorRegistry reconnect output recovery", () => {
-  it("slices a replayed UTF-8 byte overlap after the backfill cursor", async () => {
+  it("delivers the re-hello replay once, trimming duplicate and overlapping UTF-8 ranges without backfill", async () => {
     const clock = new ManualClock();
     const delivered: string[] = [];
     let registry!: MonitorRegistry;
     let watchCount = 0;
-    const backfill = `${"中\n".repeat(200)}${"字\n".repeat(50)}`;
-    const replay = `${"字\n".repeat(25)}${"N".repeat(96)}\n`;
+    const before = `${"中\n".repeat(200)}${"字\n".repeat(50)}`; // exactly 1000 UTF-8 bytes
+    const output = vi.fn(async (_id: string, cursor: number) => ({
+      chunk: "",
+      next_cursor: cursor,
+      status: "running" as const,
+      exit_code: null,
+      total_size: 1008,
+    }));
     const manager = {
       ensureAvailable: async () => true,
       isAvailable: () => true,
       start: async () => ({ task_id: "mon_utf8", pid: 13 }),
-      watch: async () => { watchCount++; },
-      output: async (_id: string, cursor: number) => {
-        if (cursor === 0) {
-          registry.handleOutput("mon_utf8", replay, 1097);
-          return { chunk: backfill, next_cursor: 1000, status: "running", exit_code: null, total_size: 1097 };
+      watch: async () => {
+        watchCount++;
+        if (watchCount === 2) {
+          // The manager replays [1000, 1004) after re-hello. Duplicate it,
+          // then send an overlapping [996, 1008) range as a safety check.
+          registry.handleOutput("mon_utf8", "new\n", 1004);
+          registry.handleOutput("mon_utf8", "new\n", 1004);
+          registry.handleOutput("mon_utf8", "字\nnew\n中\n", 1008);
         }
-        return { chunk: "", next_cursor: cursor, status: "running", exit_code: null, total_size: 1097 };
       },
+      output,
       stop: async () => {},
     } as unknown as ManagerClient;
     const center = {
@@ -91,54 +100,16 @@ describe("MonitorRegistry reconnect output recovery", () => {
       clock,
     });
     await registry.start({ command: "ticker", description: "ticker", persistent: true }, { cwd: "/tmp" } as ExtensionContext);
+    registry.handleOutput("mon_utf8", before, 1000);
     await registry.rewatchAll();
     clock.advanceBy(200);
+    const text = delivered.join("\n");
     expect(watchCount).toBe(2);
-    expect(delivered.join("\n")).toBe(`${backfill.slice(0, -1)}\n${"N".repeat(96)}`);
-    expect(delivered.join("\n").match(/字/g)).toHaveLength(50);
-    expect(delivered.join("\n").match(/N/g)).toHaveLength(96);
-    registry.disposeAll();
-  });
-
-  it("fetches the gap before queued events and dedupes overlapping cursors", async () => {
-    const clock = new ManualClock();
-    const sent: { details?: unknown; content?: string }[] = [];
-    let watchCount = 0;
-    const manager = {
-      ensureAvailable: async () => true,
-      isAvailable: () => true,
-      start: async () => ({ task_id: "mon_gap", pid: 12 }),
-      watch: async () => {
-        watchCount++;
-        if (watchCount === 2) registry.handleOutput("mon_gap", "new\n", 12);
-      },
-      output: async (_id: string, cursor: number) => {
-        if (cursor === 4) {
-          // Simulate a delayed overlapping output event racing the gap read.
-          registry.handleOutput("mon_gap", "gap\n", 8);
-          return { chunk: "gap\n", next_cursor: 8, status: "running", exit_code: null, total_size: 12 };
-        }
-        return { chunk: "", next_cursor: cursor, status: "running", exit_code: null, total_size: 12 };
-      },
-      stop: async () => {},
-    } as unknown as ManagerClient;
-    const center = new NotifyCenter({ sendMessage: (m) => sent.push(m), isIdle: () => true, clock });
-    const registry = new MonitorRegistry({
-      getClient: () => manager,
-      sessionEnv: () => ({}),
-      getNotifyCenter: () => center,
-      trackTask: () => {},
-      clock,
-    });
-    await registry.start({ command: "ticker", description: "ticker", persistent: true }, { cwd: "/tmp" } as ExtensionContext);
-    // The event stream skips the gap line, then overlaps it and continues.
-    registry.handleOutput("mon_gap", "old\n", 4);
-    await registry.rewatchAll();
-    clock.advanceBy(200);
-    const wake = sent.map((m) => m.details as PbsWake | undefined).find((d) => d?.kind === "monitor");
-    expect(wake).toMatchObject({ kind: "monitor", event: "old\ngap\nnew" });
-    expect(sent[0]?.content).not.toContain("gap\ngap");
-    center.dispose();
+    expect(output).not.toHaveBeenCalled();
+    expect(text).toBe(`${before.slice(0, -1)}\nnew\n中`);
+    expect(text.match(/字/g)).toHaveLength(50);
+    expect(text.match(/new/g)).toHaveLength(1);
+    expect(text.match(/中/g)).toHaveLength(201);
     registry.disposeAll();
   });
 });

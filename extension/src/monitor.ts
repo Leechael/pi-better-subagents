@@ -272,17 +272,9 @@ export class MonitorRegistry {
     if (!client || !client.isAvailable()) return;
     for (const entry of this.entries.values()) {
       entry.recovering = true;
+      // Re-hello on an upgraded daemon already replays the exact missed watch
+      // range. watch() is idempotent; do not output(cursor)-backfill it again.
       await client.watch(entry.taskId).catch(() => {});
-      let cursor = entry.cursor;
-      // Read the durable log gap before delivering events queued while
-      // watch/output catch-up was active. A handover may replay overlapping
-      // event ranges; acceptOutput trims them to the first unseen byte cursor.
-      for (;;) {
-        const gap = await client.output(entry.taskId, cursor, 64 * 1024).catch(() => null);
-        if (!gap || !gap.chunk || gap.next_cursor <= cursor) break;
-        this.acceptOutput(entry, gap.chunk, gap.next_cursor);
-        cursor = gap.next_cursor;
-      }
       entry.recovering = false;
       const queued = entry.queuedOutput.splice(0).sort((a, b) => (a.cursor ?? 0) - (b.cursor ?? 0));
       for (const output of queued) this.acceptOutput(entry, output.chunk, output.cursor);
