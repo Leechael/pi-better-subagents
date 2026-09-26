@@ -336,6 +336,8 @@ async fn serve(state: Shared, listener: tokio::net::UnixListener, daemon_lock: l
     spawn_session_gc(&state);
     // In-place upgrade when the binary on disk changes.
     spawn_exe_watch(&state);
+    #[cfg(feature = "test-clock")]
+    spawn_test_owner_watch(&home);
 
     // §3.2: the idle rule applies from boot (clients connect within 2s of
     // spawn per §3.1, so this never fires for a healthy startup).
@@ -1111,6 +1113,26 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         #[cfg(feature = "test-clock")]
         RequestKind::DebugCrash => std::process::exit(101),
     }
+}
+
+/// Test-only: exit once the test process named by `PBS_TEST_OWNER` is gone.
+/// A manual-clock daemon never idles out on its own (only the test advances
+/// its timers), so one left by a killed test binary would otherwise run, and
+/// hold its tasks, forever. Exiting without a shutdown is a crash: every
+/// runner's lifeline breaks and takes its group down. Polls in real time.
+#[cfg(feature = "test-clock")]
+fn spawn_test_owner_watch(home: &std::path::Path) {
+    let Some(owner) = std::env::var("PBS_TEST_OWNER").ok().and_then(|v| v.parse::<u32>().ok()) else {
+        return;
+    };
+    let home = home.to_path_buf();
+    std::thread::spawn(move || {
+        while crate::sys::pid_alive(owner) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        lifecycle::log_line(&home, &format!("test owner {owner} is gone; exiting"));
+        std::process::exit(1);
+    });
 }
 
 /// Test-only: inspect or advance the manual clock (`test-clock` feature).
