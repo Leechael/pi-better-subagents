@@ -108,7 +108,7 @@ SESSION   PI_PID STATE     CWD         SINCE    LAST_SEEN RUNNING TASKS AGENTS
 0199aaaa  81234  connected ~/src/app   14:02:11 now       2       7     1
 ```
 
-Connected sessions only (a gone session is listed while it still runs something). When a pi session exits, it leaves the listings at once; its files stay on disk for `goneSessionRetention` (see below) so `show`, `agent` and `events --session` still reach it, and are then deleted. `SESSION` is the shortest unique prefix, at least 8 characters. `RUNNING` counts running tasks and agents; a record that says an agent is running while its session is gone is not counted (it cannot be alive).
+Connected sessions only (a gone session is listed while it still runs something). When a pi session exits, it leaves the listings at once; its files stay on disk for `goneSessionRetention` (see below) so `agent` and `events --session` still reach it, and are then deleted. A finished task's own record and output reach `show` for only `finishedTaskRetention` (see below), which can be shorter. `SESSION` is the shortest unique prefix, at least 8 characters. `RUNNING` counts running tasks and agents; a record that says an agent is running while its session is gone is not counted (it cannot be alive).
 
 ### `ls` / `list`
 
@@ -119,7 +119,7 @@ mon_e1351cb1 monitor 0199aaaa  ~/src/app  killed    14:01:10 30s    SIGTERM stop
 ch_7d0e22a1  agent   0199aaaa  ~/src/app  failed    14:00:05 12s    -       model-error  broken (worker) m1
 ```
 
-Work of connected sessions, running and finished, plus anything still running in a gone session (a live process is never hidden). There is no `--all`: a gone session's finished work is reached by id (`show`) until its retention ends. Filters: `--session PREFIX` (session id prefix), `--cwd DIR` (that directory or below; agents use their session's cwd), `--since DUR` (started within). `--json` prints an array of row objects (`id`, `kind`, `session_id`, `cwd`, `status`, `started_at`, `ended_at`, `duration_ms`, `exit_code`, `signal`, `end_reason`, `title`, plus `pid`/`origin`/`backgrounded_at`/`run_id`/`error` when known).
+Work of connected sessions, running and finished, plus anything still running in a gone session (a live process is never hidden). There is no `--all`: a gone session's finished work is reached by id (`show`) until its session's retention or the finished-task retention ends, whichever comes first. Filters: `--session PREFIX` (session id prefix), `--cwd DIR` (that directory or below; agents use their session's cwd), `--since DUR` (started within). `--json` prints an array of row objects (`id`, `kind`, `session_id`, `cwd`, `status`, `started_at`, `ended_at`, `duration_ms`, `exit_code`, `signal`, `end_reason`, `title`, plus `pid`/`origin`/`backgrounded_at`/`run_id`/`error` when known).
 
 - `EXIT` is the exit code, a signal name (`SIGTERM`, `SIGKILL`, …), or `-`.
 - `REASON` is the task's `end_reason` (see below), or an agent record's `end_reason`.

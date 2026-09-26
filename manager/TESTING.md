@@ -215,12 +215,12 @@ States: `absent` → `starting` (claim) → `serving` (≥1 active conn) ⇄ `id
 | D18 | serving | all watched tasks finished | serving | idle: no busy loop | no | `g10` |
 | D25 | starting | the startup scan outlasts the spawning client's 2s socket wait (a large home) | serving | the socket is bound before the scan; the client queues in the backlog and is served, not refused | no | `d25` |
 
-**Coverage:** 56 cells (C 10, S 6, T 20, D 20).
+**Coverage:** 57 cells (C 10, S 6, T 20, D 21).
 
 | | Covered | Partial | Uncovered | Violated by the code |
 |---|---|---|---|---|
 | Before (original code, original tests) | 7 | 10 (unit-level, status-only, or in-process close) | 38 | 8 (C10, T6b, T6c, T15, T16, D2, D3, D13) |
-| After (fixed code) | 56 | 0 | 0 | 0 |
+| After (fixed code) | 57 | 0 | 0 | 0 |
 
 ## Bugs found (all fixed)
 
@@ -626,7 +626,7 @@ it):
 | T17 | running / stop grace pending / timeout armed | upgrade | unchanged | later exits report the real code and signal; the timeout fires from the original start; a pending kill grace is re-armed with the time it had left | `u1`, `u8` |
 | T18 | running, watched (monitor) | upgrade | unchanged | the session's watch comes back on re-hello with exactly the bytes its connection had not been written; a UTF-8 character split across the handover arrives whole | `u1`, `u10`, `u11` |
 
-**Coverage:** 65 cells (C 10, S 7, T 22, D 26).
+**Coverage:** 68 cells (C 10, S 7, T 22, D 29).
 
 Measured client-visible gap (from "quiescing" to the new image accepting,
 in `manager.log`, under the parallel suite): 30–46 ms. Connects during it
