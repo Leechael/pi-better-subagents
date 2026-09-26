@@ -17,6 +17,7 @@
  * Zero pi dependency.
  */
 import { randomBytes } from "node:crypto";
+import { realClock, type Clock } from "../clock";
 import type {
   ChildHandle,
   ChildResult,
@@ -37,7 +38,12 @@ export interface RunRecord {
     childId: string;
     name: string;
     agent: string;
+    model?: string;
     status: ChildStatus;
+    /** User-authored prompt (after chain interpolation), without injected preamble. */
+    prompt?: string;
+    /** Agent-authored instructions prepended to the task prompt. */
+    preamble?: string;
     result?: ChildResult;
     startedAt: number;
     endedAt?: number;
@@ -66,8 +72,8 @@ export interface SubagentRegistryOptions {
   maxConcurrentChildren?: number;
   /** Max child sessions created per hour (default 32). */
   spawnBudgetPerHour?: number;
-  /** Clock override for tests. */
-  now?: () => number;
+  /** Shared time source. */
+  clock?: Clock;
 }
 
 export interface StartChildOptions {
@@ -84,6 +90,7 @@ export interface ActiveChildInfo {
   runId: string;
   name: string;
   agent: string;
+  model?: string;
   status: ChildStatus;
   startedAt: number;
   lastEventAt: number;
@@ -94,7 +101,11 @@ interface InternalChild {
   runId: string;
   name: string;
   agent: string;
+  /** Best-effort model id for fleet / ls (set when startChild runs). */
+  model?: string;
   status: ChildStatus;
+  prompt?: string;
+  preamble?: string;
   result?: ChildResult;
   startedAt: number;
   endedAt?: number;
@@ -157,12 +168,20 @@ class FailedChildHandle implements ChildHandle {
   lastEventAt(): number {
     return this.at;
   }
+
+  resolvedModel(): string | undefined {
+    return undefined;
+  }
+
+  conversation() {
+    return [];
+  }
 }
 
 export class SubagentRegistry implements RunRegistry {
   private readonly maxChildren: number;
   private readonly spawnBudget: number;
-  private readonly now: () => number;
+  private readonly clock: Clock;
 
   private runner: ChildRunner | null = null;
   private readonly runs = new Map<string, InternalRun>();
@@ -175,7 +194,11 @@ export class SubagentRegistry implements RunRegistry {
   constructor(opts: SubagentRegistryOptions = {}) {
     this.maxChildren = opts.maxConcurrentChildren ?? 8;
     this.spawnBudget = opts.spawnBudgetPerHour ?? 32;
-    this.now = opts.now ?? Date.now;
+    this.clock = opts.clock ?? realClock;
+  }
+
+  private now(): number {
+    return this.clock.now();
   }
 
   /** Late-bound to break the registry <-> runner construction cycle. */
@@ -233,13 +256,29 @@ export class SubagentRegistry implements RunRegistry {
   disposeRun(runId: string): void {
     const run = this.runs.get(runId);
     if (!run) return;
+    const now = this.now();
+    // Settle while children are still in the map. interrupt() calls settleChild,
+    // which no-ops once the child has been deleted — that used to emit a final
+    // "running" record (ghost agents in ls).
+    for (const child of run.children) {
+      if (child.status === "pending" || child.status === "running") {
+        child.status = "interrupted";
+        child.endedAt = now;
+        child.result = {
+          status: "interrupted",
+          text: child.result?.text ?? "",
+          error: "disposed",
+          durationMs: Math.max(0, now - child.startedAt),
+        };
+      }
+    }
+    this.recomputeRunStatus(run);
+    this.emit(run);
     this.runs.delete(runId);
     for (const child of run.children) {
       this.children.delete(child.childId);
       const handle = child.handle as DisposableChildHandle | undefined;
       if (!handle) continue;
-      // interrupt() settles synchronously; abort floats. dispose() releases
-      // timers and the underlying session.
       void handle.interrupt().catch(() => {});
       try {
         handle.dispose?.();
@@ -247,8 +286,6 @@ export class SubagentRegistry implements RunRegistry {
         // ignore
       }
     }
-    // Fire a final transition so observers (fleet widget) refresh.
-    this.emit(run);
   }
 
   // -------------------------------------------------------------------------
@@ -282,6 +319,9 @@ export class SubagentRegistry implements RunRegistry {
     const child = this.children.get(req.childId);
     if (!child) throw new Error(`unknown child ${req.childId} (addChild first)`);
     child.shouldStart = opts?.shouldStart;
+    child.prompt = req.taskPrompt ?? req.prompt;
+    child.preamble = req.agent.systemPrompt || undefined;
+    child.model = req.model ?? req.agent.model;
 
     const runner = this.runner;
     if (!runner) {
@@ -295,6 +335,10 @@ export class SubagentRegistry implements RunRegistry {
 
     const handle = await runner.start(req);
     child.handle = handle;
+    // Prefer the actually resolved provider/id over the request-time spec
+    // (inherits parent model when neither param nor agent.model is set).
+    const resolved = handle.resolvedModel();
+    if (resolved) child.model = resolved;
     // Generation-1 result wiring (later generations are wired in admitChild,
     // where the handle is already visible).
     handle.result.then((result) => this.settleChild(child.childId, result));
@@ -302,6 +346,10 @@ export class SubagentRegistry implements RunRegistry {
     // states are left to the result wiring above so the result is recorded.
     if (handle.status() === "running" && child.status === "pending") {
       this.transitionChild(child, "running");
+    } else if (resolved) {
+      // Model became known after session create — refresh observers/disk.
+      const run = this.runs.get(child.runId);
+      if (run) this.emit(run);
     }
     return handle;
   }
@@ -377,6 +425,7 @@ export class SubagentRegistry implements RunRegistry {
         runId: child.runId,
         name: child.name,
         agent: child.agent,
+        model: child.model,
         status: child.status,
         startedAt: child.startedAt,
         lastEventAt: child.handle?.lastEventAt() ?? child.startedAt,
@@ -514,7 +563,10 @@ function snapshot(run: InternalRun): RunRecord {
       childId: c.childId,
       name: c.name,
       agent: c.agent,
+      ...(c.model !== undefined ? { model: c.model } : {}),
       status: c.status,
+      ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
+      ...(c.preamble !== undefined ? { preamble: c.preamble } : {}),
       result: c.result,
       startedAt: c.startedAt,
       endedAt: c.endedAt,

@@ -38,6 +38,7 @@ function fakeHandle(childId: string, calls: HandleCalls): ChildHandle {
     interrupt: async () => {},
     status: () => "running",
     lastEventAt: () => 0,
+    resolvedModel: () => undefined,
   };
 }
 
@@ -72,13 +73,16 @@ class FakeHost implements CommsHost {
     const cb = this.children.get(b);
     return !!ca && !!cb && ca.runId === cb.runId;
   }
-  notifySupervisor(content: string) {
-    this.notifications.push(content);
+  notifySupervisor(wake: { content: string }) {
+    this.notifications.push(wake.content);
   }
 }
 
 const CTX = {} as ExtensionContext;
-const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+const tick = async () => {
+  await Promise.resolve();
+  await Promise.resolve();
+};
 
 /** Extract the text of a tool result's first content block (assumes text). */
 function textOf(res: { content: ({ type: "text"; text: string } | { type: string })[] }): string {
@@ -105,7 +109,7 @@ describe("contact_supervisor tool", () => {
     );
     expect(res.content[0]).toEqual({ type: "text", text: "ok" });
     expect(res.details).toMatchObject({ reason: "progress_update", replied: false });
-    expect(host.notifications[0]).toContain("<supervisor-update");
+    expect(host.notifications[0]).toContain('kind="supervisor-update"');
   });
 
   it("need_decision blocks and returns the supervisor reply as tool text", async () => {
@@ -122,7 +126,7 @@ describe("contact_supervisor tool", () => {
       CTX,
     );
     await tick();
-    expect(host.notifications[0]).toContain("<supervisor-request");
+    expect(host.notifications[0]).toContain('kind="supervisor-request"');
     comms.reply("ch_a", "yes, delete it");
 
     const res = await p;
@@ -170,7 +174,7 @@ describe("agent_message tool (parent sender)", () => {
     expect(b.steer).toEqual([]);
   });
 
-  it("send to a finished child resumes it", async () => {
+  it("send to a finished child errors and points at subagent resume", async () => {
     const { tool, host } = setup();
     const res = await tool.execute(
       "t3",
@@ -179,9 +183,10 @@ describe("agent_message tool (parent sender)", () => {
       undefined,
       CTX,
     );
-    expect(res.details).toMatchObject({ ok: true });
-    expect(host.calls.get("ch_c")!.resume).toEqual(["again please"]);
-    expect(textOf(res)).toContain("resumed");
+    expect(res.details).toMatchObject({ ok: false });
+    expect(host.calls.get("ch_c")!.resume).toEqual([]);
+    expect(textOf(res)).toContain('action: "resume"');
+    expect(textOf(res)).toContain("ch_c");
   });
 
   it("send without to or message returns a clear error text", async () => {

@@ -60,7 +60,8 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 ~/.pi/agent/pbs/
 ├── manager.sock          # unix domain socket
 ├── manager.pid           # {pid, version, started_at} JSON
-├── manager.spawn.lock    # fd-lock 占用即有效
+├── manager.lock          # daemon 生命周期锁(flock,daemon 存活期间一直持有)
+├── manager.spawn.lock    # 客户端 spawn 锁(fd-lock 占用即有效)
 ├── manager.log           # manager 自身日志
 ├── config.json           # 可选用户配置
 └── sessions/<session_id>/tasks/<task_id>.json    # 任务状态
@@ -73,21 +74,40 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 2. 失败 → 抢 `manager.spawn.lock`(fd-lock,非阻塞 trylock)
 3. 抢到 → spawn `pbs-manager daemon`(detached)→ 轮询等 socket 就绪(2s 超时)→ 释放锁
 4. 没抢到 → 说明别人正在 spawn,轮询等 socket 就绪
-5. socket 存在但 hello 失败(僵尸 socket)→ 检查 manager.pid 的 pid 存活;死则清理 socket/pid 文件后重试一次
+5. socket 存在但连不上(僵尸 socket)→ 同 2–4:spawn 一个 daemon,由它清理。**客户端从不删除 socket/pid 文件**(否则可能删掉另一个客户端刚 spawn 出的 daemon 的 socket)
+6. `hello` 被拒且是 manager 正在 graceful shutdown(§3.2)→ 等它退出,再走 2–4。精确协议(Rust CLI `client::connect` 即此实现,测试 `d8`/`d8b`):
+   - 识别:对 `hello` 的响应为 `{"ok":false,"error":{"code":"E_INTERNAL","message":"manager is shutting down"}}`(`id` 为该 hello 的 id),随后 manager 关闭该连接。以 `code == "E_INTERNAL"` 且 `message == "manager is shutting down"` 精确匹配;其他 `E_INTERNAL` 不适用本步骤。该响应立即返回(shutdown 期间 manager 仍 accept),不会等到 hello 超时
+   - 等待:读 `manager.pid` 的 `pid`,每 50ms 以 `kill(pid, 0)` 探测,直到进程不存在或累计 5s(graceful shutdown 最多 2s kill grace + 收尾)。读不到 pid 文件则不等。等待期间不删任何文件、不重连旧连接
+   - 之后:走 2–4(抢 spawn 锁 → spawn → 等 socket 2s),再连接 + `hello` 一次;仍失败才向上报错。5s 到了旧 manager 仍在时也照此继续:新 spawn 的 daemon 拿不到 `manager.lock` 会以 "already running" 退出,本次连接按普通失败处理
 
-`manager.pid` 与 socket 所有权: daemon 启动时先检查 pid 文件,pid 存活则拒绝启动(打印 "already running" 退出码 0);pid 死则清理后接管。
+`manager.pid` 与 socket 所有权: daemon 身份 = 持有 `manager.lock` 的独占 flock,从启动持有到退出(崩溃时由 OS 释放;fd 为 CLOEXEC,任务进程不继承)。daemon 启动时 trylock:失败 → 已有 daemon,打印 "already running" 退出码 0;成功 → 此时 socket/pid 文件必然陈旧,删除后 bind 并写 pid。不以 pid 存活判断身份(pid 可能被无关进程复用)。`doctor` 同理:只在拿到锁时清理陈旧文件。
 
 ### 3.2 生命周期(反僵尸硬语义)
 
 - 每个扩展连接在 `hello` 时注册 `{session_id, pi_pid}`;该连接即此 session 的控制通道
 - 连接断开(unix socket 下进程死亡必然触发,含 kill -9)→ 该 session 标记 disconnected
 - **活跃连接数归零持续 5s → graceful shutdown**:
-  1. 对所有 running 任务发 SIGTERM(进程组)
-  2. 2s grace → 未死的 SIGKILL
+  1. 对所有 running 任务发 SIGTERM(进程组);leader 已退出但进程组仍有成员(后台子进程)的任务也包括在内
+  2. 2s grace → 对仍可能有成员的**进程组**发 SIGKILL(即使 leader 已死,忽略 SIGTERM 的子孙也会被杀)
   3. 任务状态落盘标记 `killed`(reason: "manager_shutdown")
   4. 删除 socket/pid 文件,退出
+- shutdown 期间 manager 仍接受新连接,但立即拒绝其 `hello`(`E_INTERNAL` "manager is shutting down");客户端按 §3.1 第 6 步等该 manager 退出后 spawn 继任者,而不是卡到响应超时
 - 后台任务不允许比最后一个 pi 活得久。`pi --resume` 的 reattach 只在"还有其他 pi 活着"时成立
 - manager **永不自我复活**;只有客户端(扩展/CLI)在需要时 spawn
+- **manager 是所有任务的父进程,它以任何方式结束,任务都随之清理(lifeline)**:每个任务由 `pbs-manager __run <command>`(runner)作为进程组 leader 启动,runner 再以子进程启动同一进程组里的 `sh -c <command>`(`sh.spawn()`,runner 自己不 exec、留在组内)。runner 在 fd 3 持有 lifeline:一条只有 daemon 持有写端的 pipe 的读端。daemon 无论怎样结束(`shutdown`、`kill -9`、panic),内核都会关闭写端,runner 读到 EOF → 对自己的进程组 SIGTERM → 2s → SIGKILL。**保证只覆盖进程组成员**:命令若把某个后代移入新 session(如 `setsid`),它就脱离了该组,lifeline 管不到——已知边界,不做隔离。**没有崩溃恢复**:新 daemon 启动时不接管任何任务(见 §3.4)。
+  - runner 在 fd 4 通过状态 pipe 上报命令的真实退出码/信号(`exit <code> <alone|linger>` 或 `signal <n> <alone|linger>`)。若命令留下了后台子进程(`cmd &`),runner 留下来当守护者(guardian),继续持有 lifeline,直到进程组只剩它自己;daemon 以"收到状态"为任务结束,以"runner 退出"为进程组已空。
+  - runner 屏蔽 SIGTERM(子进程在 exec 前解除屏蔽),所以 stop/shutdown 的组 SIGTERM 只作用于命令,runner 能上报命令是怎么结束的;runner 自身只被 SIGKILL 带走,此时 daemon 退回用 runner 的 wait 状态。
+  - lifeline 写端只有一个持有者(`task::lifeline()`,CLOEXEC),方便后续原地 exec 交接只处理一个 fd。
+- **原地升级(exec 交接,对运行中的工作透明)**:替换二进制后,daemon `exec()` 新二进制,**pid 不变**,所有 runner 仍是它的子进程(`waitpid` 照常,退出码真实),任务不中断、不需要用户判断"现在能不能升级"。
+  - 触发:`pbs-manager upgrade`;或 daemon 每 2s 检查自身可执行文件(dev/inode/size/mtime),文件变化且再稳定一个周期后自动升级(`trigger: "binary-changed"`)。安装仍用 `install`(新 inode,macOS 签名缓存)。
+  - 步骤:① preflight:运行 `<新二进制> __handover-check`,必须回答同一交接格式版本;不兼容/损坏的二进制在此止步,什么都不动(换同一文件前不再重试)。② quiesce:各任务的输出泵只在两次读之间停下、退出等待挂起,fanout 推完已读内容,关闭所有客户端连接并让写端 flush;上限 quiesce 5s + flush 2s,超时则放弃升级、旧映像恢复。③ 写 `<home>/handover.json`(版本化:任务记录、kill 请求/原因、**绝对**超时截止与 kill grace 截止、守护者状态、各 fd 号),对要继承的 fd 清 CLOEXEC,exec。④ exec 失败:fd 恢复 CLOEXEC、任务继续、结果记入 `status.last_upgrade`,旧映像照常服务。
+  - 跨 exec 继承的 fd:监听 socket(**不重新 bind**,交接中的新连接在 backlog 里等,不会被拒)、`manager.lock`、lifeline 两端(写端若关闭所有任务都会被清理)、每个任务的 stdout/stderr/状态 pipe 读端。
+  - 新映像以 `daemon --handover <file>` 恢复;恢复失败即退出,lifeline 断开,所有任务被清理——与崩溃同一语义(无崩溃恢复,不做抢救)。
+  - 恢复后先有 **30s 交接宽限期**(`handover-grace`),期间不适用"零连接 5s 关机",等客户端重连。
+  - 客户端可见的断连窗口实测 30–46 ms(并行测试负载下);交接中在途请求**得不到响应**,连接直接关闭,客户端重连 + 重新 hello 后重发:幂等请求(wait/output/list/watch/status/stop/mark_background)直接重发,`start` 以同一个 `key` 重发(见 §3.3)。
+  - 会话在交接前的 watch 在重新 hello 时自动恢复,并补发它漏掉的输出区间 `[交接前已送达的 cursor, 当前)`,不缺不重。
+  - `status` 增加 `generation`(本 pid 经历的原地升级次数)与 `last_upgrade`(`at, ok, from_version, to_version?, error?, trigger: "cli"|"binary-changed"`)。
+- **已断开 session 的保留期**:session 断开后立即从 `ls` / `sessions` 消失;`sessions/<sid>/` 在最后一次写入后保留 `goneSessionRetention`(config.json,默认 24h),期间 `show` / `agent` / `events` 仍可查(事后排查、`pi --resume`),到期由 daemon 删除目录并从内存移除其任务。启动时与每 `min(保留期, 1h)` 清扫一次;已连接、或仍有 running 任务/存活进程组的 session 永不清扫
 
 ### 3.3 传输与协议
 
@@ -96,6 +116,15 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 - 请求: `{"v":1, "id":"<uuid>", "type":"...", ...}`(**所有请求含 hello 都带 v+id**;下文示例为简洁省略 v/id)
 - 响应: `{"v":1, "id":"<uuid>", "ok":true, ...}` 或 `{"v":1, "id":"...", "ok":false, "error":{"code":"E_*","message":"..."}}`
 - 事件(服务端推送,无 id): `{"v":1, "type":"event", "event":"...", ...}`
+
+**版本兼容(N−1,原地升级的前提)**:升级后,仍在运行的 pi 里加载的是旧扩展,会立刻以旧协议重连。规则:
+- 帧版本 `v` 固定为 1,仅它不匹配才回 `E_VERSION`;hello 里的 `protocol` 级别只作信息,旧级别照常接受。
+- 新字段一律可选(`#[serde(default)]`),旧客户端不发即取默认;新增请求/事件不得改变已有请求/事件的语义。
+- 测试守住:交接后用旧协议 hello 连接仍可正常工作。
+
+**输出游标契约**:输出事件的 `next_cursor` 与 `output` 请求的 `cursor`/`next_cursor` 是同一个**单调递增的字节偏移**(合并输出 `.output` 内)。一个输出事件覆盖 `[next_cursor − bytes(chunk), next_cursor)`。块边界 UTF-8 安全(事件会扣住不完整的尾部字节,交接时一并带过)。在末尾调用 `output` 返回空 chunk 且 `next_cursor == cursor`(已追平)。客户端据此对自身的 `output(cursor)` 补读与交接后的补发按字节范围去重/裁剪。
+
+**`start` 幂等**:`start` 可带可选的 `key`(客户端生成);同一会话内以同一 key 重发返回第一次启动的任务,不会再启动一次;key 跨原地升级保留。
 
 **补充裁决(2026-09-17)**:
 - `kind:"shell"` 的命令经 shell 解释: unix 用 `env.SHELL -c`(env 未给 SHELL 则 `/bin/sh -c`);Windows 用 `cmd /c`
@@ -107,24 +136,29 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 
 **hello** — 连接后第一个消息,必须是它:
 ```json
-→ {"type":"hello", "client_kind":"extension", "session_id":"<pi session id>", "pi_pid":1234}
+→ {"type":"hello", "client_kind":"extension", "session_id":"<pi session id>", "pi_pid":1234, "cwd":"/path",
+   "extension_version":"0.3.0", "protocol":2}
 → {"type":"hello", "client_kind":"cli"}
 ← {"ok":true, "version":"0.1.0", "pid":4321, "started_at":1726...}
 ```
 - `extension` 必须带 `session_id` + `pi_pid`;此后该连接接收此 session 的事件
+- `cwd` 可选(向后兼容)。扩展在 hello 里带上 session cwd;manager 存入 session 并在 status/sessions 里返回。旧客户端省略该字段仍可握手
+- `extension_version`(字符串)、`protocol`(整数)可选:manager 按 session 存储,在 `status` 的 sessions 里返回,`doctor` 据此检查每个已连接 session 的协议与 manager 一致。`protocol` 为特性级别:1 = 原始 §3.3,2 = 可观测性契约(origin / mark_background / stop.reason / end_reason / events.jsonl)。缺省 = 旧扩展
 - 同一 `session_id` 重复 hello: 新连接赢,旧连接收到 `{"type":"event","event":"session_rebound"}` 后由服务端关闭
 - `cli` 不带 session;可访问跨 session 的只读/管理操作
 
 **start** — 启动进程:
 ```json
 → {"type":"start", "kind":"shell"|"monitor", "command":"...", "cwd":"...",
-   "env":{...}, "run_in_background":false, "timeout_ms":null}
+   "env":{...}, "run_in_background":false, "timeout_ms":null,
+   "origin":{"via":"child-bash", "child_id":"ch_…", "run_id":"run_…"}}
 ← {"ok":true, "task_id":"sh_a1b2c3d4", "pid":5678}
 ```
 - `session_id` 从连接绑定取
 - `env` 为子进程**完整环境**(客户端负责构造;扩展侧传 `process.env` + `PI_*` 注入)
 - `timeout_ms`: 硬 kill 上限;`null` = 无限制(后台任务默认)
 - `run_in_background:true` 仅语义标记(客户端不再 wait);manager 行为相同
+- `origin` 可选,记录谁发起:`via` 为 `"bash-fg"`(前台 bash,可能随后被转后台) | `"bash-bg"` | `"child-bash"`(子代理的 bash,带 `child_id`/`run_id`) | `"monitor"`;manager 原样存入 TaskRecord(新值不会导致 start 失败)
 - task_id 格式: `<kind 前缀>_<8位hex>`;前缀 `sh`(shell) / `mon`(monitor) / 未来 `ag`(agent)
 
 **wait** — 等待退出(预算内):
@@ -142,13 +176,30 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 ```
 - cursor 是字节偏移;`next_cursor` 供下次增量读
 - chunk 为 UTF-8 lossy 字符串;v1 不支持二进制保真
+- chunk 边界永不切断 UTF-8 字符:切点回退到字符边界,不会为合法文本产生 U+FFFD,也不会跳过字节(`next_cursor` 指向第一个未发送字节)。末尾不完整的序列在任务仍在运行时暂缓发送。若首个字符本身超过 `max_bytes`,整字符发出(chunk 最多超出 3 字节);`max_bytes:0` 返回空 chunk
+- chunk 经 JSON 转义后的大小受帧上限约束(控制字符转义为 6 字节),响应不会超过 4 MiB;任何放不进一帧的响应改为 `E_INTERNAL` 错误,连接保持可用
+- `watch` 的 `output` 事件同样遵守字符边界
+
+**mark_background** — 扩展把任务转入后台时通知 manager(前台预算用尽或 run_in_background):
+```json
+→ {"type":"mark_background", "task_id":"sh_a1b2c3d4"}
+← {"ok":true}
+```
+manager 在 TaskRecord 记录 `backgrounded_at`(ms);只记第一次;任务已结束则为空操作。
 
 **stop**:
 ```json
-→ {"type":"stop", "task_id":"sh_a1b2c3d4"}
+→ {"type":"stop", "task_id":"sh_a1b2c3d4", "reason":"tui"|"cli"|"tool"|"timeout"|"rate-limit"|"session-end"}
 ← {"ok":true}
 ```
-SIGTERM 进程组 → 2s → SIGKILL。终态 `killed`。
+`reason` 可选(缺省视为 `"tool"`,兼容旧扩展),未知值 → `E_BAD_REQUEST`。CLI `stop` 发送 `"cli"`。
+SIGTERM 进程组 → 2s → SIGKILL(发给进程组,leader 已退出也照发)。终态 `killed`。对已终止但仍有后台子进程残留的任务,`stop` 同样清理其进程组,状态不变。
+
+**end_reason**(TaskRecord 与 `task_exited` 事件):任务为何结束,取值之一
+`exited`(自然退出,任意退出码) | `timeout` | `stopped:tui` | `stopped:cli` | `stopped:tool` | `rate-limit` | `session-end` | `manager-shutdown` | `manager-crash`。
+映射:stop 带 reason X → `stopped:X`,但 timeout / rate-limit / session-end 映射为自身;`timeout_ms` 到期 → `timeout`;`shutdown_session` → `session-end`;manager 优雅关闭 → `manager-shutdown`;manager 未经关闭就死掉(kill -9、panic),下一个 daemon 启动时把仍为 running 的记录标为 `orphaned` → `manager-crash`。多个原因先到先得(stop 之后的关闭不覆盖 `stopped:cli`)。
+
+`signal` 字段(`task_exited` 事件与 TaskRecord)为信号名字符串,如 `"SIGTERM"` / `"SIGKILL"`;正常退出为 `null`。旧版本写入的数字仍可读取(按名称转换)。
 
 **list**:
 ```json
@@ -171,13 +222,15 @@ SIGTERM 进程组 → 2s → SIGKILL。终态 `killed`。
 ← {"ok":true, "stopped":["sh_a","mon_b"]}
 ```
 
-**status** (cli):
+**status**(只读,cli 与 extension 均可):
 ```json
 → {"type":"status"}
-← {"ok":true, "version":"0.1.0", "pid":4321, "uptime_ms":3600000,
-   "sessions":[{"session_id":"...","pi_pid":1234,"connected":true}],
+← {"ok":true, "version":"0.1.0", "pid":4321, "uptime_ms":3600000, "protocol":2,
+   "sessions":[{"session_id":"...","pi_pid":1234,"connected":true,"cwd":"/path",
+                "extension_version":"0.3.0","protocol":2,"connected_at":1726...,"last_seen":1726...}],
    "task_counts":{"running":2,"terminal":5}}
 ```
+`protocol` 为 manager 的协议级别;`connected_at` = 本 manager 首次见到该 session 的 hello(重连保持不变);`last_seen` = 最近一次请求或断开(连接中为当前时间)。
 
 **shutdown** (cli): 触发与"连接归零"相同的 graceful shutdown。
 
@@ -187,8 +240,26 @@ SIGTERM 进程组 → 2s → SIGKILL。终态 `killed`。
 |---|---|---|
 | `task_started` | task_id, kind, command, pid, ts | 始终(推给 owning session) |
 | `output` | task_id, chunk, next_cursor | 仅 watch 后 |
-| `task_exited` | task_id, exit_code, signal, duration_ms, output_path, output_size, ts | 始终 |
+| `task_exited` | task_id, exit_code, signal, duration_ms, output_path, output_size, ts, end_reason | 始终(崩溃扫描的孤儿标记除外,见下) |
 | `session_rebound` | — | 被替换的旧连接 |
+
+注:`task_exited` 的"始终"指 daemon 存活期间。崩溃扫描(§3.4)把仍 running 的记录标为 orphaned 时**不推任何事件**——旧 daemon 已死,没有可推的会话;客户端靠重连后的 `list`(扩展的 reconnect reconcile)或 `wait` 得知翻转,不要等一个不会来的事件。
+
+#### 事件日志(events.jsonl)
+
+- 文件:`<home>/sessions/<session_id>/events.jsonl`,只追加,一行一个 JSON 对象;无 session 的 daemon 事件写 `<home>/events.jsonl`
+- 每行 < 4 KiB(含换行):超长的字符串字段被截断(以 `…` 结尾)并加 `"truncated":true`;`src`/`type`/`ts` 不截断。每行用一次 O_APPEND `write` 写入,manager 与扩展并发追加也不会交错
+- 公共字段:`ts`(ms)、`src`(`"manager"` | `"extension"`)、`type`、`id?`(task/child id),加类型字段
+- manager 写:`session.connect {pi_pid, cwd, extension_version, protocol}`、`session.disconnect {reason: closed|rebound}`、`task.start {kind, command(≤200 字符), origin, pid}`、`task.background {after_ms}`、`task.stop {reason}`、`task.exit {exit_code, signal, end_reason, duration_ms}`(含 orphaned 与关闭时强制结束的任务)、`daemon.start {pid, version, protocol, orphaned, loaded}` / `daemon.shutdown {pid, killed_tasks}`(也写 manager.log)
+- 扩展写:`wake.emit {kind, ids[], batch}`、`wake.deliver {kind, mode: trigger|steer}`、`wake.dedupe {id}`、`monitor.drop {id, lines}`、`monitor.stop {id, reason}`、`agent.start {child_id, run_id, name, agent, model}`、`agent.settle {child_id, status, error?, duration_ms}`、`agent.stall {child_id}`、`agent.timeout {child_id}`、`decision.request/reply/timeout {child_id}`
+- 读者(CLI `events`/`show`/`sessions`)跳过无法解析、或缺 `ts`/`type` 的行
+- 保留:随 session 目录存放,v1 不轮转(deferred: rotation | impact: 超长 session 磁盘增长 | trigger: doctor 报告 sessions 目录 > 100MB)
+
+#### Agent 记录(扩展所有,`<home>/sessions/<sid>/agents/`)
+
+- `<ch>.json`:`{child_id, run_id, session_id, name, agent, model?, status, started_at, ended_at?, error?, end_reason?(completed|failed|model-error|stalled|timeout|interrupted|disposed), prompt_head(仅任务 prompt,不含 agent preamble,≤2000), result_tail(≤2000), tool_calls, transcript}`
+- `<ch>.jsonl` transcript:每条消息一行 `{role, text, tool?, args?, isError?, ts}`,实时追加
+- CLI 只读这些文件(`ls`/`show`/`agent`/`log`);记录显示 running 但所属 session 未连接时,CLI 视为 `interrupted`,`doctor` 报为陈旧记录
 
 #### 错误码
 
@@ -200,28 +271,30 @@ SIGTERM 进程组 → 2s → SIGKILL。终态 `killed`。
 running ──exit 0──► completed
        ──exit≠0──► failed
        ──stop────► killed
-       ──manager 重启 re-adopt 失败──► orphaned
+       ──manager 崩溃(下次启动时标记)──► orphaned
 ```
 
-- TaskRecord(磁盘 `<task_id>.json`): `{task_id, session_id, kind, command, cwd, pid, status, exit_code, signal, started_at, ended_at, output_path, output_size}`
+- TaskRecord(磁盘 `<task_id>.json`): `{task_id, session_id, kind, command, cwd, pid, status, exit_code, signal, started_at, ended_at, output_path, output_size, origin?, backgrounded_at?, end_reason?}`(后三项为可观测性契约新增,可选,旧记录照常加载)
 - 输出: 内存 ring buffer(64KB)+ 磁盘全量追加;`output_size` 单调增
-- **manager 重启 re-adopt**: 读 state dir,pid 存活 → re-adopt(继续 tail 输出文件;退出检测靠 `kill(pid,0)` 轮询 1s,退出码不可得 → 终态 `completed`, `exit_code:null`);pid 死 → `orphaned`
+- **崩溃后启动(无崩溃恢复)**: 读 state dir。仍为 running 的记录属于一个未经关闭就死掉的 daemon,它的 runner 已经看到 lifeline 断开并清理了进程组(§3.2),没有可接管的东西:记录标为 `orphaned`(`end_reason:"manager-crash"`,`ended_at` 设为启动时刻)并落盘,`output_size` 从文件长度恢复。**不向旧记录里的 pid/pgid 发任何信号**(pid 可能已被复用)。
 
 ### 3.5 CLI(inspection 管理,用户侧)
 
-单 binary,`pbs-manager <subcommand>`;除 `daemon` 外都是客户端:
+单 binary,`pbs-manager <subcommand>`;除 `daemon` 外都是客户端。完整手册见 `docs/cli.md`。
 
 ```
-pbs-manager daemon                      # 前台运行(被 spawn 时用;--foreground 供调试)
-pbs-manager status                      # 版本/uptime/sessions/任务计数
-pbs-manager sessions                    # 连接的 pi 会话列表
-pbs-manager list [--session <id>] [--all]
-pbs-manager output <task_id> [-f]       # 读输出,-f 跟随
-pbs-manager stop <task_id>
+pbs-manager daemon [--foreground]        # 前台运行(被 spawn 时用)
+pbs-manager status [--json]              # 版本/协议/uptime/sessions/任务与 agent 计数;不启动 daemon
+pbs-manager sessions [--json]            # 已连接的会话(断开但仍有运行中任务的也列出)
+pbs-manager ls [--session P] [--cwd D] [--since DUR] [--json]   # 已连接会话的全部工作 + 任何仍在运行的
+pbs-manager show <id> [--json]           # sh_/mon_/ch_/run_ 任意 id,模糊匹配
+pbs-manager agent <ch_id> [--full] [-f]  # 渲染 agent transcript
+pbs-manager events [-f] [--session P] [--id X] [--since DUR] [--json]
+pbs-manager log|tail [ID]                # manager.log / 任务输出 / agent transcript
+pbs-manager output|wait|stop <id>        # stop 对 agent 报错(子代理在 pi 进程内)
 pbs-manager kill-session <session_id>
-pbs-manager doctor                      # socket/pid/lock 一致性检查,清僵尸文件
+pbs-manager doctor                       # 健康检查;任何 FAIL → 退出码 1
 pbs-manager shutdown
-pbs-manager log [-f]                    # tail manager.log
 ```
 
 ### 3.6 Rust 结构
@@ -233,11 +306,16 @@ manager/
     ├── main.rs       # clap 分发: daemon | 客户端子命令
     ├── daemon.rs     # listener、accept loop、连接注册、归零 shutdown
     ├── proto.rs      # 帧 codec + 消息 serde 类型
-    ├── task.rs       # spawn(进程组)、输出 tee、exit watch、stop
+    ├── task.rs       # spawn(经 runner、进程组)、lifeline、输出 tee
+    ├── runner.rs     # `__run`:任务进程组 leader,lifeline、状态上报、残留子进程守护
     ├── sys.rs        # 唯一生产 unsafe 缝: setsid(pre_exec) + kill(pgid)/liveness
     ├── registry.rs   # task registry + session 命名空间 + 磁盘持久化
-    ├── lifecycle.rs  # spawn lock、pid claim、re-adopt、优雅 shutdown
-    └── client.rs     # CLI 子命令的客户端实现
+    ├── lifecycle.rs  # spawn lock、pid claim、崩溃后启动扫描(标记 orphaned)
+    ├── client.rs     # CLI: 连接/spawn 流程、作用于 daemon 的命令、log/tail、doctor
+    ├── inspect.rs    # CLI: status/sessions/ls/show/agent/events 与数据层
+    ├── events.rs     # events.jsonl 写(manager)与读(CLI)
+    ├── fmt.rs        # 显示宽度(CJK)、时长、本地时间
+    └── out.rs        # 管道关闭时静默退出 0 的 stdout
 ```
 
 依赖: tokio(full), clap(derive), serde + serde_json, interprocess(跨平台 socket), fd-lock(spawn lock), libc(仅经 `sys.rs` 封装进程组)。Windows 进程组用 Job Object(v1 可先 `taskkill /T`)。
@@ -271,10 +349,9 @@ execute:
   run_in_background → 立即返回后台通知
   否则 wait(foregroundBudgetMs, 默认 20000, config 可配):
     done → output 全量读 → 尾部截断(2000 行 / 50KB,同内置) → {content, details:{truncation, fullOutputPath}}
-    超时 → 返回后台通知:
-      "Command moved to background (task_id: sh_x). Output: <path>.
-       You will be notified when it completes. Do not poll or sleep."
-      details: {backgrounded:true, task_id, fullOutputPath}
+    超时 → 返回一行后台状态: `⏵ sh_x running in background · /tasks`
+      (no instructions or duplicate output path in transcript)
+      details: {backgrounded:true, task_id, fullOutputPath}; no-poll/end-turn guidance stays model-facing in tool guidelines
 ```
 
 - `details` 保持 `BashToolDetails` 兼容(truncation/fullOutputPath),扩展字段加在 details 上
@@ -283,7 +360,7 @@ execute:
 
 ### 4.3 task_* 工具 (`src/task-tools.ts`)
 
-- `task_list({all?})` → manager list(合并未来进程内 subagent run)
+- `task_list({all?})` → manager list **合并**进程内 subagent children(扩展 registry + `sessions/<sid>/agents/*.json`);`pbs-manager ls` 同步读该落盘记录
 - `task_output({task_id, cursor?, max_bytes?})` → manager output;返回尾部 + 文件指针
 - `task_stop({task_id})` → manager stop
 
@@ -297,10 +374,11 @@ monitor({ command, description, timeout_ms = 300000 (min 1000, max 3600000),
 - `manager.start({kind:"monitor", run_in_background:true})` + `watch(task_id)`
 - 扩展侧行处理(纯函数,便于测试):
   - `LineBatcher`: chunk → `\n` 切分 → 200ms 合批;单行 cap 500 字符,单批 cap 3000 字符
-  - `RateLimiter`: token bucket(容量 10,每 2s +1);连续 30s 打满 → 自动 stop + 通知
-- 事件注入: `<monitor-event description task_id>` + 批文本;idle→triggerTurn,busy→steer
+  - `RateLimiter`: token bucket(容量 10,每 2s +1);过去 30s 内至少 10 个批次且丢弃比例 ≥50% → 自动 stop + 通知
+- 事件注入: `<pbs-wake kind="monitor">`(见 §4.5);idle→triggerTurn,busy→steer;busy 期间按 monitor 合并并在 `agent_settled` 后发送,携带 `event-count` 与 `dropped-lines`
 - 进程退出 → 结束通知;timeout 到期 → stop + "[Monitor timed out — re-arm if needed.]"
 - `persistent:true` → 活到 session 结束(无 timeout)
+- 所有时间源与定时器由 extension scope 注入的 `Clock` 驱动,包括批处理、限速与 timeout;测试用 `ManualClock`,不替换全局 fake timers
 - prompt 文案(防误用): 命令必须 line-buffered;"silence is not success"(grep 要覆盖失败特征);事件不是用户回复;不要 poll
 
 ### 4.5 NotifyCenter (`src/notify.ts`)
@@ -313,22 +391,35 @@ notify({ customType, content, details }): void
 // busy → pi.sendMessage(msg, {deliverAs:"steer"})
 ```
 
-- 200ms 合批窗口: 多条 task_exited 合并为一条 `<task-notification>` 列表
+- 200ms 合批窗口: 多条 task_exited 合并为**一个** `<pbs-wake kind="task">`,内含多个 `<task>`
 - 去重: 同一 task 同一事件只发一次
-- 通知格式:
+- 所有异步注入共用一个 `customType`: `pbs-wake`。不再发送 `pbs-task-notification` / `pbs-monitor-event` / `pbs-subagent-notification` / `pbs-supervisor-message`。旧 renderer 已删除;旧 transcript 走 pi 默认 custom message。
+- Lead-in 只有一句,导出为 `PBS_WAKE_LEAD_IN`:
 
-```xml
-<task-notification>
-  <task-id>sh_a1b2c3d4</task-id><kind>shell</kind>
-  <status>completed|failed|killed</status>
-  <summary>Background command "..." completed (exit code 0)</summary>
-  <output-file>~/.pi/agent/pbs/sessions/.../sh_x.output</output-file>
-  <preview>...尾部, cap 4000 字符...</preview>
-  <duration-ms>12345</duration-ms>
-</task-notification>
+```ts
+export const PBS_WAKE_LEAD_IN =
+  "System wake — not a new user message. Handle this <pbs-wake> before other work.";
 ```
 
-- `before_agent_start` 注入行为准则: 不要 poll/不要 sleep 等待/不要伪造结果;通知是 system wake(外表像 user message 但不是新用户请求),收到后**先处理再继续工作**,不要只回复确认就停
+  content = lead-in + 空行 + 一个 `<pbs-wake>`。lead-in 换成 `""` 后仍是可解析的 envelope。Renderer 只读 `details.kind`,不从 XML 猜类型。Pill 的颜色/glyph 用 details 里的 status/exitCode,不用 summary 文本。
+
+### pbs-wake 合同(eval wake adapter 以此为准)
+
+属性 kebab-case,值 XML 转义。子元素文本一律转义(含 monitor `<event>`)。`details` camelCase,按 `kind` 区分。`still-running` 是子元素,不是属性;空则省略。item 文本是显示标题(shell: 命令压成一行并 cap 80;agent: name)。
+
+| kind | 根属性 | 子元素 | details |
+|---|---|---|---|
+| `task` | (无;still-running 不是属性) | `<still-running><item id>` 可选;一个或多个 `<task id kind status duration-ms exit-code? signal?>`,内含 `summary` `command` `output-file` `preview` | `{ kind:"task"; stillRunning: {id,title}[]; tasks: [{ id, taskKind, status, summary, command, outputPath, preview, durationMs, exitCode: number\|null, signal?: string }] }` |
+| `monitor` | `id` `description` `status?` | `<event>` | `{ kind:"monitor"; id; description; status?; event }` |
+| `subagent-handover` | `run-id` `child-id` `name` `status` | `<still-running>` 可选;`summary` `prompt` `result`;`error` 可选 | `{ kind:"subagent-handover"; runId; childId; name; status; stillRunning: {id,title}[]; summary; prompt; result; error? }` |
+| `subagent-done` | `run-id` `status` `duration-ms` | `summary`,然后每个 child 一个 `<child id name status>`,内含 `prompt`(头 cap 2000)、`error` 可选、`result`(尾 cap 2000) | `{ kind:"subagent-done"; runId; status; durationMs; summary; children: [{ childId, name, status, prompt, result, error? }] }` |
+| `supervisor-request` | `from` `name` | `message`,`reply-with` | `{ kind:"supervisor-request"; from; name; message }` |
+| `supervisor-update` | `from` `name` | `message` | `{ kind:"supervisor-update"; from; name; message }` |
+
+- `exit-code` 属性在 `exitCode === null` 时省略;details 里始终是 `number | null`。`signal` 是信号名字符串(`"SIGTERM"` | `"SIGKILL"`),没有则省略,不是数字。
+- `reply-with` 文本是 `agent_message { action: "reply", to: "<childId>", message: "<your decision>" }`,不写进 `message`。
+- subagent-done 的 pill 显示各 status 计数,例如 `3 completed · 1 failed`。
+- 行为准则是持久 section,不是 `before_agent_start` 返回的整段 systemPrompt。收到 `<pbs-wake>` 后先处理再继续,不要 poll/sleep/伪造结果。
 
 ### 4.6 subagent 工具 (M3)
 
@@ -357,12 +448,14 @@ subagent({
 ```
 
 - `tasks` 与 `chain` 互斥,且与 `action` 互斥;三者必须居一
-- 同步路径: 等待至全部完成或 **subagentBudgetMs(默认 45000, config 可配)** 到期 → 转异步,立即返回 `{ run_id, status: "backgrounded" }` + "完成时会通知你,不要 poll" 文案;完成时 NotifyCenter 注入 `<subagent-notification>`
+- 同步路径: 等待至全部完成或 **subagentBudgetMs(默认 45000, config 可配)** 到期 → 转异步,立即返回 `{ run_id, status: "backgrounded" }` + "完成时会通知你,不要 poll" 文案;完成时 NotifyCenter 注入 `<pbs-wake kind="subagent-done">`
 - chain 插值: `{previous}` = 上一节点结果文本, `{outputs.<label>}` = 指定 label 节点结果;未定义 label 引用 → 立即报错不启动
 - 并行: worker pool(concurrency 槽位),结果按 tasks 数组 ordinal 保序返回
 - 单个子代理失败不拖垮整组: 结果数组该项标 `status:"failed", error`;fail_fast=true 时取消未启动项
 - 结果文本: 每个子代理取 `session.getLastAssistantText()`;空 → "(no output)"
 - 深度: 扩展记录自身 depth(主=0);子会话工具集中**不含 subagent**(depth 1 硬上限,v1 不开放更深)
+- **child session isolation**: `createPiSessionFn` 显式传入 `DefaultResourceLoader({ cwd, agentDir, noExtensions:true, noSkills:true, noPromptTemplates:true, noThemes:true, noContextFiles:true })`;不加载 user/project extensions、skills、prompt templates、themes 或 context files。特别是不能加载父 extension,否则它的 session_start / before_agent_start 会把 parent wake guidelines 注入 child prompt。child 仍单独注入 `CHILD_BEHAVIOR_GUIDELINES`;没有配置开关。
+- **统一时钟与 generation timer ownership**: 扩展创建一个 `Clock` 并通过依赖注入传给时间相关服务。`ManualClock` 确定性地按 deadline、再按插入顺序执行同刻 timer;`advance()` 中新产生且已到期的 timer 也会运行, callback 内清除 timer 会阻止后续执行,大跨度 interval 每个到期点只触发一次。每个 child generation 有自己的 `TimerScope`; settle、interrupt、resume 或 dispose 时清除该 scope 的所有 timeout,避免过期 generation 影响后续状态。无需 Effect-TS;试点被拒绝的原因和数据见 `docs/decisions/effect-child-runner-pilot.md`。
 - 子代理 bash: `child-bash.ts` 禁后台变体——schema 无 `run_in_background`;execute 走 manager start + wait(timeout_ms 全程),到期 SIGKILL 并返回超时错误(不转后台);裸 sleep 拦截规则与主 bash 相同
 - 限制: 全局并发 8(跨 run);stall watchdog——子代理 10min 无任何事件 → abort 标记 `failed (stalled)`;session 级 spawn 预算 32 个子代理/小时,超限报错
 - 管理 action: `list`(本 session 全部 run + 状态), `get`(run_id → 完整结果), `status`(run_id → 每子代理状态/耗时/最后事件), `interrupt`(abort 子代理或整 run), `steer`(运行中子代理 → `session.steer(message)`), `resume`(已结束子代理 → `session.prompt(message)` 续跑, 结果完成时再通知), **`models`(列出可指定的模型, 供调用前自查)**
@@ -378,14 +471,7 @@ subagent({
 
 **通知格式**(NotifyCenter 合批规则与 task_exited 相同):
 
-```xml
-<subagent-notification>
-  <run-id>run_x1y2</run-id>
-  <status>completed|partial|failed|interrupted</status>
-  <summary>3/3 subagents completed in 41234ms</summary>
-  <results>...每个子代理: name + status + 结果文本尾部 2000 字符...</results>
-</subagent-notification>
-```
+完成通知是 `<pbs-wake kind="subagent-done">`,交接是 `<pbs-wake kind="subagent-handover">`。形状见 §4.5,不使用 `<subagent-notification>`。
 
 **fleet widget**(M5 部分提前到 M3,因依赖 registry): `ui.setWidget("pbs-fleet", lines, {placement:"belowEditor"})`,仅 `ctx.hasUI` 时;内容 = 每个活跃子代理一行 `● name (agent) — 12s`,无活跃时 `undefined` 清除;更新时机: registry 任何状态迁移 + 每 5s 计时刷新(活跃时)。
 
@@ -394,8 +480,8 @@ subagent({
 模块: `src/comms/`(mailbox.ts / tools.ts / routing.ts)。**只依赖附录 B 的 `CommsHost` 接口**,不 import subagent 实现(测试用 mock host)。
 
 - `contact_supervisor`(注册在子会话, customTools): `{ reason: "need_decision"|"progress_update", message: string }`
-  - `progress_update`: 即发即返(经 NotifyCenter 注入 `<supervisor-update>` 通知父 agent,不阻塞)
-  - `need_decision`: 阻塞子代理 tool execute,等父 agent 回复;**per-child 独立 waiter**(无全局锁——pi-intercom 教训);10min 超时返回 `"Supervisor did not respond within 10 minutes; decide yourself and continue."`;父侧收到 `<supervisor-request from child_id name>` + message,用 `agent_message reply` 应答
+  - `progress_update`: 即发即返(经 NotifyCenter 注入 `<pbs-wake kind="supervisor-update">` 通知父 agent,不阻塞)
+  - `need_decision`: 阻塞子代理 tool execute,等父 agent 回复;**per-child 独立 waiter**(无全局锁——pi-intercom 教训);10min 超时返回 `"Supervisor did not respond within 10 minutes; decide yourself and continue."`;父侧收到 `<pbs-wake kind="supervisor-request">`(见 §4.5),用 `agent_message reply` 应答
 - `agent_message`(父会话;子会话变体带 `from`): `{ action: "send"|"reply"|"broadcast"|"list", to?: string(child_id|name), message?: string, delivery?: "steer"|"queue"(默认 steer) }`
   - send 到运行中子代理: steer → `session.steer(message)`;queue → `session.followUp(message)`
   - send 到已结束子代理: 即 resume(`session.prompt(message)`),完成时再通知
@@ -415,7 +501,7 @@ markdown 文件,frontmatter(yaml 子集,手写解析,不引依赖):
 ---
 name: explorer
 description: Fast codebase exploration — finds files, symbols, answers structure questions
-tools: [read, bash, grep, find, ls]     # allowlist; 缺省 = [read, bash, edit, write]
+tools: [read, bash, grep, find, ls]     # 或 `read, bash, grep, find, ls`; 缺省 = [read, bash, edit, write]
 model: anthropic:claude-haiku-4-5       # 可选; "provider:id" 或裸 id
 thinking: high                          # 可选: minimal|low|medium|high|xhigh
 ---
@@ -433,7 +519,7 @@ You are an explorer agent. ... (body = system prompt 追加段)
 `~/.pi/agent/pbs/config.json`(扩展读):
 
 ```json
-{ "foregroundBudgetMs": 20000, "subagentBudgetMs": 45000, "managerPath": null, "logLevel": "info" }
+{ "foregroundBudgetMs": 20000, "subagentBudgetMs": 45000, "managerPath": null, "logLevel": "info", "goneSessionRetention": "24h" }
 ```
 
 ## 5. 测试策略
@@ -445,7 +531,7 @@ You are an explorer agent. ... (body = system prompt 追加段)
 - 协议: hello/start/wait/output/stop/list/watch 全消息往返
 - 事件: task_exited 推送、watch 后 output 推送
 - 生命周期: 连接归零 → manager 退出且任务被清算;spawn lock 单例(第二个 daemon 拒绝启动)
-- re-adopt: 杀 manager → 重启 → 活任务 re-adopt / 死任务 orphaned
+- 崩溃: kill -9 / panic manager → 所有任务的进程组随之清理(SIGTERM;忽略 SIGTERM 的成员在 2s grace 期满后才被 SIGKILL,顽固组清理约 2s + 杀进程时间)→ 重启后仍 running 的记录标为 orphaned(manager-crash),不接管、不发信号
 - 输出: 大输出 cursor 增量读、UTF-8 lossy
 
 ### TS(`extension/tests/`)
@@ -474,8 +560,8 @@ M1 后手动: `pi -e ./extension` 跑长命令验证自动后台 + 通知 + `pbs
 - LineBatcher 定时 flush **排空全部缓冲,含未换行残行**("窗口结束不丢数据")。(初版裁决是只发完整行;实现方收敛于 drain-at-end,对 progress bar / 慢速行场景更友好——残行立即可见而非无限持有)
 - `truncateTail` 的 maxBytes 是**硬上限**: 若保留的最后一行单独超限,对该行做 UTF-8 字符边界安全的字节截尾,结果永远 ≤ maxBytes;不产生 U+FFFD 溢出
 - `truncateTail` 的 `totalLines`: 原始文本行数;空串 = 0 行。截断发生时,输出首行为标记行 `… (truncated: showing last K of N lines)`
-- `formatTaskNotification`: 多事件合并为**多个 `<task-notification>` 块纵向拼接**(每块自包含;实现与测试双方收敛于此,而非单根多子元素);`exitCode:null` 的 summary 文案为 `finished (exit code unknown)`;command/preview 内容必须 XML 转义(`& < >`)
-- `formatBackgroundNotice` 文案包含 command 摘要(前 80 字符)
+- `formatTaskNotification`: 见 §4.5。多事件合并为一个 `<pbs-wake kind="task">`;command/preview 必须 XML 转义(`& < >`);`exitCode:null` 省略 `exit-code` 属性
+- `formatBackgroundNotice` 是一行任务状态 (`⏵ sh_x running in background · /tasks`); no-poll/end-turn 指引仅进入 model-facing tool guidelines
 - **spawn daemon 必须显式传 `--home <resolvedHome>`**(`pbs-manager --home X daemon`),不得依赖 PBS_HOME 环境继承——调用方的 home 可能来自显式覆盖而非环境变量(2026-09-17 端到端联调发现的实际 bug)
 - CLI `status` 输出汇总计数(version/pid/uptime/sessions 数/tasks 数);session 明细用 `sessions` 子命令
 - monitor 的 `timeout_ms` 由**扩展侧**强制执行(传 manager `timeout_ms:null`):若由 manager 硬杀,超时通知会退化为普通 task_exited,无法产出 "[Monitor timed out — re-arm if needed.]" 文案;扩展死亡时由 manager 连接归零清算兜底
@@ -519,9 +605,9 @@ export interface TaskExitInfo {
   exitCode: number | null; durationMs: number;
   outputPath: string; preview: string;  // preview 由调用方先截断到 4000
 }
-export function formatTaskNotification(events: TaskExitInfo[]): string;  // <task-notification> XML, 多条合并
+export function formatTaskNotification(events: TaskExitInfo[], stillRunning?: WakeItem[], leadIn?: string): FormattedWake;  // §4.5
 export function formatBackgroundNotice(taskId: string, command: string, outputPath: string): string;
-export function formatMonitorEvent(description: string, taskId: string, batchText: string): string;
+export function formatMonitorEvent(description: string, taskId: string, batchText: string, status?: string): FormattedWake;  // §4.5
 ```
 
 ## 附录 B: M3-M5 接口签名契约(subagent / comms / agents 三方的共同依据)

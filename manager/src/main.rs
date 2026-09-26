@@ -2,11 +2,20 @@
 //! Single binary: `daemon` runs the manager; every other subcommand is a
 //! socket client (design doc §3.5).
 
+mod out;
+
 mod client;
+mod clock;
 mod daemon;
+mod events;
+mod fmt;
+mod gc;
+mod handover;
+mod inspect;
 mod lifecycle;
 mod proto;
 mod registry;
+mod runner;
 mod sys;
 mod task;
 
@@ -34,39 +43,97 @@ enum Sub {
         /// Also log to stderr (for debugging).
         #[arg(long)]
         foreground: bool,
+        /// Internal: continue an in-place upgrade from this handover file.
+        #[arg(long, hide = true)]
+        handover: Option<PathBuf>,
     },
-    /// Show version/uptime/sessions/task counts.
-    Status,
-    /// List connected pi sessions.
-    Sessions,
-    /// List tasks (running only by default). Alias: `ls`.
+    /// Version, protocol, uptime, sessions, task and agent counts. Never
+    /// starts the daemon ("pbs-manager is not running", exit 1).
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Connected pi sessions (a gone session only while it still runs
+    /// something). Gone sessions' records are kept for `goneSessionRetention`
+    /// (config.json, default 24h) and stay reachable via show/agent/events.
+    Sessions {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Tasks and agents of connected sessions, running and finished, plus
+    /// anything still running elsewhere. Alias: `ls`.
     #[command(visible_alias = "ls")]
     List {
-        /// Only show this session's tasks.
+        /// Only sessions whose id starts with this prefix.
         #[arg(long)]
         session: Option<String>,
-        /// Include exited/terminal tasks (default: running only).
-        #[arg(short = 'a', long)]
-        all: bool,
+        /// Only work whose cwd is this directory or below it.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Only work started within this long (e.g. 30s, 10m, 2h, 1d).
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
-    /// Read a task's output; -f follows (long-lived).
+    /// Everything about one task, monitor, agent (ch_…) or run (run_…).
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Render an agent's transcript (preamble hidden unless --full).
+    Agent {
+        id: String,
+        /// Include the system prompt / agent preamble.
+        #[arg(long)]
+        full: bool,
+        /// Keep following the transcript.
+        #[arg(short = 'f', long)]
+        follow: bool,
+    },
+    /// Event log, merged and time-ordered across sessions.
+    Events {
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Only sessions whose id starts with this prefix.
+        #[arg(long)]
+        session: Option<String>,
+        /// Only events about this task/agent id.
+        #[arg(long)]
+        id: Option<String>,
+        /// Only events within this long (e.g. 30s, 10m, 2h).
+        #[arg(long)]
+        since: Option<String>,
+        /// One raw JSON object per line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read a task's output through the protocol; -f follows. For an agent
+    /// id, prints its result.
     Output {
         task_id: String,
         /// Follow the output stream.
         #[arg(short = 'f', long)]
         follow: bool,
-        /// Per-read chunk cap.
-        #[arg(long, default_value_t = 65536)]
-        max_bytes: u64,
+        /// Print at most this many bytes in total.
+        #[arg(long)]
+        max_bytes: Option<u64>,
     },
     /// Stop a task (SIGTERM group -> 2s -> SIGKILL).
     Stop { task_id: String },
     /// Stop all running tasks of a session.
     KillSession { session_id: String },
-    /// Check socket/pid/lock consistency; clean zombie files.
+    /// Health checks (daemon, socket, config, protocol, stale records,
+    /// orphan pids, disk use); fixes stale socket/pid files. Exit 1 on any
+    /// failure.
     Doctor,
     /// Gracefully shut the manager down (kills remaining tasks).
     Shutdown,
+    /// Replace the running manager, in place, with the binary now installed
+    /// at its path: same pid, every task keeps running, clients reconnect.
+    /// The daemon also does this by itself when that file changes.
+    Upgrade,
     /// Tail manager.log, or a task's output when TASK_ID is given.
     /// With TASK_ID: follows the merged `.output` file (use --stderr for the
     /// stderr-only sibling). Without TASK_ID: tails manager.log.
@@ -124,15 +191,70 @@ enum Sub {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // `__run` is every task's process-group leader (`runner`): plain
+    // threads, no async runtime, and not a user-facing subcommand.
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("__run") => {
+            let command = args.next().unwrap_or_default();
+            std::process::exit(runner::main(&command));
+        }
+        // An in-place upgrade asks the new binary this before exec'ing it.
+        Some(handover::CHECK_ARG) => {
+            println!("{}", handover::check_line());
+            std::process::exit(0);
+        }
+        _ => {}
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async_main());
+}
+
+async fn async_main() {
     let cli = Cli::parse();
     let home = lifecycle::resolve_home(cli.home.as_deref());
     let code = match cli.cmd {
-        Sub::Daemon { foreground } => daemon::run(home, foreground).await,
-        Sub::Status => run_client(client::cmd_status(&home)).await,
-        Sub::Sessions => run_client(client::cmd_sessions(&home)).await,
-        Sub::List { session, all } => run_client(client::cmd_list(&home, session, all)).await,
+        Sub::Daemon { foreground, handover } => daemon::run(home, foreground, handover).await,
+        Sub::Status { json } => run_client(inspect::cmd_status(&home, json)).await,
+        Sub::Sessions { json } => run_client(inspect::cmd_sessions(&home, json)).await,
+        Sub::List {
+            session,
+            cwd,
+            since,
+            json,
+        } => {
+            let opts = inspect::LsOpts {
+                session,
+                cwd,
+                since,
+                json,
+            };
+            run_client(inspect::cmd_ls(&home, opts)).await
+        }
+        Sub::Show { id, json } => run_client(inspect::cmd_show(&home, &id, json)).await,
+        Sub::Agent { id, full, follow } => {
+            run_client(inspect::cmd_agent(&home, &id, full, follow)).await
+        }
+        Sub::Events {
+            follow,
+            session,
+            id,
+            since,
+            json,
+        } => {
+            let opts = inspect::EventsOpts {
+                follow,
+                session,
+                id,
+                since,
+                json,
+            };
+            run_client(inspect::cmd_events(&home, opts)).await
+        }
         Sub::Output {
             task_id,
             follow,
@@ -144,6 +266,7 @@ async fn main() {
         }
         Sub::Doctor => client::cmd_doctor(&home).await,
         Sub::Shutdown => run_client(client::cmd_shutdown(&home)).await,
+        Sub::Upgrade => run_client(client::cmd_upgrade(&home)).await,
         Sub::Log {
             task_id,
             follow,

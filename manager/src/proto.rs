@@ -13,6 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PROTO_VERSION: u32 = 1;
+/// Feature level of the protocol, exchanged in hello (`protocol`) and
+/// returned by `status`. 1 = original §3.3; 2 = observability contract
+/// (origin, mark_background, stop.reason, end_reason, events.jsonl).
+pub const PROTOCOL: u32 = 2;
 /// §3.3: max frame 4 MiB.
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
 
@@ -23,6 +27,51 @@ pub const E_VERSION: &str = "E_VERSION";
 pub const E_SESSION_REQUIRED: &str = "E_SESSION_REQUIRED";
 pub const E_FORBIDDEN: &str = "E_FORBIDDEN";
 pub const E_INTERNAL: &str = "E_INTERNAL";
+/// `E_INTERNAL` message for requests (hello included) during graceful
+/// shutdown. Clients wait for that manager to exit, then spawn a successor.
+pub const SHUTTING_DOWN: &str = "manager is shutting down";
+
+/// §3.3: signals travel as names ("SIGTERM", "SIGKILL"). Unknown numbers
+/// render as "SIG<n>".
+pub fn signal_name(sig: i32) -> String {
+    let name = match sig {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGUSR2 => "SIGUSR2",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGXCPU => "SIGXCPU",
+        libc::SIGXFSZ => "SIGXFSZ",
+        _ => return format!("SIG{sig}"),
+    };
+    name.to_string()
+}
+
+/// Accept a signal as a name (current format) or a number (records written
+/// before signal names, which are converted).
+fn de_signal<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Sig {
+        Name(String),
+        Num(i32),
+    }
+    Ok(match Option::<Sig>::deserialize(d)? {
+        None => None,
+        Some(Sig::Name(s)) => Some(s),
+        Some(Sig::Num(n)) => Some(signal_name(n)),
+    })
+}
 
 /// Epoch milliseconds; used for started_at/ended_at/ts fields everywhere.
 pub fn now_ms() -> u64 {
@@ -77,8 +126,48 @@ impl TaskStatus {
     }
 }
 
+/// Who asked for a task (observability contract): how the extension ran it,
+/// and for shells run by a subagent, which child and run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    /// "bash-fg" | "bash-bg" | "child-bash" | "monitor". Stored as sent, so a
+    /// newer extension adding a value never breaks `start`.
+    pub via: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+/// Why a task ended (TaskRecord.end_reason, task_exited.end_reason).
+pub mod end_reason {
+    pub const EXITED: &str = "exited";
+    pub const TIMEOUT: &str = "timeout";
+    pub const SESSION_END: &str = "session-end";
+    pub const MANAGER_SHUTDOWN: &str = "manager-shutdown";
+    /// A record left "running" by a daemon that died without shutting down
+    /// (kill -9, panic). Its runners took the tasks down (lifeline, §3.2);
+    /// the next daemon only marks the record.
+    pub const MANAGER_CRASH: &str = "manager-crash";
+}
+
+/// `stop.reason` values accepted on the wire.
+pub const STOP_REASONS: &[&str] = &["tui", "cli", "tool", "timeout", "rate-limit", "session-end"];
+
+/// Map a `stop.reason` to the task's end_reason: `stopped:<reason>`, except
+/// timeout / rate-limit / session-end, which map to themselves. A stop with
+/// no reason (older clients) is `stopped:tool`.
+pub fn end_reason_for_stop(reason: Option<&str>) -> String {
+    match reason {
+        Some(r @ ("timeout" | "rate-limit" | "session-end")) => r.to_string(),
+        Some(r) => format!("stopped:{r}"),
+        None => "stopped:tool".to_string(),
+    }
+}
+
 /// §3.4: TaskRecord persisted at sessions/<sid>/tasks/<task_id>.json.
-/// Field set is contractual — do not add/remove fields.
+/// Fields after `output_size` were added by the observability contract; they
+/// are optional so records written by older managers still load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
     pub task_id: String,
@@ -89,11 +178,22 @@ pub struct TaskRecord {
     pub pid: u32,
     pub status: TaskStatus,
     pub exit_code: Option<i32>,
-    pub signal: Option<i32>,
+    /// Terminating signal name, e.g. "SIGTERM" / "SIGKILL" (§3.3). Records
+    /// written by older managers stored the number; those still load.
+    #[serde(default, deserialize_with = "de_signal")]
+    pub signal: Option<String>,
     pub started_at: u64,
     pub ended_at: Option<u64>,
     pub output_path: String,
     pub output_size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
+    /// When the extension moved the task to the background (ms epoch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backgrounded_at: Option<u64>,
+    /// See [`end_reason`]; set when the task reaches a terminal status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +223,15 @@ pub enum RequestKind {
         session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pi_pid: Option<u32>,
+        /// Session working directory. Optional so older clients still hello.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// Extension package version, stored per session (doctor, sessions).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension_version: Option<String>,
+        /// Protocol level the client speaks; see [`PROTOCOL`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<u32>,
     },
     /// §3.3 start — env is the child's *complete* environment.
     Start {
@@ -136,6 +245,17 @@ pub enum RequestKind {
         run_in_background: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Origin>,
+        /// Client-chosen idempotency key. A start resent with the same key
+        /// (after a lost connection, e.g. an in-place upgrade) returns the
+        /// task the first one started instead of starting it again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
+    /// Record that the extension moved a task to the background.
+    MarkBackground {
+        task_id: String,
     },
     Wait {
         task_id: String,
@@ -148,6 +268,9 @@ pub enum RequestKind {
     },
     Stop {
         task_id: String,
+        /// One of [`STOP_REASONS`]; absent = "tool" (older clients).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     List {
         #[serde(default)]
@@ -164,6 +287,23 @@ pub enum RequestKind {
     ShutdownSession,
     Status,
     Shutdown,
+    /// CLI only: replace this daemon in place with the binary now at its
+    /// executable path (exec, same pid; see `handover.rs`). Answered before
+    /// the handover starts; the result shows in `status.last_upgrade`.
+    Upgrade,
+    /// Test-only (`test-clock` feature): pending manual-clock timers. Sent
+    /// as the first frame of a connection, without hello, so it never counts
+    /// as an active connection.
+    #[cfg(feature = "test-clock")]
+    ClockStatus,
+    /// Test-only (`test-clock` feature): advance the manual clock.
+    #[cfg(feature = "test-clock")]
+    ClockAdvance { ms: u64 },
+    /// Test-only (`test-clock` feature): end the daemon on the spot the way
+    /// a panic in its main future does (exit status 101, no shutdown path,
+    /// no destructors). Sent without hello.
+    #[cfg(feature = "test-clock")]
+    DebugCrash,
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +390,20 @@ pub struct SessionInfo {
     pub session_id: String,
     pub pi_pid: u32,
     pub connected: bool,
+    /// Present when the extension sent cwd on hello. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_version: Option<String>,
+    /// Protocol level the session's client announced (absent: older client).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<u32>,
+    /// First hello of this session seen by this manager (ms epoch).
+    #[serde(default)]
+    pub connected_at: u64,
+    /// Last request or disconnect (ms epoch); "now" while connected.
+    #[serde(default)]
+    pub last_seen: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,6 +419,38 @@ pub struct StatusOk {
     pub uptime_ms: u64,
     pub sessions: Vec<SessionInfo>,
     pub task_counts: TaskCounts,
+    /// The manager's protocol level ([`PROTOCOL`]).
+    #[serde(default)]
+    pub protocol: u32,
+    /// In-place upgrades this daemon (this pid) has gone through.
+    #[serde(default)]
+    pub generation: u32,
+    /// The latest in-place upgrade attempt, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_upgrade: Option<UpgradeInfo>,
+}
+
+/// Outcome of an in-place upgrade attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UpgradeInfo {
+    /// When it finished (ms epoch).
+    pub at: u64,
+    pub ok: bool,
+    pub from_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
+    /// Why it did not happen; the daemon kept running the old binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// What started it: "cli" (`pbs-manager upgrade`) or "binary-changed".
+    #[serde(default)]
+    pub trigger: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpgradeOk {
+    pub from_version: String,
+    pub generation: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -312,11 +498,15 @@ pub enum EventKind {
     TaskExited {
         task_id: String,
         exit_code: Option<i32>,
-        signal: Option<i32>,
+        /// Signal name ("SIGTERM"/"SIGKILL"/...), null when the task exited.
+        signal: Option<String>,
         duration_ms: u64,
         output_path: String,
         output_size: u64,
         ts: u64,
+        /// Why the task ended; see [`end_reason`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_reason: Option<String>,
     },
     /// Pushed to the old connection when a session is rebound (§3.3 hello).
     SessionRebound {},
@@ -445,6 +635,9 @@ mod tests {
                 client_kind: ClientKind::Extension,
                 session_id: Some("sess1".into()),
                 pi_pid: Some(1234),
+                cwd: None,
+                extension_version: None,
+                protocol: None,
             },
         };
         let v: serde_json::Value = serde_json::from_slice(&encode(&req)).unwrap();
@@ -463,6 +656,9 @@ mod tests {
                 client_kind: ClientKind::Cli,
                 session_id: None,
                 pi_pid: None,
+                cwd: None,
+                extension_version: None,
+                protocol: None,
             },
         };
         let v: serde_json::Value = serde_json::from_slice(&encode(&req)).unwrap();
@@ -506,13 +702,17 @@ mod tests {
                 env,
                 run_in_background,
                 timeout_ms,
+                origin,
+                key,
             } => {
+                assert_eq!(key, None, "key is optional (older clients)");
                 assert_eq!(kind, TaskKind::Shell);
                 assert_eq!(command, "ls -la");
                 assert_eq!(cwd.as_deref(), Some("/tmp"));
                 assert_eq!(env.get("PATH").unwrap(), "/bin");
                 assert!(!run_in_background);
                 assert_eq!(timeout_ms, None);
+                assert_eq!(origin, None, "origin is optional (older clients)");
             }
             other => panic!("wrong kind: {other:?}"),
         }
@@ -584,6 +784,7 @@ mod tests {
             output_path: "/tmp/x.output".into(),
             output_size: 7,
             ts: 1726000000000,
+            end_reason: None,
         });
         let v: serde_json::Value = serde_json::from_slice(&encode(&ev)).unwrap();
         assert_eq!(v["v"], serde_json::json!(1));
@@ -601,12 +802,102 @@ mod tests {
     }
 
     #[test]
+    fn signal_names_on_wire_and_legacy_numbers_load() {
+        for (sig, name) in [
+            (libc::SIGHUP, "SIGHUP"),
+            (libc::SIGINT, "SIGINT"),
+            (libc::SIGQUIT, "SIGQUIT"),
+            (libc::SIGILL, "SIGILL"),
+            (libc::SIGTRAP, "SIGTRAP"),
+            (libc::SIGABRT, "SIGABRT"),
+            (libc::SIGBUS, "SIGBUS"),
+            (libc::SIGFPE, "SIGFPE"),
+            (libc::SIGKILL, "SIGKILL"),
+            (libc::SIGUSR1, "SIGUSR1"),
+            (libc::SIGSEGV, "SIGSEGV"),
+            (libc::SIGUSR2, "SIGUSR2"),
+            (libc::SIGPIPE, "SIGPIPE"),
+            (libc::SIGALRM, "SIGALRM"),
+            (libc::SIGTERM, "SIGTERM"),
+            (libc::SIGXCPU, "SIGXCPU"),
+            (libc::SIGXFSZ, "SIGXFSZ"),
+        ] {
+            assert_eq!(signal_name(sig), name);
+        }
+        assert_eq!(signal_name(250), "SIG250");
+        let base = serde_json::json!({
+            "task_id":"sh_00000001","session_id":"s","kind":"shell","command":"x",
+            "cwd":"/","pid":1,"status":"killed","exit_code":null,
+            "started_at":1,"ended_at":2,"output_path":"/x","output_size":0
+        });
+        let with = |sig: serde_json::Value| {
+            let mut v = base.clone();
+            v["signal"] = sig;
+            serde_json::from_value::<TaskRecord>(v).unwrap().signal
+        };
+        assert_eq!(with(serde_json::json!(9)).as_deref(), Some("SIGKILL"));
+        assert_eq!(with(serde_json::json!("SIGTERM")).as_deref(), Some("SIGTERM"));
+        assert_eq!(with(serde_json::Value::Null), None);
+        // Missing field is fine too.
+        assert_eq!(serde_json::from_value::<TaskRecord>(base).unwrap().signal, None);
+        // And it serializes as the name.
+        let ev = Event::new(EventKind::TaskExited {
+            task_id: "sh_a".into(),
+            exit_code: None,
+            signal: Some(signal_name(libc::SIGKILL)),
+            duration_ms: 1,
+            output_path: "/x".into(),
+            output_size: 0,
+            ts: 1,
+            end_reason: None,
+        });
+        let v: serde_json::Value = serde_json::from_slice(&encode(&ev)).unwrap();
+        assert_eq!(v["signal"], serde_json::json!("SIGKILL"));
+    }
+
+    #[test]
+    fn observability_fields_round_trip() {
+        let raw = r#"{"v":1,"id":"a","type":"start","kind":"shell","command":"x",
+            "origin":{"via":"child-bash","child_id":"ch_1","run_id":"run_1"}}"#;
+        let req: Request = serde_json::from_str(raw).unwrap();
+        let RequestKind::Start { origin, .. } = req.kind else { panic!() };
+        let o = origin.unwrap();
+        assert_eq!((o.via.as_str(), o.child_id.as_deref(), o.run_id.as_deref()), ("child-bash", Some("ch_1"), Some("run_1")));
+        let req: Request =
+            serde_json::from_str(r#"{"id":"b","type":"mark_background","task_id":"sh_1"}"#).unwrap();
+        assert!(matches!(req.kind, RequestKind::MarkBackground { ref task_id } if task_id == "sh_1"));
+        let req: Request =
+            serde_json::from_str(r#"{"id":"c","type":"stop","task_id":"sh_1","reason":"cli"}"#).unwrap();
+        assert!(matches!(req.kind, RequestKind::Stop { reason: Some(ref r), .. } if r == "cli"));
+        let req: Request = serde_json::from_str(
+            r#"{"type":"hello","client_kind":"extension","session_id":"s","pi_pid":1,"extension_version":"0.3.0","protocol":2}"#,
+        )
+        .unwrap();
+        assert!(matches!(req.kind, RequestKind::Hello { protocol: Some(2), extension_version: Some(ref v), .. } if v == "0.3.0"));
+        // end_reason mapping
+        assert_eq!(end_reason_for_stop(Some("cli")), "stopped:cli");
+        assert_eq!(end_reason_for_stop(Some("tui")), "stopped:tui");
+        assert_eq!(end_reason_for_stop(Some("tool")), "stopped:tool");
+        assert_eq!(end_reason_for_stop(Some("timeout")), "timeout");
+        assert_eq!(end_reason_for_stop(Some("rate-limit")), "rate-limit");
+        assert_eq!(end_reason_for_stop(Some("session-end")), "session-end");
+        assert_eq!(end_reason_for_stop(None), "stopped:tool");
+    }
+
+    #[test]
     fn request_id_is_uuid_shaped() {
         let id = new_request_id();
         assert_eq!(id.len(), 36);
         assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
         assert_ne!(new_request_id(), id);
+        // RFC 4122 v4: version nibble 4, variant 10xx, on every id.
+        for _ in 0..200 {
+            let id = new_request_id();
+            let c: Vec<char> = id.chars().collect();
+            assert_eq!(c[14], '4', "{id}");
+            assert!(matches!(c[19], '8' | '9' | 'a' | 'b'), "{id}");
+        }
     }
 
     #[test]

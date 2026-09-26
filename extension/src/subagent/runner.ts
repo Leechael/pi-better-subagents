@@ -19,6 +19,7 @@
  * waitForIdle() is awaited afterwards as belt-and-braces for queued
  * steer/followUp processing.
  */
+import { realClock, TimerScope, type Clock, type ClockTimer } from "../clock";
 import type {
   ChildResult,
   ChildRunRequest,
@@ -29,20 +30,26 @@ import type {
   DisposableChildHandle,
 } from "./types";
 
-export const DEFAULT_STALL_MS = 10 * 60 * 1000;
+/** Inactivity abort. Paused while a tool is executing or a need_decision is pending. */
+export const DEFAULT_STALL_MS = 5 * 60 * 1000;
 
 export interface InProcessRunnerOptions {
   createSession: CreateSessionFn;
   /** Stall watchdog timeout (ms). Default 10 minutes. */
   stallMs?: number;
-  /** Clock override for tests. */
-  now?: () => number;
+  /** Shared time source and scheduler. */
+  clock?: Clock;
   /**
    * Per-generation admission hook. Awaited before each (re)start; the
    * resolved releaser is called when the generation settles. Rejecting
    * cancels the generation as {status:"interrupted", error}.
    */
   acquire?: (req: ChildRunRequest) => Promise<() => void>;
+  /**
+   * Called after the child's conversation may have changed (a message or
+   * tool finished, or the generation settled). Used to persist transcripts.
+   */
+  onActivity?: (childId: string) => void;
 }
 
 function errorMessage(err: unknown): string {
@@ -67,10 +74,12 @@ class InProcessChildHandle implements DisposableChildHandle {
   private readonly req: ChildRunRequest;
   private readonly createSession: CreateSessionFn;
   private readonly stallMs: number;
-  private readonly now: () => number;
+  private readonly clock: Clock;
   private readonly acquire?: (req: ChildRunRequest) => Promise<() => void>;
+  private readonly onActivity?: (childId: string) => void;
 
   private session: ChildSessionAdapter | null = null;
+  private resolvedModel_: string | undefined;
   private unsubscribe: (() => void) | null = null;
   private status_: ChildStatus = "pending";
   private lastEvent: number;
@@ -79,18 +88,24 @@ class InProcessChildHandle implements DisposableChildHandle {
   private settledFlag = false;
   private resolveResult!: (result: ChildResult) => void;
   private resultPromise: Promise<ChildResult>;
-  private timeoutTimer: NodeJS.Timeout | null = null;
-  private stallTimer: NodeJS.Timeout | null = null;
+  private timeoutTimer: ClockTimer | null = null;
+  private stallTimer: ClockTimer | null = null;
+  private timerScope: TimerScope | null = null;
   private releaseSlot: (() => void) | null = null;
   private disposed = false;
+  /** Nested tool_execution_start/end. Stall stays paused while > 0. */
+  private toolDepth = 0;
+  /** contact_supervisor need_decision. Stall stays paused while true. */
+  private decisionPaused = false;
 
   constructor(req: ChildRunRequest, opts: InProcessRunnerOptions) {
     this.req = req;
     this.createSession = opts.createSession;
     this.stallMs = opts.stallMs ?? DEFAULT_STALL_MS;
-    this.now = opts.now ?? Date.now;
+    this.clock = opts.clock ?? realClock;
     this.acquire = opts.acquire;
-    this.startedAt = this.now();
+    this.onActivity = opts.onActivity;
+    this.startedAt = this.clock.now();
     this.lastEvent = this.startedAt;
     this.resultPromise = new Promise((resolve) => {
       this.resolveResult = resolve;
@@ -112,6 +127,26 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   lastEventAt(): number {
     return this.lastEvent;
+  }
+
+  resolvedModel(): string | undefined {
+    return this.resolvedModel_ ?? this.session?.resolvedModel;
+  }
+
+  /** Pause the stall watchdog (need_decision). Nested with tool execution. */
+  pauseStall(): void {
+    this.decisionPaused = true;
+    this.clearStall();
+  }
+
+  resumeStall(): void {
+    this.decisionPaused = false;
+    this.lastEvent = this.clock.now();
+    if (this.status_ === "running" && this.toolDepth === 0) this.armStall(this.generation);
+  }
+
+  conversation() {
+    return this.session?.getConversation() ?? [];
   }
 
   /** Launch generation 1. Resolves once the prompt is issued (not completed). */
@@ -197,10 +232,16 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   private async beginGeneration(prompt: string, first: boolean): Promise<void> {
     const gen = ++this.generation;
+    this.timerScope?.dispose();
+    this.timerScope = new TimerScope(this.clock);
     this.settledFlag = false;
     this.status_ = "pending";
-    this.startedAt = this.now();
+    this.startedAt = this.clock.now();
     this.lastEvent = this.startedAt;
+    // A tool_execution_end from the previous generation may have been dropped
+    // after settle. Don't carry that depth (or a pending decision) into this one.
+    this.toolDepth = 0;
+    this.decisionPaused = false;
 
     if (this.acquire) {
       try {
@@ -225,6 +266,7 @@ class InProcessChildHandle implements DisposableChildHandle {
     if (first) {
       try {
         this.session = await this.createSession(this.req);
+        this.resolvedModel_ = this.session.resolvedModel;
       } catch (err) {
         this.settle(gen, {
           status: "failed",
@@ -238,10 +280,28 @@ class InProcessChildHandle implements DisposableChildHandle {
         this.release();
         return;
       }
-      this.unsubscribe = this.session.subscribe(() => {
+      this.unsubscribe = this.session.subscribe((event) => {
+        if (event.type === "message_end" || event.type === "tool_execution_end" || event.type === "agent_end") {
+          this.notifyActivity();
+        }
+        // Track depth even after settle. A late tool_execution_end must not
+        // leak into the next resume, and must not rearm a stale generation.
+        if (event.type === "tool_execution_start") {
+          this.toolDepth++;
+          if (this.status_ === "running") this.clearStall();
+          return;
+        }
+        if (event.type === "tool_execution_end") {
+          this.toolDepth = Math.max(0, this.toolDepth - 1);
+          this.lastEvent = this.now();
+          if (this.status_ === "running" && this.toolDepth === 0 && !this.decisionPaused) {
+            this.armStall(this.generation);
+          }
+          return;
+        }
         if (this.status_ !== "running") return;
         this.lastEvent = this.now();
-        this.armStall(gen);
+        if (this.toolDepth === 0 && !this.decisionPaused) this.armStall(this.generation);
       });
     }
 
@@ -258,8 +318,13 @@ class InProcessChildHandle implements DisposableChildHandle {
 
     this.armTimeout(gen);
     this.armStall(gen);
+    // Tell the child which model it is — otherwise only the parent/fleet knows.
+    const prompted =
+      first && session.resolvedModel
+        ? `You are running as model ${session.resolvedModel}.\n\n${prompt}`
+        : prompt;
     // Floating: prompt() resolves when the whole run settles (pi semantics).
-    session.prompt(prompt).then(
+    session.prompt(prompted).then(
       () => {
         void this.finishGeneration(gen);
       },
@@ -287,6 +352,17 @@ class InProcessChildHandle implements DisposableChildHandle {
       }
     }
     if (!this.isCurrent(gen)) return;
+    const failure = session?.getLastAssistantFailure?.();
+    if (failure) {
+      this.settle(gen, {
+        status: "failed",
+        text: this.partialText(),
+        error: failure.errorMessage?.trim() || `Model stopped with ${failure.stopReason}`,
+        endReason: "model-error",
+        durationMs: this.now() - this.startedAt,
+      });
+      return;
+    }
     this.settle(gen, {
       status: "completed",
       text: this.partialText(),
@@ -296,6 +372,10 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   private partialText(): string {
     return this.session?.getLastAssistantText() || "(no output)";
+  }
+
+  private now(): number {
+    return this.clock.now();
   }
 
   private isSettled(gen: number): boolean {
@@ -316,7 +396,16 @@ class InProcessChildHandle implements DisposableChildHandle {
     }
     this.status_ = result.status;
     this.release();
+    this.notifyActivity();
     this.resolveResult(result);
+  }
+
+  private notifyActivity(): void {
+    try {
+      this.onActivity?.(this.req.childId);
+    } catch {
+      // persistence observers must not break the child lifecycle
+    }
   }
 
   private release(): void {
@@ -333,11 +422,11 @@ class InProcessChildHandle implements DisposableChildHandle {
 
   private armTimeout(gen: number): void {
     if (this.timeoutTimer !== null) {
-      clearTimeout(this.timeoutTimer);
+      this.timerScope?.clearTimeout(this.timeoutTimer);
       this.timeoutTimer = null;
     }
     if (!(this.req.timeoutMs > 0)) return;
-    this.timeoutTimer = setTimeout(() => {
+    this.timeoutTimer = this.timerScope?.setTimeout(() => {
       this.timeoutTimer = null;
       if (!this.isCurrent(gen)) return;
       this.settle(gen, {
@@ -347,17 +436,16 @@ class InProcessChildHandle implements DisposableChildHandle {
         durationMs: this.now() - this.startedAt,
       });
       void this.session?.abort().catch(() => {});
-    }, this.req.timeoutMs);
-    this.timeoutTimer.unref?.();
+    }, this.req.timeoutMs) ?? null;
   }
 
   private armStall(gen: number): void {
     if (this.stallTimer !== null) {
-      clearTimeout(this.stallTimer);
+      this.timerScope?.clearTimeout(this.stallTimer);
       this.stallTimer = null;
     }
     if (!(this.stallMs > 0)) return;
-    this.stallTimer = setTimeout(() => {
+    this.stallTimer = this.timerScope?.setTimeout(() => {
       this.stallTimer = null;
       if (!this.isCurrent(gen)) return;
       this.settle(gen, {
@@ -367,18 +455,23 @@ class InProcessChildHandle implements DisposableChildHandle {
         durationMs: this.now() - this.startedAt,
       });
       void this.session?.abort().catch(() => {});
-    }, this.stallMs);
-    this.stallTimer.unref?.();
+    }, this.stallMs) ?? null;
+  }
+
+  private clearStall(): void {
+    if (this.stallTimer !== null) {
+      this.timerScope?.clearTimeout(this.stallTimer);
+      this.stallTimer = null;
+    }
   }
 
   private clearTimers(): void {
     if (this.timeoutTimer !== null) {
-      clearTimeout(this.timeoutTimer);
+      this.timerScope?.clearTimeout(this.timeoutTimer);
       this.timeoutTimer = null;
     }
-    if (this.stallTimer !== null) {
-      clearTimeout(this.stallTimer);
-      this.stallTimer = null;
-    }
+    this.clearStall();
+    this.timerScope?.dispose();
+    this.timerScope = null;
   }
 }

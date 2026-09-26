@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  backgroundRowText,
   formatBackgroundNotice,
   formatMonitorEvent,
   formatTaskNotification,
@@ -77,82 +78,94 @@ function exitInfo(overrides: Partial<TaskExitInfo> = {}): TaskExitInfo {
 
 describe("formatTaskNotification", () => {
   it("matches the §4.5 XML layout for a single event", () => {
-    const xml = formatTaskNotification([exitInfo()]);
-    expect(xml).toContain("system wake");
-    expect(xml).toContain("Handle each task-notification block");
-    expect(xml).toContain(
-      [
-        "<task-notification>",
-        "  <task-id>sh_a1b2c3d4</task-id><kind>shell</kind>",
-        "  <status>completed</status>",
-        '  <summary>Background command "npm test" completed (exit code 0)</summary>',
-        "  <output-file>/home/u/.pi/agent/pbs/sessions/s/tasks/sh_a1b2c3d4.output</output-file>",
-        "  <preview>all tests passed</preview>",
-        "  <duration-ms>12345</duration-ms>",
-        "</task-notification>",
-      ].join("\n"),
-    );
+    const xml = formatTaskNotification([exitInfo()]).content;
+    expect(xml).toContain("System wake");
+    expect(xml).toContain('<pbs-wake kind="task">');
+    expect(xml).toContain('<task id="sh_a1b2c3d4" kind="shell" status="completed" duration-ms="12345" exit-code="0">');
+    expect(xml).toContain('<summary>Background command "npm test" completed (exit code 0)</summary>');
+    expect(xml).toContain("<command>npm test</command>");
+    expect(xml).toContain("<output-file>/home/u/.pi/agent/pbs/sessions/s/tasks/sh_a1b2c3d4.output</output-file>");
+    expect(xml).toContain("<preview>all tests passed</preview>");
   });
 
-  it("merges multiple events into a list of notification blocks", () => {
+  it("merges multiple events into one envelope", () => {
     const xml = formatTaskNotification([
       exitInfo(),
       exitInfo({ taskId: "sh_deadbeef", status: "failed", exitCode: 1, command: "make" }),
-    ]);
-    expect(xml.match(/<task-notification>/g)).toHaveLength(2);
-    expect(xml).toContain("<task-id>sh_deadbeef</task-id>");
-    expect(xml).toContain("<status>failed</status>");
+    ]).content;
+    expect(xml.match(/<pbs-wake /g)).toHaveLength(1);
+    expect(xml.match(/<task /g)).toHaveLength(2);
+    expect(xml).toContain('id="sh_deadbeef"');
+    expect(xml).toContain('status="failed"');
     expect(xml).toContain('Background command "make" failed (exit code 1)');
   });
 
   it("renders killed and orphaned statuses", () => {
-    expect(formatTaskNotification([exitInfo({ status: "killed", exitCode: null })])).toContain(
+    expect(formatTaskNotification([exitInfo({ status: "killed", exitCode: null })]).content).toContain(
       "was killed",
     );
-    expect(formatTaskNotification([exitInfo({ status: "orphaned", exitCode: null })])).toContain(
-      "<status>orphaned</status>",
+    expect(formatTaskNotification([exitInfo({ status: "orphaned", exitCode: null })]).content).toContain(
+      'status="orphaned"',
     );
   });
 
   it("escapes XML in command and preview", () => {
     const xml = formatTaskNotification([
       exitInfo({ command: 'grep "<a>&" file', preview: "x < y & z > w" }),
-    ]);
+    ]).content;
     expect(xml).toContain('grep "&lt;a&gt;&amp;" file');
     expect(xml).toContain("x &lt; y &amp; z &gt; w");
     expect(xml).not.toContain("x < y");
   });
 
   it("truncates very long commands in the summary", () => {
-    const xml = formatTaskNotification([exitInfo({ command: `cmd ${"x".repeat(200)}` })]);
+    const xml = formatTaskNotification([exitInfo({ command: `cmd ${"x".repeat(200)}` })]).content;
     expect(xml).toContain("…");
-    expect(xml.length).toBeLessThan(1000);
+    expect(xml.length).toBeLessThan(1500);
+  });
+
+  it("names background tasks that are still running", () => {
+    const xml = formatTaskNotification([exitInfo()], [{ id: "sh_other", title: "sleep 30" }]).content;
+    expect(xml).toContain('<item id="sh_other">sleep 30</item>');
+    expect(xml).toContain("<command>");
+    expect(xml).toContain("npm test");
   });
 });
 
 describe("formatBackgroundNotice", () => {
-  it("contains task id, output path and the no-poll instruction", () => {
+  it("keeps the model-facing notice actionable", () => {
     const text = formatBackgroundNotice("sh_a1b2c3d4", "npm run build", "/tmp/out.log");
     expect(text).toContain("task_id: sh_a1b2c3d4");
     expect(text).toContain("Output: /tmp/out.log");
-    expect(text).toContain("You will be notified when it completes. Do not poll or sleep");
-    expect(text).toContain("<task-notification>");
-    expect(text).toContain('"npm run build"');
+    expect(text).toContain("Do not poll");
+  });
+
+  it("draws the transcript row from live task state, not from the model text", () => {
+    expect(backgroundRowText("sh_1", undefined, 0)).toMatchObject({ glyph: "⏵", text: "sh_1 running in background · /tasks" });
+    expect(backgroundRowText("sh_1", { status: "running", startedAt: 0 }, 5_000).glyph).toBe("⏵");
+    expect(backgroundRowText("sh_1", { status: "completed", exitCode: 0, startedAt: 0, endedAt: 14_000 }, 20_000)).toEqual({
+      glyph: "✓",
+      color: "success",
+      text: "sh_1 finished · exit 0 · 14.0s",
+    });
+    expect(backgroundRowText("sh_1", { status: "failed", exitCode: 3, startedAt: 0, endedAt: 12_000 }, 20_000)).toMatchObject({
+      glyph: "✗",
+      text: "sh_1 failed · exit 3 · 12.0s · /tasks",
+    });
   });
 });
 
 describe("formatMonitorEvent", () => {
-  it("wraps the batch in a monitor-event element with attributes", () => {
-    const text = formatMonitorEvent("watch tests", "mon_ab12", "line1\nline2");
-    expect(text).toContain('<monitor-event description="watch tests" task_id="mon_ab12">');
-    expect(text).toContain("system wake");
-    expect(text).toContain('Monitor event (system wake — not a new user message): "watch tests"');
-    expect(text).toContain("<event>\nline1\nline2\n</event>");
-    expect(text).toContain("</monitor-event>");
+  it("wraps the batch in a pbs-wake monitor envelope", () => {
+    const text = formatMonitorEvent("watch tests", "mon_ab12", "line1\nline2").content;
+    expect(text).toContain('<pbs-wake kind="monitor" id="mon_ab12" description="watch tests">');
+    expect(text).toContain("System wake");
+    expect(text).toContain("<event>line1\nline2</event>");
+    expect(text).toContain("</pbs-wake>");
   });
 
   it("escapes attribute values", () => {
-    const text = formatMonitorEvent('a "b" <c>', "mon_x", "body");
+    const text = formatMonitorEvent('a "b" <c>', "mon_x", "body").content;
     expect(text).toContain('description="a &quot;b&quot; &lt;c&gt;"');
   });
 });

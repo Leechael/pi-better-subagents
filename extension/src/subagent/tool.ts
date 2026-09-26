@@ -7,7 +7,7 @@
  *   interpolation (unknown labels rejected before anything starts);
  * - sync wait bounded by subagentBudgetMs (default 45000, config subagent
  *   section); on expiry the run continues in the background and completion is
- *   delivered via a <subagent-notification> through the NotifyCenter;
+ *   delivered via a <pbs-wake kind="subagent-done"> through the NotifyCenter;
  * - management actions: list / get / status / interrupt / resume / steer.
  *
  * pi-free apart from type-only imports; the registry, runner and session
@@ -15,13 +15,16 @@
  */
 import { Type } from "typebox";
 import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { formatSubagentNotification, truncateTail } from "../format";
+import { formatSubagentHandover, formatSubagentNotification, truncateTail } from "../format";
+import { realClock, type Clock, type ClockTimer } from "../clock";
+
 import type { NotifyCenter } from "../notify";
+import { statusGlyph, toolComponent } from "../tui/tool-component";
+import type { WorkIndex } from "../work-index";
 import { runChain, runTasks, validateChainSteps } from "./pool";
 import type { RunRecord, SubagentRegistry } from "./registry";
-import type { AgentDefinition, ChildResult, ChildRunRequest } from "./types";
+import type { AgentDefinition, ChildHandle, ChildResult, ChildRunRequest } from "./types";
 
-export const SUBAGENT_NOTIFICATION_CUSTOM_TYPE = "pbs-subagent-notification";
 
 /** Overall result text cap (§4.6: truncateTail 512 lines / 48KB). */
 const RESULT_MAX_LINES = 512;
@@ -76,7 +79,7 @@ const subagentParameters = Type.Object({
   ),
   timeout_ms: Type.Optional(
     Type.Number({
-      description: `Hard timeout per subagent in ms (default 600000, max ${MAX_TIMEOUT_MS})`,
+      description: `Hard timeout per subagent in ms (default 1800000, max ${MAX_TIMEOUT_MS})`,
       maximum: MAX_TIMEOUT_MS,
     }),
   ),
@@ -126,6 +129,9 @@ export interface SubagentToolDeps {
   defaultTimeoutMs: number;
   /** Default tasks worker-pool concurrency. */
   defaultConcurrency: number;
+  clock?: Clock;
+  /** Live background work; lets a backgrounded run's row redraw as children finish. */
+  getIndex?: () => WorkIndex | null;
   /** Agent definition resolver (M5 wires the real loader; default: worker). */
   resolveAgent?: (name: string | undefined) => AgentDefinition;
   /** Selectable models for action:"models" (§4.6); absent → action errors. */
@@ -184,13 +190,14 @@ function runDurationMs(record: RunRecord, now: number): number {
 }
 
 /** Per-child sections plus a summary header, capped to 512 lines / 48KB. */
-export function formatRunResults(record: RunRecord, now: number = Date.now()): string {
+export function formatRunResults(record: RunRecord, now: number = realClock.now()): string {
   const completed = record.children.filter((c) => c.status === "completed").length;
   const header =
     `Run ${record.runId} [${record.kind}] ${record.status} — ` +
     `${completed}/${record.children.length} subagents completed in ${formatDurationMs(runDurationMs(record, now))}.`;
   const sections = record.children.map((child) => {
     const lines = [`## ${child.name} (${child.status})`];
+    if (child.model) lines.push(`Model: ${child.model}`);
     if (child.result?.warning) lines.push(`Warning: ${child.result.warning}`);
     if (child.result?.error) lines.push(`Error: ${child.result.error}`);
     if (child.result) lines.push(child.result.text || "(no output)");
@@ -210,10 +217,12 @@ function toNotificationInfo(record: RunRecord, now: number) {
     status: record.status as "completed" | "partial" | "failed" | "interrupted",
     durationMs: runDurationMs(record, now),
     children: record.children.map((c) => ({
+      childId: c.childId,
       name: c.name,
       status: c.status,
       text: c.result?.text ?? "",
       error: c.result?.error,
+      ...(c.prompt !== undefined ? { prompt: c.prompt } : {}),
     })),
   };
 }
@@ -228,11 +237,13 @@ function raceBudget<T>(
   promise: Promise<T>,
   budgetMs: number,
   signal: AbortSignal | undefined,
+  clock: Clock,
 ): Promise<RaceOutcome<T>> {
   return new Promise((resolve) => {
     let finished = false;
+    let timer: ClockTimer;
     const cleanup = () => {
-      clearTimeout(timer);
+      clock.clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
     };
     const settle = (outcome: RaceOutcome<T>) => {
@@ -241,8 +252,8 @@ function raceBudget<T>(
       cleanup();
       resolve(outcome);
     };
-    const timer = setTimeout(() => settle({ done: false }), budgetMs);
-    timer.unref?.();
+    timer = clock.setTimeout(() => settle({ done: false }), budgetMs);
+    clock.unref?.(timer);
     const onAbort = () => settle({ done: false });
     if (signal?.aborted) {
       settle({ done: false });
@@ -264,6 +275,7 @@ export function createSubagentTool(
   deps: SubagentToolDeps,
 ): ToolDefinition<typeof subagentParameters, unknown> {
   const resolveAgent = deps.resolveAgent ?? defaultResolveAgent;
+  const clock = deps.clock ?? realClock;
 
   const requireRegistry = (): SubagentRegistry => {
     const registry = deps.getRegistry();
@@ -276,11 +288,42 @@ export function createSubagentTool(
   const notifyRunCompleted = (registry: SubagentRegistry, runId: string): void => {
     const record = registry.get(runId);
     if (!record) return;
-    deps.getNotifyCenter()?.notify({
-      customType: SUBAGENT_NOTIFICATION_CUSTOM_TYPE,
-      content: formatSubagentNotification(toNotificationInfo(record, Date.now())),
-      details: { run_id: runId },
-    });
+    deps.getNotifyCenter()?.notify(formatSubagentNotification(toNotificationInfo(record, clock.now())));
+  };
+
+  /**
+   * A child settled while siblings are still in flight. Returns true when a
+   * handover was sent. The run-complete notification covers the last child.
+   */
+  const notifyChildHandover = (
+    registry: SubagentRegistry,
+    runId: string,
+    childId: string,
+    handedOver: Set<string>,
+  ): boolean => {
+    if (handedOver.has(childId)) return false;
+    const record = registry.get(runId);
+    if (!record) return false;
+    const child = record.children.find((c) => c.childId === childId);
+    if (!child || child.status === "pending" || child.status === "running") return false;
+    const stillRunning = record.children
+      .filter((c) => c.status === "pending" || c.status === "running")
+      .map((c) => ({ id: c.childId, title: c.name }));
+    if (stillRunning.length === 0) return false;
+    handedOver.add(childId);
+    deps.getNotifyCenter()?.notify(
+      formatSubagentHandover({
+        runId,
+        childId: child.childId,
+        name: child.name,
+        status: child.status,
+        prompt: child.prompt ?? "",
+        text: child.result?.text ?? "",
+        ...(child.result?.error !== undefined ? { error: child.result.error } : {}),
+        stillRunning,
+      }),
+    );
+    return true;
   };
 
   const startRun = async (
@@ -318,11 +361,29 @@ export function createSubagentTool(
       runId: run.runId,
       name: resolved[ordinal].name,
       prompt: buildPrompt(resolved[ordinal].agent, prompt),
+      taskPrompt: prompt,
       agent: resolved[ordinal].agent,
       model: params.model,
       timeoutMs,
       depth: 1,
     });
+
+    const handedOver = new Set<string>();
+    let backgrounded = false;
+    const armBackground = (): void => {
+      backgrounded = true;
+      for (const childId of childIds) {
+        notifyChildHandover(registry, run.runId, childId, handedOver);
+      }
+    };
+    const watchChild = (ordinal: number, started: Promise<ChildHandle>): Promise<ChildResult> =>
+      started.then((handle) => {
+        void handle.result.then(() => {
+          if (!backgrounded) return;
+          notifyChildHandover(registry, run.runId, childIds[ordinal], handedOver);
+        });
+        return handle.result;
+      });
 
     const completion: Promise<ChildResult[]> =
       kind === "tasks"
@@ -330,15 +391,16 @@ export function createSubagentTool(
             concurrency,
             failFast,
             startChild: (_task, ordinal, ctx) =>
-              registry
-                .startChild(makeRequest(ordinal, resolved[ordinal].prompt), {
+              watchChild(
+                ordinal,
+                registry.startChild(makeRequest(ordinal, resolved[ordinal].prompt), {
                   shouldStart: () => !ctx.cancelled(),
-                })
-                .then((handle) => handle.result),
+                }),
+              ),
           })
         : runChain(items, {
             startChild: (_step, ordinal, interpolated) =>
-              registry.startChild(makeRequest(ordinal, interpolated)).then((handle) => handle.result),
+              watchChild(ordinal, registry.startChild(makeRequest(ordinal, interpolated))),
           });
 
     const tracked = completion.then((results) => {
@@ -367,22 +429,24 @@ export function createSubagentTool(
           type: "text",
           text:
             `Started ${items.length} subagent(s) in run ${run.runId}. ${reason}\n` +
-            `You will be notified via <subagent-notification> when the run completes. ` +
-            `Do not poll or sleep to wait for it. ` +
-            `Use subagent({action:"status", run_id:"${run.runId}"}) only if you must inspect progress, ` +
-            `and subagent({action:"get", run_id:"${run.runId}"}) to read final results.`,
+            `While others are still running, each finished subagent arrives as <pbs-wake kind="subagent-handover"> ` +
+            `with that child's prompt and result. Read it and continue: subagent({action:"resume", run_id, child_id, message}) for that child, ` +
+            `or agent_message to steer the ones still running. Do not wait for the whole run. Do not poll. ` +
+            `<pbs-wake kind="subagent-done"> arrives when every subagent in the run has finished. ` +
+            `Use subagent({action:"get", run_id:"${run.runId}"}) if you need the full record.`,
         },
       ],
       details: { run_id: run.runId, status: "backgrounded" },
     });
 
     if (params.async === true) {
+      armBackground();
       settleSync();
       return backgroundedText("The run is executing in the background.");
     }
 
     const budgetMs = deps.budgetMs();
-    const outcome = await raceBudget(tracked, budgetMs, signal);
+    const outcome = await raceBudget(tracked, budgetMs, signal, clock);
     if (outcome.done) {
       deliveredSync = true;
       settleSync();
@@ -395,6 +459,7 @@ export function createSubagentTool(
         details: { run_id: run.runId, status: record?.status ?? "completed", results: outcome.value },
       };
     }
+    armBackground();
     settleSync();
     return backgroundedText(
       `The foreground budget (${Math.round(budgetMs / 1000)}s) elapsed and the run continues in the background.`,
@@ -453,7 +518,7 @@ export function createSubagentTool(
       if (runs.length === 0) {
         return { content: [{ type: "text", text: "No subagent runs in this session." }], details: { runs: [] } };
       }
-      const now = Date.now();
+      const now = clock.now();
       const lines = runs.map((run) => {
         const counts = new Map<string, number>();
         for (const c of run.children) counts.set(c.status, (counts.get(c.status) ?? 0) + 1);
@@ -471,16 +536,17 @@ export function createSubagentTool(
 
     if (action === "get") {
       return {
-        content: [{ type: "text", text: formatRunResults(record) }],
+        content: [{ type: "text", text: formatRunResults(record, clock.now()) }],
         details: { run_id: record.runId, status: record.status },
       };
     }
 
     if (action === "status") {
-      const now = Date.now();
+      const now = clock.now();
       const lines = record.children.map((child) => {
         const elapsed = formatDurationMs((child.endedAt ?? now) - child.startedAt);
         let line = `${child.name} (${child.childId}): ${child.status}, ${elapsed} elapsed`;
+        if (child.model) line += `, model ${child.model}`;
         if (child.status === "running" || child.status === "pending") {
           const last = registry.handle(child.childId)?.lastEventAt() ?? child.startedAt;
           line += `, last event ${formatDurationMs(now - last)} ago`;
@@ -530,15 +596,22 @@ export function createSubagentTool(
     const handle = registry.handle(child.childId);
     if (!handle) throw new Error(`subagent ${child.childId} has no live session to resume`);
     await handle.resume(params.message);
-    // Resume is inherently asynchronous: always notify on completion.
-    void registry.getResult(child.childId)?.then(() => notifyRunCompleted(registry, record.runId));
+    // Resume is asynchronous. If siblings are still running, hand this child
+    // back as soon as it finishes; otherwise the run-complete wake covers it.
+    const handedOver = new Set<string>();
+    void registry.getResult(child.childId)?.then(() => {
+      if (!notifyChildHandover(registry, record.runId, child.childId, handedOver)) {
+        notifyRunCompleted(registry, record.runId);
+      }
+    });
     return {
       content: [
         {
           type: "text",
           text:
             `Resumed subagent ${child.name} (${child.childId}) in run ${record.runId}. ` +
-            "You will be notified via <subagent-notification> when it completes. Do not poll.",
+            "You will be notified via <pbs-wake kind=\"subagent-handover\"> if others are still running, " +
+            "otherwise via <pbs-wake kind=\"subagent-done\"> when it completes. Do not poll.",
         },
       ],
       details: { run_id: record.runId, child_id: child.childId },
@@ -551,15 +624,56 @@ export function createSubagentTool(
     description:
       "Run subagents in parallel (tasks) or sequentially (chain with {previous}/{outputs.<label>} " +
       "interpolation). By default the call waits up to a foreground budget (default 45s); longer runs " +
-      "continue in the background and completion arrives via <subagent-notification> — never poll or " +
-      "sleep to wait. Use action=list/get/status/interrupt/resume/steer to manage existing runs.",
+      "continue in the background. Each child that finishes while others are still running wakes you with " +
+      "<pbs-wake kind=\"subagent-handover\"> (its prompt and result). The whole run wakes you with <pbs-wake kind=\"subagent-done\">. " +
+      "Never poll or sleep to wait. Use action=list/get/status/interrupt/resume/steer to manage existing runs.",
     promptSnippet: "Fan out subagents in parallel or sequence them in a chain",
     promptGuidelines: [
-      "Subagent runs that exceed the foreground budget continue in the background; you are notified on completion — do not poll.",
+      'When a <pbs-wake kind="subagent-handover"> arrives, read <prompt> and <result> immediately and continue: subagent({action:"resume", run_id, child_id, message}) for that child, or agent_message to steer children that are still running. Do not wait for the rest of the run.',
+      "Subagent runs that exceed the foreground budget continue in the background; you are notified per finished child and again when the run completes — do not poll.",
       "A failed subagent does not fail the whole run; inspect per-subagent sections in the result.",
-      "<subagent-notification> is a system notification, not a user reply.",
+      "<pbs-wake> is a system wake, not a user reply. kind=subagent-handover is one child; kind=subagent-done is the whole run.",
     ],
     parameters: subagentParameters,
+    renderResult(result, { expanded }, theme, context) {
+      const details = result.details as { run_id?: string; status?: string } | undefined;
+      const record = details?.run_id ? deps.getRegistry()?.get(details.run_id) : undefined;
+      if (details?.status === "backgrounded" && record) {
+        // UI row only: one line per child with live status. The model-facing
+        // instructions stay in result.content.
+        const index = deps.getIndex?.() ?? null;
+        const state = context.state as { unsubscribe?: () => void };
+        const active = record.children.some((c) => c.status === "pending" || c.status === "running");
+        if (index && !state.unsubscribe && active) {
+          state.unsubscribe = index.onChange(() => {
+            const now = deps.getRegistry()?.get(record.runId);
+            if (!now || now.children.every((c) => c.status !== "pending" && c.status !== "running")) {
+              state.unsubscribe?.();
+              state.unsubscribe = () => {};
+            }
+            context.invalidate();
+          });
+        }
+        const now = clock.now();
+        const lines = [theme.fg("muted", `run ${record.runId} · ${record.status} · /tasks`)];
+        for (const c of record.children) {
+          const g = statusGlyph(c.status);
+          const age = formatDurationMs((c.endedAt ?? now) - c.startedAt);
+          const err = c.result?.error ? ` · ${c.result.error}` : "";
+          lines.push(`  ${theme.fg(g.color as never, g.glyph)} ${c.name} ${theme.fg("dim", `${c.status} ${age}${err}`)}`);
+        }
+        return toolComponent(lines) as never;
+      }
+      const text = result.content
+        .filter((c): c is { type: "text"; text: string } => c.type === "text")
+        .map((c) => c.text)
+        .join("\n");
+      const all = text.split("\n");
+      const shown = expanded ? all : all.slice(0, 10);
+      const out = shown.map((l) => theme.fg("toolOutput", l));
+      if (shown.length < all.length) out.push(theme.fg("muted", `... (${all.length - shown.length} more lines, ctrl+o to expand)`));
+      return toolComponent(out) as never;
+    },
     async execute(_toolCallId, rawParams, signal, _onUpdate, _ctx) {
       const params = rawParams as SubagentParams;
       const hasTasks = params.tasks !== undefined;

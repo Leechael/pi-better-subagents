@@ -25,14 +25,24 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { taskOutputPath, type PbsConfig } from "./config";
-import { formatBackgroundNotice, truncateTail } from "./format";
+import { realClock, type Clock, type ClockTimer } from "./clock";
+import { backgroundRowText, formatBackgroundNotice, truncateTail } from "./format";
+import { toolComponent } from "./tui/tool-component";
+import type { WorkIndex } from "./work-index";
 import type { ManagerClient } from "./manager-client";
+import {
+  appendStatus,
+  bareSleepError,
+  collectOutput,
+  formatFinishedOutput,
+  SHELL_MAX_BYTES,
+  SHELL_MAX_LINES,
+  withAbort,
+} from "./shell-exec";
 
 /** Same limits as the built-in bash tool. */
-const MAX_LINES = 2000;
-const MAX_BYTES = 51200;
-/** Read window used when collecting finished task output. */
-const OUTPUT_WINDOW_BYTES = 512 * 1024;
+const MAX_LINES = SHELL_MAX_LINES;
+const MAX_BYTES = SHELL_MAX_BYTES;
 
 const bashParameters = Type.Object({
   command: Type.String({ description: "The bash command to execute" }),
@@ -63,27 +73,30 @@ export interface BashOverrideDeps {
   /** Extra environment injected into managed child processes (PI_* vars). */
   sessionEnv: (ctx: ExtensionContext) => Record<string, string>;
   /** Register task metadata so exit notifications can describe the task. */
-  trackTask: (taskId: string, meta: { kind: string; command: string }) => void;
+  trackTask: (taskId: string, meta: { kind: string; command: string; cwd?: string }) => void;
+  /**
+   * Mark a task so its task_exited event becomes a parent <pbs-wake kind="task">.
+   * Only backgrounded parent bash should call this — sync waits (foreground
+   * budget hit, child-bash) must not wake the parent session.
+   */
+  markNotifyOnExit: (taskId: string) => void;
+  clock?: Clock;
+  /** Live background work, so a backgrounded row can show its final status. */
+  getIndex?: () => WorkIndex | null;
 }
 
-/**
- * Bare sleep / idle-loop patterns (§4.2). These block the foreground budget
- * without producing anything; the agent should use monitor or backgrounding.
- */
-const BARE_SLEEP_PATTERNS: RegExp[] = [
-  /^\s*sleep\s+\d/,
-  /^\s*while\s+true\b/,
-  /^\s*while\s+sleep\b/,
-  /^\s*until\s+/,
-];
+/** Same collapsed preview as pi's default tool-result view. */
+const PREVIEW_LINES = 10;
 
-function bareSleepError(command: string): string | null {
-  if (!BARE_SLEEP_PATTERNS.some((re) => re.test(command))) return null;
-  return [
-    `Refusing to run a bare sleep/idle-loop command: ${JSON.stringify(command)}.`,
-    "Do not sleep to wait for background work; completion is delivered via notification.",
-    "Use the monitor tool to watch for a condition, or run_in_background for long commands.",
-  ].join(" ");
+function isActiveStatus(status: string | undefined): boolean {
+  return status === undefined || status === "running" || status === "pending";
+}
+
+const BARE_SLEEP_GUIDANCE =
+  "Do not sleep to wait for background work; completion is delivered via notification. Use the monitor tool to watch for a condition, or run_in_background for long commands.";
+
+function rejectBareSleep(command: string): string | null {
+  return bareSleepError(command, BARE_SLEEP_GUIDANCE);
 }
 
 function resolveTimeoutMs(timeoutSeconds: number | undefined): number | null {
@@ -103,110 +116,6 @@ function fullEnv(ctx: ExtensionContext, deps: BashOverrideDeps): Record<string, 
   return env;
 }
 
-/** Race a promise against an AbortSignal; runs cleanup on abort. */
-function withAbort<T>(
-  promise: Promise<T>,
-  signal: AbortSignal | undefined,
-  onAbort: () => void,
-): Promise<T> {
-  if (!signal) return promise;
-  if (signal.aborted) {
-    onAbort();
-    return Promise.reject(new Error("aborted"));
-  }
-  return new Promise<T>((resolve, reject) => {
-    const handler = () => {
-      onAbort();
-      reject(new Error("aborted"));
-    };
-    signal.addEventListener("abort", handler, { once: true });
-    promise.then(
-      (value) => {
-        signal.removeEventListener("abort", handler);
-        resolve(value);
-      },
-      (err) => {
-        signal.removeEventListener("abort", handler);
-        reject(err);
-      },
-    );
-  });
-}
-
-interface CollectedOutput {
-  text: string;
-  totalSize: number;
-  /** True when only a tail window of the full output was read. */
-  windowed: boolean;
-}
-
-/** Read the (finished) task output from the manager, tail-windowed. */
-async function collectOutput(client: ManagerClient, taskId: string): Promise<CollectedOutput> {
-  const probe = await client.output(taskId, 0, 1);
-  const totalSize = probe.total_size;
-  const start = Math.max(0, totalSize - OUTPUT_WINDOW_BYTES);
-  let cursor = start;
-  let text = "";
-  for (;;) {
-    const res = await client.output(taskId, cursor, OUTPUT_WINDOW_BYTES);
-    text += res.chunk;
-    if (res.next_cursor <= cursor || res.next_cursor >= res.total_size) break;
-    cursor = res.next_cursor;
-  }
-  return { text, totalSize, windowed: start > 0 };
-}
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes}B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)}KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
-}
-
-interface FormattedOutput {
-  text: string;
-  details: PbsBashDetails | undefined;
-}
-
-/** Tail-truncate finished output and format it like the built-in bash tool. */
-function formatFinishedOutput(raw: CollectedOutput, outputPath: string): FormattedOutput {
-  const t = truncateTail(raw.text, MAX_LINES, MAX_BYTES);
-  const truncated = t.truncated || raw.windowed;
-  let text = t.text || "(no output)";
-  if (!truncated) return { text, details: undefined };
-
-  const outputLines = t.text.length === 0 ? 0 : t.text.split("\n").length;
-  const outputBytes = Buffer.byteLength(t.text, "utf8");
-  const truncatedBy = t.totalLines > MAX_LINES ? "lines" : "bytes";
-  const details: PbsBashDetails = {
-    truncation: {
-      content: t.text,
-      truncated: true,
-      truncatedBy,
-      totalLines: t.totalLines,
-      totalBytes: raw.totalSize,
-      outputLines,
-      outputBytes,
-      lastLinePartial: false,
-      firstLineExceedsLimit: false,
-      maxLines: MAX_LINES,
-      maxBytes: MAX_BYTES,
-    },
-    fullOutputPath: outputPath,
-  };
-  const startLine = t.totalLines - outputLines + 1;
-  const endLine = t.totalLines;
-  if (truncatedBy === "lines") {
-    text += `\n\n[Showing lines ${startLine}-${endLine} of ${t.totalLines}. Full output: ${outputPath}]`;
-  } else {
-    text += `\n\n[Showing lines ${startLine}-${endLine} of ${t.totalLines} (${formatSize(MAX_BYTES)} limit). Full output: ${outputPath}]`;
-  }
-  return { text, details };
-}
-
-function appendStatus(text: string, status: string): string {
-  return text ? `${text}\n\n${status}` : status;
-}
-
 // ---------------------------------------------------------------------------
 // Local fallback (manager unavailable): mimics the built-in bash tool.
 // ---------------------------------------------------------------------------
@@ -215,6 +124,7 @@ async function executeLocal(
   params: BashParams,
   signal: AbortSignal | undefined,
   ctx: ExtensionContext,
+  clock: Clock,
 ): Promise<AgentToolResult<PbsBashDetails | undefined>> {
   const timeoutMs = resolveTimeoutMs(params.timeout);
   const shell = process.env.SHELL && process.env.SHELL.length > 0 ? process.env.SHELL : "/bin/bash";
@@ -230,10 +140,11 @@ async function executeLocal(
       let settled = false;
       let timedOut = false;
       let aborted = false;
+      let timer: ClockTimer | null = null;
       const finish = (exitCode: number | null) => {
         if (settled) return;
         settled = true;
-        if (timer) clearTimeout(timer);
+        if (timer !== null) clock.clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
         resolve({ text: Buffer.concat(chunks).toString("utf8"), exitCode, timedOut, aborted });
       };
@@ -248,19 +159,19 @@ async function executeLocal(
         aborted = true;
         kill();
       };
-      const timer =
+      timer =
         timeoutMs !== null
-          ? setTimeout(() => {
+          ? clock.setTimeout(() => {
               timedOut = true;
               kill();
             }, timeoutMs)
           : null;
-      timer?.unref?.();
+      if (timer !== null) clock.unref?.(timer);
       signal?.addEventListener("abort", onAbort, { once: true });
       child.stdout?.on("data", (d: Buffer) => chunks.push(d));
       child.stderr?.on("data", (d: Buffer) => chunks.push(d));
       child.on("error", (err) => {
-        if (timer) clearTimeout(timer);
+        if (timer !== null) clock.clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
         if (!settled) {
           settled = true;
@@ -327,20 +238,52 @@ export function createBashOverride(
     promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
     promptGuidelines: [
       "You can inspect PI_* environment variables for current model and session details.",
-      "Long-running bash commands are moved to the background automatically; do not poll or sleep to wait for them.",
+      "Long-running bash commands are moved to the background automatically; do not poll or sleep to wait for them. End your turn and resume from the task wake when it arrives.",
     ],
     parameters: bashParameters,
+    renderResult(result, { expanded }, theme, context) {
+      const details = result.details as PbsBashDetails | undefined;
+      if (details?.backgrounded && details.task_id) {
+        const taskId = details.task_id;
+        const index = deps.getIndex?.() ?? null;
+        const state = context.state as { unsubscribe?: () => void };
+        const item = index?.get(taskId);
+        if (index && !state.unsubscribe && isActiveStatus(item?.status)) {
+          // Redraw this row when the task finishes, then stop listening.
+          state.unsubscribe = index.onChange(() => {
+            if (!isActiveStatus(index.get(taskId)?.status)) {
+              state.unsubscribe?.();
+              state.unsubscribe = () => {};
+            }
+            context.invalidate();
+          });
+        }
+        const row = backgroundRowText(taskId, item, (deps.clock ?? realClock).now());
+        return toolComponent([`${theme.fg(row.color as never, row.glyph)} ${theme.fg("muted", row.text)}`]) as never;
+      }
+      const text = result.content
+        .filter((c): c is { type: "text"; text: string } => c.type === "text")
+        .map((c) => c.text)
+        .join("\n");
+      const lines = text.split("\n");
+      const shown = expanded ? lines : lines.slice(0, PREVIEW_LINES);
+      const out = shown.map((l) => theme.fg("toolOutput", l));
+      if (shown.length < lines.length) {
+        out.push(theme.fg("muted", `... (${lines.length - shown.length} more lines, ctrl+o to expand)`));
+      }
+      return toolComponent(out) as never;
+    },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const input = params as BashParams;
 
-      const sleepError = bareSleepError(input.command);
+      const sleepError = rejectBareSleep(input.command);
       if (sleepError) throw new Error(sleepError);
 
       const client = deps.getClient();
       const managed = client !== null && (await client.ensureAvailable());
       if (!managed || client === null) {
         // Degraded mode: run locally like the built-in bash tool.
-        return executeLocal(input, signal, ctx);
+        return executeLocal(input, signal, ctx, deps.clock ?? realClock);
       }
 
       const timeoutMs = resolveTimeoutMs(input.timeout);
@@ -353,15 +296,17 @@ export function createBashOverride(
           env: fullEnv(ctx, deps),
           run_in_background: input.run_in_background === true,
           timeout_ms: timeoutMs,
+          origin: { via: input.run_in_background === true ? "bash-bg" : "bash-fg" },
         });
       } catch {
         // Manager request failed mid-session; degrade to local execution.
-        return executeLocal(input, signal, ctx);
+        return executeLocal(input, signal, ctx, deps.clock ?? realClock);
       }
-      deps.trackTask(start.task_id, { kind: "shell", command: input.command });
+      deps.trackTask(start.task_id, { kind: "shell", command: input.command, cwd: ctx.cwd });
       const outputPath = taskOutputPath(deps.home, deps.sessionId(), start.task_id);
 
       if (input.run_in_background === true) {
+        deps.markNotifyOnExit(start.task_id);
         return {
           content: [
             { type: "text", text: formatBackgroundNotice(start.task_id, input.command, outputPath) },
@@ -374,13 +319,14 @@ export function createBashOverride(
       let waitResult;
       try {
         waitResult = await withAbort(client.wait(start.task_id, deps.config.foregroundBudgetMs), signal, () => {
-          client.stop(start.task_id).catch(() => {});
+          client.stop(start.task_id, "tool").catch(() => {});
         });
       } catch (err) {
         if ((err as Error).message === "aborted") {
           throw new Error("Command aborted (background task stopped)");
         }
         // Lost contact with the manager while waiting; the task may still run.
+        deps.markNotifyOnExit(start.task_id);
         return {
           content: [
             {
@@ -396,6 +342,7 @@ export function createBashOverride(
       }
 
       if (!waitResult.done) {
+        deps.markNotifyOnExit(start.task_id);
         return {
           content: [
             { type: "text", text: formatBackgroundNotice(start.task_id, input.command, outputPath) },

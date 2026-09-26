@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
+import { ManualClock } from "../../src/clock";
 import { InProcessRunner } from "../../src/subagent/runner";
 import type { ChildRunRequest } from "../../src/subagent/types";
 import { FakeChildSession, SessionFactory, tick, WORKER_AGENT } from "./subagent-fakes";
@@ -17,6 +18,23 @@ function makeReq(overrides: Partial<ChildRunRequest> = {}): ChildRunRequest {
 }
 
 describe("InProcessRunner", () => {
+  for (const stopReason of ["error", "aborted"] as const) {
+    it(`settles provider stopReason=${stopReason} as failed`, async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      factory.configure = (session) => {
+        session.lastAssistantFailure = { stopReason, errorMessage: "529 overloaded_error" };
+      };
+      const runner = new InProcessRunner({ createSession: factory.fn });
+      const handle = await runner.start(makeReq());
+      factory.sessions[0].complete();
+      const result = await handle.result;
+      expect(result.status).toBe("failed");
+      expect(result.error).toBe("529 overloaded_error");
+      expect(handle.status()).toBe("failed");
+    });
+  }
+
   it("completes with the last assistant text", async () => {
     const factory = new SessionFactory();
     factory.autoComplete = "all done";
@@ -28,6 +46,39 @@ describe("InProcessRunner", () => {
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
     expect(factory.sessions[0].prompts).toEqual(["do the thing"]);
     expect(handle.status()).toBe("completed");
+  });
+
+  it("tells the child its resolved model on the first prompt", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = "ok";
+    factory.configure = (session) => {
+      session.resolvedModel = "openai/gpt-5.6-sol";
+    };
+    const runner = new InProcessRunner({ createSession: factory.fn });
+    const handle = await runner.start(makeReq());
+    await handle.result;
+    expect(handle.resolvedModel()).toBe("openai/gpt-5.6-sol");
+    expect(factory.sessions[0].prompts[0]).toBe(
+      "You are running as model openai/gpt-5.6-sol.\n\ndo the thing",
+    );
+  });
+
+  it("does not re-announce the model on resume prompts", async () => {
+    const factory = new SessionFactory();
+    factory.autoComplete = "first";
+    factory.configure = (session) => {
+      session.resolvedModel = "openai/gpt-5.6-sol";
+    };
+    const runner = new InProcessRunner({ createSession: factory.fn });
+    const handle = await runner.start(makeReq());
+    await handle.result;
+    factory.sessions[0].autoComplete = "second";
+    await handle.resume("keep going");
+    await handle.result;
+    expect(factory.sessions[0].prompts).toEqual([
+      "You are running as model openai/gpt-5.6-sol.\n\ndo the thing",
+      "keep going",
+    ]);
   });
 
   it('maps empty output to "(no output)"', async () => {
@@ -168,21 +219,19 @@ describe("InProcessRunner", () => {
     expect(factory.sessions).toHaveLength(0); // no session was created
   });
 
-  describe("timers (fake clock)", () => {
+  describe("timers (ManualClock)", () => {
+    let clock: ManualClock;
     beforeEach(() => {
-      vi.useFakeTimers();
-    });
-    afterEach(() => {
-      vi.useRealTimers();
+      clock = new ManualClock();
     });
 
     it("hard timeout aborts and resolves interrupted with error=timeout", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
-      const runner = new InProcessRunner({ createSession: factory.fn });
+      const runner = new InProcessRunner({ createSession: factory.fn, clock });
       const handle = await runner.start(makeReq({ timeoutMs: 1000 }));
       expect(handle.status()).toBe("running");
-      await vi.advanceTimersByTimeAsync(1000);
+      clock.advanceBy(1000);
       const result = await handle.result;
       expect(result.status).toBe("interrupted");
       expect(result.error).toBe("timeout");
@@ -192,26 +241,77 @@ describe("InProcessRunner", () => {
     it("stall watchdog aborts after stallMs without events", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
-      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500 });
+      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock });
       const handle = await runner.start(makeReq());
-      await vi.advanceTimersByTimeAsync(500);
+      clock.advanceBy(500);
       const result = await handle.result;
       expect(result.status).toBe("failed");
       expect(result.error).toBe("stalled");
       expect(factory.sessions[0].aborts).toBe(1);
     });
 
+    it("does not stall while a tool is executing", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock });
+      const handle = await runner.start(makeReq());
+      const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string }) => void }).emit.bind(
+        factory.sessions[0],
+      );
+      emit({ type: "tool_execution_start" });
+      clock.advanceBy(2_000);
+      expect(handle.status()).toBe("running");
+      emit({ type: "tool_execution_end" });
+      clock.advanceBy(500);
+      expect(handle.status()).toBe("failed");
+    });
+
+    it("stalls generation 2 after a timeout that landed mid-tool", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 50, clock });
+      const handle = await runner.start(makeReq({ timeoutMs: 100 }));
+      const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string }) => void }).emit.bind(
+        factory.sessions[0],
+      );
+      emit({ type: "tool_execution_start" });
+      clock.advanceBy(100);
+      expect(handle.status()).toBe("interrupted");
+      emit({ type: "tool_execution_end" });
+      await handle.resume("again");
+      emit({ type: "tool_execution_end" });
+      clock.advanceBy(50);
+      expect(handle.status()).toBe("failed");
+      expect((await handle.result).error).toBe("stalled");
+    });
+
+    it("pauses the stall watchdog while a supervisor decision is pending", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock });
+      const handle = await runner.start(makeReq());
+      const stallControl = handle as typeof handle & { pauseStall(): void; resumeStall(): void };
+      stallControl.pauseStall();
+      clock.advanceBy(2_000);
+      expect(handle.status()).toBe("running");
+      stallControl.resumeStall();
+      clock.advanceBy(499);
+      expect(handle.status()).toBe("running");
+      clock.advanceBy(1);
+      expect((await handle.result).error).toBe("stalled");
+    });
+
     it("session events reset the stall watchdog", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
-      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500 });
+      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock });
       const handle = await runner.start(makeReq());
       const session = factory.sessions[0];
-      await vi.advanceTimersByTimeAsync(400);
+      clock.advanceBy(400);
       session.event(); // resets the watchdog at t=400
-      await vi.advanceTimersByTimeAsync(400); // t=800, 400 since last event
+      clock.advanceBy(400); // t=800, 400 since last event
       expect(handle.status()).toBe("running");
-      await vi.advanceTimersByTimeAsync(100); // t=900, 500 since last event
+      clock.advanceBy(100); // t=900, 500 since last event
       const result = await handle.result;
       expect(result.status).toBe("failed");
       expect(result.error).toBe("stalled");
@@ -220,21 +320,21 @@ describe("InProcessRunner", () => {
     it("events after settle do not re-arm the watchdog", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = "quick";
-      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500 });
+      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock });
       const handle = await runner.start(makeReq());
       await handle.result;
       factory.sessions[0].event();
-      await vi.advanceTimersByTimeAsync(1000);
+      clock.advanceBy(1000);
       expect(handle.status()).toBe("completed"); // unchanged
     });
 
     it("lastEventAt tracks session events", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
-      const runner = new InProcessRunner({ createSession: factory.fn });
+      const runner = new InProcessRunner({ createSession: factory.fn, clock });
       const handle = await runner.start(makeReq());
       const atStart = handle.lastEventAt();
-      await vi.advanceTimersByTimeAsync(2000);
+      clock.advanceBy(2000);
       factory.sessions[0].event();
       expect(handle.lastEventAt()).toBeGreaterThan(atStart);
       factory.sessions[0].complete();
@@ -242,15 +342,20 @@ describe("InProcessRunner", () => {
     });
   });
 
-  it("dispose releases the session and never hangs result waiters", async () => {
+  it("dispose releases the session, closes generation timers, and never hangs result waiters", async () => {
+    const clock = new ManualClock();
     const factory = new SessionFactory();
     factory.autoComplete = null;
-    const runner = new InProcessRunner({ createSession: factory.fn });
-    const handle = await runner.start(makeReq());
+    const runner = new InProcessRunner({ createSession: factory.fn, clock, stallMs: 50 });
+    const handle = await runner.start(makeReq({ timeoutMs: 100 }));
     handle.dispose();
     const result = await handle.result;
+    clock.advanceBy(1000);
     expect(result.status).toBe("interrupted");
+    expect(result.error).toBe("disposed");
+    expect(handle.status()).toBe("interrupted");
     expect(factory.sessions[0].disposed).toBe(true);
+    expect(factory.sessions[0].aborts).toBe(0);
     await tick();
   });
 });

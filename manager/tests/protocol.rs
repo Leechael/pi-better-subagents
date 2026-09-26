@@ -323,6 +323,27 @@ fn pid_alive(pid: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Like `pid_alive` but a zombie (exited, not yet reaped by its parent)
+/// counts as dead: after the daemon's SIGKILL the task processes re-parent
+/// to init, and a non-reaping PID 1 would otherwise keep `kill -0`
+/// succeeding until the deadline.
+fn pid_running(pid: u64) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output();
+    match out {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let s = s.trim();
+            !s.is_empty() && !s.starts_with('Z')
+        }
+        Err(_) => true,
+    }
+}
+
 /// Run a CLI invocation against the daemon at `home`, capturing output.
 fn run_cli(home: &Path, args: &[&str], timeout: Duration) -> (ExitStatus, String) {
     let mut child = Command::new(BIN)
@@ -563,6 +584,28 @@ fn t07_watch_streams_output_events() {
     );
 }
 
+/// A monitor streams to the connection that started it from spawn on. With a
+/// separate `watch` round trip, a fast command (`echo noop`) printed and
+/// exited before the watch landed: its lines were lost and the extension
+/// never saw the monitor end (manual testing, 2026-09-24).
+#[test]
+fn t07b_monitor_streams_from_spawn_without_watch() {
+    let d = Daemon::start("monitor-autowatch");
+    let mut c = d.connect();
+    hello_ext(&mut c, "sess-mon");
+
+    let req = start_req("r7b-start", "echo early-line", true).replace(r#""kind":"shell""#, r#""kind":"monitor""#);
+    let resp = c.request(&req, "r7b-start");
+    let task_id = extract_str(&resp, "task_id").expect("task_id").to_string();
+
+    let ev = c
+        .read_until_event("output", EVENT_TIMEOUT)
+        .expect("output event without a watch request");
+    assert!(ev.contains(&task_id) && ev.contains("early-line"), "first line reaches the starter: {ev}");
+    let exit = c.read_until_event("task_exited", EVENT_TIMEOUT).expect("task_exited");
+    assert!(exit.contains(&task_id), "exit event: {exit}");
+}
+
 /// §3.4 state machine: running --stop--> killed (terminal).
 /// NOTE: whether the stop response is acked before/after the state flips is
 /// unspecified — we poll list until the terminal state is observable.
@@ -665,7 +708,7 @@ fn t10_second_daemon_refused() {
 
 /// §3.5 CLI smoke: status/sessions/list/doctor against a running daemon.
 /// NOTE: CLI output format is unspecified — we assert exit codes only
-/// (plus non-empty output for `status`).
+/// (plus non-empty output for `status`, and doctor's protocol verdict).
 #[test]
 fn t11_cli_smoke() {
     let d = Daemon::start("cli");
@@ -678,8 +721,7 @@ fn t11_cli_smoke() {
         &["status"][..],
         &["sessions"][..],
         &["list"][..],
-        &["list", "--all"][..],
-        &["doctor"][..],
+        &["ls", "--json"][..],
     ] {
         let (status, text) = run_cli(&d.home, args, Duration::from_secs(5));
         assert!(
@@ -693,65 +735,71 @@ fn t11_cli_smoke() {
         !out.trim().is_empty(),
         "status should print something about the running daemon"
     );
+
+    // This session's hello follows the original §3.3 example, which has no
+    // `protocol` field: doctor must flag it as an older extension and exit 1.
+    let (status, text) = run_cli(&d.home, &["doctor"], Duration::from_secs(5));
+    assert_eq!(status.code(), Some(1), "doctor: {text}");
+    assert!(
+        text.contains("FAIL  protocol: session sess-cli did not announce a protocol"),
+        "doctor must name the session without a protocol: {text}"
+    );
 }
 
-/// §3.1 step 5 + §3.4 re-adopt: SIGKILL the daemon (stale socket/pid files
-/// remain), restart with the same PBS_HOME — the new daemon must clean the
-/// stale files, take over, and re-adopt the still-live task (pid alive →
-/// status running; exit detection via kill(pid,0) polling).
+/// §3.1 step 5 + §3.2 lifeline: SIGKILL the daemon (stale socket/pid files
+/// remain). Its task dies with it: the runner sees the lifeline break. A
+/// restart with the same PBS_HOME cleans the stale files, takes over, and
+/// lists the task as orphaned (end_reason manager-crash) without
+/// re-adopting anything.
 #[test]
-fn t12_restart_readopts_live_task() {
-    let home = test_home("readopt");
+fn t12_restart_after_crash_orphans_the_task() {
+    let home = test_home("crash");
     let mut d1 = spawn_daemon(&home);
     wait_for_socket(&home, Duration::from_secs(2));
 
     let mut c1 = connect(&home, CONNECT_TIMEOUT);
-    hello_ext(&mut c1, "sess-readopt");
-    let resp = c1.request(&start_req("r12-start", "sleep 30", true), "r12-start");
+    hello_ext(&mut c1, "sess-crash");
+    // The command reports its own pid: the task's pid is its runner's, and
+    // the command must die too, not just the runner.
+    let resp = c1.request(&start_req("r12-start", "echo $$; exec sleep 30", true), "r12-start");
     let task_id = extract_str(&resp, "task_id").expect("task_id").to_string();
     let task_pid = extract_num(&resp, "pid").expect("pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut i = 0;
+    let cmd_pid: u64 = loop {
+        i += 1;
+        let id = format!("r12-out-{i:04}"); // fixed width: no id is a prefix of another
+        let out = c1.request(&output_req(&id, &task_id, 0), &id);
+        let digits: String = extract_str(&out, "chunk").unwrap_or("").chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(p) = digits.parse() {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "command did not print its pid: {out}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
     drop(c1);
 
     d1.kill().expect("SIGKILL daemon");
     d1.wait().expect("reap daemon");
-    assert!(
-        pid_alive(task_pid),
-        "orphaned task should survive daemon SIGKILL"
-    );
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while pid_running(task_pid) || pid_running(cmd_pid) {
+        assert!(Instant::now() < deadline, "task (runner {task_pid}, command {cmd_pid}) survived the daemon's SIGKILL");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     let mut d2 = spawn_daemon(&home);
     // Stale socket file still exists; retry connect while the new daemon
     // clears it and rebinds (§3.1 zombie-socket path).
     let mut c2 = connect(&home, Duration::from_secs(5));
-    hello_ext(&mut c2, "sess-readopt");
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut last: String;
-    let mut i = 0;
-    loop {
-        let id = format!("r12-list-{i}");
-        last = c2.request(&list_req(&id), &id);
-        if last.contains(&task_id) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "restarted daemon must list the re-adopted task {task_id}; last list: {last}"
-        );
-        i += 1;
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    hello_ext(&mut c2, "sess-crash");
+    let last = c2.request(&list_req("r12-list"), "r12-list");
+    assert!(last.contains(&task_id), "restarted daemon lists the task: {last}");
+    let flat = compact(&last);
     assert!(
-        compact(&last).contains("\"status\":\"running\""),
-        "re-adopted live task should be running (§3.4): {last}"
+        flat.contains("\"status\":\"orphaned\"") && flat.contains("\"end_reason\":\"manager-crash\""),
+        "crashed task is orphaned, not re-adopted: {last}"
     );
 
-    // cleanup: stop the task so no `sleep 30` leaks past the test
-    let s = c2.request(&stop_req("r12-stop", &task_id), "r12-stop");
-    assert!(compact(&s).contains("\"ok\":true"), "stop: {s}");
-    let _ = Command::new("kill")
-        .args(["-9", &task_pid.to_string()])
-        .status();
     drop(c2);
     let _ = d2.kill();
     let _ = d2.wait();

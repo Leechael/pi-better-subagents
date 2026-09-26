@@ -1,145 +1,183 @@
 /**
  * Custom message renderers for PBS notifications (Claude-style compact pills).
  *
- * Uses `@earendil-works/pi-tui` Box/Text when resolvable (via the host pi
- * package); otherwise falls back to a plain multi-line text component so
- * print-mode / unit tests still work.
+ * Box is `(paddingX, paddingY, bgFn)` — the second argument is vertical padding,
+ * not a child gap. `outputPad` is the horizontal pad (0 or 1), matching pi's
+ * custom-message boxes which use `new Box(1, 1, bg)`.
  */
-import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { SUPERVISOR_NOTIFICATION_CUSTOM_TYPE } from "../comms/registry-host";
-import { MONITOR_EVENT_CUSTOM_TYPE } from "../monitor";
-import { TASK_NOTIFICATION_CUSTOM_TYPE } from "../notify";
-import { SUBAGENT_NOTIFICATION_CUSTOM_TYPE } from "../subagent/tool";
+import { PBS_WAKE_CUSTOM_TYPE, PBS_WAKE_LEAD_IN, type PbsWake, type TaskWake } from "../wake";
+import { fitLines, loadPiTui } from "./pi-tui-load";
+import { statusGlyph } from "./tool-component";
 
 type Theme = {
   fg(color: string, text: string): string;
   bg(color: string, text: string): string;
 };
 
-type PiTui = {
-  Box: new (
-    pad: number,
-    gap: number,
-    bg: (t: string) => string,
-  ) => { addChild(c: unknown): void };
-  Text: new (text: string, padX: number, padY: number) => unknown;
+type PillComponent = {
+  render(width: number): string[];
+  invalidate(): void;
 };
 
-function loadPiTui(): PiTui | null {
-  try {
-    const require = createRequire(import.meta.url);
-    // Prefer the copy nested under pi-coding-agent (always present when pi runs).
-    try {
-      return require("@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui") as PiTui;
-    } catch {
-      return require("@earendil-works/pi-tui") as PiTui;
+const STATUS_ORDER = [
+  "completed",
+  "failed",
+  "interrupted",
+  "killed",
+  "orphaned",
+  "pending",
+  "running",
+  "partial",
+  "timeout",
+  "stopped",
+];
+
+function countStatuses(statuses: string[]): string {
+  const counts = new Map<string, number>();
+  for (const status of statuses) counts.set(status, (counts.get(status) ?? 0) + 1);
+  const parts = STATUS_ORDER.filter((status) => counts.has(status)).map(
+    (status) => `${counts.get(status)} ${status}`,
+  );
+  return parts.join(" · ");
+}
+
+function badExit(status: string | undefined, exitCode?: number | null): boolean {
+  if (exitCode !== undefined && exitCode !== null && exitCode !== 0) return true;
+  return status === "failed" || status === "killed" || status === "orphaned" || status === "interrupted";
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
+}
+
+function taskExit(task: TaskWake): string {
+  if (task.exitCode !== null) return `exit ${task.exitCode}`;
+  return task.signal ?? task.status;
+}
+
+function taskHead(details: Extract<PbsWake, { kind: "task" }>): string {
+  const taskInfo = details.tasks.length === 1
+    ? `${formatDuration(details.tasks[0].durationMs)} · ${taskExit(details.tasks[0])}`
+    : `${details.tasks.length} tasks · ${countStatuses(details.tasks.map((task) => task.status))}`;
+  const still = details.stillRunning.length > 0 ? ` · ${details.stillRunning.length} still running` : "";
+  const summary = details.tasks.length === 1 ? details.tasks[0].summary : "Background work";
+  return `${summary} · ${taskInfo}${still}`;
+}
+
+function collapsedText(details: PbsWake, theme: Theme): string {
+  switch (details.kind) {
+    case "task": {
+      const bad = details.tasks.some((task) => badExit(task.status, task.exitCode));
+      const { color, glyph } = statusGlyph(bad ? "failed" : "completed");
+      return `${theme.fg(color, glyph)} ${theme.fg("muted", "task")} ${taskHead(details)}`;
     }
-  } catch {
-    return null;
+    case "monitor": {
+      const preview = details.event.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "(event)";
+      const { color, glyph } = details.status
+        ? statusGlyph(details.status)
+        : { color: "accent", glyph: "›" };
+      const statusBit = details.status ? ` ${theme.fg("dim", `· ${details.status}`)}` : "";
+      const countBit = details.eventCount && details.eventCount > 1
+        ? ` ${theme.fg("dim", `· ${details.eventCount} events`)}`
+        : "";
+      const droppedBit = details.droppedLines
+        ? ` ${theme.fg("warning", `· ${details.droppedLines} lines dropped`)}`
+        : "";
+      return `${theme.fg(color, glyph)} ${theme.fg("muted", "monitor")} ${theme.fg("accent", `"${details.description}"`)}${statusBit}${countBit}${droppedBit}\n${theme.fg("dim", preview)}`;
+    }
+    case "subagent-handover": {
+      const { color, glyph } = statusGlyph(details.status);
+      const snippet = details.result.replace(/\s+/g, " ").trim().slice(0, 72);
+      return `${theme.fg(color, glyph)} ${theme.fg("muted", "handover")} ${details.name} ${details.status}${snippet ? ` · ${snippet}` : ""}`;
+    }
+    case "subagent-done": {
+      const bad = details.children.some((child) => badExit(child.status));
+      const { color, glyph } = statusGlyph(bad ? "failed" : details.status);
+      return `${theme.fg(color, glyph)} ${theme.fg("muted", "subagent")} ${countStatuses(details.children.map((child) => child.status))}`;
+    }
+    case "supervisor-request":
+      return [
+        `${theme.fg("warning", "?")} ${theme.fg("muted", `decision for ${details.name}`)} ${details.message.slice(0, 100)}`,
+        theme.fg("dim", `/reply ${details.from} <decision>`),
+      ].join("\n");
+    case "supervisor-update":
+      return `${theme.fg("muted", "↑")} ${theme.fg("muted", "supervisor update")} ${details.message.slice(0, 100)}`;
   }
 }
 
-function asText(content: string | unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
+export function expandedWakeText(details: PbsWake | undefined, content: string): string {
+  if (!details) {
     return content
-      .map((c) => (c && typeof c === "object" && "text" in c ? String((c as { text: unknown }).text) : ""))
-      .join("\n");
+      .replace(PBS_WAKE_LEAD_IN, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&amp;/g, "&")
+      .trim();
   }
-  return String(content ?? "");
-}
-
-function firstLine(text: string): string {
-  return text.split("\n").find((l) => l.trim().length > 0)?.trim() ?? text.trim();
-}
-
-function stripXml(text: string): string {
-  return text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function extractTag(text: string, tag: string): string | undefined {
-  const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "i"));
-  return m?.[1]?.trim();
-}
-
-function truncate(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return `${s.slice(0, Math.max(0, max - 1))}…`;
-}
-
-function makeBox(tui: PiTui | null, pad: number, theme: Theme, text: string): unknown {
-  if (!tui) {
-    return { render: () => text.split("\n") };
+  switch (details.kind) {
+    case "task":
+      return [
+        `Tasks (${details.tasks.length})`,
+        ...details.tasks.map((task) => [
+          `${task.id} · ${task.taskKind} · ${task.status} · ${formatDuration(task.durationMs)} · ${taskExit(task)}`,
+          `$ ${task.command}`,
+          `Output: ${task.outputPath}`,
+          ...(task.preview ? [`Preview: ${task.preview}`] : []),
+        ].join("\n")),
+        ...(details.stillRunning.length ? [`Still running (${details.stillRunning.length}): ${details.stillRunning.map((item) => `${item.id} ${item.title}`).join(", ")}`] : []),
+      ].join("\n\n");
+    case "monitor":
+      return [`Monitor: ${details.description}`, `Task: ${details.id}`, ...(details.status ? [`Status: ${details.status}`] : []), `Event: ${details.event}`, ...(details.eventCount ? [`Events: ${details.eventCount}`] : []), ...(details.droppedLines ? [`Dropped lines: ${details.droppedLines}`] : [])].join("\n");
+    case "subagent-handover":
+      return [`Subagent handover: ${details.name} (${details.status})`, `Run: ${details.runId}`, `Child: ${details.childId}`, `Task prompt: ${details.prompt}`, `Result: ${details.result}`, ...(details.error ? [`Error: ${details.error}`] : []), ...(details.stillRunning.length ? [`Still running: ${details.stillRunning.map((item) => `${item.id} ${item.title}`).join(", ")}`] : [])].join("\n\n");
+    case "subagent-done":
+      return [`Subagent run: ${details.runId} (${details.status})`, `Duration: ${formatDuration(details.durationMs)}`, ...details.children.map((child) => [`${child.name} (${child.childId}) · ${child.status}`, `Task prompt: ${child.prompt}`, `Result: ${child.result}`, ...(child.error ? [`Error: ${child.error}`] : [])].join("\n"))].join("\n\n");
+    case "supervisor-request":
+      return [`Decision requested by ${details.name} (${details.from})`, `Request: ${details.message}`, `Reply with /reply ${details.from} <decision>`].join("\n");
+    case "supervisor-update":
+      return [`Update from ${details.name} (${details.from})`, details.message].join("\n");
   }
-  const box = new tui.Box(pad, 1, (s) => theme.bg("customMessageBg", s));
-  box.addChild(new tui.Text(text, 0, 0));
-  return box;
+}
+
+function wakeDetails(message: { details?: unknown }): PbsWake | undefined {
+  const details = message.details as PbsWake | undefined;
+  if (!details || typeof details !== "object" || !("kind" in details)) return undefined;
+  return details;
+}
+
+function makeComponent(pad: number, theme: Theme, text: string): PillComponent {
+  const tui = loadPiTui();
+  if (tui) {
+    // paddingX = outputPad, paddingY = 1 (blank line above/below), then bg.
+    const box = new tui.Box(pad, 1, (s) => theme.bg("customMessageBg", s));
+    box.addChild(new tui.Text(text, 0, 0));
+    const rendered = box as unknown as { render(width: number): string[]; invalidate(): void };
+    if (typeof rendered.invalidate !== "function") {
+      rendered.invalidate = () => {};
+    }
+    return rendered;
+  }
+  return {
+    render(width: number) {
+      const inner = Math.max(1, width - pad * 2);
+      const padStr = " ".repeat(Math.max(0, pad));
+      return fitLines(text, inner).map((line) => padStr + line);
+    },
+    invalidate() {},
+  };
 }
 
 export function registerPbsMessageRenderers(pi: ExtensionAPI): void {
-  const tui = loadPiTui();
-
-  pi.registerMessageRenderer(TASK_NOTIFICATION_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
-    const content = asText(message.content);
-    const summary =
-      extractTag(content, "summary") || truncate(stripXml(content), 120) || "Background task finished";
-    const head = `${theme.fg("success", "✓")} ${theme.fg("muted", "task")} ${summary}`;
-    const body = expanded ? `\n${theme.fg("dim", content)}` : "";
-    return makeBox(tui, outputPad, theme, head + body) as never;
-  });
-
-  pi.registerMessageRenderer(SUBAGENT_NOTIFICATION_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
-    const content = asText(message.content);
-    const summary =
-      extractTag(content, "summary") || truncate(stripXml(content), 120) || "Subagent run finished";
-    const status = extractTag(content, "status") ?? "";
-    const color =
-      status === "failed" || status === "interrupted" ? "error" : status === "partial" ? "warning" : "success";
-    const glyph = color === "error" ? "✗" : color === "warning" ? "■" : "✓";
-    const head = `${theme.fg(color, glyph)} ${theme.fg("muted", "subagent")} ${summary}`;
-    const body = expanded ? `\n${theme.fg("dim", content)}` : "";
-    return makeBox(tui, outputPad, theme, head + body) as never;
-  });
-
-  pi.registerMessageRenderer(MONITOR_EVENT_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
-    const content = asText(message.content);
-    const details = message.details as { description?: string; status?: string } | undefined;
-    const desc =
-      details?.description ??
-      content.match(/description="([^"]*)"/)?.[1] ??
-      content.match(/Monitor event: "([^"]*)"/)?.[1] ??
-      "monitor";
-    const status = details?.status;
-    const eventBody =
-      extractTag(content, "event") ??
-      firstLine(
-        stripXml(content)
-          .replace(/Monitor event:\s*"[^"]*"\s*/i, "")
-          .trim(),
-      );
-    const preview = truncate(eventBody || "(event)", 120);
-    // Claude Code lead-in: Monitor event: "description"
-    const lead = `${theme.fg("accent", "●")} ${theme.fg("muted", "Monitor event:")} ${theme.fg("accent", `"${desc}"`)}`;
-    const statusBit = status ? ` ${theme.fg("dim", `· ${status}`)}` : "";
-    const head = `${lead}${statusBit}\n${theme.fg("dim", preview)}`;
-    const body = expanded ? `\n${theme.fg("dim", content)}` : "";
-    return makeBox(tui, outputPad, theme, head + body) as never;
-  });
-
-  pi.registerMessageRenderer(SUPERVISOR_NOTIFICATION_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
-    const content = asText(message.content);
-    const isRequest = /supervisor-request/i.test(content);
-    const label = isRequest ? "supervisor request" : "supervisor update";
-    const color = isRequest ? "warning" : "muted";
-    const glyph = isRequest ? "?" : "↑";
-    const preview = truncate(stripXml(content), 100);
-    const head = `${theme.fg(color, glyph)} ${theme.fg("muted", label)} ${preview}`;
-    const hint =
-      isRequest && !expanded
-        ? `\n${theme.fg("dim", '  reply with agent_message { action:"reply", to, message }')}`
-        : "";
-    const body = expanded ? `\n${theme.fg("dim", content)}` : hint;
-    return makeBox(tui, outputPad, theme, head + body) as never;
+  pi.registerMessageRenderer(PBS_WAKE_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
+    const details = wakeDetails(message);
+    const content = typeof message.content === "string" ? message.content : "";
+    const head = details ? collapsedText(details, theme) : theme.fg("muted", "wake");
+    const body = expanded && content ? `\n${theme.fg("dim", expandedWakeText(details, content))}` : "";
+    return makeComponent(outputPad, theme, head + body) as never;
   });
 }
+

@@ -30,14 +30,24 @@ export interface ChildResult {
   error?: string;
   /** Non-fatal caveat, e.g. agent-definition model fell back to parent model. */
   warning?: string;
+  /** Set when the model itself stopped with an error (provider failure). */
+  endReason?: "model-error";
   durationMs: number;
+}
+
+/** One turn of a child session, for the /tasks conversation view. */
+export interface ConversationTurn {
+  role: string;
+  text: string;
 }
 
 export interface ChildRunRequest {
   childId: string; // assigned by the registry: "ch_" + 8
   runId: string; // "run_" + 8
   name: string; // display name (tasks[].name or agent name or ordinal)
-  prompt: string; // already interpolated
+  prompt: string; // actual first prompt sent to the session, including agent preamble
+  /** User-authored task prompt without agent or model preamble. */
+  taskPrompt?: string;
   agent: AgentDefinition; // already resolved
   model?: string; // subagent() parameter-level override
   timeoutMs: number;
@@ -56,6 +66,10 @@ export interface ChildHandle {
   interrupt(): Promise<void>; // abort; result resolves as interrupted
   status(): ChildStatus;
   lastEventAt(): number; // for the stall watchdog / status display
+  /** Resolved `provider/id` once the child session has been constructed. */
+  resolvedModel(): string | undefined;
+  /** Live child transcript. Empty when the session never started. */
+  conversation(): ConversationTurn[];
 }
 
 /**
@@ -65,12 +79,23 @@ export interface ChildHandle {
 export interface ChildSessionAdapter {
   /** Non-fatal setup caveat (e.g. model fallback); copied to ChildResult. */
   readonly warning?: string;
+  /**
+   * Resolved model label (`provider/id`) after session construction.
+   * Used for fleet/ls persistence and so the child prompt can name its model.
+   */
+  readonly resolvedModel?: string;
   prompt(text: string): Promise<void>;
   steer(text: string): Promise<void>;
   followUp(text: string): Promise<void>;
   abort(): Promise<void>;
   waitForIdle(): Promise<void>;
   getLastAssistantText(): string | undefined;
+  /** Provider/model failure outcome of the last assistant turn, when any. */
+  getLastAssistantFailure?(): { stopReason: "error" | "aborted"; errorMessage?: string } | undefined;
+  getConversation(): ConversationTurn[];
+  /** Introspection for child-session orchestration and contract tests. */
+  getActiveToolNames?(): string[];
+  getSystemPrompt?(): string;
   isStreaming(): boolean;
   subscribe(listener: (event: { type: string }) => void): () => void;
   dispose(): void;

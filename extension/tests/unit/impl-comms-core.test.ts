@@ -35,6 +35,7 @@ function fakeHandle(childId: string, calls: HandleCalls, failSteer = false): Chi
     interrupt: async () => {},
     status: () => "running",
     lastEventAt: () => 0,
+    resolvedModel: () => undefined,
   };
 }
 
@@ -80,12 +81,15 @@ class FakeHost implements CommsHost {
     const cb = this.children.get(b);
     return !!ca && !!cb && ca.runId === cb.runId;
   }
-  notifySupervisor(content: string) {
-    this.notifications.push(content);
+  notifySupervisor(wake: { content: string }) {
+    this.notifications.push(wake.content);
   }
 }
 
-const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+const tick = async () => {
+  await Promise.resolve();
+  await Promise.resolve();
+};
 
 // ---------------------------------------------------------------------------
 
@@ -93,7 +97,8 @@ describe("contactSupervisor", () => {
   it("need_decision blocks until reply() resolves it with the reply text", async () => {
     const host = new FakeHost();
     host.add("ch_a", "run_1", "explorer", "running");
-    const comms = createComms(host);
+    const events: { type: string; fields?: Record<string, unknown> }[] = [];
+    const comms = createComms(host, { logEvent: (type, fields) => events.push({ type, fields }) });
 
     let settled = false;
     const p = comms
@@ -106,10 +111,10 @@ describe("contactSupervisor", () => {
     // parent was notified with a supervisor-request that explains how to reply
     expect(host.notifications).toHaveLength(1);
     const note = host.notifications[0];
-    expect(note).toContain('<supervisor-request from="ch_a" name="explorer">');
-    expect(note).toContain("Which file should I modify?");
+    expect(note).toContain('<pbs-wake kind="supervisor-request" from="ch_a" name="explorer">');
+    expect(note).toContain("<message>Which file should I modify?</message>");
     expect(note).toContain('action: "reply"');
-    expect(note).toContain("</supervisor-request>");
+    expect(note).toContain("</pbs-wake>");
 
     await tick();
     expect(settled).toBe(false); // blocked
@@ -117,15 +122,23 @@ describe("contactSupervisor", () => {
     comms.reply("ch_a", "src/index.ts");
     await expect(p).resolves.toBe("src/index.ts");
     expect(settled).toBe(true);
+    expect(events).toContainEqual({ type: "decision.request", fields: { child_id: "ch_a" } });
+    expect(events).toContainEqual({ type: "decision.reply", fields: { child_id: "ch_a" } });
   });
 
   it("need_decision times out after the injected timeout with the contract message", async () => {
     const host = new FakeHost();
     host.add("ch_a", "run_1", "explorer", "running");
-    const comms = createComms(host, { decisionTimeoutMs: 20 });
+    const events: { type: string; fields?: Record<string, unknown> }[] = [];
+    const comms = createComms(host, {
+      decisionTimeoutMs: 20,
+      logEvent: (type, fields) => events.push({ type, fields }),
+    });
 
     const p = comms.contactSupervisor("ch_a", "need_decision", "quick question");
+    expect(events).toContainEqual({ type: "decision.request", fields: { child_id: "ch_a" } });
     await expect(p).resolves.toBe(DECISION_TIMEOUT_MESSAGE);
+    expect(events).toContainEqual({ type: "decision.timeout", fields: { child_id: "ch_a" } });
     expect(comms.pendingRequests()).toEqual([]);
   });
 
@@ -158,7 +171,7 @@ describe("contactSupervisor", () => {
     const r = await comms.contactSupervisor("ch_a", "progress_update", "50% done");
     expect(r).toBe("ok");
     expect(host.notifications).toHaveLength(1);
-    expect(host.notifications[0]).toContain('<supervisor-update from="ch_a" name="explorer">');
+    expect(host.notifications[0]).toContain('<pbs-wake kind="supervisor-update" from="ch_a" name="explorer">');
     expect(host.notifications[0]).toContain("50% done");
     expect(comms.pendingRequests()).toEqual([]);
   });
@@ -225,16 +238,17 @@ describe("send", () => {
   });
 
   it.each(["completed", "failed", "interrupted"] as const)(
-    "terminal (%s) child is resumed with the message",
+    "terminal (%s) child is not resumed; the error points at subagent resume",
     async (status) => {
       const host = new FakeHost();
       const calls = host.add("ch_a", "run_1", "explorer", status);
       const comms = createComms(host);
 
-      await comms.send("ch_a", "one more thing", "steer");
-      expect(calls.resume).toEqual(["one more thing"]);
+      await expect(comms.send("ch_a", "one more thing", "steer")).rejects.toThrow(
+        /subagent\(\{ action: "resume", run_id: "run_1", child_id: "ch_a"/,
+      );
+      expect(calls.resume).toEqual([]);
       expect(calls.steer).toEqual([]);
-      expect(calls.followUp).toEqual([]);
     },
   );
 
@@ -334,9 +348,9 @@ describe("XML escaping", () => {
     const xml = formatSupervisorRequest(
       { childId: "ch_a", name: 'evil"<name>&' },
       'use <tag> & "quotes"',
-    );
+    ).content;
     expect(xml).toContain('name="evil&quot;&lt;name&gt;&amp;"');
-    expect(xml).toContain("use &lt;tag&gt; &amp; &quot;quotes&quot;");
+    expect(xml).toContain('use &lt;tag&gt; &amp; "quotes"');
     expect(xml).not.toContain('"<name>');
   });
 
@@ -347,7 +361,7 @@ describe("XML escaping", () => {
 
     await comms.contactSupervisor("ch_a", "progress_update", 'found <script> & "x"');
     const note = host.notifications[0];
-    expect(note).toContain("found &lt;script&gt; &amp; &quot;x&quot;");
+    expect(note).toContain('found &lt;script&gt; &amp; "x"');
     expect(note).not.toContain("<script>");
   });
 });

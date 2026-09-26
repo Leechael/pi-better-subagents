@@ -4,7 +4,7 @@
  * - Implements the §3.1 startup flow: connect -> spawn via lock -> zombie cleanup.
  * - Request/response multiplexing over a single long-lived connection.
  * - Server events dispatched to registered handlers.
- * - On unexpected disconnect: exponential backoff reconnect (0.5s/1s/2s, 3 attempts),
+ * - On unexpected disconnect: immediate then exponential-backoff reconnect for 22s,
  *   re-hello after reconnect. If all attempts fail the client is marked unavailable
  *   and callers are expected to degrade (bash falls back to local execution).
  */
@@ -13,18 +13,30 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { pbsPaths } from "./config";
+import { realClock, type Clock, type ClockTimer } from "./clock";
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
+const EXTENSION_VERSION = "0.1.0";
+const OBSERVABILITY_PROTOCOL = 2;
 const HELLO_TIMEOUT_MS = 5000;
+const RECONNECT_HELLO_TIMEOUT_MS = 25_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const SOCKET_READY_TIMEOUT_MS = 2000;
 const SOCKET_READY_POLL_MS = 50;
-const RECONNECT_DELAYS_MS = [500, 1000, 2000];
+const RECONNECT_WINDOW_MS = 27_000;
 const RETRY_COOLDOWN_MS = 30000;
+const MANAGER_SHUTDOWN_WAIT_MS = 5000;
+const MANAGER_SHUTTING_DOWN = "manager is shutting down";
 
 // ---------------------------------------------------------------------------
 // Protocol types (field names are contractual, see design doc §3.3)
 // ---------------------------------------------------------------------------
+
+export type TaskOrigin =
+  | { via: "bash-fg" | "bash-bg" | "monitor" }
+  | { via: "child-bash"; child_id: string; run_id: string };
+
+export type StopReason = "tui" | "cli" | "tool" | "timeout" | "rate-limit" | "session-end";
 
 export interface StartRequest {
   kind: "shell" | "monitor";
@@ -33,6 +45,7 @@ export interface StartRequest {
   env: Record<string, string>;
   run_in_background?: boolean;
   timeout_ms?: number | null;
+  origin?: TaskOrigin;
 }
 
 export interface StartResponse {
@@ -67,6 +80,9 @@ export interface TaskRecord {
   ended_at: number | null;
   output_path: string;
   output_size: number;
+  origin?: TaskOrigin;
+  backgrounded_at?: number;
+  end_reason?: string;
 }
 
 /** Server-pushed event (§3.3). Fields beyond `event` depend on the event kind. */
@@ -83,6 +99,7 @@ export interface ManagerEvent {
   duration_ms?: number;
   output_path?: string;
   output_size?: number;
+  end_reason?: string;
   ts?: number;
 }
 
@@ -100,7 +117,34 @@ export interface ManagerClientOptions {
   sessionId: string;
   managerPath: string | null;
   piPid?: number;
+  /** Session working directory, sent on hello (optional; older managers ignore it). */
+  cwd?: string;
   log?: (message: string) => void;
+  clock?: Clock;
+}
+
+export interface LastUpgrade {
+  at: number;
+  ok: boolean;
+  from_version: string;
+  to_version?: string;
+  error?: string;
+  trigger: string;
+}
+
+export interface ManagerStatusResponse {
+  sessions: SessionInfo[];
+  generation?: number;
+  last_upgrade?: LastUpgrade | null;
+}
+
+export interface SessionInfo {
+  session_id: string;
+  pi_pid: number;
+  connected: boolean;
+  cwd?: string;
+  extension_version?: string;
+  protocol?: number;
 }
 
 type ClientState = "disconnected" | "connected" | "unavailable";
@@ -110,7 +154,10 @@ type EventHandler = (event: ManagerEvent) => void;
 interface PendingRequest {
   resolve: (value: Record<string, unknown>) => void;
   reject: (err: Error) => void;
-  timer: NodeJS.Timeout;
+  timer: ClockTimer;
+  message: Record<string, unknown>;
+  timeoutMs: number;
+  retryable: boolean;
 }
 
 /** Reassembles `u32 BE length + JSON` frames from a byte stream. */
@@ -155,13 +202,51 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-function delay(ms: number): Promise<void> {
-  // NOTE: timers here must stay ref'd. Awaited connect/request paths rely on
-  // them; with unref'd timers a print-mode pi process can exit mid-handshake
-  // (empty event loop) before the manager connection completes.
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
+/**
+ * O_EXCL pid-file lock used by the extension while spawning the daemon.
+ * The Rust CLI uses an fd-lock on the same path and leaves an empty file after
+ * release — treat empty / non-pid / dead-pid contents as stale and break them.
+ * Exported for unit tests.
+ */
+export function tryAcquireSpawnLockFile(lockPath: string, pid: number = process.pid): boolean {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      writeFileSync(lockPath, String(pid), { flag: "wx" });
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") return false;
+      let stale = false;
+      try {
+        const raw = readFileSync(lockPath, "utf8").trim();
+        const holderPid = Number.parseInt(raw, 10);
+        // Empty (Rust leftover), unparseable, or dead holder → reclaim.
+        stale = raw === "" || !Number.isFinite(holderPid) || !pidAlive(holderPid);
+      } catch {
+        stale = true;
+      }
+      if (!stale) return false;
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+export function releaseSpawnLockFile(lockPath: string): void {
+  try {
+    unlinkSync(lockPath);
+  } catch {
+    // already gone
+  }
+}
+
+function delay(clock: Clock, ms: number): Promise<void> {
+  // These awaited timers intentionally remain ref'd; an unref'd handshake
+  // timer can let print-mode pi exit before the manager connection completes.
+  return clock.sleep(ms);
 }
 
 export class ManagerClient {
@@ -169,11 +254,14 @@ export class ManagerClient {
   private readonly sessionId: string;
   private readonly managerPath: string | null;
   private readonly piPid: number;
+  private readonly cwd: string | undefined;
   private readonly log: (message: string) => void;
+  private readonly clock: Clock;
 
   private socket: net.Socket | null = null;
   private decoder = new FrameDecoder();
   private pending = new Map<string, PendingRequest>();
+  private queuedRequests = new Set<PendingRequest>();
   private helloWaiter: { resolve: () => void; reject: (err: Error) => void } | null = null;
   private eventHandlers = new Set<EventHandler>();
   private reconnectHandlers = new Set<() => void>();
@@ -181,18 +269,32 @@ export class ManagerClient {
   private intentionalClose = false;
   private rebound = false;
   private reconnecting: Promise<void> | null = null;
+  /** One in-flight connect shared by session_start and ensureAvailable. */
+  private connecting: Promise<boolean> | null = null;
   private lastFailureAt = 0;
+  private lastFailureMessage = "";
 
   constructor(options: ManagerClientOptions) {
     this.home = options.home;
     this.sessionId = options.sessionId;
     this.managerPath = options.managerPath;
     this.piPid = options.piPid ?? process.pid;
+    this.cwd = options.cwd;
     this.log = options.log ?? (() => {});
+    this.clock = options.clock ?? realClock;
+  }
+
+  private now(): number {
+    return this.clock.now();
   }
 
   isAvailable(): boolean {
     return this.state === "connected";
+  }
+
+  /** Last connect/reconnect failure reason (empty when never failed / currently connected). */
+  lastError(): string {
+    return this.lastFailureMessage;
   }
 
   /**
@@ -202,11 +304,12 @@ export class ManagerClient {
    */
   async ensureAvailable(): Promise<boolean> {
     if (this.state === "connected") return true;
+    if (this.connecting) return this.connecting;
     if (this.reconnecting) {
       await this.reconnecting;
       return this.isAvailable();
     }
-    if (this.state === "unavailable" && Date.now() - this.lastFailureAt < RETRY_COOLDOWN_MS) {
+    if (this.state === "unavailable" && this.now() - this.lastFailureAt < RETRY_COOLDOWN_MS) {
       return false;
     }
     return this.connect();
@@ -229,17 +332,26 @@ export class ManagerClient {
    */
   async connect(): Promise<boolean> {
     if (this.state === "connected") return true;
+    if (this.connecting) return this.connecting;
     this.intentionalClose = false;
-    try {
-      await this.connectFlow(true);
-      this.state = "connected";
-      return true;
-    } catch (err) {
-      this.log(`connect failed: ${(err as Error).message}`);
-      this.state = "unavailable";
-      this.lastFailureAt = Date.now();
-      return false;
-    }
+    let run!: Promise<boolean>;
+    run = (async (): Promise<boolean> => {
+      try {
+        await this.connectFlow(true);
+        this.state = "connected";
+        return true;
+      } catch (err) {
+        this.log(`connect failed: ${(err as Error).message}`);
+        this.state = "unavailable";
+        this.lastFailureAt = this.now();
+        this.lastFailureMessage = (err as Error).message;
+        return false;
+      } finally {
+        if (this.connecting === run) this.connecting = null;
+      }
+    })();
+    this.connecting = run;
+    return run;
   }
 
   /** Graceful session shutdown: stop all tasks of this session, then disconnect. */
@@ -249,7 +361,7 @@ export class ManagerClient {
   }
 
   async start(req: StartRequest): Promise<StartResponse> {
-    const res = await this.request({ type: "start", ...req });
+    const res = await this.request({ type: "start", ...req, key: randomUUID() });
     return { task_id: res.task_id as string, pid: res.pid as number };
   }
 
@@ -277,13 +389,34 @@ export class ManagerClient {
     };
   }
 
-  async stop(taskId: string): Promise<void> {
-    await this.request({ type: "stop", task_id: taskId });
+  async markBackground(taskId: string): Promise<void> {
+    await this.request({ type: "mark_background", task_id: taskId });
+  }
+
+  async stop(taskId: string, reason: StopReason = "tool"): Promise<void> {
+    await this.request({ type: "stop", task_id: taskId, reason });
   }
 
   async list(all = false): Promise<TaskRecord[]> {
     const res = await this.request({ type: "list", all });
     return ((res.tasks as TaskRecord[] | undefined) ?? []) as TaskRecord[];
+  }
+
+  /** Daemon status, including optional in-place upgrade metadata. */
+  async status(): Promise<ManagerStatusResponse> {
+    const res = await this.request({ type: "status" });
+    return {
+      sessions: (res.sessions as SessionInfo[] | undefined) ?? [],
+      ...(typeof res.generation === "number" ? { generation: res.generation } : {}),
+      ...(res.last_upgrade && typeof res.last_upgrade === "object"
+        ? { last_upgrade: res.last_upgrade as LastUpgrade }
+        : {}),
+    };
+  }
+
+  /** Connected sessions (status). Older managers may reject this for extension clients. */
+  async sessions(): Promise<SessionInfo[]> {
+    return (await this.status()).sessions;
   }
 
   async watch(taskId: string): Promise<void> {
@@ -312,17 +445,27 @@ export class ManagerClient {
   // Startup flow (§3.1)
   // -------------------------------------------------------------------------
 
-  private async connectFlow(allowZombieRetry: boolean): Promise<void> {
+  private async connectFlow(allowZombieRetry: boolean, helloTimeoutMs = HELLO_TIMEOUT_MS): Promise<void> {
     const paths = pbsPaths(this.home);
     try {
-      await this.connectAndHello(paths.socket);
+      await this.connectAndHello(paths.socket, helloTimeoutMs);
       return;
     } catch (err) {
       if (err instanceof HelloError) {
+        if (err.message.includes(MANAGER_SHUTTING_DOWN)) {
+          // A shutdown manager refuses hello while it completes its bounded
+          // kill grace. Wait for its pid to exit before retrying/spawning.
+          await this.waitForManagerExit(paths.pidFile);
+          if (allowZombieRetry) {
+            await this.connectFlow(false, helloTimeoutMs);
+            return;
+          }
+          throw err;
+        }
         // Socket exists but hello failed: possible zombie socket (§3.1 step 5).
         this.handleZombie(paths.socket, paths.pidFile);
         if (allowZombieRetry) {
-          await this.connectFlow(false);
+          await this.connectFlow(false, helloTimeoutMs);
           return;
         }
         throw err;
@@ -344,7 +487,22 @@ export class ManagerClient {
       // Someone else is spawning; just wait for the socket to appear.
       await this.waitForSocket(paths.socket, SOCKET_READY_TIMEOUT_MS);
     }
-    await this.connectAndHello(paths.socket);
+    await this.connectAndHello(paths.socket, helloTimeoutMs);
+  }
+
+  private async waitForManagerExit(pidFile: string): Promise<void> {
+    let pid: number;
+    try {
+      const info = JSON.parse(readFileSync(pidFile, "utf8")) as { pid?: number };
+      if (typeof info.pid !== "number") return;
+      pid = info.pid;
+    } catch {
+      return;
+    }
+    const deadline = this.now() + MANAGER_SHUTDOWN_WAIT_MS;
+    while (pidAlive(pid) && this.now() < deadline) {
+      await this.clock.sleep(SOCKET_READY_POLL_MS);
+    }
   }
 
   private handleZombie(socketPath: string, pidFile: string): void {
@@ -369,38 +527,17 @@ export class ManagerClient {
   }
 
   /**
-   * Simulate the fd-lock with an O_EXCL file create. The file holds the
-   * creator's pid so a stale lock left by a dead process can be broken.
+   * Exclusive create of manager.spawn.lock with our pid as contents.
+   * Compatible with the Rust CLI's fd-lock on the same path: that lock leaves
+   * an empty file behind after release, which must not look like a live hold.
+   * Returns false only when another live holder (numeric pid still alive) owns it.
    */
   private tryAcquireSpawnLock(lockPath: string): boolean {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        writeFileSync(lockPath, String(process.pid), { flag: "wx" });
-        return true;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "EEXIST") return false;
-        // Lock held: break it only if the holder is dead.
-        try {
-          const holderPid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
-          if (Number.isFinite(holderPid) && !pidAlive(holderPid)) {
-            unlinkSync(lockPath);
-            continue;
-          }
-        } catch {
-          // unreadable lock file; treat as held
-        }
-        return false;
-      }
-    }
-    return false;
+    return tryAcquireSpawnLockFile(lockPath, process.pid);
   }
 
   private releaseSpawnLock(lockPath: string): void {
-    try {
-      unlinkSync(lockPath);
-    } catch {
-      // already gone
-    }
+    releaseSpawnLockFile(lockPath);
   }
 
   private spawnManager(): void {
@@ -419,7 +556,7 @@ export class ManagerClient {
   }
 
   private async waitForSocket(socketPath: string, timeoutMs: number): Promise<void> {
-    const deadline = Date.now() + timeoutMs;
+    const deadline = this.now() + timeoutMs;
     for (;;) {
       if (existsSync(socketPath)) {
         const ok = await new Promise<boolean>((resolve) => {
@@ -432,10 +569,10 @@ export class ManagerClient {
         });
         if (ok) return;
       }
-      if (Date.now() >= deadline) {
+      if (this.now() >= deadline) {
         throw new Error("timed out waiting for pbs-manager socket");
       }
-      await delay(SOCKET_READY_POLL_MS);
+      await delay(this.clock, SOCKET_READY_POLL_MS);
     }
   }
 
@@ -443,7 +580,7 @@ export class ManagerClient {
   // Connection / protocol internals
   // -------------------------------------------------------------------------
 
-  private async connectAndHello(socketPath: string): Promise<void> {
+  private async connectAndHello(socketPath: string, helloTimeoutMs = HELLO_TIMEOUT_MS): Promise<void> {
     const socket = await new Promise<net.Socket>((resolve, reject) => {
       const s = net.connect(socketPath);
       s.once("connect", () => resolve(s));
@@ -451,7 +588,7 @@ export class ManagerClient {
     });
     this.attachSocket(socket);
     try {
-      await this.hello();
+      await this.hello(helloTimeoutMs);
     } catch (err) {
       this.detachSocket();
       throw new HelloError((err as Error).message);
@@ -459,11 +596,26 @@ export class ManagerClient {
   }
 
   private attachSocket(socket: net.Socket): void {
+    const previous = this.socket;
+    if (previous && previous !== socket) {
+      // Drop the old socket's handlers before it can close and tear down the new one.
+      previous.removeAllListeners();
+      previous.destroy();
+    }
     this.socket = socket;
     this.decoder.reset();
-    socket.on("data", (data) => this.onData(data));
-    socket.on("close", () => this.onClose());
-    socket.on("error", (err) => this.log(`socket error: ${err.message}`));
+    socket.on("data", (data) => {
+      if (this.socket !== socket) return;
+      this.onData(data);
+    });
+    socket.on("close", () => {
+      if (this.socket !== socket) return;
+      this.onClose();
+    });
+    socket.on("error", (err) => {
+      if (this.socket !== socket) return;
+      this.log(`socket error: ${err.message}`);
+    });
   }
 
   private detachSocket(): void {
@@ -475,7 +627,7 @@ export class ManagerClient {
     }
   }
 
-  private hello(): Promise<void> {
+  private hello(timeoutMs = HELLO_TIMEOUT_MS): Promise<void> {
     const socket = this.socket;
     if (!socket) return Promise.reject(new Error("no socket"));
     // The id is included so a manager that echoes request ids resolves via the
@@ -483,15 +635,18 @@ export class ManagerClient {
     const id = randomUUID();
     return new Promise<void>((resolve, reject) => {
       const done = (err?: Error) => {
-        clearTimeout(timer);
+        this.clock.clearTimeout(timer);
         this.pending.delete(id);
         this.helloWaiter = null;
         if (err) reject(err);
         else resolve();
       };
-      const timer = setTimeout(() => done(new Error("hello timed out")), HELLO_TIMEOUT_MS);
+      const timer = this.clock.setTimeout(() => done(new Error("hello timed out")), timeoutMs);
       this.helloWaiter = { resolve: () => done(), reject: (err) => done(err) };
-      this.pending.set(id, { resolve: () => done(), reject: (err) => done(err), timer });
+      this.pending.set(id, {
+        resolve: () => done(), reject: (err) => done(err), timer,
+        message: { type: "hello" }, timeoutMs, retryable: false,
+      });
       socket.write(
         encodeFrame({
           v: 1,
@@ -500,6 +655,9 @@ export class ManagerClient {
           client_kind: "extension",
           session_id: this.sessionId,
           pi_pid: this.piPid,
+          ...(this.cwd ? { cwd: this.cwd } : {}),
+          extension_version: EXTENSION_VERSION,
+          protocol: OBSERVABILITY_PROTOCOL,
         }),
       );
     });
@@ -524,7 +682,8 @@ export class ManagerClient {
     if (msg.type === "event") {
       const event = msg as unknown as ManagerEvent;
       if (event.event === "session_rebound") {
-        // Another connection claimed this session id; the server will close us.
+        // Only the socket that is still current lost the session. A stale
+        // hello's rebound must not disable reconnect on the winning socket.
         this.rebound = true;
       }
       for (const handler of this.eventHandlers) {
@@ -555,7 +714,7 @@ export class ManagerClient {
     const entry = this.pending.get(id);
     if (!entry) return;
     this.pending.delete(id);
-    clearTimeout(entry.timer);
+    this.clock.clearTimeout(entry.timer);
     if (msg.ok === true) {
       entry.resolve(msg);
     } else {
@@ -564,25 +723,53 @@ export class ManagerClient {
   }
 
   private request(msg: Record<string, unknown>, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<Record<string, unknown>> {
-    const socket = this.socket;
-    if (!socket || this.state !== "connected") {
-      return Promise.reject(new Error("pbs-manager not connected"));
-    }
-    const id = randomUUID();
+    const type = String(msg.type);
+    const retryable = ["wait", "output", "list", "watch", "status", "stop", "mark_background", "start"].includes(type);
+    const effectiveTimeoutMs = retryable ? Math.max(timeoutMs, RECONNECT_WINDOW_MS + 1000) : timeoutMs;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`pbs-manager request timed out: ${String(msg.type)}`));
-      }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
-      socket.write(encodeFrame({ v: 1, id, ...msg }));
+      const entry: PendingRequest = {
+        resolve, reject, message: msg, timeoutMs: effectiveTimeoutMs, retryable,
+        timer: this.clock.setTimeout(() => {
+          for (const [id, pending] of this.pending) {
+            if (pending === entry) this.pending.delete(id);
+          }
+          this.queuedRequests.delete(entry);
+          reject(new Error(`pbs-manager request timed out: ${type}`));
+        }, effectiveTimeoutMs),
+      };
+      if (this.socket && this.state === "connected") this.sendPending(entry);
+      else if (retryable && (this.reconnecting || this.connecting)) this.queuedRequests.add(entry);
+      else {
+        this.clock.clearTimeout(entry.timer);
+        reject(new Error("pbs-manager not connected"));
+      }
     });
+  }
+
+  private sendPending(entry: PendingRequest): void {
+    const socket = this.socket;
+    if (!socket || this.state !== "connected") return;
+    const id = randomUUID();
+    this.pending.set(id, entry);
+    socket.write(encodeFrame({ v: 1, id, ...entry.message }));
+  }
+
+  private resendPending(): void {
+    const entries = [...new Set([...this.pending.values(), ...this.queuedRequests])].filter((entry) => entry.retryable);
+    this.pending.clear();
+    this.queuedRequests.clear();
+    for (const entry of entries) this.sendPending(entry);
   }
 
   private onClose(): void {
     const wasConnected = this.state === "connected";
     this.detachSocket();
-    this.failAllPending(new Error("pbs-manager connection lost"));
+    for (const [id, entry] of [...this.pending]) {
+      if (entry.retryable && !this.intentionalClose && !this.rebound) continue;
+      this.pending.delete(id);
+      this.clock.clearTimeout(entry.timer);
+      entry.reject(new Error("pbs-manager connection lost"));
+    }
     if (this.helloWaiter) {
       this.helloWaiter.reject(new Error("connection closed during hello"));
       this.helloWaiter = null;
@@ -593,17 +780,24 @@ export class ManagerClient {
     }
     this.state = "disconnected";
     if (wasConnected) {
-      this.reconnecting = this.reconnectLoop();
+      let run!: Promise<void>;
+      run = this.reconnectLoop().finally(() => {
+        if (this.reconnecting === run) this.reconnecting = null;
+      });
+      this.reconnecting = run;
     }
   }
 
   private async reconnectLoop(): Promise<void> {
-    for (const delayMs of RECONNECT_DELAYS_MS) {
-      await delay(delayMs);
+    const deadline = this.now() + RECONNECT_WINDOW_MS;
+    let nextDelayMs = 0;
+    while (this.now() < deadline) {
+      if (nextDelayMs > 0) await delay(this.clock, Math.min(nextDelayMs, deadline - this.now()));
       if (this.intentionalClose || this.rebound) return;
       try {
-        await this.connectFlow(true);
+        await this.connectFlow(true, RECONNECT_HELLO_TIMEOUT_MS);
         this.state = "connected";
+        this.resendPending();
         this.log("reconnected to pbs-manager");
         for (const handler of this.reconnectHandlers) {
           try {
@@ -615,19 +809,24 @@ export class ManagerClient {
         return;
       } catch (err) {
         this.log(`reconnect attempt failed: ${(err as Error).message}`);
+        nextDelayMs = nextDelayMs === 0 ? 100 : Math.min(nextDelayMs * 2, 2000);
       }
     }
     this.state = "unavailable";
-    this.lastFailureAt = Date.now();
+    this.lastFailureAt = this.now();
+    this.lastFailureMessage = "reconnect exhausted";
+    this.failAllPending(new Error("pbs-manager reconnect exhausted"));
     this.log("giving up on pbs-manager; bash falls back to local execution");
   }
 
   private failAllPending(err: Error): void {
-    for (const entry of this.pending.values()) {
-      clearTimeout(entry.timer);
+    const entries = new Set([...this.pending.values(), ...this.queuedRequests]);
+    for (const entry of entries) {
+      this.clock.clearTimeout(entry.timer);
       entry.reject(err);
     }
     this.pending.clear();
+    this.queuedRequests.clear();
   }
 }
 

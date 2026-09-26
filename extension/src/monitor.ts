@@ -2,32 +2,54 @@
  * monitor tool (design doc §4.4).
  *
  * Starts a long-lived `kind:"monitor"` process via pbs-manager, watches its
- * output stream, and injects line batches as <monitor-event> messages.
+ * output stream, and injects line batches as <pbs-wake kind="monitor"> messages.
  * Batching (LineBatcher) and throttling (RateLimiter) happen extension-side;
- * a monitor that saturates the rate limiter for 30s continuously is stopped.
+ * a monitor is stopped when at least half its batches are dropped in a rolling
+ * 30-second window.
  */
 import { Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { formatMonitorEvent } from "./format";
-import type { ManagerClient, ManagerEvent } from "./manager-client";
-import { LineBatcher, RateLimiter } from "./monitor-batching";
-import type { NotifyCenter } from "./notify";
+import { realClock, type Clock, type ClockTimer } from "./clock";
 
-export const MONITOR_EVENT_CUSTOM_TYPE = "pbs-monitor-event";
+import type { ManagerClient, ManagerEvent, TaskRecord } from "./manager-client";
+import { LineBatcher, RateLimiter, SaturationWindow } from "./monitor-batching";
+import type { NotifyCenter } from "./notify";
+import { statusGlyph, toolComponent } from "./tui/tool-component";
+
 
 const DEFAULT_TIMEOUT_MS = 300_000;
 const MIN_TIMEOUT_MS = 1_000;
 const MAX_TIMEOUT_MS = 3_600_000;
-/** Continuous rate-limit saturation before a monitor is auto-stopped. */
-const SATURATION_LIMIT_MS = 30_000;
+/** Rolling-window drop ratio required before a monitor is auto-stopped. */
+const SATURATION_WINDOW_MS = 30_000;
+const SATURATION_DROP_RATIO = 0.5;
+const SATURATION_MIN_BATCHES = 10;
+/**
+ * Events for ids the registry does not know yet. The manager streams a monitor
+ * from spawn, so output and even the exit can arrive before `start()` has the
+ * task id (same socket read as the start response). Bounded: unrelated shell
+ * exits land here too and age out.
+ */
+const EARLY_MAX_IDS = 32;
+const EARLY_MAX_CHARS = 64 * 1024;
 
 export interface MonitorDeps {
   getClient: () => ManagerClient | null;
   sessionEnv: (ctx: ExtensionContext) => Record<string, string>;
   getNotifyCenter: () => NotifyCenter | null;
-  trackTask: (taskId: string, meta: { kind: string; command: string }) => void;
+  trackTask: (taskId: string, meta: { kind: string; command: string; cwd?: string }) => void;
   /** Optional TUI toast for lifecycle notices (exit / timeout / rate-limit). */
   toast?: (message: string, type?: "info" | "warning" | "error") => void;
+  clock?: Clock;
+  logEvent?: (type: string, fields?: Record<string, unknown>) => void;
+  /** A known monitor ended (event, replayed early exit, or reconcile). */
+  onExited?: (taskId: string, event: ManagerEvent) => void;
+  /**
+   * After a timeout or rate-limit stop. The process may already have exited
+   * with its exit event lost, in which case no further event will settle it.
+   */
+  afterStop?: () => void;
 }
 
 interface MonitorEntry {
@@ -36,18 +58,25 @@ interface MonitorEntry {
   startedAt: number;
   batcher: LineBatcher;
   limiter: RateLimiter;
-  saturatedSince: number | null;
-  timeoutTimer: NodeJS.Timeout | null;
+  saturation: SaturationWindow;
+  droppedLinesPending: number;
+  timeoutTimer: ClockTimer | null;
   stopped: boolean;
+  cursor: number;
+  recovering: boolean;
+  queuedOutput: { chunk: string; cursor?: number }[];
 }
 
 export class MonitorRegistry {
   private readonly deps: MonitorDeps;
+  private readonly clock: Clock;
   private readonly entries = new Map<string, MonitorEntry>();
   private readonly changeListeners = new Set<() => void>();
+  private readonly early = new Map<string, { chunks: { chunk: string; cursor?: number }[]; chars: number; exit?: ManagerEvent }>();
 
   constructor(deps: MonitorDeps) {
     this.deps = deps;
+    this.clock = deps.clock ?? realClock;
   }
 
   /** Subscribe to start/stop transitions (fleet status refresh). */
@@ -102,73 +131,153 @@ export class MonitorRegistry {
       env: fullEnv(ctx, this.deps),
       run_in_background: true,
       timeout_ms: null, // timeout is enforced extension-side to control the notice
+      origin: { via: "monitor" },
     });
-    await client.watch(task_id);
-    this.deps.trackTask(task_id, { kind: "monitor", command: params.command });
+    this.deps.trackTask(task_id, { kind: "monitor", command: params.command, cwd: ctx.cwd });
 
     const entry: MonitorEntry = {
       taskId: task_id,
       description: params.description,
-      startedAt: Date.now(),
+      startedAt: this.clock.now(),
       batcher: null as unknown as LineBatcher, // assigned below (self-reference in callback)
-      limiter: new RateLimiter(),
-      saturatedSince: null,
+      limiter: new RateLimiter({ clock: this.clock }),
+      saturation: new SaturationWindow({
+        windowMs: SATURATION_WINDOW_MS,
+        dropRatio: SATURATION_DROP_RATIO,
+        minimumBatches: SATURATION_MIN_BATCHES,
+      }),
+      droppedLinesPending: 0,
       timeoutTimer: null,
       stopped: false,
+      cursor: 0,
+      recovering: false,
+      queuedOutput: [],
     };
     entry.batcher = new LineBatcher({
       onFlush: (text) => this.onBatch(entry, text),
+      clock: this.clock,
     });
     if (timeoutMs !== null) {
-      entry.timeoutTimer = setTimeout(() => {
+      entry.timeoutTimer = this.clock.setTimeout(() => {
         void this.timeout(entry);
       }, timeoutMs);
-      entry.timeoutTimer.unref?.();
+      this.clock.unref?.(entry.timeoutTimer);
     }
     this.entries.set(task_id, entry);
     this.emitChange();
+    // Replay what arrived before we knew the id: lines first, then the exit.
+    const early = this.early.get(task_id);
+    this.early.delete(task_id);
+    for (const output of early?.chunks ?? []) this.acceptOutput(entry, output.chunk, output.cursor);
+    if (early?.exit) this.handleExit(task_id, early.exit);
+    // Older managers only stream after an explicit watch; newer ones already do.
+    else await client.watch(task_id).catch(() => {});
     return { taskId: task_id, timeoutMs };
   }
 
   /** Handle a watched output event from the manager. */
-  handleOutput(taskId: string, chunk: string): void {
-    this.entries.get(taskId)?.batcher.push(chunk);
+  handleOutput(taskId: string, chunk: string, nextCursor?: number): void {
+    const entry = this.entries.get(taskId);
+    if (entry) {
+      if (entry.recovering) entry.queuedOutput.push({ chunk, cursor: nextCursor });
+      else this.acceptOutput(entry, chunk, nextCursor);
+      return;
+    }
+    const early = this.earlyFor(taskId);
+    if (early.chars + chunk.length > EARLY_MAX_CHARS) return;
+    early.chunks.push({ chunk, cursor: nextCursor });
+    early.chars += chunk.length;
   }
 
-  /** Handle the manager's task_exited event for a monitored task. */
-  handleExit(taskId: string, event: ManagerEvent): void {
+  private acceptOutput(entry: MonitorEntry, chunk: string, nextCursor?: number): void {
+    let deliver = Buffer.from(chunk, "utf8");
+    if (typeof nextCursor === "number") {
+      if (nextCursor <= entry.cursor) return;
+      const startCursor = nextCursor - deliver.byteLength;
+      if (startCursor < entry.cursor) {
+        deliver = deliver.subarray(entry.cursor - startCursor);
+      }
+      entry.cursor = nextCursor;
+    } else {
+      entry.cursor += deliver.byteLength;
+    }
+    if (deliver.byteLength > 0) entry.batcher.push(deliver.toString("utf8"));
+  }
+
+  /**
+   * Handle the manager's task_exited event. Returns true when it closed a
+   * known monitor; an unknown id is kept briefly in case `start()` is about to
+   * register it.
+   */
+  handleExit(taskId: string, event: ManagerEvent): boolean {
     const entry = this.entries.get(taskId);
-    if (!entry) return;
+    if (!entry) {
+      this.earlyFor(taskId).exit = event;
+      return false;
+    }
     // Drain remaining buffered lines before closing out.
     entry.batcher.flush();
     const alreadyStopped = entry.stopped;
     this.cleanup(entry);
-    if (alreadyStopped) return; // timeout/saturation notice already sent
+    this.deps.onExited?.(taskId, event);
+    if (alreadyStopped) return true; // timeout/saturation notice already sent
     const exitCode = event.exit_code ?? null;
     const duration =
       typeof event.duration_ms === "number" ? `${(event.duration_ms / 1000).toFixed(1)}s` : "unknown duration";
-    this.deps.getNotifyCenter()?.notify({
-      customType: MONITOR_EVENT_CUSTOM_TYPE,
-      content:
-        `<monitor-event description="${escapeAttr(entry.description)}" task_id="${entry.taskId}" status="exited">\n` +
-        `Monitor event: "${entry.description}"\n` +
-        `<event>\nMonitor process exited (exit code ${exitCode === null ? "null" : exitCode}, after ${duration}). ` +
-        "No further events will be delivered.\n</event>\n" +
-        "</monitor-event>",
-      details: { taskId: entry.taskId, description: entry.description, exitCode, status: "exited" },
-    });
+    this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: event.end_reason ?? "exited" });
+    this.deps.getNotifyCenter()?.notify(
+      formatMonitorEvent(
+        entry.description,
+        entry.taskId,
+        `Monitor process exited (exit code ${exitCode === null ? "null" : exitCode}, after ${duration}). No further events will be delivered.${entry.droppedLinesPending > 0 ? ` ${entry.droppedLinesPending} output lines were dropped.` : ""}`,
+        "exited",
+        { droppedLines: entry.droppedLinesPending },
+      ),
+    );
     this.deps.toast?.(
       `Monitor "${entry.description}" exited (code ${exitCode === null ? "?" : exitCode})`,
       exitCode === 0 || exitCode === null ? "info" : "warning",
     );
+    return true;
   }
 
-  /** Re-subscribe watches after a manager reconnect. */
+  /**
+   * Close monitors the manager already reports as finished: the safety net for
+   * an exit event that never reached us (reconnect, older manager). Returns the
+   * ids it closed.
+   */
+  reconcile(tasks: readonly TaskRecord[]): string[] {
+    const closed: string[] = [];
+    for (const task of tasks) {
+      if (task.status === "running" || !this.entries.has(task.task_id)) continue;
+      this.handleExit(task.task_id, exitEventFromRecord(task));
+      closed.push(task.task_id);
+    }
+    return closed;
+  }
+
+  private earlyFor(taskId: string): { chunks: { chunk: string; cursor?: number }[]; chars: number; exit?: ManagerEvent } {
+    let early = this.early.get(taskId);
+    if (!early) {
+      early = { chunks: [], chars: 0 };
+      this.early.set(taskId, early);
+      while (this.early.size > EARLY_MAX_IDS) this.early.delete(this.early.keys().next().value as string);
+    }
+    return early;
+  }
+
+  /** Re-subscribe watches after a manager reconnect, then drop monitors that ended meanwhile. */
   async rewatchAll(): Promise<void> {
     const client = this.deps.getClient();
     if (!client || !client.isAvailable()) return;
     for (const entry of this.entries.values()) {
+      entry.recovering = true;
+      // Re-hello on an upgraded daemon already replays the exact missed watch
+      // range. watch() is idempotent; do not output(cursor)-backfill it again.
       await client.watch(entry.taskId).catch(() => {});
+      entry.recovering = false;
+      const queued = entry.queuedOutput.splice(0).sort((a, b) => (a.cursor ?? 0) - (b.cursor ?? 0));
+      for (const output of queued) this.acceptOutput(entry, output.chunk, output.cursor);
     }
   }
 
@@ -177,66 +286,71 @@ export class MonitorRegistry {
       this.cleanup(entry);
     }
     this.entries.clear();
+    this.early.clear();
   }
 
   private onBatch(entry: MonitorEntry, text: string): void {
     if (entry.stopped) return;
-    if (!entry.limiter.tryConsume()) {
-      // Saturated: drop the batch and track continuous saturation.
-      if (entry.saturatedSince === null) {
-        entry.saturatedSince = Date.now();
-      } else if (Date.now() - entry.saturatedSince >= SATURATION_LIMIT_MS) {
-        void this.autoStop(entry);
-      }
+    const now = this.clock.now();
+    const accepted = entry.limiter.tryConsume();
+    entry.saturation.record(!accepted, now);
+    if (!accepted) {
+      const droppedLines = text.split("\n").length;
+      this.deps.logEvent?.("monitor.drop", { id: entry.taskId, lines: droppedLines });
+      entry.droppedLinesPending += droppedLines;
+      if (entry.saturation.isSaturated(now)) void this.autoStop(entry);
       return;
     }
-    entry.saturatedSince = null;
-    this.deps.getNotifyCenter()?.notify({
-      customType: MONITOR_EVENT_CUSTOM_TYPE,
-      content: formatMonitorEvent(entry.description, entry.taskId, text),
-      details: { taskId: entry.taskId, description: entry.description },
-    });
+    const droppedLines = entry.droppedLinesPending;
+    entry.droppedLinesPending = 0;
+    this.deps.getNotifyCenter()?.notifyMonitorEvent(entry.description, entry.taskId, text, droppedLines);
   }
 
   /** Timeout reached: stop the process and notify (§4.4). */
   private async timeout(entry: MonitorEntry): Promise<void> {
     if (entry.stopped) return;
     entry.stopped = true;
+    this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: "timeout" });
     const client = this.deps.getClient();
-    await client?.stop(entry.taskId).catch(() => {});
-    this.deps.getNotifyCenter()?.notify({
-      customType: MONITOR_EVENT_CUSTOM_TYPE,
-      content:
-        `<monitor-event description="${escapeAttr(entry.description)}" task_id="${entry.taskId}" status="timeout">\n` +
-        `Monitor event: "${entry.description}"\n` +
-        `<event>\n[Monitor timed out — re-arm if needed.]\n</event>\n` +
-        "</monitor-event>",
-      details: { taskId: entry.taskId, description: entry.description, status: "timeout" },
-    });
+    await client?.stop(entry.taskId, "timeout").catch(() => {});
+    this.deps.getNotifyCenter()?.notify(
+      formatMonitorEvent(
+        entry.description,
+        entry.taskId,
+        "[Monitor timed out — re-arm if needed.]",
+
+        "timeout",
+        { droppedLines: entry.droppedLinesPending },
+      ),
+    );
     this.deps.toast?.(`Monitor "${entry.description}" timed out — re-arm if needed.`, "warning");
     this.cleanup(entry);
+    this.deps.afterStop?.();
   }
 
   /** Rate limiter saturated for too long: stop and notify (§4.4). */
   private async autoStop(entry: MonitorEntry): Promise<void> {
     if (entry.stopped) return;
     entry.stopped = true;
+    this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: "rate-limit" });
     const client = this.deps.getClient();
-    await client?.stop(entry.taskId).catch(() => {});
-    this.deps.getNotifyCenter()?.notify({
-      customType: MONITOR_EVENT_CUSTOM_TYPE,
-      content:
-        `<monitor-event description="${escapeAttr(entry.description)}" task_id="${entry.taskId}" status="stopped">\n` +
-        `Monitor event: "${entry.description}"\n` +
-        `<event>\n[Monitor stopped: event rate limit saturated for 30s.]\n</event>\n` +
-        "</monitor-event>",
-      details: { taskId: entry.taskId, description: entry.description, status: "stopped" },
-    });
+    await client?.stop(entry.taskId, "rate-limit").catch(() => {});
+    this.deps.getNotifyCenter()?.notify(
+      formatMonitorEvent(
+        entry.description,
+        entry.taskId,
+        "[Monitor stopped: at least half of output batches were dropped in the last 30s.]",
+
+        "stopped",
+        { droppedLines: entry.droppedLinesPending },
+      ),
+    );
     this.deps.toast?.(
       `Monitor "${entry.description}" stopped — too much output (rate limit).`,
       "warning",
     );
     this.cleanup(entry);
+    this.deps.afterStop?.();
   }
 
   private cleanup(entry: MonitorEntry): void {
@@ -244,12 +358,25 @@ export class MonitorRegistry {
     entry.batcher.dispose();
     entry.limiter.dispose();
     if (entry.timeoutTimer !== null) {
-      clearTimeout(entry.timeoutTimer);
+      this.clock.clearTimeout(entry.timeoutTimer);
       entry.timeoutTimer = null;
     }
     this.entries.delete(entry.taskId);
     this.emitChange();
   }
+}
+
+/** A task_exited-shaped event rebuilt from a manager record (reconcile). */
+export function exitEventFromRecord(task: TaskRecord): ManagerEvent {
+  return {
+    event: "task_exited",
+    task_id: task.task_id,
+    exit_code: task.exit_code,
+    signal: task.signal,
+    ...(task.ended_at !== null ? { duration_ms: task.ended_at - task.started_at } : {}),
+    output_path: task.output_path,
+    ...(task.end_reason ? { end_reason: task.end_reason } : {}),
+  };
 }
 
 function fullEnv(ctx: ExtensionContext, deps: MonitorDeps): Record<string, string> {
@@ -259,14 +386,6 @@ function fullEnv(ctx: ExtensionContext, deps: MonitorDeps): Record<string, strin
   }
   Object.assign(env, deps.sessionEnv(ctx));
   return env;
-}
-
-function escapeAttr(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
 }
 
 const monitorParameters = Type.Object({
@@ -298,15 +417,15 @@ export function createMonitorTool(
     label: "Monitor",
     description:
       "Start a background monitor process whose stdout lines are injected back to you as " +
-      "<monitor-event> messages (batched over 200ms, rate-limited). " +
+      "<pbs-wake kind=\"monitor\"> messages (batched over 200ms, rate-limited). " +
       "The command must be line-buffered: each event must be a single line. " +
       "Silence is not success: write the command so failures also produce lines " +
       "(e.g. grep for both success and error patterns). " +
-      "Events arrive as system wakes (not new user messages). Handle each <monitor-event> before other work. Do not poll.",
+      "Events arrive as system wakes (not new user messages). Handle each <pbs-wake kind=\"monitor\"> before other work. Do not poll.",
     promptSnippet: "Watch a command's line stream and get injected events",
     promptGuidelines: [
       "Use the monitor tool to watch for conditions instead of running sleep/poll loops in bash.",
-      "When woken by a <monitor-event>, handle the event content before doing anything else — it is not a new user request and not user confirmation.",
+      "When woken by a <pbs-wake kind=\"monitor\">, handle the <event> before doing anything else — it is not a new user request and not user confirmation.",
     ],
     parameters: monitorParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -325,17 +444,19 @@ export function createMonitorTool(
     },
     renderCall(args, theme) {
       const desc = String((args as { description?: string }).description ?? "monitor");
-      return {
-        render: () => [`${theme.fg("toolTitle", "Monitor")} ${theme.fg("muted", desc)}`],
-      } as never;
+      return toolComponent([
+        `${theme.fg("toolTitle", "Monitor")} ${theme.fg("muted", desc)}`,
+      ]) as never;
     },
-    renderResult(result, { expanded }, theme) {
+    renderResult(result, { expanded }, theme, context) {
       const text = result.content
         .filter((c): c is { type: "text"; text: string } => c.type === "text")
         .map((c) => c.text)
         .join("\n");
-      const line = `${theme.fg("success", "✓")} ${text}${expanded ? "" : theme.fg("dim", "  · ↓ manage via /tasks")}`;
-      return { render: () => [line] } as never;
+      const failed = context.isError || /\b(failed|killed|orphaned|error)\b/i.test(text);
+      const { color, glyph } = statusGlyph(failed ? "failed" : "completed", failed);
+      const line = `${theme.fg(color as "error", glyph)} ${text}${expanded ? "" : theme.fg("dim", "  · manage via /tasks")}`;
+      return toolComponent([line]) as never;
     },
   };
 }

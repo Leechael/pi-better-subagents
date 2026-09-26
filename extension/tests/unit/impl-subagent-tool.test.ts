@@ -1,16 +1,24 @@
 import { describe, expect, it, vi } from "vitest";
+import { ManualClock } from "../../src/clock";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SubagentRegistry } from "../../src/subagent/registry";
 import { InProcessRunner } from "../../src/subagent/runner";
-import { createSubagentTool, SUBAGENT_NOTIFICATION_CUSTOM_TYPE } from "../../src/subagent/tool";
+import { createSubagentTool } from "../../src/subagent/tool";
+import { PBS_WAKE_CUSTOM_TYPE } from "../../src/wake";
 import { SessionFactory, tick } from "./subagent-fakes";
 
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 16; i++) await Promise.resolve();
+}
+
 function makeStack(opts: { budgetMs?: number; autoComplete?: string | null } = {}) {
-  const registry = new SubagentRegistry({});
+  const clock = new ManualClock();
+  const registry = new SubagentRegistry({ clock });
   const factory = new SessionFactory();
   factory.autoComplete = opts.autoComplete === undefined ? "done" : opts.autoComplete;
   const runner = new InProcessRunner({
     createSession: factory.fn,
+    clock,
     acquire: (req) => registry.admitChild(req.childId),
   });
   registry.setRunner(runner);
@@ -21,11 +29,12 @@ function makeStack(opts: { budgetMs?: number; autoComplete?: string | null } = {
     budgetMs: () => opts.budgetMs ?? 45_000,
     defaultTimeoutMs: 600_000,
     defaultConcurrency: 4,
+    clock,
   });
   const ctx = { cwd: "/tmp" } as ExtensionContext;
   const exec = (params: Record<string, unknown>, signal?: AbortSignal) =>
     tool.execute("tc", params as never, signal, undefined, ctx);
-  return { registry, factory, notify, exec };
+  return { registry, factory, notify, exec, clock };
 }
 
 describe("subagent tool — validation", () => {
@@ -110,7 +119,8 @@ describe("subagent tool — tasks", () => {
     });
     // worker-1 is still running (manual); wait for the workers to spin up,
     // then complete it to let the run finish.
-    await vi.waitFor(() => expect(factory.sessions.length).toBeGreaterThanOrEqual(2));
+    await flushMicrotasks();
+    expect(factory.sessions.length).toBeGreaterThanOrEqual(2);
     factory.sessions[0].complete("finally");
     const settled = await pending;
     const text = settled.content[0].type === "text" ? settled.content[0].text : "";
@@ -121,9 +131,29 @@ describe("subagent tool — tasks", () => {
     expect(factory.sessions).toHaveLength(2); // third never spawned
   });
 
+  it("reports provider stopReason errors as failed in the result and wake", async () => {
+    const { exec, factory, notify } = makeStack({ autoComplete: null });
+    factory.configure = (session) => {
+      session.lastAssistantFailure = { stopReason: "error", errorMessage: "529 overloaded_error" };
+    };
+    const result = await exec({ tasks: [{ prompt: "slow" }], async: true });
+    await flushMicrotasks();
+    expect(factory.sessions).toHaveLength(1);
+    factory.sessions[0].complete();
+    await flushMicrotasks();
+
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0].content).toContain('status="failed"');
+    expect(notify.mock.calls[0][0].content).toContain("<error>529 overloaded_error</error>");
+    expect(result.details).toMatchObject({ status: "backgrounded" });
+  });
+
   it("backgrounds the run when the foreground budget elapses, then notifies", async () => {
-    const { exec, factory, notify } = makeStack({ budgetMs: 50, autoComplete: null });
-    const result = await exec({ tasks: [{ prompt: "slow" }] });
+    const { exec, factory, notify, clock } = makeStack({ budgetMs: 50, autoComplete: null });
+    const pending = exec({ tasks: [{ prompt: "slow" }] });
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    clock.advanceBy(50);
+    const result = await pending;
     const text = result.content[0].type === "text" ? result.content[0].text : "";
     expect(text).toContain("run_");
     expect(text).toContain("background");
@@ -132,16 +162,18 @@ describe("subagent tool — tasks", () => {
     const runId = (result.details as { run_id: string }).run_id;
 
     // Complete the child later -> completion notification fires.
-    await vi.waitFor(() => expect(factory.sessions).toHaveLength(1));
+    await flushMicrotasks();
+    expect(factory.sessions).toHaveLength(1);
     factory.sessions[0].complete("late result");
-    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    await flushMicrotasks();
+    expect(notify).toHaveBeenCalledTimes(1);
     const message = notify.mock.calls[0][0];
-    expect(message.customType).toBe(SUBAGENT_NOTIFICATION_CUSTOM_TYPE);
-    expect(message.content).toContain("<subagent-notification>");
-    expect(message.content).toContain(`<run-id>${runId}</run-id>`);
-    expect(message.content).toContain("<status>completed</status>");
+    expect(message.customType).toBe(PBS_WAKE_CUSTOM_TYPE);
+    expect(message.content).toContain('kind="subagent-done"');
+    expect(message.content).toContain(`run-id="${runId}"`);
+    expect(message.content).toContain('status="completed"');
     expect(message.content).toContain("late result");
-    expect(message.details).toEqual({ run_id: runId });
+    expect(message.details).toMatchObject({ kind: "subagent-done", runId });
   });
 
   it("async: true returns immediately and still notifies on completion", async () => {
@@ -151,11 +183,20 @@ describe("subagent tool — tasks", () => {
     expect(text).toContain("Do not poll");
     expect((result.details as { status: string }).status).toBe("backgrounded");
     expect(notify).not.toHaveBeenCalled();
-    await vi.waitFor(() => expect(factory.sessions).toHaveLength(2));
+    await flushMicrotasks();
+    expect(factory.sessions).toHaveLength(2);
     factory.sessions[0].complete("r1");
+    await flushMicrotasks();
+    expect(notify).toHaveBeenCalledTimes(1);
+    const handover = notify.mock.calls[0][0].content as string;
+    expect(handover).toContain('kind="subagent-handover"');
+    expect(handover).toContain("<prompt>");
+    expect(handover).toContain("r1");
+    expect(handover).toContain("still running");
     factory.sessions[1].complete("r2");
-    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
-    expect(notify.mock.calls[0][0].content).toContain("2/2 subagents completed");
+    await flushMicrotasks();
+    expect(notify).toHaveBeenCalledTimes(2);
+    expect(notify.mock.calls[1][0].content).toContain("2/2 subagents completed");
   });
 
   it("an aborted sync wait backgrounds the run rather than killing it", async () => {
@@ -166,7 +207,8 @@ describe("subagent tool — tasks", () => {
     const result = await pending;
     expect((result.details as { status: string }).status).toBe("backgrounded");
     // The child is still running (not interrupted).
-    await vi.waitFor(() => expect(factory.sessions).toHaveLength(1));
+    await flushMicrotasks();
+    expect(factory.sessions).toHaveLength(1);
     expect(factory.sessions[0].isStreaming()).toBe(true);
     factory.sessions[0].complete("done");
   });
@@ -222,7 +264,8 @@ describe("subagent tool — management actions", () => {
     const { exec, factory } = makeStack({ autoComplete: null });
     const started = await exec({ tasks: [{ prompt: "a", name: "longrunner" }], async: true });
     const runId = (started.details as { run_id: string }).run_id;
-    await vi.waitFor(() => expect(factory.sessions).toHaveLength(1));
+    await flushMicrotasks();
+    expect(factory.sessions).toHaveLength(1);
     const status = await exec({ action: "status", run_id: runId });
     const text = status.content[0].type === "text" ? status.content[0].text : "";
     expect(text).toContain("longrunner");
@@ -237,11 +280,10 @@ describe("subagent tool — management actions", () => {
     const runId = (started.details as { run_id: string }).run_id;
     // Wait until the handle is registered (implies the session is assigned
     // inside the handle and the prompt was issued).
-    await vi.waitFor(() => {
-      const rec = registry.get(runId)!;
-      expect(rec.children).toHaveLength(1);
-      expect(registry.handle(rec.children[0].childId)).toBeDefined();
-    });
+    await flushMicrotasks();
+    const rec = registry.get(runId)!;
+    expect(rec.children).toHaveLength(1);
+    expect(registry.handle(rec.children[0].childId)).toBeDefined();
     const result = await exec({ action: "interrupt", run_id: runId });
     const text = result.content[0].type === "text" ? result.content[0].text : "";
     expect(text).toContain("Interrupted 1 subagent(s)");
@@ -255,12 +297,11 @@ describe("subagent tool — management actions", () => {
     const { exec, factory, registry } = makeStack({ autoComplete: null });
     const started = await exec({ tasks: [{ prompt: "a" }, { prompt: "b" }], async: true });
     const runId = (started.details as { run_id: string }).run_id;
-    await vi.waitFor(() => {
-      const rec = registry.get(runId)!;
-      expect(rec.children).toHaveLength(2);
-      expect(registry.handle(rec.children[0].childId)).toBeDefined();
-      expect(registry.handle(rec.children[1].childId)).toBeDefined();
-    });
+    await flushMicrotasks();
+    const rec = registry.get(runId)!;
+    expect(rec.children).toHaveLength(2);
+    expect(registry.handle(rec.children[0].childId)).toBeDefined();
+    expect(registry.handle(rec.children[1].childId)).toBeDefined();
     await exec({ action: "interrupt", run_id: runId, child_id: "worker-1" });
     expect(factory.sessions[0].aborts).toBe(1);
     expect(factory.sessions[1].aborts).toBe(0);
@@ -271,11 +312,10 @@ describe("subagent tool — management actions", () => {
     const { exec, factory, registry } = makeStack({ autoComplete: null });
     const started = await exec({ tasks: [{ prompt: "a" }], async: true });
     const runId = (started.details as { run_id: string }).run_id;
-    await vi.waitFor(() => {
-      const rec = registry.get(runId)!;
-      expect(rec.children).toHaveLength(1);
-      expect(registry.handle(rec.children[0].childId)).toBeDefined();
-    });
+    await flushMicrotasks();
+    const rec = registry.get(runId)!;
+    expect(rec.children).toHaveLength(1);
+    expect(registry.handle(rec.children[0].childId)).toBeDefined();
     const result = await exec({ action: "steer", run_id: runId, message: "focus on tests" });
     expect(factory.sessions[0].steers).toEqual(["focus on tests"]);
     expect(result.content[0].type === "text" && result.content[0].text).toContain("Steered");
@@ -304,7 +344,8 @@ describe("subagent tool — management actions", () => {
     expect(factory.sessions[0].prompts).toEqual(["a", "now do more"]);
 
     factory.sessions[0].complete("second result");
-    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    await flushMicrotasks();
+    expect(notify).toHaveBeenCalledTimes(1);
     expect(notify.mock.calls[0][0].content).toContain("second result");
   });
 
@@ -312,11 +353,10 @@ describe("subagent tool — management actions", () => {
     const { exec, factory, registry } = makeStack({ autoComplete: null });
     const started = await exec({ tasks: [{ prompt: "a" }], async: true });
     const runId = (started.details as { run_id: string }).run_id;
-    await vi.waitFor(() => {
-      const rec = registry.get(runId)!;
-      expect(rec.children).toHaveLength(1);
-      expect(registry.handle(rec.children[0].childId)).toBeDefined();
-    });
+    await flushMicrotasks();
+    const rec = registry.get(runId)!;
+    expect(rec.children).toHaveLength(1);
+    expect(registry.handle(rec.children[0].childId)).toBeDefined();
     await expect(
       exec({ action: "resume", run_id: runId, child_id: "worker-1", message: "x" }),
     ).rejects.toThrow(/still running/);

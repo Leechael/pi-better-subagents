@@ -1,17 +1,16 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { LineBatcher, RateLimiter } from "../../src/monitor-batching";
+import { beforeEach, describe, expect, it } from "vitest";
+import { ManualClock } from "../../src/clock";
+import { LineBatcher, RateLimiter, SaturationWindow } from "../../src/monitor-batching";
 
 describe("LineBatcher", () => {
+  let clock: ManualClock;
   beforeEach(() => {
-    vi.useFakeTimers();
-  });
-  afterEach(() => {
-    vi.useRealTimers();
+    clock = new ManualClock();
   });
 
   function collect(opts: Partial<ConstructorParameters<typeof LineBatcher>[0]> = {}) {
     const batches: string[] = [];
-    const batcher = new LineBatcher({ onFlush: (text) => batches.push(text), ...opts });
+    const batcher = new LineBatcher({ onFlush: (text) => batches.push(text), clock, ...opts });
     return { batches, batcher };
   }
 
@@ -21,7 +20,7 @@ describe("LineBatcher", () => {
     batcher.push("two\n");
     batcher.push("three\n");
     expect(batches).toEqual([]);
-    vi.advanceTimersByTime(200);
+    clock.advanceBy(200);
     expect(batches).toEqual(["one\ntwo\nthree"]);
     batcher.dispose();
   });
@@ -29,9 +28,9 @@ describe("LineBatcher", () => {
   it("emits separate batches when pushes are further apart than the window", () => {
     const { batches, batcher } = collect();
     batcher.push("one\n");
-    vi.advanceTimersByTime(200);
+    clock.advanceBy(200);
     batcher.push("two\n");
-    vi.advanceTimersByTime(200);
+    clock.advanceBy(200);
     expect(batches).toEqual(["one", "two"]);
     batcher.dispose();
   });
@@ -40,7 +39,7 @@ describe("LineBatcher", () => {
     const { batches, batcher } = collect();
     batcher.push("hel");
     batcher.push("lo\nworld\n");
-    vi.advanceTimersByTime(200);
+    clock.advanceBy(200);
     expect(batches).toEqual(["hello\nworld"]);
     batcher.dispose();
   });
@@ -48,7 +47,7 @@ describe("LineBatcher", () => {
   it("drains an unterminated trailing line at window end (no data loss)", () => {
     const { batches, batcher } = collect();
     batcher.push("done\ntail-without-newline");
-    vi.advanceTimersByTime(200);
+    clock.advanceBy(200);
     expect(batches).toEqual(["done\ntail-without-newline"]);
     batcher.dispose();
   });
@@ -59,7 +58,7 @@ describe("LineBatcher", () => {
     batcher.flush();
     expect(batches).toEqual(["abc"]);
     // The pending timer must not re-deliver the same content.
-    vi.advanceTimersByTime(1000);
+    clock.advanceBy(1000);
     expect(batches).toEqual(["abc"]);
     batcher.dispose();
   });
@@ -67,7 +66,7 @@ describe("LineBatcher", () => {
   it("caps individual lines at maxLineChars", () => {
     const { batches, batcher } = collect({ maxLineChars: 5 });
     batcher.push("1234567890\n");
-    vi.advanceTimersByTime(200);
+    clock.advanceBy(200);
     expect(batches).toEqual(["12345"]);
     batcher.dispose();
   });
@@ -75,7 +74,7 @@ describe("LineBatcher", () => {
   it("caps a batch at maxBatchChars keeping the tail", () => {
     const { batches, batcher } = collect({ maxBatchChars: 10 });
     batcher.push("aaaa\nbbbb\ncccc\n");
-    vi.advanceTimersByTime(200);
+    clock.advanceBy(200);
     expect(batches).toHaveLength(1);
     expect(batches[0].length).toBe(10);
     expect(batches[0].startsWith("…")).toBe(true);
@@ -87,7 +86,7 @@ describe("LineBatcher", () => {
     const { batches, batcher } = collect();
     batcher.push("");
     batcher.flush();
-    vi.advanceTimersByTime(1000);
+    clock.advanceBy(1000);
     expect(batches).toEqual([]);
     batcher.dispose();
   });
@@ -96,7 +95,7 @@ describe("LineBatcher", () => {
     const { batches, batcher } = collect();
     batcher.push("one\n");
     batcher.dispose();
-    vi.advanceTimersByTime(1000);
+    clock.advanceBy(1000);
     batcher.push("two\n");
     batcher.flush();
     expect(batches).toEqual([]);
@@ -105,24 +104,45 @@ describe("LineBatcher", () => {
   it("honors a custom flush window", () => {
     const { batches, batcher } = collect({ flushMs: 50 });
     batcher.push("x\n");
-    vi.advanceTimersByTime(49);
+    clock.advanceBy(49);
     expect(batches).toEqual([]);
-    vi.advanceTimersByTime(1);
+    clock.advanceBy(1);
     expect(batches).toEqual(["x"]);
     batcher.dispose();
   });
 });
 
-describe("RateLimiter", () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
+describe("SaturationWindow", () => {
+  it("stops only after a full window with at least half of batches dropped", () => {
+    const window = new SaturationWindow({ windowMs: 30_000, dropRatio: 0.5, minimumBatches: 10 });
+    for (let i = 0; i < 10; i++) window.record(i % 2 === 0, i * 2_000);
+    expect(window.isSaturated(29_999)).toBe(false);
+    expect(window.isSaturated(30_000)).toBe(true);
   });
-  afterEach(() => {
-    vi.useRealTimers();
+
+  it("does not trip when drops fall below half of the rolling window", () => {
+    const window = new SaturationWindow({ windowMs: 30_000, dropRatio: 0.5, minimumBatches: 10 });
+    for (let i = 0; i < 10; i++) window.record(i < 4, i * 2_000);
+    expect(window.isSaturated(30_000)).toBe(false);
+  });
+
+  it("expires old samples so a past burst cannot keep saturation latched", () => {
+    const window = new SaturationWindow({ windowMs: 30_000, dropRatio: 0.5, minimumBatches: 10 });
+    for (let i = 0; i < 10; i++) window.record(true, i * 1_000);
+    expect(window.isSaturated(30_000)).toBe(true);
+    for (let i = 0; i < 10; i++) window.record(false, 31_000 + i * 1_000);
+    expect(window.isSaturated(60_000)).toBe(false);
+  });
+});
+
+describe("RateLimiter", () => {
+  let clock: ManualClock;
+  beforeEach(() => {
+    clock = new ManualClock();
   });
 
   it("allows up to capacity tokens, then refuses", () => {
-    const limiter = new RateLimiter({ capacity: 3, refillIntervalMs: 1000, refillAmount: 1 });
+    const limiter = new RateLimiter({ capacity: 3, refillIntervalMs: 1000, refillAmount: 1, clock });
     expect(limiter.tryConsume()).toBe(true);
     expect(limiter.tryConsume()).toBe(true);
     expect(limiter.tryConsume()).toBe(true);
@@ -131,13 +151,13 @@ describe("RateLimiter", () => {
   });
 
   it("refills tokens at the configured interval", () => {
-    const limiter = new RateLimiter({ capacity: 2, refillIntervalMs: 2000, refillAmount: 1 });
+    const limiter = new RateLimiter({ capacity: 2, refillIntervalMs: 2000, refillAmount: 1, clock });
     expect(limiter.tryConsume(2)).toBe(true);
     expect(limiter.tryConsume()).toBe(false);
-    vi.advanceTimersByTime(2000);
+    clock.advanceBy(2000);
     expect(limiter.tryConsume()).toBe(true);
     expect(limiter.tryConsume()).toBe(false);
-    vi.advanceTimersByTime(4000);
+    clock.advanceBy(4000);
     // Refill never exceeds capacity.
     expect(limiter.tryConsume(2)).toBe(true);
     expect(limiter.tryConsume()).toBe(false);
@@ -145,7 +165,7 @@ describe("RateLimiter", () => {
   });
 
   it("supports consuming multiple tokens at once", () => {
-    const limiter = new RateLimiter({ capacity: 5 });
+    const limiter = new RateLimiter({ capacity: 5, clock });
     expect(limiter.tryConsume(4)).toBe(true);
     expect(limiter.tryConsume(2)).toBe(false);
     expect(limiter.tryConsume(1)).toBe(true);
@@ -153,16 +173,16 @@ describe("RateLimiter", () => {
   });
 
   it("uses the documented defaults (capacity 10, +1 per 2s)", () => {
-    const limiter = new RateLimiter();
+    const limiter = new RateLimiter({ clock });
     for (let i = 0; i < 10; i++) expect(limiter.tryConsume()).toBe(true);
     expect(limiter.tryConsume()).toBe(false);
-    vi.advanceTimersByTime(2000);
+    clock.advanceBy(2000);
     expect(limiter.tryConsume()).toBe(true);
     limiter.dispose();
   });
 
   it("refuses consumption after dispose", () => {
-    const limiter = new RateLimiter({ capacity: 1 });
+    const limiter = new RateLimiter({ capacity: 1, clock });
     limiter.dispose();
     expect(limiter.tryConsume()).toBe(false);
   });

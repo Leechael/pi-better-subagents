@@ -5,49 +5,41 @@
  * its XML formats; nothing is added to src/format.ts).
  */
 import {
+  DECISION_TIMEOUT_MESSAGE,
   Mailbox,
-  type MailboxClock,
   type MailboxOptions,
 } from "./mailbox";
 import type { Comms, CommsHost } from "./types";
+import { formatPbsWake, type FormattedWake } from "../wake";
+import type { Clock } from "../clock";
 
 /** Ring bucket used when the host does not know the child (defensive fallback). */
 export const UNKNOWN_RUN_ID = "unknown";
-
-/** Escape `& < > "` in both attribute values and text content. */
-function escapeXml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
 
 /** Fire-and-forget progress notification shown to the parent agent. */
 export function formatSupervisorUpdate(
   from: { childId: string; name: string },
   message: string,
-): string {
-  return [
-    `<supervisor-update from="${escapeXml(from.childId)}" name="${escapeXml(from.name)}">`,
-    escapeXml(message),
-    "</supervisor-update>",
-  ].join("\n");
+): FormattedWake {
+  return formatPbsWake({
+    kind: "supervisor-update",
+    from: from.childId,
+    name: from.name,
+    message,
+  });
 }
 
-/** Blocking decision request; tells the parent agent exactly how to answer. */
+/** Blocking decision request; the reply recipe is a <reply-with> child, not message text. */
 export function formatSupervisorRequest(
   from: { childId: string; name: string },
   message: string,
-): string {
-  return [
-    `<supervisor-request from="${escapeXml(from.childId)}" name="${escapeXml(from.name)}">`,
-    escapeXml(message),
-    "",
-    "This subagent is blocked waiting for your decision. Reply with the agent_message tool:",
-    `{ action: "reply", to: "${escapeXml(from.childId)}", message: "<your decision>" }`,
-    "</supervisor-request>",
-  ].join("\n");
+): FormattedWake {
+  return formatPbsWake({
+    kind: "supervisor-request",
+    from: from.childId,
+    name: from.name,
+    message,
+  });
 }
 
 /**
@@ -72,7 +64,8 @@ export interface CommsOptions {
   /** Pre-built mailbox (tests); otherwise one is created from the options below. */
   mailbox?: Mailbox;
   decisionTimeoutMs?: MailboxOptions["decisionTimeoutMs"];
-  clock?: MailboxClock;
+  clock?: Clock;
+  logEvent?: (type: string, fields?: Record<string, unknown>) => void;
 }
 
 export function createComms(host: CommsHost, options: CommsOptions = {}): CommsWithOrigin {
@@ -104,10 +97,20 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
       // need_decision: register the per-child waiter BEFORE notifying, so a
       // supervisor that replies synchronously still resolves correctly.
       const wait = mailbox.beginDecision(fromChildId, name, message);
+      options.logEvent?.("decision.request", { child_id: fromChildId });
+      const stall = child?.handle as { pauseStall?: () => void; resumeStall?: () => void } | undefined;
+      stall?.pauseStall?.();
       host.notifySupervisor(formatSupervisorRequest({ childId: fromChildId, name }, message));
-      const replyText = await wait;
-      entry.reply = replyText;
-      return replyText;
+      try {
+        const replyText = await wait;
+        if (replyText === DECISION_TIMEOUT_MESSAGE) {
+          options.logEvent?.("decision.timeout", { child_id: fromChildId });
+        }
+        entry.reply = replyText;
+        return replyText;
+      } finally {
+        stall?.resumeStall?.();
+      }
     },
 
     reply(toChildId, message, from = "supervisor") {
@@ -122,6 +125,7 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
         );
       }
       mailbox.append(runIdOf(toChildId), { from, to: toChildId, kind: "reply", message });
+      options.logEvent?.("decision.reply", { child_id: toChildId });
     },
 
     async send(toChildId, message, delivery, from = "supervisor") {
@@ -142,8 +146,13 @@ export function createComms(host: CommsHost, options: CommsOptions = {}): CommsW
         child.status === "failed" ||
         child.status === "interrupted"
       ) {
-        // §4.7: messaging a finished child resumes it (fire-and-resume).
-        await child.handle.resume(message);
+        // Lifecycle (resume) belongs to the subagent tool. Resuming here never
+        // wired a completion wake, so the parent hung.
+        throw new Error(
+          `Child ${toChildId} (${child.name}) has finished (${child.status}). ` +
+            `agent_message does not resume children. ` +
+            `Use subagent({ action: "resume", run_id: "${child.runId}", child_id: "${toChildId}", message: "..." }).`,
+        );
       } else {
         throw new Error(
           `Child ${toChildId} (${child.name}) is ${child.status}; ` +

@@ -4,6 +4,10 @@
  * These functions are the shared contract between implementation and tests.
  * Signatures must match Appendix A exactly.
  */
+import { formatPbsWake, shellWakeTitle, type FormattedWake, type WakeItem } from "./wake";
+
+export { PBS_WAKE_LEAD_IN } from "./wake";
+export type { FormattedWake, WakeItem } from "./wake";
 
 export interface TruncationInfo {
   truncated: boolean;
@@ -68,24 +72,13 @@ export interface TaskExitInfo {
   outputPath: string;
   /** Pre-truncated by the caller to 4000 chars. */
   preview: string;
-}
-
-function escapeXml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function escapeXmlAttr(text: string): string {
-  return escapeXml(text).replace(/"/g, "&quot;");
+  /** Signal name from the manager, when the exit was a signal. */
+  signal?: string;
 }
 
 /** Shorten a command for one-line display inside notifications. */
-function displayCommand(command: string, maxChars = 80): string {
-  const oneLine = command.replace(/\s+/g, " ").trim();
-  if (oneLine.length <= maxChars) return oneLine;
-  return `${oneLine.slice(0, maxChars - 1)}…`;
+function displayCommand(command: string): string {
+  return shellWakeTitle(command);
 }
 
 function statusPhrase(info: TaskExitInfo): string {
@@ -98,38 +91,48 @@ function statusPhrase(info: TaskExitInfo): string {
     case "killed":
       return "was killed";
     case "orphaned":
-      return "was orphaned (manager restarted)";
+      return "ended when pbs-manager crashed";
   }
 }
 
-/** Lead-in so the model treats the injection as a wake to act on (Claude Code pattern). */
-const TASK_NOTIFICATION_WAKE =
-  "Background task update (system wake — not a new user message). " +
-  "Handle each task-notification block below before anything else: read status and preview, " +
-  "use task_output only if you need more than the preview, then continue the work that " +
-  "depended on this command. Do not wait for further user input when the next step is clear.";
+const TASK_COMMAND_CHARS = 2000;
 
-function formatOneTaskNotification(info: TaskExitInfo): string {
-  const summary = `Background command "${displayCommand(info.command)}" ${statusPhrase(info)}`;
-  return [
-    "<task-notification>",
-    `  <task-id>${escapeXml(info.taskId)}</task-id><kind>${escapeXml(info.kind)}</kind>`,
-    `  <status>${info.status}</status>`,
-    `  <summary>${escapeXml(summary)}</summary>`,
-    `  <output-file>${escapeXml(info.outputPath)}</output-file>`,
-    `  <preview>${escapeXml(info.preview)}</preview>`,
-    `  <duration-ms>${Math.round(info.durationMs)}</duration-ms>`,
-    "</task-notification>",
-  ].join("\n");
+function capCommand(command: string): string {
+  return command.length > TASK_COMMAND_CHARS ? `${command.slice(0, TASK_COMMAND_CHARS)}…` : command;
+}
+
+function taskSummary(info: TaskExitInfo): string {
+  return `Background command "${displayCommand(info.command)}" ${statusPhrase(info)}`;
 }
 
 /**
- * Format one or more task exit events as a single notification payload.
- * Multiple events are merged into a list of <task-notification> blocks (§4.5).
- * Prefixed with a wake instruction so idle→triggerTurn turns continue work.
+ * One <pbs-wake kind="task"> for a batch of exits (§4.5).
+ * `leadIn` is the ablation seam: "" leaves a parseable envelope.
  */
-export function formatTaskNotification(events: TaskExitInfo[]): string {
-  return [TASK_NOTIFICATION_WAKE, ...events.map(formatOneTaskNotification)].join("\n\n");
+export function formatTaskNotification(
+  events: TaskExitInfo[],
+  stillRunning: WakeItem[] = [],
+  leadIn?: string,
+): FormattedWake {
+  return formatPbsWake(
+    {
+      kind: "task",
+      stillRunning,
+      tasks: events.map((info) => ({
+        id: info.taskId,
+        taskKind: info.kind,
+        status: info.status,
+        summary: taskSummary(info),
+        command: capCommand(info.command),
+        outputPath: info.outputPath,
+        preview: info.preview,
+        durationMs: info.durationMs,
+        exitCode: info.exitCode,
+        ...(info.signal ? { signal: info.signal } : {}),
+      })),
+    },
+    leadIn,
+  );
 }
 
 /** Tool-result text returned when a foreground command is moved to the background (§4.2). */
@@ -138,27 +141,48 @@ export function formatBackgroundNotice(
   command: string,
   outputPath: string,
 ): string {
+  // Model-facing. The transcript row is drawn by the bash tool's renderResult.
   return [
     `Command "${displayCommand(command)}" moved to background (task_id: ${taskId}). Output: ${outputPath}.`,
-    "You will be notified when it completes. Do not poll or sleep — end your turn and continue from the <task-notification> when it arrives.",
+    'You will be notified when it completes, even if other commands are still running. Do not poll or sleep — end your turn and continue from the <pbs-wake kind="task"> when it arrives.',
   ].join("\n");
 }
 
-/** Injected payload for a batch of monitor output lines (§4.4). */
+/** Transcript row for a backgrounded command (UI only; never sent to the model). */
+export function backgroundRowText(
+  taskId: string,
+  item: { status: string; exitCode?: number | null; startedAt: number; endedAt?: number } | undefined,
+  now: number,
+): { glyph: string; color: string; text: string } {
+  if (!item || item.status === "running" || item.status === "pending") {
+    return { glyph: "⏵", color: "accent", text: `${taskId} running in background · /tasks` };
+  }
+  const secs = ((item.endedAt ?? now) - item.startedAt) / 1000;
+  const dur = secs < 60 ? `${secs.toFixed(1)}s` : `${Math.floor(secs / 60)}m${Math.round(secs % 60)}s`;
+  const exit = item.exitCode === null || item.exitCode === undefined ? "" : ` · exit ${item.exitCode}`;
+  const ok = item.status === "completed" && (item.exitCode === 0 || item.exitCode === null || item.exitCode === undefined);
+  return ok
+    ? { glyph: "✓", color: "success", text: `${taskId} finished${exit} · ${dur}` }
+    : { glyph: "✗", color: "error", text: `${taskId} ${item.status}${exit} · ${dur} · /tasks` };
+}
+
+/** Injected payload for a batch of monitor output lines (§4.4 / §4.5). */
 export function formatMonitorEvent(
   description: string,
   taskId: string,
   batchText: string,
-): string {
-  // Claude Code shape: human lead-in + <event> body, wrapped in our
-  // contractual <monitor-event> envelope so the model and the TUI pill agree.
-  // Lead-in mirrors "If you were woken by a <task-notification>, handle the event…"
-  return (
-    `<monitor-event description="${escapeXmlAttr(description)}" task_id="${escapeXmlAttr(taskId)}">\n` +
-    `Monitor event (system wake — not a new user message): "${description}". Handle <event> before other work.\n` +
-    `<event>\n${batchText}\n</event>\n` +
-    `</monitor-event>`
-  );
+  status?: string,
+  extras: { eventCount?: number; droppedLines?: number } = {},
+): FormattedWake {
+  return formatPbsWake({
+    kind: "monitor",
+    id: taskId,
+    description,
+    ...(status ? { status } : {}),
+    event: batchText,
+    ...(extras.eventCount !== undefined ? { eventCount: extras.eventCount } : {}),
+    ...(extras.droppedLines !== undefined ? { droppedLines: extras.droppedLines } : {}),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -166,10 +190,13 @@ export function formatMonitorEvent(
 // ---------------------------------------------------------------------------
 
 export interface SubagentChildInfo {
+  childId: string;
   name: string;
   status: "pending" | "running" | "completed" | "failed" | "interrupted";
   text: string;
   error?: string;
+  /** Task prompt that was sent to this child. */
+  prompt?: string;
 }
 
 export interface SubagentNotificationInfo {
@@ -182,32 +209,68 @@ export interface SubagentNotificationInfo {
 /** Per-child result text is capped to its tail inside notifications (§4.6). */
 const SUBAGENT_NOTIFICATION_CHILD_CHARS = 2000;
 
-/**
- * Format a finished subagent run as a <subagent-notification> payload.
- * Each child contributes `## name (status)` plus the tail of its result text.
- */
-export function formatSubagentNotification(info: SubagentNotificationInfo): string {
+function capTail(text: string): string {
+  return text.length > SUBAGENT_NOTIFICATION_CHILD_CHARS
+    ? text.slice(-SUBAGENT_NOTIFICATION_CHILD_CHARS)
+    : text;
+}
+
+/** Keep the start of a task prompt; the assignment is at the beginning. */
+function capPrompt(text: string): string {
+  return text.length > SUBAGENT_NOTIFICATION_CHILD_CHARS
+    ? `${text.slice(0, SUBAGENT_NOTIFICATION_CHILD_CHARS)}…`
+    : text;
+}
+
+export interface SubagentHandoverInfo {
+  runId: string;
+  childId: string;
+  name: string;
+  status: "completed" | "failed" | "interrupted";
+  prompt: string;
+  text: string;
+  error?: string;
+  /** Children that are still pending or running. Title is the agent name. */
+  stillRunning: WakeItem[];
+}
+
+/** Finished run: one <child> per child inside <pbs-wake kind="subagent-done">. */
+export function formatSubagentNotification(info: SubagentNotificationInfo): FormattedWake {
   const completed = info.children.filter((c) => c.status === "completed").length;
   const summary = `${completed}/${info.children.length} subagents completed in ${Math.round(info.durationMs)}ms`;
-  const results = info.children
-    .map((child) => {
-      const tail =
-        child.text.length > SUBAGENT_NOTIFICATION_CHILD_CHARS
-          ? child.text.slice(-SUBAGENT_NOTIFICATION_CHILD_CHARS)
-          : child.text;
-      const errorLine = child.error ? `Error: ${child.error}\n` : "";
-      return `## ${child.name} (${child.status})\n${errorLine}${tail}`;
-    })
-    .join("\n\n");
-  return [
-    "Subagent run finished (system wake — not a new user message). " +
-      "Read <results>, synthesize findings, and continue your plan " +
-      "(or use agent_message to follow up with a child). Do not merely acknowledge.",
-    "<subagent-notification>",
-    `  <run-id>${escapeXml(info.runId)}</run-id>`,
-    `  <status>${info.status}</status>`,
-    `  <summary>${escapeXml(summary)}</summary>`,
-    `  <results>\n${escapeXml(results)}\n  </results>`,
-    "</subagent-notification>",
-  ].join("\n");
+  return formatPbsWake({
+    kind: "subagent-done",
+    runId: info.runId,
+    status: info.status,
+    durationMs: info.durationMs,
+    summary,
+    children: info.children.map((child) => ({
+      childId: child.childId,
+      name: child.name,
+      status: child.status,
+      prompt: capPrompt(child.prompt ?? ""),
+      result: capTail(child.text),
+      ...(child.error ? { error: child.error } : {}),
+    })),
+  });
+}
+
+/**
+ * One child finished while others in the same run are still going.
+ * The parent must see the original prompt and the result, then keep working.
+ */
+export function formatSubagentHandover(info: SubagentHandoverInfo): FormattedWake {
+  const summary = `${info.name} ${info.status}; ${info.stillRunning.length} still running`;
+  return formatPbsWake({
+    kind: "subagent-handover",
+    runId: info.runId,
+    childId: info.childId,
+    name: info.name,
+    status: info.status,
+    stillRunning: info.stillRunning,
+    summary,
+    prompt: capPrompt(info.prompt),
+    result: capTail(info.text),
+    ...(info.error ? { error: info.error } : {}),
+  });
 }

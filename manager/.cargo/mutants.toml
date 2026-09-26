@@ -1,0 +1,5 @@
+# cargo-mutants runs the whole suite once per mutant. With the manual clock
+# the lifecycle tests step the 5s idle / 2s kill graces instead of waiting
+# for them (see TESTING.md "Time in tests"); the real-time canaries in
+# tests/timing_canary.rs still pin the actual values.
+features = ["test-clock"]

@@ -11,21 +11,23 @@
  * allowlist plus injected custom tools (child bash, M4 comms), and wraps it
  * into a ChildSessionAdapter.
  *
- * Child sessions never bind extensions (createAgentSession only returns
- * extensionsResult; binding is a separate explicit step we skip), so the
- * subagent tool itself is never present in a child session — the depth-1 cap
- * holds by construction.
+ * Child sessions receive an isolated DefaultResourceLoader with extensions
+ * disabled; createAgentSession binds whatever the loader returns. Thus the
+ * subagent tool is never present in a child session — the depth-1 cap holds
+ * by construction.
  */
 import type {
   ExtensionContext,
   ModelRegistry,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { CHILD_BEHAVIOR_GUIDELINES } from "../behavior-guidelines";
 import {
   modelResolutionError,
   resolveModelSpec,
   type ModelCandidate,
 } from "./model-spec";
+import { turnsFromMessages } from "./conversation";
 import type { ChildRunRequest, ChildSessionAdapter, CreateSessionFn } from "./types";
 
 /** Structural subset of the pi module namespace we rely on. */
@@ -38,6 +40,12 @@ type Model = NonNullable<ExtensionContext["model"]>;
 export interface PiRuntimeDeps {
   /** Parent session model registry (ctx.modelRegistry). */
   getModelRegistry: () => ModelRegistry | null;
+  /**
+   * Parent ModelRuntime, including providers registered by other extensions.
+   * createAgentSession without this builds a fresh runtime and fails those
+   * providers with "No API key found".
+   */
+  getModelRuntime?: () => unknown;
   /** Parent session current model (ctx.model) — default for children. */
   getParentModel: () => Model | undefined;
   /** Parent session thinking level (ctx.thinkingLevel). */
@@ -146,17 +154,101 @@ function resolveModel(deps: PiRuntimeDeps, req: ChildRunRequest): ResolvedModel 
 }
 
 /** Wrap a real AgentSession into the pi-free ChildSessionAdapter. */
-function wrapSession(session: PiAgentSession): ChildSessionAdapter {
+function wrapSession(
+  session: PiAgentSession,
+  extras: { warning?: string; resolvedModel?: string } = {},
+): ChildSessionAdapter {
   return {
+    ...(extras.warning !== undefined ? { warning: extras.warning } : {}),
+    ...(extras.resolvedModel !== undefined ? { resolvedModel: extras.resolvedModel } : {}),
     prompt: (text) => session.prompt(text),
     steer: (text) => session.steer(text),
     followUp: (text) => session.followUp(text),
     abort: () => session.abort(),
     waitForIdle: () => session.waitForIdle(),
     getLastAssistantText: () => session.getLastAssistantText(),
+    getLastAssistantFailure: () => {
+      const lastAssistant = [...session.messages].reverse().find((message) => message.role === "assistant") as
+        | { stopReason?: string; errorMessage?: string }
+        | undefined;
+      if (lastAssistant?.stopReason !== "error" && lastAssistant?.stopReason !== "aborted") return undefined;
+      return {
+        stopReason: lastAssistant.stopReason,
+        ...(lastAssistant.errorMessage ? { errorMessage: lastAssistant.errorMessage } : {}),
+      };
+    },
+    getConversation: () => turnsFromMessages(session.messages),
+    getActiveToolNames: () => session.getActiveToolNames(),
+    getSystemPrompt: () => session.systemPrompt,
     isStreaming: () => session.isStreaming,
     subscribe: (listener) => session.subscribe((event) => listener({ type: event.type })),
     dispose: () => session.dispose(),
+  };
+}
+
+/** Options passed to createAgentSession. Tested without loading pi. */
+export function childResourceLoaderOptions(input: { cwd: string; agentDir: string }): {
+  cwd: string;
+  agentDir: string;
+  noExtensions: true;
+  noSkills: true;
+  noPromptTemplates: true;
+  noThemes: true;
+  noContextFiles: true;
+} {
+  return {
+    cwd: input.cwd,
+    agentDir: input.agentDir,
+    noExtensions: true,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+  };
+}
+
+export function childSessionCreateOptions(input: {
+  cwd: string;
+  model: unknown;
+  thinkingLevel: unknown;
+  tools?: string[];
+  customTools?: unknown[];
+  modelRuntime?: unknown;
+  resourceLoader?: unknown;
+}): {
+  cwd: string;
+  model: unknown;
+  thinkingLevel: unknown;
+  tools?: string[];
+  customTools?: unknown[];
+  modelRuntime?: unknown;
+  resourceLoader?: unknown;
+} {
+  const tools = input.tools && input.tools.length > 0 ? [...input.tools] : undefined;
+  const customTools = input.customTools?.map((customTool) => {
+    const tool = customTool as { name?: unknown; promptGuidelines?: string[] };
+    if (tool.name === "contact_supervisor") {
+      return {
+        ...tool,
+        promptGuidelines: [...(tool.promptGuidelines ?? []), CHILD_BEHAVIOR_GUIDELINES],
+      };
+    }
+    return customTool;
+  });
+  if (tools && customTools) {
+    for (const customTool of customTools) {
+      const name = (customTool as { name?: unknown }).name;
+      if (typeof name === "string" && !tools.includes(name)) tools.push(name);
+    }
+  }
+  return {
+    cwd: input.cwd,
+    model: input.model,
+    thinkingLevel: input.thinkingLevel,
+    ...(tools ? { tools } : {}),
+    ...(customTools && customTools.length > 0 ? { customTools } : {}),
+    ...(input.modelRuntime ? { modelRuntime: input.modelRuntime } : {}),
+    ...(input.resourceLoader ? { resourceLoader: input.resourceLoader } : {}),
   };
 }
 
@@ -172,19 +264,32 @@ export function createPiSessionFn(deps: PiRuntimeDeps): CreateSessionFn {
       (resolved.thinkingOverride as ExtensionContext["thinkingLevel"]) ??
       req.agent.thinking ??
       deps.getParentThinkingLevel();
+    const cwd = deps.getCwd();
+    const resourceLoader = new pi.DefaultResourceLoader(
+      childResourceLoaderOptions({ cwd, agentDir: pi.getAgentDir() }),
+    );
+    await resourceLoader.reload();
     const customTools = deps.customTools?.(req) ?? [];
-    const { session } = await pi.createAgentSession({
-      cwd: deps.getCwd(),
+    const modelRuntime = deps.getModelRuntime?.();
+    const options = childSessionCreateOptions({
+      cwd,
       model: resolved.model,
       thinkingLevel,
       tools: req.agent.tools.length > 0 ? [...req.agent.tools] : undefined,
       customTools: customTools.length > 0 ? customTools : undefined,
-      sessionManager: pi.SessionManager.inMemory(deps.getCwd()),
+      modelRuntime,
+      resourceLoader,
     });
-    const adapter = wrapSession(session);
-    if (resolved.warning) {
-      (adapter as { warning?: string }).warning = resolved.warning;
-    }
-    return adapter;
+    const { session } = await pi.createAgentSession({
+      ...options,
+      sessionManager: pi.SessionManager.inMemory(cwd),
+    } as never);
+    const resolvedModel = resolved.model
+      ? `${resolved.model.provider}/${resolved.model.id}`
+      : undefined;
+    return wrapSession(session, {
+      ...(resolved.warning !== undefined ? { warning: resolved.warning } : {}),
+      ...(resolvedModel !== undefined ? { resolvedModel } : {}),
+    });
   };
 }

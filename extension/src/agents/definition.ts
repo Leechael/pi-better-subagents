@@ -7,7 +7,7 @@
  *   ---
  *   name: explorer
  *   description: Fast codebase exploration
- *   tools: [read, bash, grep, find, ls]
+ *   tools: [read, bash, grep, find, ls]   # or: read, bash, grep, find, ls
  *   model: anthropic:claude-haiku-4-5
  *   thinking: high
  *   ---
@@ -88,10 +88,16 @@ function parseScalar(raw: string, field: string, fail: Fail): string {
 
 function parseStringArray(raw: string, field: string, fail: Fail): string[] {
   const value = stripInlineComment(raw).trim();
-  if (!value.startsWith("[") || !value.endsWith("]")) {
-    fail(`field '${field}' must use array syntax: [a, b, c]`);
+  // Accept both YAML flow arrays `[a, b, c]` and bare comma lists `a, b, c`
+  // (single item `a` included). Half-open brackets are still errors.
+  let inner: string;
+  if (value.startsWith("[") && value.endsWith("]")) {
+    inner = value.slice(1, -1).trim();
+  } else if (value.startsWith("[") || value.endsWith("]")) {
+    fail(`field '${field}' must use array syntax [a, b, c] or a comma list a, b, c`);
+  } else {
+    inner = value;
   }
-  const inner = value.slice(1, -1).trim();
   if (inner === "") return [];
   return inner.split(",").map((item) => {
     const scalar = unquote(item.trim());

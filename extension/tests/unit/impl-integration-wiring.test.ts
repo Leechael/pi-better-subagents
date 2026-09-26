@@ -12,7 +12,6 @@ import { createAgentLoader } from "../../src/agents/loader";
 import { createComms } from "../../src/comms/comms";
 import {
   createRegistryCommsHost,
-  SUPERVISOR_NOTIFICATION_CUSTOM_TYPE,
 } from "../../src/comms/registry-host";
 import { createAgentMessageTool, createContactSupervisorTool } from "../../src/comms/tools";
 import { SubagentRegistry } from "../../src/subagent/registry";
@@ -29,12 +28,12 @@ function makeStack() {
     acquire: (req) => registry.admitChild(req.childId),
   });
   registry.setRunner(runner);
-  const notifications: { customType: string; content: string }[] = [];
+  const notifications: { customType: string; content: string; details?: unknown }[] = [];
   const host = createRegistryCommsHost({
     getRegistry: () => registry,
     getNotifyCenter: () => ({
       notify: (msg) => {
-        notifications.push({ customType: msg.customType, content: msg.content });
+        notifications.push({ customType: msg.customType, content: msg.content, details: msg.details });
       },
     }),
   });
@@ -75,15 +74,22 @@ describe("registry-host adapter over a real registry", () => {
 
   it("notifySupervisor reaches the NotifyCenter sink with the comms customType", () => {
     const { host, notifications } = makeStack();
-    host.notifySupervisor("<supervisor-update>hi</supervisor-update>");
+    host.notifySupervisor({
+      content: "<pbs-wake kind=\"supervisor-update\">hi</pbs-wake>",
+      details: { kind: "supervisor-update", from: "ch_a", name: "alpha", message: "hi" },
+    });
     expect(notifications).toEqual([
-      { customType: SUPERVISOR_NOTIFICATION_CUSTOM_TYPE, content: "<supervisor-update>hi</supervisor-update>" },
+      {
+        customType: "pbs-wake",
+        content: "<pbs-wake kind=\"supervisor-update\">hi</pbs-wake>",
+        details: { kind: "supervisor-update", from: "ch_a", name: "alpha", message: "hi" },
+      },
     ]);
   });
 });
 
 describe("comms tools over the real registry", () => {
-  it("parent send steers a running child; send to a terminal child resumes it", async () => {
+  it("parent send steers a running child; send to a terminal child does not resume it", async () => {
     const { registry, factory, comms, host } = makeStack();
     factory.autoComplete = null;
     const run = registry.createRun("tasks");
@@ -102,8 +108,8 @@ describe("comms tools over the real registry", () => {
     const r2 = (await execTool(tool, { action: "send", to: "alpha", message: "now docs" })) as {
       details: { ok: boolean };
     };
-    expect(r2.details.ok).toBe(true);
-    expect(factory.sessions[0].prompts).toEqual(["do alpha", "now docs"]);
+    expect(r2.details.ok).toBe(false);
+    expect(factory.sessions[0].prompts).toEqual(["do alpha"]);
   });
 
   it("need_decision blocks the child until the parent replies via the tool", async () => {

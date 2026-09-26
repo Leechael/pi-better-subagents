@@ -25,7 +25,10 @@ export class FakeChildSession implements ChildSessionAdapter {
   aborts = 0;
   disposed = false;
   lastText: string | undefined;
+  lastAssistantFailure: { stopReason: "error" | "aborted"; errorMessage?: string } | undefined;
   streaming = false;
+  /** When set, runner prepends "You are running as model …" on first prompt. */
+  resolvedModel?: string;
   /** When non-null, prompt() completes immediately with this text. */
   autoComplete: string | null = null;
   /** When set, prompt() rejects with this error. */
@@ -86,6 +89,16 @@ export class FakeChildSession implements ChildSessionAdapter {
 
   getLastAssistantText(): string | undefined {
     return this.lastText;
+  }
+
+  getLastAssistantFailure() {
+    return this.lastAssistantFailure;
+  }
+
+  getConversation() {
+    const turns = this.prompts.map((text) => ({ role: "user", text }));
+    if (this.lastText !== undefined) turns.push({ role: "assistant", text: this.lastText });
+    return turns;
   }
 
   isStreaming(): boolean {

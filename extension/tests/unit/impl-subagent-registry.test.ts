@@ -1,17 +1,21 @@
 import { describe, expect, it } from "vitest";
+import { ManualClock } from "../../src/clock";
 import { SubagentRegistry, type RunRecord } from "../../src/subagent/registry";
 import { InProcessRunner } from "../../src/subagent/runner";
 import type { ChildRunRequest } from "../../src/subagent/types";
 import { SessionFactory, tick, WORKER_AGENT } from "./subagent-fakes";
 
 function makeStack(opts: { maxConcurrentChildren?: number; spawnBudgetPerHour?: number } = {}) {
+  const clock = new ManualClock();
   const registry = new SubagentRegistry({
     maxConcurrentChildren: opts.maxConcurrentChildren ?? 8,
     spawnBudgetPerHour: opts.spawnBudgetPerHour ?? 32,
+    clock,
   });
   const factory = new SessionFactory();
   const runner = new InProcessRunner({
     createSession: factory.fn,
+    clock,
     acquire: (req) => registry.admitChild(req.childId),
   });
   registry.setRunner(runner);
@@ -51,8 +55,12 @@ describe("SubagentRegistry", () => {
     });
     const run = registry.createRun("tasks");
     const req = addReq(registry, run.runId, "a");
+    req.agent = { ...WORKER_AGENT, systemPrompt: "agent preamble" };
+    req.prompt = "agent preamble\n\n---\n\ndo a";
+    req.taskPrompt = "do a";
     const handle = await registry.startChild(req);
     expect(handle.status()).toBe("running");
+    expect(factory.sessions[0].prompts).toEqual(["agent preamble\n\n---\n\ndo a"]);
     factory.sessions[0].complete("done");
     await handle.result;
     await tick();
@@ -61,6 +69,8 @@ describe("SubagentRegistry", () => {
     expect(record.status).toBe("completed");
     expect(record.children[0].status).toBe("completed");
     expect(record.children[0].result?.text).toBe("done");
+    expect(record.children[0].prompt).toBe("do a");
+    expect(record.children[0].preamble).toBe("agent preamble");
     expect(record.children[0].endedAt).toBeTypeOf("number");
     // Transitions observed: run creation, addChild, running, completed.
     expect(seen.some((s) => s.children === "pending")).toBe(true);
@@ -221,6 +231,20 @@ describe("SubagentRegistry", () => {
     expect(factory.sessions[0].disposed).toBe(true);
     const result = await handle.result;
     expect(result.status).toBe("interrupted");
+  });
+
+  it("emits interrupted before disposeRun drops the children", async () => {
+    const { registry, factory } = makeStack();
+    factory.autoComplete = null;
+    const seen: string[] = [];
+    registry.onTransition((run) => {
+      seen.push(run.children.map((c) => c.status).join(","));
+    });
+    const run = registry.createRun("tasks");
+    const req = addReq(registry, run.runId, "a");
+    await registry.startChild(req);
+    registry.disposeRun(run.runId);
+    expect(seen.at(-1)).toBe("interrupted");
   });
 
   it("disposeAll disposes every run", async () => {

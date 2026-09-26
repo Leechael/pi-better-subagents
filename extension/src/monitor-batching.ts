@@ -7,12 +7,14 @@
  *
  * RateLimiter is a token bucket used to throttle monitor event injection.
  */
+import { realClock, type Clock, type ClockTimer } from "./clock";
 
 export interface LineBatcherOptions {
   flushMs?: number; // batching window, default 200
   maxLineChars?: number; // per-line cap, default 500
   maxBatchChars?: number; // per-batch cap, default 3000
   onFlush: (text: string) => void;
+  clock?: Clock;
 }
 
 export class LineBatcher {
@@ -20,10 +22,11 @@ export class LineBatcher {
   private readonly maxLineChars: number;
   private readonly maxBatchChars: number;
   private readonly onFlush: (text: string) => void;
+  private readonly clock: Clock;
 
   private partial = ""; // trailing bytes not yet terminated by \n
   private lines: string[] = []; // complete lines awaiting emission
-  private timer: NodeJS.Timeout | null = null;
+  private timer: ClockTimer | null = null;
   private disposed = false;
 
   constructor(opts: LineBatcherOptions) {
@@ -31,6 +34,7 @@ export class LineBatcher {
     this.maxLineChars = opts.maxLineChars ?? 500;
     this.maxBatchChars = opts.maxBatchChars ?? 3000;
     this.onFlush = opts.onFlush;
+    this.clock = opts.clock ?? realClock;
   }
 
   /** Feed a raw output chunk (may contain no/newlines or multiple lines). */
@@ -70,18 +74,18 @@ export class LineBatcher {
 
   private schedule(): void {
     if (this.timer !== null) return;
-    this.timer = setTimeout(() => {
+    this.timer = this.clock.setTimeout(() => {
       this.timer = null;
       // Window end drains everything, including an unterminated trailing
       // line (no data loss); a fresh window starts on the next push.
       this.emit();
     }, this.flushMs);
-    this.timer.unref?.();
+    this.clock.unref?.(this.timer);
   }
 
   private clearTimer(): void {
     if (this.timer !== null) {
-      clearTimeout(this.timer);
+      this.clock.clearTimeout(this.timer);
       this.timer = null;
     }
   }
@@ -102,28 +106,74 @@ export class LineBatcher {
   }
 }
 
+export interface SaturationWindowOptions {
+  windowMs: number;
+  dropRatio: number;
+  minimumBatches: number;
+}
+
+/** Tracks whether a rolling window has a sustained ratio of dropped batches. */
+export class SaturationWindow {
+  private readonly windowMs: number;
+  private readonly dropRatio: number;
+  private readonly minimumBatches: number;
+  private samples: { at: number; dropped: boolean }[] = [];
+
+  constructor(opts: SaturationWindowOptions) {
+    this.windowMs = opts.windowMs;
+    this.dropRatio = opts.dropRatio;
+    this.minimumBatches = opts.minimumBatches;
+  }
+
+  record(dropped: boolean, at: number): void {
+    this.prune(at);
+    this.samples.push({ at, dropped });
+  }
+
+  isSaturated(now: number): boolean {
+    this.prune(now);
+    if (this.samples.length < this.minimumBatches) return false;
+    const first = this.samples[0];
+    // Require the retained samples to span a full window; sparse bursts alone
+    // should not be treated as sustained saturation.
+    if (!first || now - first.at < this.windowMs) return false;
+    const dropped = this.samples.reduce((count, sample) => count + Number(sample.dropped), 0);
+    return dropped / this.samples.length >= this.dropRatio;
+  }
+
+  private prune(now: number): void {
+    const cutoff = now - this.windowMs;
+    let firstLive = 0;
+    while (firstLive < this.samples.length && this.samples[firstLive].at < cutoff) firstLive++;
+    if (firstLive > 0) this.samples = this.samples.slice(firstLive);
+  }
+}
+
 export interface RateLimiterOptions {
   capacity?: number; // default 10
   refillIntervalMs?: number; // default 2000
   refillAmount?: number; // default 1
+  clock?: Clock;
 }
 
 export class RateLimiter {
   private readonly capacity: number;
   private readonly refillAmount: number;
   private tokens: number;
-  private readonly interval: NodeJS.Timeout;
+  private readonly interval: ClockTimer;
+  private readonly clock: Clock;
   private disposed = false;
 
   constructor(opts?: RateLimiterOptions) {
     this.capacity = opts?.capacity ?? 10;
     this.refillAmount = opts?.refillAmount ?? 1;
     const refillIntervalMs = opts?.refillIntervalMs ?? 2000;
+    this.clock = opts?.clock ?? realClock;
     this.tokens = this.capacity;
-    this.interval = setInterval(() => {
+    this.interval = this.clock.setInterval(() => {
       this.tokens = Math.min(this.capacity, this.tokens + this.refillAmount);
     }, refillIntervalMs);
-    this.interval.unref?.();
+    this.clock.unref?.(this.interval);
   }
 
   /** Consume `n` tokens (default 1); returns false when insufficient. */
@@ -136,6 +186,6 @@ export class RateLimiter {
 
   dispose(): void {
     this.disposed = true;
-    clearInterval(this.interval);
+    this.clock.clearInterval(this.interval);
   }
 }
