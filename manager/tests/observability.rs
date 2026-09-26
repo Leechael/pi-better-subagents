@@ -1001,13 +1001,27 @@ fn g15b_finished_task_survives_a_failed_delete_for_retry() {
     c.wait_terminal(&done, S(3)).unwrap();
 
     let tasks_dir = home.path.join("sessions/sess-g4b/tasks");
+    // Restores the dir to writable even if an assertion below panics, so a
+    // failed run doesn't leave an unwritable dir behind for the Home's own
+    // cleanup (or a later test) to choke on.
+    struct RestorePerms(PathBuf);
+    impl Drop for RestorePerms {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
     std::fs::set_permissions(&tasks_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let _restore = RestorePerms(tasks_dir.clone());
     home.advance("gc", 1_000);
     std::thread::sleep(MS(300));
-    std::fs::set_permissions(&tasks_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Assert survival *before* the dir goes writable again: once it does,
+    // the background sweep (polling at least once a second) can delete the
+    // record at any moment, racing these checks against the assertion below
+    // that it is still there.
     assert!(tasks_dir.join(format!("{done}.json")).exists(), "record lost before its files could be deleted");
     assert!(home.cli(&["show", &done], S(5)).status.success(), "swept from show while its files still exist");
 
+    std::fs::set_permissions(&tasks_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let swept = poll_true(S(10), || {
         home.advance("gc", 1_000);
         !tasks_dir.join(format!("{done}.json")).exists()
