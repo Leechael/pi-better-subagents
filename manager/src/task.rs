@@ -368,25 +368,35 @@ async fn pump(
     mut park: tokio::sync::watch::Receiver<bool>,
 ) -> Option<OwnedFd> {
     let mut buf = [0u8; READ_CHUNK];
+    let fd = { use std::os::fd::AsRawFd; reader.as_raw_fd() };
+    let t0 = std::time::Instant::now();
+    let mut total = 0usize;
+    eprintln!("[dbg {:?}] pump fd={fd} start", t0.elapsed());
     loop {
         let n = tokio::select! {
             biased;
             // Checked before every read: parking happens only between reads.
-            _ = parked(&mut park) => return reader.into_nonblocking_fd().ok(),
+            _ = parked(&mut park) => {
+                eprintln!("[dbg] pump fd={fd} parked after {total} bytes, {:?}", t0.elapsed());
+                return reader.into_nonblocking_fd().ok();
+            }
             // Cancel-safe: bytes leave the pipe only when this completes.
             r = reader.read(&mut buf) => match r {
-                Ok(0) => return None,
+                Ok(0) => { eprintln!("[dbg] pump fd={fd} EOF after {total}"); return None }
                 Ok(n) => n,
                 // tokio retries EINTR internally, so any error here is terminal.
-                Err(_) => return None,
+                Err(e) => { eprintln!("[dbg] pump fd={fd} read error {e} after {total}"); return None }
             },
         };
+        total += n;
+        eprintln!("[dbg] pump fd={fd} read {n} total {total} at {:?}", t0.elapsed());
         let chunk = buf[..n].to_vec();
         if let Some(f) = mirror.as_mut() {
             let _ = f.write_all(&chunk);
         }
         let next_cursor = out.lock().unwrap().append(&chunk);
         if tx.send(OutputChunk { bytes: chunk, next_cursor }).await.is_err() {
+            eprintln!("[dbg] pump fd={fd} fanout gone after {total}");
             return None;
         }
     }
