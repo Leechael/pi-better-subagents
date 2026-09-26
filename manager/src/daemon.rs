@@ -512,7 +512,20 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
     // ---- hello: must be the first message on the connection (§3.3) ----
     let first = match tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut rd)).await {
         Ok(Ok(Some(bytes))) => bytes,
-        _ => return, // timeout / EOF / io error before hello: never registered
+        // EOF before hello is a readiness probe; not worth a line.
+        Ok(Ok(None)) => return,
+        // Closed without an answer: say why, or a client that did send its
+        // hello only sees the connection drop.
+        Ok(Err(e)) => {
+            let home = state.lock().unwrap().home.clone();
+            lifecycle::log_line(&home, &format!("connection closed before hello: {e}"));
+            return;
+        }
+        Err(_) => {
+            let home = state.lock().unwrap().home.clone();
+            lifecycle::log_line(&home, &format!("connection closed: no hello within {HELLO_TIMEOUT:?}"));
+            return;
+        }
     };
     let hello = match parse_request(&first) {
         Ok(r) => r,
