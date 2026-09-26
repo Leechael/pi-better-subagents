@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -41,7 +41,14 @@ jobs:
           if-no-files-found: ignore
 
   extension:
-    runs-on: ubuntu-latest
+    name: extension (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows only here: the manager (process groups, signals, unix
+        # pipes) is unix-only, so its tests and the e2e cannot build there.
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: extension
@@ -63,7 +70,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     env:
       PBS_MANAGER_PATH: ${{ github.workspace }}/manager/target/release/pbs-manager
