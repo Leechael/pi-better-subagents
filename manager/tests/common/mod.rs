@@ -327,16 +327,26 @@ impl Drop for Home {
 }
 
 /// A failed test's home is otherwise deleted with everything the daemon
-/// said. With `PBS_TEST_ARTIFACTS` set (CI uploads it), copy its logs there.
+/// said. With `PBS_TEST_ARTIFACTS` set (CI uploads it), copy it there:
+/// logs, per-session events and task records; files over 1 MiB (large task
+/// output) and sockets are skipped.
 fn keep_failed_home(home: &Path) {
     let Some(dir) = std::env::var_os("PBS_TEST_ARTIFACTS") else { return };
     let Some(name) = home.file_name() else { return };
-    let dst = Path::new(&dir).join(name);
-    if fs::create_dir_all(&dst).is_err() {
-        return;
-    }
-    for f in ["manager.log", "daemon.stderr", "events.jsonl"] {
-        let _ = fs::copy(home.join(f), dst.join(f));
+    copy_small_files(home, &Path::new(&dir).join(name));
+}
+
+fn copy_small_files(src: &Path, dst: &Path) {
+    let Ok(entries) = fs::read_dir(src) else { return };
+    let _ = fs::create_dir_all(dst);
+    for e in entries.flatten() {
+        let Ok(t) = e.file_type() else { continue };
+        let (from, to) = (e.path(), dst.join(e.file_name()));
+        if t.is_dir() {
+            copy_small_files(&from, &to);
+        } else if t.is_file() && e.metadata().map(|m| m.len() <= 1 << 20).unwrap_or(false) {
+            let _ = fs::copy(&from, &to);
+        }
     }
 }
 
