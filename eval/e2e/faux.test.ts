@@ -23,7 +23,24 @@ function explain(ep: FauxEpisode): string {
     if (i.kind === "toolResult") return `#${i.seq} t=${i.t} toolResult ${i.toolName} ${JSON.stringify(i.text).slice(0, 120)}`;
     return `#${i.seq} t=${i.t} ${i.kind}`;
   });
-  return `${lines.join("\n")}\nfaux calls: ${ep.calls.length}\nstderr: ${ep.stderr.slice(0, 800)}`;
+  return `${lines.join("\n")}\nfaux calls: ${ep.calls.length}\nstderr: ${ep.stderr.slice(0, 800)}${
+    ep.midwayError ? `\nmidwayError: ${ep.midwayError}` : ""
+  }`;
+}
+
+/** Poll until `pid` is gone (ESRCH); false after timeoutMs. */
+async function waitPidGone(pid: number, timeoutMs = 10_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ESRCH") return true;
+      throw err;
+    }
+    if (Date.now() > deadline) return false;
+    await new Promise((res) => setTimeout(res, 100));
+  }
 }
 
 /** Every faux call was scripted: no unexpected LLM requests, no exhaustion. */
@@ -121,15 +138,62 @@ describe("faux e2e", { concurrency: true }, () => {
   });
 
   it("(e2) a manager crash ends a backgrounded command with an orphaned exit wake", async () => {
+    // Keep in sync with scripts/manager-crash.ts (importing it here would pull
+    // faux-dsl.ts -> @earendil-works/pi-ai, which only resolves inside pi).
+    const commandMarker = "crash-start";
     let managerPid = 0;
+    let runnerPid = 0;
     const ep = await runFaux({
       script: "manager-crash.ts",
       pbsConfig: { foregroundBudgetMs: 300 },
       midway: {
         when: (items) => toolResults(items).some((r) => r.toolName === "bash" && r.details?.backgrounded === true),
         act: (sb) => {
-          const st = spawnSync(sb.env.PBS_MANAGER_PATH, ["--home", sb.pbsHome, "status", "--json"], { encoding: "utf8" });
-          managerPid = Number(JSON.parse(st.stdout).pid);
+          // A stalled or failing manager must hang the test at most 3s and
+          // fail with a diagnostic, not a cryptic JSON parse error.
+          const mgr = sb.env.PBS_MANAGER_PATH;
+          const fail = (what: string, detail: string): never => {
+            throw new Error(`midway ${what} failed: ${detail}`);
+          };
+          const st = spawnSync(mgr, ["--home", sb.pbsHome, "status", "--json"], { encoding: "utf8", timeout: 3000 });
+          if (st.error) fail("status", String(st.error));
+          if (st.status !== 0) fail("status", `exit ${st.status}: ${st.stderr.slice(0, 300)}`);
+          if (!st.stdout.trim()) fail("status", "empty stdout");
+          let parsed: { pid?: unknown };
+          try {
+            parsed = JSON.parse(st.stdout) as { pid?: unknown };
+          } catch (err) {
+            throw new Error(`midway status failed: stdout is not JSON: ${(err as Error).message}: ${st.stdout.slice(0, 300)}`);
+          }
+          if (!Number.isInteger(parsed.pid) || (parsed.pid as number) <= 0) {
+            fail("status", `pid is not a positive integer: ${JSON.stringify(parsed.pid)}`);
+          }
+          managerPid = parsed.pid as number;
+
+          // The runner (process-group leader) must actually die for the
+          // lifeline to count as working; capture it before the kill.
+          const ls = spawnSync(mgr, ["--home", sb.pbsHome, "ls", "--json"], { encoding: "utf8", timeout: 3000 });
+          if (ls.error) fail("ls", String(ls.error));
+          if (ls.status !== 0) fail("ls", `exit ${ls.status}: ${ls.stderr.slice(0, 300)}`);
+          if (!ls.stdout.trim()) fail("ls", "empty stdout");
+          let rows: Array<{ kind?: string; title?: string; running?: boolean; pid?: unknown }>;
+          try {
+            rows = JSON.parse(ls.stdout) as typeof rows;
+          } catch (err) {
+            throw new Error(`midway ls failed: stdout is not JSON: ${(err as Error).message}: ${ls.stdout.slice(0, 300)}`);
+          }
+          const row = rows.find(
+            (r) => r.kind === "shell" && r.running === true && typeof r.title === "string" && r.title.includes(commandMarker),
+          );
+          if (!row) {
+            fail("ls", `no running shell task matching ${JSON.stringify(commandMarker)} in: ${ls.stdout.slice(0, 400)}`);
+          }
+          const foundRow = row as { pid?: unknown };
+          if (!Number.isInteger(foundRow.pid) || (foundRow.pid as number) <= 0) {
+            fail("ls", `runner pid is not a positive integer: ${JSON.stringify(foundRow.pid)}`);
+          }
+          runnerPid = foundRow.pid as number;
+
           process.kill(managerPid, "SIGKILL");
         },
       },
@@ -138,7 +202,9 @@ describe("faux e2e", { concurrency: true }, () => {
       quietMs: 1500,
     });
     episodes.push(ep);
+    assert.ok(!ep.midwayError, explain(ep));
     assert.ok(managerPid > 0, explain(ep));
+    assert.ok(runnerPid > 0, `runner pid not captured\n${explain(ep)}`);
     const bash = bashResult(ep.items);
     const taskId = String(bash?.details?.task_id);
     const ws = wakes(ep.items).filter((w) => w.wake.kind === "task");
@@ -147,6 +213,9 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.equal(ws[0].wake.status, "orphaned", explain(ep));
     assert.ok(followedByAssistant(ep.items, ws[0].seq), `the wake did not start a turn\n${explain(ep)}`);
     assert.match((ep.items.at(-1) as { text?: string }).text ?? "", /WOKE orphaned/);
+    // The runner only exits after its process group is empty, so its death
+    // proves the lifeline tore down `sleep 30` (SIGTERM, then SIGKILL).
+    assert.ok(await waitPidGone(runnerPid), `runner pid ${runnerPid} still alive 10s after the manager crash\n${explain(ep)}`);
   });
 
   it("(c2) a monitor that exits at once ends with an exit wake, not a timeout", async () => {

@@ -22,6 +22,8 @@ export interface FauxEpisode {
   stderr: string;
   sandbox: Sandbox;
   pi: PiRpc;
+  /** Set when the midway phase failed; the episode still ran to completion. */
+  midwayError?: string;
 }
 
 export interface FauxRunOptions {
@@ -63,13 +65,22 @@ export async function runFaux(opts: FauxRunOptions): Promise<FauxEpisode> {
     model: "faux/faux-1",
     extensions: [FAUX_EXT, ...(opts.extensions ?? [])],
   });
+  let midwayError: string | undefined;
   try {
     if (opts.warm !== false) await waitManagerReady(sandbox);
     await pi.prompt(opts.prompt ?? "go");
     if (opts.midway) {
       const { when, act } = opts.midway;
-      await pi.waitFor((evs) => when(itemsFromEvents(evs)), 15_000, "midway condition");
-      act(sandbox);
+      try {
+        await pi.waitFor((evs) => when(itemsFromEvents(evs)), 15_000, "midway condition");
+        act(sandbox);
+      } catch (err) {
+        // Fail in-band: a rejection here would leave the caller without an
+        // episode, so its after() hook never cleans up the sandbox (or the
+        // orphaned process group the midway act may have created). Keep
+        // running the until/quiet phases and report via explain().
+        midwayError = err instanceof Error ? (err.stack ?? err.message) : String(err);
+      }
     }
     if (opts.until) {
       const until = opts.until;
@@ -88,5 +99,6 @@ export async function runFaux(opts: FauxRunOptions): Promise<FauxEpisode> {
     stderr: pi.stderr.join(""),
     sandbox,
     pi,
+    midwayError,
   };
 }
