@@ -559,8 +559,10 @@ fn c1_ls_columns_filters_json_and_cjk() {
 }
 
 /// Run the CLI with its stdout on a pseudo-terminal (script(1)), the way a
-/// person runs it, and return what reached the terminal.
-fn cli_on_tty(home: &Home, args: &[&str], env: &[(&str, &str)]) -> String {
+/// person runs it, and return what reached the terminal. None when `script`
+/// isn't runnable here (missing, or no pty available), so a minimal host
+/// skips just the pager test instead of failing to launch it.
+fn cli_on_tty(home: &Home, args: &[&str], env: &[(&str, &str)]) -> Option<String> {
     let mut argv: Vec<String> = vec![BIN.into(), "--home".into(), home.path.to_string_lossy().into_owned()];
     argv.extend(args.iter().map(|a| a.to_string()));
     let mut cmd = std::process::Command::new("script");
@@ -570,8 +572,8 @@ fn cli_on_tty(home: &Home, args: &[&str], env: &[(&str, &str)]) -> String {
         let quoted: Vec<String> = argv.iter().map(|a| format!("'{}'", a.replace('\'', "'\\''"))).collect();
         cmd.arg("-qec").arg(quoted.join(" ")).arg("/dev/null");
     }
-    let out = cmd.envs(env.iter().copied()).stdin(std::process::Stdio::null()).output().expect("script(1)");
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    let out = cmd.envs(env.iter().copied()).stdin(std::process::Stdio::null()).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Pager: on a terminal, listings go through `PBS_PAGER` / `PAGER` (default
@@ -583,14 +585,17 @@ fn c10_pager_on_a_terminal_only() {
     append_event(&home, "sess-c10", json!({"ts":now_ms(),"src":"manager","type":"task.start","id":"sh_0000c10a"}));
     let pager = [("PBS_PAGER", "sed s/^/PAGED:/"), ("PAGER", "false")];
 
-    let paged = cli_on_tty(&home, &["events"], &pager);
+    let Some(paged) = cli_on_tty(&home, &["events"], &pager) else {
+        eprintln!("skipping c10_pager_on_a_terminal_only: script(1) is not runnable here");
+        return;
+    };
     assert!(paged.contains("PAGED:") && paged.contains("sh_0000c10a"), "{paged:?}");
-    let via_pager = cli_on_tty(&home, &["events"], &[("PBS_PAGER", ""), ("PAGER", "sed s/^/PAGER:/")]);
+    let via_pager = cli_on_tty(&home, &["events"], &[("PBS_PAGER", ""), ("PAGER", "sed s/^/PAGER:/")]).unwrap();
     assert!(via_pager.contains("PAGER:"), "PAGER is the fallback: {via_pager:?}");
 
-    let plain = cli_on_tty(&home, &["--no-pager", "events"], &pager);
+    let plain = cli_on_tty(&home, &["--no-pager", "events"], &pager).unwrap();
     assert!(plain.contains("sh_0000c10a") && !plain.contains("PAGED:"), "{plain:?}");
-    let cat = cli_on_tty(&home, &["events"], &[("PBS_PAGER", "cat")]);
+    let cat = cli_on_tty(&home, &["events"], &[("PBS_PAGER", "cat")]).unwrap();
     assert!(cat.contains("sh_0000c10a"), "{cat:?}");
     let piped = run_cli_env(&home.path, &["events"], S(5), &pager);
     assert!(piped.stdout.contains("sh_0000c10a") && !piped.stdout.contains("PAGED:"), "not a terminal: {}", piped.stdout);
