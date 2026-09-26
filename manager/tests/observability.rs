@@ -975,6 +975,45 @@ fn g4_finished_tasks_expire_in_a_connected_session() {
     kill_group(leftover_pid, 9);
 }
 
+/// A sweep that cannot delete a finished task's files must not forget the
+/// task either: the record is the only thing that says the files still need
+/// deleting, so losing it while the files stay behind orphans them until a
+/// restart's startup scan (or forever, if nothing ever re-scans). Block the
+/// delete with an unwritable tasks dir, sweep, and check the record is still
+/// there; unblock it and check the next sweep finishes the job.
+#[test]
+fn g4b_finished_task_survives_a_failed_delete_for_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root ignores directory modes; nothing to assert
+    }
+    let home = Home::new("g4b");
+    std::fs::create_dir_all(&home.path).unwrap();
+    std::fs::write(home.path.join("config.json"), r#"{"finishedTaskRetention":"0s"}"#).unwrap();
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-g4b", "/tmp");
+    let (done, _) = start(&mut c, "true", json!({}));
+    c.wait_terminal(&done, S(3)).unwrap();
+
+    let tasks_dir = home.path.join("sessions/sess-g4b/tasks");
+    std::fs::set_permissions(&tasks_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    home.advance("gc", 1_000);
+    std::thread::sleep(MS(300));
+    std::fs::set_permissions(&tasks_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(tasks_dir.join(format!("{done}.json")).exists(), "record lost before its files could be deleted");
+    assert!(home.cli(&["show", &done], S(5)).status.success(), "swept from show while its files still exist");
+
+    let swept = poll_true(S(10), || {
+        home.advance("gc", 1_000);
+        !tasks_dir.join(format!("{done}.json")).exists()
+    });
+    assert!(swept, "retry sweep never finished deleting the task");
+    for ext in ["output", "stderr"] {
+        assert!(!tasks_dir.join(format!("{done}.{ext}")).exists(), "{done}.{ext} left behind");
+    }
+}
+
 #[test]
 fn g2_doctor_flags_a_bad_retention() {
     let home = Home::new("g2");

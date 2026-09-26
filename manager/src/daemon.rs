@@ -923,32 +923,59 @@ fn spawn_session_gc(state: &Shared) {
 /// Delete the files of tasks that ended more than `retention_ms` ago and
 /// forget them, in every session. A task whose group still lingers is kept.
 fn run_task_gc(state: &Shared, retention_ms: u64) {
-    let mut st = state.lock().unwrap();
-    let now = now_ms();
-    let expired: Vec<String> = st
-        .registry
-        .tasks
-        .values()
-        .filter(|e| !e.owns_live_group())
-        .filter(|e| e.record.ended_at.is_some_and(|t| now.saturating_sub(t) >= retention_ms))
-        .map(|e| e.record.task_id.clone())
-        .collect();
-    if expired.is_empty() {
+    let (home, candidates) = {
+        let st = state.lock().unwrap();
+        let now = now_ms();
+        let candidates: Vec<TaskRecord> = st
+            .registry
+            .tasks
+            .values()
+            .filter(|e| !e.owns_live_group())
+            .filter(|e| e.record.ended_at.is_some_and(|t| now.saturating_sub(t) >= retention_ms))
+            .map(|e| e.record.clone())
+            .collect();
+        (st.home.clone(), candidates)
+    };
+    if candidates.is_empty() {
         return;
     }
-    let home = st.home.clone();
-    for id in &expired {
-        let Some(e) = st.registry.tasks.remove(id) else { continue };
-        let r = &e.record;
-        let output = PathBuf::from(&r.output_path);
-        let _ = std::fs::remove_file(crate::task::stderr_path_for(&output));
-        let _ = std::fs::remove_file(&output);
-        let _ = std::fs::remove_file(registry::task_json_path(&home, &r.session_id, &r.task_id));
+    // Delete files with the state lock released, so an hourly sweep over a
+    // large home does not block every status/ls/output/tail handler for the
+    // whole batch. A task is forgotten only once its files are gone; a
+    // failed remove is retried on the next sweep instead of the record
+    // vanishing while the file it named stays behind, unreachable.
+    let removed: Vec<String> = candidates
+        .into_iter()
+        .filter(|r| {
+            let output = PathBuf::from(&r.output_path);
+            remove_file_if_present(&crate::task::stderr_path_for(&output))
+                && remove_file_if_present(&output)
+                && remove_file_if_present(&registry::task_json_path(&home, &r.session_id, &r.task_id))
+        })
+        .map(|r| r.task_id)
+        .collect();
+    if removed.is_empty() {
+        return;
+    }
+    {
+        let mut st = state.lock().unwrap();
+        for id in &removed {
+            st.registry.tasks.remove(id);
+        }
     }
     lifecycle::log_line(
         &home,
-        &format!("gc: removed {} finished task(s): {}", expired.len(), crate::gc::log_ids(&expired)),
+        &format!("gc: removed {} finished task(s): {}", removed.len(), crate::gc::log_ids(&removed)),
     );
+}
+
+/// Remove a file, treating "already gone" as success.
+fn remove_file_if_present(path: &std::path::Path) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
 }
 
 fn run_session_gc(state: &Shared, retention_ms: u64) {
