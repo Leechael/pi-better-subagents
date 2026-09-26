@@ -777,10 +777,14 @@ fn c6_status_counts_uptime_and_not_running() {
     let s = &out.stdout;
     // The version names the commit the binary was built from ("0.1.0" alone
     // cannot tell builds apart), and status names the daemon's binary: the
-    // file an upgrade execs, which need not be the CLI's own.
-    let head = std::process::Command::new("git").args(["rev-parse", "--short=10", "HEAD"]).output().unwrap();
-    let head = String::from_utf8(head.stdout).unwrap();
-    assert!(s.contains(&format!("version:  0.1.0+{} (protocol 3)", head.trim())), "{s}");
+    // file an upgrade execs, which need not be the CLI's own. Compare
+    // against the version embedded at build time (same as main.rs's
+    // VERSION), not a fresh `git rev-parse`: shelling out again would fail
+    // outside a git checkout, where build.rs already fell back to
+    // "unknown", and would drift from the built-from commit on any tree
+    // whose HEAD moved since the daemon binary was built.
+    let version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PBS_GIT_SHA"));
+    assert!(s.contains(&format!("version:  {version} (protocol 3)")), "{s}");
     let bin = std::fs::canonicalize(BIN).unwrap();
     assert!(s.contains(&format!("binary:   {}", bin.display())), "{s}");
     let uptime = s.lines().find(|l| l.starts_with("uptime:")).unwrap();
