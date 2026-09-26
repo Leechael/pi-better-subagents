@@ -643,6 +643,41 @@ fn c1b_ls_running_first_newest_first_agents_by_last_message() {
     assert!(header.split_whitespace().any(|h| h == "TIME"), "{header}");
 }
 
+/// `status`, `doctor` and a plain `ls` never pay for an agent's transcript
+/// read unless that agent is actually about to be shown with its TIME: a
+/// fifo with no writer blocks a real `File::open` forever, so a bounded CLI
+/// call proves nothing tried to open it.
+#[test]
+fn c1c_status_and_doctor_never_read_agent_transcripts() {
+    let home = Home::new("c1c");
+    let sid = "sess-c1c";
+    agent_fixture(
+        &home,
+        sid,
+        json!({"child_id":"ch_0000c1c1","session_id":sid,"name":"stuck","agent":"w",
+        "status":"completed","started_at":now_ms() - 5000,"ended_at":now_ms() - 1000}),
+    );
+    let dir = home.path.join("sessions").join(sid).join("agents");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("ch_0000c1c1.jsonl");
+    let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+    let _d = home.start_daemon();
+    let mut conn = home.connect();
+    conn.request_ok(json!({"type":"hello","client_kind":"extension","session_id":sid,
+        "pi_pid":std::process::id(),"cwd":"/tmp","extension_version":"0.9.0-test","protocol":3}));
+    // Bounded well under the fifo's indefinite block: none of these may open it.
+    let out = home.cli(&["status", "--json"], S(3));
+    assert!(out.status.success(), "status: {}{}", out.stdout, out.stderr);
+    let out = home.cli(&["doctor"], S(3));
+    assert!(out.status.success(), "doctor: {}{}", out.stdout, out.stderr);
+    // The agent is finished work of a connected session: hidden by the
+    // running-only default before anything reads its transcript.
+    let out = home.cli(&["ls"], S(3));
+    assert!(out.status.success(), "ls: {}{}", out.stdout, out.stderr);
+    assert!(!out.stdout.contains("ch_0000c1c1"), "{}", out.stdout);
+}
+
 #[test]
 fn c2_show_task_agent_and_run() {
     let home = Home::new("c2");

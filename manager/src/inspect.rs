@@ -56,9 +56,6 @@ pub struct AgentRecord {
     /// session is not connected: the child cannot be alive.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stale: bool,
-    /// Set by the CLI (not on disk): `ts` of the transcript's last line.
-    #[serde(skip)]
-    pub last_message_at: Option<u64>,
 }
 
 pub fn agent_status_terminal(status: &str) -> bool {
@@ -85,11 +82,11 @@ pub fn agents_dir(home: &Path, sid: &str) -> PathBuf {
     home.join("sessions").join(sid).join("agents")
 }
 
-/// Every agent record under `home`. Records whose session is not in
-/// `connected` and that still claim to be running are shown as
-/// `interrupted` (stale = true): a gone session cannot host a live child.
 /// `ts` of a transcript's last line, read from the file's tail. A tail with
 /// no complete line (one message over 64 KiB) falls back to the mtime.
+/// Costs an open + seek + read, so callers pay for it only when they need
+/// TIME (`ls`, `show`) — not `load_agent_records` itself, which every
+/// caller (including `status` and `doctor`) runs over every record.
 fn last_message_ts(path: &Path) -> Option<u64> {
     use std::io::{Read, Seek, SeekFrom};
     const TAIL: u64 = 64 * 1024;
@@ -109,6 +106,17 @@ fn last_message_ts(path: &Path) -> Option<u64> {
     })
 }
 
+/// An agent's TIME: its last transcript message, or its start if the
+/// transcript has none yet. Pays for `last_message_ts`'s read, so callers
+/// use it only for rows they are about to show (`ls`'s survivors, `show`,
+/// a run's children) rather than every record `load_agent_records` loads.
+pub fn agent_active_at(a: &AgentRecord, home: &Path) -> Option<u64> {
+    last_message_ts(&a.transcript_path(home)).or(a.started_at)
+}
+
+/// Every agent record under `home`. Records whose session is not in
+/// `connected` and that still claim to be running are shown as
+/// `interrupted` (stale = true): a gone session cannot host a live child.
 pub fn load_agent_records(home: &Path, connected: &HashSet<String>) -> Vec<AgentRecord> {
     let mut out = Vec::new();
     let Ok(sessions) = std::fs::read_dir(home.join("sessions")) else {
@@ -131,7 +139,6 @@ pub fn load_agent_records(home: &Path, connected: &HashSet<String>) -> Vec<Agent
                 rec.status = "interrupted".into();
                 rec.stale = true;
             }
-            rec.last_message_at = last_message_ts(&rec.transcript_path(home));
             out.push(rec);
         }
     }
@@ -416,7 +423,10 @@ pub fn task_row(t: &TaskRecord, now: u64) -> Row {
     }
 }
 
-pub fn agent_row(a: &AgentRecord, sessions: &BTreeMap<String, SessionView>, now: u64) -> Row {
+/// `active_at` is the caller's choice: `a.started_at` is cheap and right for
+/// rows that will not survive filtering, `agent_active_at` (a transcript
+/// read) is right for rows about to be shown.
+pub fn agent_row(a: &AgentRecord, sessions: &BTreeMap<String, SessionView>, now: u64, active_at: Option<u64>) -> Row {
     let end = a.ended_at.unwrap_or(now);
     Row {
         id: a.child_id.clone(),
@@ -425,7 +435,7 @@ pub fn agent_row(a: &AgentRecord, sessions: &BTreeMap<String, SessionView>, now:
         cwd: sessions.get(&a.session_id).and_then(|s| s.cwd.clone()),
         status: a.status.clone(),
         started_at: a.started_at,
-        active_at: a.last_message_at.or(a.started_at),
+        active_at,
         ended_at: a.ended_at,
         duration_ms: a.started_at.map(|s| end.saturating_sub(s)),
         exit_code: None,
@@ -441,14 +451,21 @@ pub fn agent_row(a: &AgentRecord, sessions: &BTreeMap<String, SessionView>, now:
     }
 }
 
+/// Every task and agent as a `Row`, unsorted and with a placeholder
+/// `active_at` (`started_at`) for agents: sorting and TIME both wait for
+/// `filter_rows`, which enriches only the rows that survive filtering
+/// (`sort_rows`) so a transcript is read once per row actually shown.
 pub fn all_rows(snap: &Snapshot) -> Vec<Row> {
     let mut rows: Vec<Row> = snap.tasks.iter().map(|t| task_row(t, snap.now)).collect();
-    rows.extend(snap.agents.iter().map(|a| agent_row(a, &snap.sessions, snap.now)));
-    // Running first, then finished; each newest first.
+    rows.extend(snap.agents.iter().map(|a| agent_row(a, &snap.sessions, snap.now, a.started_at)));
+    rows
+}
+
+/// Running first, then finished; each newest first.
+pub fn sort_rows(rows: &mut [Row]) {
     rows.sort_by(|a, b| {
         (!a.running, std::cmp::Reverse(a.active_at), &a.id).cmp(&(!b.running, std::cmp::Reverse(b.active_at), &b.id))
     });
-    rows
 }
 
 fn exit_col(r: &Row) -> String {
@@ -495,13 +512,21 @@ fn under_dir(cwd: &str, dir: &str) -> bool {
 /// with `all`, also the finished work of connected sessions. A gone
 /// session's finished work stays inspectable by id (`show`) until its
 /// retention expires, but is no longer listed.
-pub fn filter_rows(rows: Vec<Row>, o: &LsOpts, now: u64, connected: &HashSet<String>) -> Result<Vec<Row>, String> {
-    let since = match &o.since {
-        Some(s) => Some(now.saturating_sub(fmt::parse_duration(s)?)),
-        None => None,
-    };
+///
+/// The cheap filters (running/all, session, cwd) run first; only rows that
+/// survive them have an agent's real TIME filled in (a transcript read),
+/// so `--since` and the final order never cost a read for a row that was
+/// going to be dropped anyway.
+pub fn filter_rows(
+    rows: Vec<Row>,
+    o: &LsOpts,
+    now: u64,
+    connected: &HashSet<String>,
+    agents: &[AgentRecord],
+    home: &Path,
+) -> Result<Vec<Row>, String> {
     let dir = o.cwd.as_deref().map(normalize_dir);
-    Ok(rows
+    let mut rows: Vec<Row> = rows
         .into_iter()
         .filter(|r| r.running || (o.all && connected.contains(&r.session_id)))
         .filter(|r| o.session.as_ref().map_or(true, |p| r.session_id.starts_with(p.as_str())))
@@ -510,8 +535,21 @@ pub fn filter_rows(rows: Vec<Row>, o: &LsOpts, now: u64, connected: &HashSet<Str
             (Some(d), Some(c)) => under_dir(c, d),
             (Some(_), None) => false,
         })
-        .filter(|r| since.map_or(true, |s| r.active_at.unwrap_or(0) >= s))
-        .collect())
+        .collect();
+    if rows.iter().any(|r| r.kind == "agent") {
+        let by_id: HashMap<&str, &AgentRecord> = agents.iter().map(|a| (a.child_id.as_str(), a)).collect();
+        for r in rows.iter_mut().filter(|r| r.kind == "agent") {
+            if let Some(a) = by_id.get(r.id.as_str()) {
+                r.active_at = agent_active_at(a, home);
+            }
+        }
+    }
+    let since = match &o.since {
+        Some(s) => Some(now.saturating_sub(fmt::parse_duration(s)?)),
+        None => None,
+    };
+    rows.retain(|r| since.map_or(true, |s| r.active_at.unwrap_or(0) >= s));
+    Ok(rows)
 }
 
 pub const LS_COLUMNS: [&str; 10] = [
@@ -570,7 +608,8 @@ pub fn render_ls(rows: &[Row], prefixes: &HashMap<String, String>, now: u64, wid
 pub async fn cmd_ls(home: &Path, o: LsOpts) -> Result<(), String> {
     let snap = snapshot(home, Live::Spawn).await?;
     warn_if_older_daemon(&snap);
-    let rows = filter_rows(all_rows(&snap), &o, snap.now, &snap.connected)?;
+    let mut rows = filter_rows(all_rows(&snap), &o, snap.now, &snap.connected, &snap.agents, home)?;
+    sort_rows(&mut rows);
     if o.json {
         outln!("{}", serde_json::to_string_pretty(&rows).unwrap());
         return Ok(());
@@ -763,7 +802,7 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
                 outln!("{}", serde_json::to_string_pretty(&v).unwrap());
                 return Ok(());
             }
-            let r = agent_row(&a, &snap.sessions, now);
+            let r = agent_row(&a, &snap.sessions, now, agent_active_at(&a, home));
             kv("id", &a.child_id);
             kv("kind", "agent");
             kv("name", a.title());
@@ -822,7 +861,7 @@ pub async fn cmd_show(home: &Path, typed: &str, json_out: bool) -> Result<(), St
                 return Ok(());
             }
             kv("run", &run);
-            let rows: Vec<Row> = kids.iter().map(|a| agent_row(a, &snap.sessions, now)).collect();
+            let rows: Vec<Row> = kids.iter().map(|a| agent_row(a, &snap.sessions, now, agent_active_at(a, home))).collect();
             let done = rows.iter().filter(|r| !r.running).count();
             kv("children", format!("{} ({} finished)", rows.len(), done));
             let prefixes = session_prefixes(rows.iter().map(|r| r.session_id.as_str()));
