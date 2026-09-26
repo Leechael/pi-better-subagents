@@ -21,7 +21,10 @@ libc = "0.2"
 # PBS_TEST_CLOCK=manual. Never enable in release builds.
 test-clock = []
 
+# Thin LTO over the default codegen units: an incremental release build
+# (the install step in docs/testing-guide.md) takes ~10 s instead of ~30 s
+# with fat LTO on one unit, for a ~1 MB larger binary. The daemon is not
+# CPU-bound, so the extra optimisation bought nothing measurable.
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
 strip = true
