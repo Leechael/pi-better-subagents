@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ManualClock } from "../../src/clock";
+import { formatMonitorEvent } from "../../src/format";
 import { NotifyCenter } from "../../src/notify";
 import { PBS_WAKE_CUSTOM_TYPE, type PbsWake } from "../../src/wake";
 
@@ -37,6 +38,30 @@ describe("NotifyCenter monitor batching", () => {
     expect(sent[1].message.details).toMatchObject({ kind: "monitor", id: "mon_2", event: "ready" });
     expect(events).toContainEqual({ type: "wake.emit", fields: { kind: "monitor", ids: ["mon_1"], batch: true } });
     expect(events).toContainEqual({ type: "wake.deliver", fields: { kind: "monitor", mode: "trigger" } });
+    center.dispose();
+  });
+
+  it("delivers a busy monitor's pending events before its exit notice", () => {
+    // Seen in eval e2e (c2): `echo noop` exited while the agent was busy. The
+    // exit notice went out at once, the coalesced "noop" only after the
+    // agent settled, so the model heard "exited" before the line it printed.
+    const sent: { message: { customType: string; content: string; details?: unknown }; options: unknown }[] = [];
+    const center = new NotifyCenter({
+      sendMessage: (message, options) => sent.push({ message, options }),
+      isIdle: () => false,
+      clock: new ManualClock(),
+    });
+    center.notifyMonitorEvent("watcher", "mon_1", "noop");
+    center.notifyMonitorEvent("other", "mon_2", "still going");
+    const exit = formatMonitorEvent("watcher", "mon_1", "Monitor process exited (exit code 0).", "exited");
+    center.notify({ customType: exit.customType, content: exit.content, details: exit.details });
+    expect(sent.map((s) => s.message.details)).toMatchObject([
+      { kind: "monitor", id: "mon_1", event: "noop" },
+      { kind: "monitor", id: "mon_1", status: "exited" },
+    ]);
+    expect(sent.every((s) => (s.options as { deliverAs?: string }).deliverAs === "steer")).toBe(true);
+    // Another monitor's pending events keep waiting for the agent to settle.
+    expect(sent.some((s) => (s.message.details as { id?: string }).id === "mon_2")).toBe(false);
     center.dispose();
   });
 
