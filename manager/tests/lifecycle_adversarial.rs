@@ -486,14 +486,22 @@ fn d4b_startup_orphans_leftover_records_without_signalling() {
 #[test]
 fn d25_slow_startup_scan_still_serves_the_spawning_client() {
     let home = Home::new("d25");
+    let started = Instant::now();
     let out = run_cli_env(
         &home.path,
         &["start", "true"],
         S(20),
         &[("PBS_TEST_SLOW_SCAN_MS", "3000"), ("PBS_TEST_CLOCK", "")],
     );
+    let elapsed = started.elapsed();
     assert!(out.status.success(), "stdout: {}\nstderr: {}", out.stdout, out.stderr);
     assert!(out.stdout.contains("task_id="), "{}", out.stdout);
+    // PBS_TEST_SLOW_SCAN_MS is honored only under cfg!(debug_assertions), so
+    // a release-built daemon would skip the pause and pass this test even if
+    // the bind-before-scan ordering it guards had regressed. Requiring the
+    // client to have waited near the full 3s proves the hook actually ran,
+    // not just that starting a task succeeded quickly.
+    assert!(elapsed >= S(2), "the slow-scan hook did not run (took {elapsed:?}); is this a release build?");
 }
 
 // ===========================================================================
