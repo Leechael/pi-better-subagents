@@ -80,17 +80,22 @@ enum Sub {
         #[arg(long)]
         json: bool,
     },
-    /// Tasks and agents of connected sessions, running and finished, plus
-    /// anything still running elsewhere. Alias: `ls`.
+    /// Running tasks and agents, newest first. `--all` adds the finished
+    /// work of connected sessions, after the running group. An agent's time
+    /// is its last transcript message. Alias: `ls`.
     #[command(visible_alias = "ls")]
     List {
+        /// Also list finished work of connected sessions.
+        #[arg(short, long)]
+        all: bool,
         /// Only sessions whose id starts with this prefix.
         #[arg(long)]
         session: Option<String>,
         /// Only work whose cwd is this directory or below it.
         #[arg(long)]
         cwd: Option<String>,
-        /// Only work started within this long (e.g. 30s, 10m, 2h, 1d).
+        /// Only work active within this long (e.g. 30s, 10m, 2h, 1d): a task's
+        /// start, an agent's last message.
         #[arg(long)]
         since: Option<String>,
         #[arg(long)]
@@ -243,12 +248,14 @@ async fn async_main() {
         Sub::Status { json } => run_client(inspect::cmd_status(&home, json)).await,
         Sub::Sessions { json } => run_client(inspect::cmd_sessions(&home, json)).await,
         Sub::List {
+            all,
             session,
             cwd,
             since,
             json,
         } => {
             let opts = inspect::LsOpts {
+                all,
                 session,
                 cwd,
                 since,

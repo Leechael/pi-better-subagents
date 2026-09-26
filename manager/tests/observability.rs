@@ -508,10 +508,10 @@ fn c1_ls_columns_filters_json_and_cjk() {
     let (b, _) = c.start_with(json!({"type":"start","kind":"shell","command":"sleep 300\nsecond line","cwd":cwd,"env":{"PATH":PATH_ENV}}));
     c.wait_terminal(&a, S(3)).unwrap();
 
-    let out = cli_ok(&home, &["ls"]);
+    let out = cli_ok(&home, &["ls", "--all"]);
     let lines: Vec<&str> = out.stdout.lines().collect();
     let header: Vec<&str> = lines[0].split_whitespace().collect();
-    assert_eq!(header, ["ID", "KIND", "SESSION", "CWD", "STATUS", "STARTED", "DUR", "EXIT", "REASON", "TITLE"]);
+    assert_eq!(header, ["ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "EXIT", "REASON", "TITLE"]);
     let rows: Vec<&str> = lines[1..].to_vec();
     // The connected session's work, running and finished. 0199aaaa-1111 never
     // connected, so its finished task is not listed (still reachable via show).
@@ -537,20 +537,20 @@ fn c1_ls_columns_filters_json_and_cjk() {
         let v: Value = serde_json::from_str(&out.stdout).unwrap();
         v.as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect()
     };
-    let mut all = ids(&["ls", "--json"]);
+    let mut all = ids(&["ls", "--all", "--json"]);
     all.sort();
     let mut want = vec![a.clone(), b.clone(), "ch_0000b001".into()];
     want.sort();
     assert_eq!(all, want);
-    assert_eq!(ids(&["ls", "--json", "--session", "0199aaaa-2"]).len(), 3);
-    assert!(ids(&["ls", "--json", "--session", "0199aaaa-1"]).is_empty());
-    assert_eq!(ids(&["ls", "--json", "--since", "1h"]).len(), 3);
-    let mut in_cwd = ids(&["ls", "--json", "--cwd", cwd.to_str().unwrap()]);
+    assert_eq!(ids(&["ls", "--all", "--json", "--session", "0199aaaa-2"]).len(), 3);
+    assert!(ids(&["ls", "--all", "--json", "--session", "0199aaaa-1"]).is_empty());
+    assert_eq!(ids(&["ls", "--all", "--json", "--since", "1h"]).len(), 3);
+    let mut in_cwd = ids(&["ls", "--all", "--json", "--cwd", cwd.to_str().unwrap()]);
     in_cwd.sort();
     let mut want_cwd = vec![a.clone(), b.clone(), "ch_0000b001".into()];
     want_cwd.sort();
     assert_eq!(in_cwd, want_cwd, "agents inherit their session's cwd");
-    let out = cli_ok(&home, &["ls", "--json"]);
+    let out = cli_ok(&home, &["ls", "--all", "--json"]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     let row = v.as_array().unwrap().iter().find(|r| r["id"] == b).unwrap();
     assert_eq!((row["kind"].as_str(), row["status"].as_str(), row["title"].as_str()), (Some("shell"), Some("running"), Some("sleep 300")));
@@ -599,6 +599,48 @@ fn c10_pager_on_a_terminal_only() {
     assert!(cat.contains("sh_0000c10a"), "{cat:?}");
     let piped = run_cli_env(&home.path, &["events"], S(5), &pager);
     assert!(piped.stdout.contains("sh_0000c10a") && !piped.stdout.contains("PAGED:"), "not a terminal: {}", piped.stdout);
+}
+
+/// ls order and default: only running work unless `--all`; running first,
+/// then finished, each newest first. An agent's time is its last transcript
+/// message (a long-running agent that just spoke is recent), not its start.
+#[test]
+fn c1b_ls_running_first_newest_first_agents_by_last_message() {
+    let home = Home::new("c1b");
+    let sid = "sess-c1b";
+    let now = now_ms();
+    record_fixture(&home, sid, "sh_0000f001", now - 2 * 3_600_000, json!({}));
+    agent_fixture(&home, sid, json!({"child_id":"ch_0000a0ld","session_id":sid,"name":"old","agent":"w",
+        "status":"completed","started_at":now - 3 * 3_600_000,"ended_at":now - 10_000}));
+    transcript_fixture(&home, sid, "ch_0000a0ld", &[
+        json!({"ts":now - 3 * 3_600_000,"role":"user","text":"go"}),
+        json!({"ts":now - 10_000,"role":"assistant","text":"done"}),
+    ]);
+    agent_fixture(&home, sid, json!({"child_id":"ch_0000a0run","session_id":sid,"name":"busy","agent":"w",
+        "status":"running","started_at":now - 5 * 3_600_000}));
+    transcript_fixture(&home, sid, "ch_0000a0run", &[json!({"ts":now - 60_000,"role":"assistant","text":"working"})]);
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, sid, "/tmp");
+    let (r1, _) = start(&mut c, "sleep 300", json!({}));
+    std::thread::sleep(MS(20));
+    let (r2, _) = start(&mut c, "sleep 301", json!({}));
+
+    let ids = |args: &[&str]| -> Vec<String> {
+        let v: Value = serde_json::from_str(&cli_ok(&home, args).stdout).unwrap();
+        v.as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(ids(&["ls", "--json"]), [r2.as_str(), r1.as_str(), "ch_0000a0run"], "running only, newest first");
+    assert_eq!(
+        ids(&["ls", "--json", "--all"]),
+        [r2.as_str(), r1.as_str(), "ch_0000a0run", "ch_0000a0ld", "sh_0000f001"],
+        "running group first; the old agent's last message is newer than the old shell's start"
+    );
+    let v: Value = serde_json::from_str(&cli_ok(&home, &["ls", "--json", "-a"]).stdout).unwrap();
+    let old = v.as_array().unwrap().iter().find(|r| r["id"] == "ch_0000a0ld").unwrap();
+    assert_eq!(old["active_at"], now - 10_000, "{old}");
+    let header = cli_ok(&home, &["ls"]).stdout.lines().next().unwrap().to_string();
+    assert!(header.split_whitespace().any(|h| h == "TIME"), "{header}");
 }
 
 #[test]
@@ -967,7 +1009,7 @@ fn g1_gone_sessions_are_swept_after_retention() {
 
     // Forgotten everywhere: listings and by-id lookups.
     assert!(!home.cli(&["show", &done_task], S(5)).status.success(), "swept task is gone from show");
-    let ls = cli_ok(&home, &["ls"]).stdout;
+    let ls = cli_ok(&home, &["ls", "--all"]).stdout;
     assert!(ls.contains(&busy_task), "running work of a gone session stays listed: {ls}");
     assert!(ls.contains(&live_task), "connected session's finished work is listed: {ls}");
     assert!(!ls.contains(&done_task), "{ls}");
@@ -1014,7 +1056,7 @@ fn g15_finished_tasks_expire_in_a_connected_session() {
     assert!(pid_alive(running_pid), "sweeping never touches live processes");
 
     assert!(!home.cli(&["show", &done], S(5)).status.success(), "swept task is gone from show");
-    let ls = cli_ok(&home, &["ls"]).stdout;
+    let ls = cli_ok(&home, &["ls", "-a"]).stdout;
     assert!(ls.contains(&running) && ls.contains(&leftover) && !ls.contains(&done), "{ls}");
     let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
     assert!(log.contains(&format!("gc: removed 1 finished task(s): {done}")), "{log}");
@@ -1126,7 +1168,7 @@ fn c9_inspection_works_past_one_frame_of_records() {
     }
     let out = cli_ok(&home, &["sessions"]);
     assert!(out.stdout.contains("50"), "sessions counts every task: {}", out.stdout);
-    let out = cli_ok(&home, &["ls", "--json"]);
+    let out = cli_ok(&home, &["ls", "--all", "--json"]);
     let rows: Value = serde_json::from_str(&out.stdout).expect("ls --json");
     assert_eq!(rows.as_array().map(|a| a.len()), Some(50), "ls lists every task");
     let last = ids.last().unwrap();

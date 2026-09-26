@@ -56,6 +56,9 @@ pub struct AgentRecord {
     /// session is not connected: the child cannot be alive.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stale: bool,
+    /// Set by the CLI (not on disk): `ts` of the transcript's last line.
+    #[serde(skip)]
+    pub last_message_at: Option<u64>,
 }
 
 pub fn agent_status_terminal(status: &str) -> bool {
@@ -85,6 +88,27 @@ pub fn agents_dir(home: &Path, sid: &str) -> PathBuf {
 /// Every agent record under `home`. Records whose session is not in
 /// `connected` and that still claim to be running are shown as
 /// `interrupted` (stale = true): a gone session cannot host a live child.
+/// `ts` of a transcript's last line, read from the file's tail. A tail with
+/// no complete line (one message over 64 KiB) falls back to the mtime.
+fn last_message_ts(path: &Path) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 64 * 1024;
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let from_lines = buf
+        .split(|b| *b == b'\n')
+        .rev()
+        .filter_map(|l| serde_json::from_slice::<Value>(l).ok())
+        .find_map(|v| v.get("ts").and_then(|t| t.as_u64()));
+    from_lines.or_else(|| {
+        let m = f.metadata().ok()?.modified().ok()?;
+        Some(m.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64)
+    })
+}
+
 pub fn load_agent_records(home: &Path, connected: &HashSet<String>) -> Vec<AgentRecord> {
     let mut out = Vec::new();
     let Ok(sessions) = std::fs::read_dir(home.join("sessions")) else {
@@ -107,6 +131,7 @@ pub fn load_agent_records(home: &Path, connected: &HashSet<String>) -> Vec<Agent
                 rec.status = "interrupted".into();
                 rec.stale = true;
             }
+            rec.last_message_at = last_message_ts(&rec.transcript_path(home));
             out.push(rec);
         }
     }
@@ -334,6 +359,8 @@ pub struct Row {
     pub cwd: Option<String>,
     pub status: String,
     pub started_at: Option<u64>,
+    /// What `ls` sorts and shows: a task's start, an agent's last message.
+    pub active_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<u64>,
     pub duration_ms: Option<u64>,
@@ -373,6 +400,7 @@ pub fn task_row(t: &TaskRecord, now: u64) -> Row {
         cwd: Some(t.cwd.clone()),
         status: status_str(&t.status),
         started_at: Some(t.started_at),
+        active_at: Some(t.started_at),
         ended_at: t.ended_at,
         duration_ms: Some(end.saturating_sub(t.started_at)),
         exit_code: t.exit_code,
@@ -397,6 +425,7 @@ pub fn agent_row(a: &AgentRecord, sessions: &BTreeMap<String, SessionView>, now:
         cwd: sessions.get(&a.session_id).and_then(|s| s.cwd.clone()),
         status: a.status.clone(),
         started_at: a.started_at,
+        active_at: a.last_message_at.or(a.started_at),
         ended_at: a.ended_at,
         duration_ms: a.started_at.map(|s| end.saturating_sub(s)),
         exit_code: None,
@@ -415,7 +444,10 @@ pub fn agent_row(a: &AgentRecord, sessions: &BTreeMap<String, SessionView>, now:
 pub fn all_rows(snap: &Snapshot) -> Vec<Row> {
     let mut rows: Vec<Row> = snap.tasks.iter().map(|t| task_row(t, snap.now)).collect();
     rows.extend(snap.agents.iter().map(|a| agent_row(a, &snap.sessions, snap.now)));
-    rows.sort_by(|a, b| (a.started_at, &a.id).cmp(&(b.started_at, &b.id)));
+    // Running first, then finished; each newest first.
+    rows.sort_by(|a, b| {
+        (!a.running, std::cmp::Reverse(a.active_at), &a.id).cmp(&(!b.running, std::cmp::Reverse(b.active_at), &b.id))
+    });
     rows
 }
 
@@ -431,6 +463,7 @@ fn exit_col(r: &Row) -> String {
 // ---------------------------------------------------------------------------
 
 pub struct LsOpts {
+    pub all: bool,
     pub session: Option<String>,
     pub cwd: Option<String>,
     pub since: Option<String>,
@@ -458,8 +491,8 @@ fn under_dir(cwd: &str, dir: &str) -> bool {
     c == dir || c.starts_with(&format!("{dir}/"))
 }
 
-/// `ls` rows: work of connected sessions (running and finished) plus anything
-/// still running anywhere, so a live process is never hidden. A gone
+/// `ls` rows: anything running anywhere, so a live process is never hidden;
+/// with `all`, also the finished work of connected sessions. A gone
 /// session's finished work stays inspectable by id (`show`) until its
 /// retention expires, but is no longer listed.
 pub fn filter_rows(rows: Vec<Row>, o: &LsOpts, now: u64, connected: &HashSet<String>) -> Result<Vec<Row>, String> {
@@ -470,19 +503,19 @@ pub fn filter_rows(rows: Vec<Row>, o: &LsOpts, now: u64, connected: &HashSet<Str
     let dir = o.cwd.as_deref().map(normalize_dir);
     Ok(rows
         .into_iter()
-        .filter(|r| r.running || connected.contains(&r.session_id))
+        .filter(|r| r.running || (o.all && connected.contains(&r.session_id)))
         .filter(|r| o.session.as_ref().map_or(true, |p| r.session_id.starts_with(p.as_str())))
         .filter(|r| match (&dir, &r.cwd) {
             (None, _) => true,
             (Some(d), Some(c)) => under_dir(c, d),
             (Some(_), None) => false,
         })
-        .filter(|r| since.map_or(true, |s| r.started_at.unwrap_or(0) >= s))
+        .filter(|r| since.map_or(true, |s| r.active_at.unwrap_or(0) >= s))
         .collect())
 }
 
 pub const LS_COLUMNS: [&str; 10] = [
-    "ID", "KIND", "SESSION", "CWD", "STATUS", "STARTED", "DUR", "EXIT", "REASON", "TITLE",
+    "ID", "KIND", "SESSION", "CWD", "STATUS", "TIME", "DUR", "EXIT", "REASON", "TITLE",
 ];
 
 /// Render the ls table. TITLE is truncated to fit `width` (display columns,
@@ -497,7 +530,7 @@ pub fn render_ls(rows: &[Row], prefixes: &HashMap<String, String>, now: u64, wid
                 prefixes.get(&r.session_id).cloned().unwrap_or_else(|| r.session_id.clone()),
                 fmt::truncate_width_left(&fmt::tilde(r.cwd.as_deref().unwrap_or("-")), 24),
                 r.status.clone(),
-                r.started_at.map(|s| fmt::short_time(s, now)).unwrap_or_else(|| "-".into()),
+                r.active_at.map(|s| fmt::short_time(s, now)).unwrap_or_else(|| "-".into()),
                 r.duration_ms.map(fmt::human_duration).unwrap_or_else(|| "-".into()),
                 exit_col(r),
                 r.end_reason.clone().unwrap_or_else(|| "-".into()),
@@ -543,10 +576,10 @@ pub async fn cmd_ls(home: &Path, o: LsOpts) -> Result<(), String> {
         return Ok(());
     }
     if rows.is_empty() {
-        if o.session.is_some() || o.cwd.is_some() || o.since.is_some() {
-            outln!("no tasks");
-        } else {
-            outln!("no tasks in connected sessions");
+        match (o.all, o.session.is_some() || o.cwd.is_some() || o.since.is_some()) {
+            (false, _) => outln!("nothing running (--all adds finished work)"),
+            (true, true) => outln!("no tasks"),
+            (true, false) => outln!("no tasks in connected sessions"),
         }
         return Ok(());
     }

@@ -90,7 +90,7 @@ pbs-manager events -f
 |---|---|---|
 | 6.1 | `pbs-manager status` · `pbs-manager doctor` | Version/protocol/uptime; doctor all OK, exit 0 |
 | 6.2 | `pbs-manager sessions` | Only connected pi sessions, with PID and CWD (never blank) |
-| 6.3 | `pbs-manager ls` | Running and finished work of connected sessions: KIND (shell/monitor/agent), SESSION prefix, CWD, STATUS, DUR, EXIT, REASON. No `-a` |
+| 6.3 | `pbs-manager ls`, then `ls -a` | `ls`: running work only, newest first. `ls -a`: running first, then connected sessions' finished work, newest first. KIND (shell/monitor/agent), SESSION prefix, CWD, STATUS, TIME (an agent's last message), DUR, EXIT, REASON |
 | 6.4 | `pbs-manager show <id>` for a shell, a monitor, a `ch_…`, a `run_…` (fuzzy ids ok) | Everything about it; for an agent: model, error, reason, tool calls, result tail |
 | 6.5 | `pbs-manager agent ch_… -f` while a child runs | Live transcript; `--full` also shows the preamble |
 | 6.6 | `pbs-manager events -f` while running F1 | `task.start`, `task.background`, `task.exit`, `wake.emit`, `wake.deliver mode=…` |
