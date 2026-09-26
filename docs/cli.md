@@ -195,6 +195,7 @@ Health checks, one line each (`ok`, `fixed`, `warn`, `FAIL`), then `ok` or `N pr
 - stale agent records: an agent says running but its session is gone
 - orphan pids: a task still running with no manager to own it
 - session retention: `goneSessionRetention` in `config.json` is a valid duration
+- task retention: `finishedTaskRetention` in `config.json` is a valid duration
 - sessions dir size (warn above 100 MiB; events.jsonl has no rotation yet)
 
 ---
@@ -299,6 +300,16 @@ A session is *gone* once its pi process disconnects. Gone sessions leave `ls` an
 ```
 
 in `<home>/config.json`; any duration (`30m`, `7d`, `0s` = at the next sweep). Default `24h`. An invalid value makes `doctor` fail and the daemon use the default.
+
+## Retention of finished tasks
+
+A connected session is never swept, so a pi session left open for days would keep every command's record and output, and the daemon loads all of them at startup. Independently of the session, a finished task's files (`<id>.json`, `.output`, `.stderr`) are deleted `finishedTaskRetention` after it ended, in every session, and the task leaves `ls` and `show`. A task whose process group still has members is kept until it empties. Agent records and transcripts and `events.jsonl` are not touched by this rule (only by the session retention above).
+
+```json
+{ "finishedTaskRetention": "24h" }
+```
+
+Same duration format, default and `doctor` check as `goneSessionRetention`. The sweep runs with the session sweep, at the shorter of the two cadences.
 
 ## Typical workflows
 

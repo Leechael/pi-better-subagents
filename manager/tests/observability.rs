@@ -929,6 +929,52 @@ fn g1_gone_sessions_are_swept_after_retention() {
     kill_group(busy_pid, 9);
 }
 
+/// Finished-task retention: in every session, connected or not, a finished
+/// task's files (record, output, stderr) are deleted `finishedTaskRetention`
+/// after it ended. A pi session left open for days otherwise keeps every
+/// command's output (9,671 records, ~100 MB after 9 days on 2026-09-26),
+/// and the daemon loads all of it at startup. Running tasks, leftover
+/// process groups, agents and the session's events stay.
+#[test]
+fn g4_finished_tasks_expire_in_a_connected_session() {
+    let home = Home::new("g4");
+    std::fs::create_dir_all(&home.path).unwrap();
+    std::fs::write(home.path.join("config.json"), r#"{"finishedTaskRetention":"0s"}"#).unwrap();
+    agent_fixture(&home, "sess-g4", json!({"child_id":"ch_0000g401","session_id":"sess-g4","name":"a","agent":"w","status":"completed"}));
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-g4", "/tmp");
+    let (running, running_pid) = start(&mut c, "sleep 300", json!({}));
+    let (leftover, leftover_pid) = start(&mut c, "sleep 300 & exit 0", json!({}));
+    let (done, _) = start(&mut c, "echo out; echo err >&2", json!({}));
+    c.wait_terminal(&done, S(3)).unwrap();
+    c.wait_terminal(&leftover, S(3)).unwrap();
+
+    let tasks = home.path.join("sessions/sess-g4/tasks");
+    let swept = poll_true(S(10), || {
+        home.advance("gc", 1_000);
+        !tasks.join(format!("{done}.json")).exists()
+    });
+    assert!(swept, "finished task not swept");
+    for ext in ["output", "stderr"] {
+        assert!(!tasks.join(format!("{done}.{ext}")).exists(), "{done}.{ext} left behind");
+    }
+    for id in [&running, &leftover] {
+        assert!(tasks.join(format!("{id}.json")).exists(), "{id} kept");
+    }
+    assert!(home.path.join("sessions/sess-g4/events.jsonl").exists(), "events kept");
+    assert!(home.path.join("sessions/sess-g4/agents/ch_0000g401.json").exists(), "agents kept");
+    assert!(pid_alive(running_pid), "sweeping never touches live processes");
+
+    assert!(!home.cli(&["show", &done], S(5)).status.success(), "swept task is gone from show");
+    let ls = cli_ok(&home, &["ls"]).stdout;
+    assert!(ls.contains(&running) && ls.contains(&leftover) && !ls.contains(&done), "{ls}");
+    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
+    assert!(log.contains(&format!("gc: removed 1 finished task(s): {done}")), "{log}");
+    kill_group(running_pid, 9);
+    kill_group(leftover_pid, 9);
+}
+
 #[test]
 fn g2_doctor_flags_a_bad_retention() {
     let home = Home::new("g2");
@@ -940,6 +986,10 @@ fn g2_doctor_flags_a_bad_retention() {
     std::fs::write(home.path.join("config.json"), r#"{"goneSessionRetention":"2h"}"#).unwrap();
     let out = home.cli(&["doctor"], S(10));
     assert!(out.stdout.contains("gone sessions kept 2h"), "{}", out.stdout);
+    std::fs::write(home.path.join("config.json"), r#"{"finishedTaskRetention":"later"}"#).unwrap();
+    let out = home.cli(&["doctor"], S(10));
+    assert_eq!(out.status.code(), Some(1), "{}", out.stdout);
+    assert!(out.stdout.contains("task retention") && out.stdout.contains("later"), "{}", out.stdout);
 }
 
 /// Between a daemon crash and the next daemon start, the disk still says

@@ -887,32 +887,68 @@ fn resume_carried_watches(state: &Shared, conn_id: u64, tx: &OutTx) {
     }
 }
 
-/// §3.2: sweep gone sessions at startup and then every
-/// `gc::interval_ms(retention)`. The retention is read once per daemon.
+/// §3.2: sweep gone sessions and finished tasks at startup and then every
+/// `gc::interval_ms` of the shorter retention. Retentions are read once per
+/// daemon.
 fn spawn_session_gc(state: &Shared) {
     let (home, clock) = {
         let st = state.lock().unwrap();
         (st.home.clone(), st.clock.clone())
     };
-    let retention = match crate::gc::retention_ms(&home) {
+    let read = |r: Result<u64, String>, default: u64| match r {
         Ok(ms) => ms,
         Err(e) => {
             lifecycle::log_line(&home, &format!("config: {e}; using the default 24h"));
-            crate::gc::DEFAULT_RETENTION_MS
+            default
         }
     };
+    let retention = read(crate::gc::retention_ms(&home), crate::gc::DEFAULT_RETENTION_MS);
+    let task_retention = read(crate::gc::task_retention_ms(&home), crate::gc::DEFAULT_TASK_RETENTION_MS);
     run_session_gc(state, retention);
+    run_task_gc(state, task_retention);
     let state2 = state.clone();
     tokio::spawn(async move {
-        let every = Duration::from_millis(crate::gc::interval_ms(retention));
+        let every = Duration::from_millis(crate::gc::interval_ms(retention.min(task_retention)));
         loop {
             clock.sleep("gc", every).await;
             if state2.lock().unwrap().shutdown {
                 break;
             }
             run_session_gc(&state2, retention);
+            run_task_gc(&state2, task_retention);
         }
     });
+}
+
+/// Delete the files of tasks that ended more than `retention_ms` ago and
+/// forget them, in every session. A task whose group still lingers is kept.
+fn run_task_gc(state: &Shared, retention_ms: u64) {
+    let mut st = state.lock().unwrap();
+    let now = now_ms();
+    let expired: Vec<String> = st
+        .registry
+        .tasks
+        .values()
+        .filter(|e| !e.owns_live_group())
+        .filter(|e| e.record.ended_at.is_some_and(|t| now.saturating_sub(t) >= retention_ms))
+        .map(|e| e.record.task_id.clone())
+        .collect();
+    if expired.is_empty() {
+        return;
+    }
+    let home = st.home.clone();
+    for id in &expired {
+        let Some(e) = st.registry.tasks.remove(id) else { continue };
+        let r = &e.record;
+        let output = PathBuf::from(&r.output_path);
+        let _ = std::fs::remove_file(crate::task::stderr_path_for(&output));
+        let _ = std::fs::remove_file(&output);
+        let _ = std::fs::remove_file(registry::task_json_path(&home, &r.session_id, &r.task_id));
+    }
+    lifecycle::log_line(
+        &home,
+        &format!("gc: removed {} finished task(s): {}", expired.len(), expired.join(" ")),
+    );
 }
 
 fn run_session_gc(state: &Shared, retention_ms: u64) {

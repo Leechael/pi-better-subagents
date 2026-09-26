@@ -828,6 +828,10 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
         Ok(ms) => r.ok("session retention", format!("gone sessions kept {}", crate::fmt::human_duration(ms))),
         Err(e) => r.fail("session retention", format!("{e}; the daemon uses the default 24h")),
     }
+    match crate::gc::task_retention_ms(home) {
+        Ok(ms) => r.ok("task retention", format!("finished tasks kept {}", crate::fmt::human_duration(ms))),
+        Err(e) => r.fail("task retention", format!("{e}; the daemon uses the default 24h")),
+    }
     if let Some((p, source)) = &manager_path {
         if Path::new(p).is_file() {
             r.ok("manager path", format!("{p} ({source})"));

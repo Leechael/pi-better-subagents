@@ -1,4 +1,4 @@
-//! Retention for sessions that are gone (§3.2).
+//! Retention (§3.2): for sessions that are gone, and for finished tasks.
 //!
 //! A pi session's work leaves the listings (`ls`, `sessions`) as soon as the
 //! session disconnects. Its files (task records and output, agent records and
@@ -7,6 +7,11 @@
 //! `pi --resume`; then the daemon deletes `sessions/<sid>/` and forgets the
 //! session's tasks. Sessions that are connected, or still own a running task
 //! or a live process group, are never swept.
+//!
+//! Within any session, connected or not, a finished task's files (record,
+//! output, stderr) are deleted `finishedTaskRetention` (default 24h) after
+//! it ended, so a pi session left open for days does not keep every
+//! command's output. A task whose process group still lingers is kept.
 
 use std::collections::HashSet;
 use std::fs;
@@ -15,6 +20,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default retention for a gone session's files.
 pub const DEFAULT_RETENTION_MS: u64 = 24 * 3_600_000;
+/// Default retention for a finished task's files.
+pub const DEFAULT_TASK_RETENTION_MS: u64 = 24 * 3_600_000;
 /// Sweep cadence bounds: short retentions are honoured within a second,
 /// long ones are checked at least hourly.
 const MIN_INTERVAL_MS: u64 = 1_000;
@@ -24,21 +31,27 @@ const MAX_INTERVAL_MS: u64 = 3_600_000;
 /// Absent or unreadable config means the default; an invalid value is an
 /// error so the caller can log it (and `doctor` can flag it).
 pub fn retention_ms(home: &Path) -> Result<u64, String> {
+    config_duration(home, "goneSessionRetention", DEFAULT_RETENTION_MS)
+}
+
+/// `finishedTaskRetention` from `<home>/config.json`, like [`retention_ms`].
+pub fn task_retention_ms(home: &Path) -> Result<u64, String> {
+    config_duration(home, "finishedTaskRetention", DEFAULT_TASK_RETENTION_MS)
+}
+
+fn config_duration(home: &Path, key: &str, default: u64) -> Result<u64, String> {
     let raw = match fs::read(home.join("config.json")) {
         Ok(b) => b,
-        Err(_) => return Ok(DEFAULT_RETENTION_MS),
+        Err(_) => return Ok(default),
     };
     let v: serde_json::Value = match serde_json::from_slice(&raw) {
         Ok(v) => v,
-        Err(_) => return Ok(DEFAULT_RETENTION_MS), // doctor reports the parse error
+        Err(_) => return Ok(default), // doctor reports the parse error
     };
-    match v.get("goneSessionRetention") {
-        None | Some(serde_json::Value::Null) => Ok(DEFAULT_RETENTION_MS),
-        Some(serde_json::Value::String(s)) => crate::fmt::parse_duration(s)
-            .map_err(|e| format!("goneSessionRetention: {e}")),
-        Some(other) => Err(format!(
-            "goneSessionRetention must be a duration string such as \"24h\", got {other}"
-        )),
+    match v.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(serde_json::Value::String(s)) => crate::fmt::parse_duration(s).map_err(|e| format!("{key}: {e}")),
+        Some(other) => Err(format!("{key} must be a duration string such as \"24h\", got {other}")),
     }
 }
 
