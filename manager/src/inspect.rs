@@ -173,9 +173,17 @@ pub async fn snapshot(home: &Path, live: Live) -> Result<Snapshot, String> {
         // still saying "running" is what the next daemon start marks orphaned.
         None => {
             let mut tasks = registry::load_all_records(home);
-            for t in tasks.iter_mut().filter(|t| t.status == TaskStatus::Running) {
-                t.status = TaskStatus::Orphaned;
-                t.end_reason = Some(crate::proto::end_reason::MANAGER_CRASH.to_string());
+            for t in tasks.iter_mut() {
+                // The persisted output_size lags the output file (a running
+                // task's is only written at exit); with no daemon the file
+                // can no longer grow, so it is the truth (as in scan_tasks).
+                if let Ok(m) = std::fs::metadata(&t.output_path) {
+                    t.output_size = t.output_size.max(m.len());
+                }
+                if t.status == TaskStatus::Running {
+                    t.status = TaskStatus::Orphaned;
+                    t.end_reason = Some(crate::proto::end_reason::MANAGER_CRASH.to_string());
+                }
             }
             (None, tasks)
         }
