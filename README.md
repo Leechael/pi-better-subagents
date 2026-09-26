@@ -114,7 +114,7 @@ Operations manual (every subcommand, fuzzy ids, output formats): **[docs/cli.md]
 |---|---|
 | Is the daemon healthy? | `pbs-manager doctor` (non-zero exit on any failure), `pbs-manager status` |
 | What is each pi session doing, and where? | `pbs-manager sessions` (connected sessions: PID, CWD, running/tasks/agents) |
-| What is running / just finished? | `pbs-manager ls [-a] [--session P] [--cwd DIR] [--since 10m] [--json]` (what is running, newest first; `-a` adds connected sessions' finished work; KIND, CWD, STATUS, DUR, EXIT, REASON). A session that exits disappears from `sessions` at once, and its finished rows drop out of `ls`, while its running work stays listed until it ends; its records stay reachable by id for `goneSessionRetention` (default 24h) |
+| What is running / just finished? | `pbs-manager ls [-a] [--session P] [--cwd DIR] [--since 10m] [--json]` (what is running, newest first; `-a` adds connected sessions' finished work; KIND, CWD, STATUS, DUR, EXIT, REASON). A session that exits drops its finished rows from `ls` at once, and drops out of `sessions` too once nothing of it is still running; either way its running work stays listed until it ends, and its records stay reachable by id for `goneSessionRetention` (default 24h) |
 | Why did this end? What did it print? | `pbs-manager show <id>` (shell, monitor, `ch_…` agent or `run_…`) |
 | What did this subagent do? | `pbs-manager agent <ch_id> [-f] [--full]` (live transcript) |
 | Why didn't a notification arrive? | `pbs-manager events [-f] [--id X]` (task lifecycle + wake emit/deliver/dedupe/drop) |
