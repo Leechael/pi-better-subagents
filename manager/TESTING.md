@@ -267,6 +267,7 @@ fixtures in the contract's format, because the extension side may land later.
 | every line < 4 KiB, oversized fields truncated (`truncated:true`), ids never cut | `e2`, unit `events::*` |
 | concurrent appends (8 extension-style writers × 300 lines of 1–3.5 KiB, plus the manager) never interleave or lose lines | `e3` |
 | `events`: malformed lines skipped with a stderr count; `--id` matches `id`/`ids[]`/`child_id`; `--session`, `--since`, `--json`, `-f` (incl. new sessions); cross-session time order; never starts the daemon | `e4` |
+| pager: on a terminal (script(1) pty) listings go through `PBS_PAGER`, else `PAGER`; not with `--no-pager`, `cat`, or piped stdout; a bare `less` runs as `less -FRX` | `c10`, unit `pager::*` |
 | `ls`: columns, running-only default, `-a`, agents included, SESSION shortest unique prefix ≥ 8, CJK display-width truncation, `--json`, `--session`/`--cwd`/`--since`, bad duration rejected | `c1`, unit `fmt::*`, `inspect::*` |
 | `show` for sh_/ch_/run_ (header, origin, backgrounded, wake emitted→delivered, last 10 lines; agent error/tool calls/shells/prompt/result tail 20), fuzzy + `--json`, one-line not-found with closest match | `c2` |
 | `agent` (preamble hidden, `--full`), `log`/`tail -f` on ch_ ids, `output`/`wait` on ch_, `stop` on an agent refused with the contract message | `c3` |
