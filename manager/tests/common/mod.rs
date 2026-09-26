@@ -226,6 +226,16 @@ impl Home {
             .into_iter()
             .find(|r| r["task_id"].as_str() == Some(task_id))
     }
+    /// The daemon's stderr (panics land here), appended to `daemon.stderr`
+    /// in the home so a failed test can keep it (see `Drop`).
+    fn daemon_stderr(&self) -> Stdio {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path.join("daemon.stderr"))
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null())
+    }
     /// Spawn `pbs-manager --home H daemon` as a direct child of the test.
     pub fn spawn_daemon(&self) -> Child {
         Command::new(BIN)
@@ -235,7 +245,7 @@ impl Home {
             .arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(self.daemon_stderr())
             .spawn()
             .expect("spawn daemon")
     }
@@ -258,7 +268,7 @@ impl Home {
             .arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(self.daemon_stderr());
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -309,7 +319,24 @@ impl Drop for Home {
         for pid in daemon_pids_for(&self.path) {
             kill_pid(pid, libc::SIGKILL);
         }
+        if std::thread::panicking() {
+            keep_failed_home(&self.path);
+        }
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A failed test's home is otherwise deleted with everything the daemon
+/// said. With `PBS_TEST_ARTIFACTS` set (CI uploads it), copy its logs there.
+fn keep_failed_home(home: &Path) {
+    let Some(dir) = std::env::var_os("PBS_TEST_ARTIFACTS") else { return };
+    let Some(name) = home.file_name() else { return };
+    let dst = Path::new(&dir).join(name);
+    if fs::create_dir_all(&dst).is_err() {
+        return;
+    }
+    for f in ["manager.log", "daemon.stderr", "events.jsonl"] {
+        let _ = fs::copy(home.join(f), dst.join(f));
     }
 }
 
