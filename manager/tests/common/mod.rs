@@ -305,6 +305,9 @@ impl Home {
 
 impl Drop for Home {
     fn drop(&mut self) {
+        if std::thread::panicking() && std::env::var_os("PBS_TEST_ARTIFACTS").is_some() {
+            self.dump_processes();
+        }
         for r in self.records() {
             if let Some(pid) = r["pid"].as_u64() {
                 kill_group(pid as u32, libc::SIGKILL);
@@ -323,6 +326,49 @@ impl Drop for Home {
             keep_failed_home(&self.path);
         }
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+impl Home {
+    /// Before a failed test's processes are killed: what each task and the
+    /// daemon are doing (`ps` state and wait channel, stdio descriptors),
+    /// to `processes.txt` in the home. A task that stopped making progress
+    /// shows here whether it is blocked writing to a pipe, sleeping, or gone.
+    fn dump_processes(&self) {
+        let mut groups: Vec<String> = self
+            .records()
+            .iter()
+            .filter_map(|r| r["pid"].as_u64().map(|p| p.to_string()))
+            .collect();
+        let daemon = self.pidfile_pid().map(|p| p.to_string());
+        let ps = Command::new("ps")
+            .args(["-axo", "pid,ppid,pgid,stat,wchan,etime,command"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let mut report = String::new();
+        let mut pids = Vec::new();
+        for (i, line) in ps.lines().enumerate() {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            let hit = cols.len() > 2 && (groups.contains(&cols[2].to_string()) || daemon.as_deref() == Some(cols[0]));
+            if i == 0 || hit {
+                report.push_str(line);
+                report.push('\n');
+                if hit {
+                    pids.push(cols[0].to_string());
+                }
+            }
+        }
+        for pid in &pids {
+            let lsof = Command::new("lsof")
+                .args(["-a", "-p", pid, "-d", "0-2"])
+                .output()
+                .map(|o| format!("{}\n{}{}", o.status, String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
+                .unwrap_or_else(|e| format!("lsof: {e}"));
+            report.push_str(&format!("\n# lsof -p {pid} -d 0-2\n{lsof}"));
+        }
+        groups.sort();
+        let _ = fs::write(self.path.join("processes.txt"), format!("# task groups: {}\n{report}", groups.join(" ")));
     }
 }
 
