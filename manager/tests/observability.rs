@@ -940,7 +940,7 @@ fn g1_gone_sessions_are_swept_after_retention() {
 /// and the daemon loads all of it at startup. Running tasks, leftover
 /// process groups, agents and the session's events stay.
 #[test]
-fn g4_finished_tasks_expire_in_a_connected_session() {
+fn g15_finished_tasks_expire_in_a_connected_session() {
     let home = Home::new("g4");
     std::fs::create_dir_all(&home.path).unwrap();
     std::fs::write(home.path.join("config.json"), r#"{"finishedTaskRetention":"0s"}"#).unwrap();
@@ -986,7 +986,7 @@ fn g4_finished_tasks_expire_in_a_connected_session() {
 /// delete with an unwritable tasks dir, sweep, and check the record is still
 /// there; unblock it and check the next sweep finishes the job.
 #[test]
-fn g4b_finished_task_survives_a_failed_delete_for_retry() {
+fn g15b_finished_task_survives_a_failed_delete_for_retry() {
     use std::os::unix::fs::PermissionsExt;
     if unsafe { libc::geteuid() } == 0 {
         return; // root ignores directory modes; nothing to assert

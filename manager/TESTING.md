@@ -274,7 +274,8 @@ fixtures in the contract's format, because the extension side may land later.
 | `sessions`: connected only, gone sessions hidden but `show`/`events` still reach them, counts, `--json`, no spawn | `c5` |
 | gone-session retention: swept after `goneSessionRetention`; connected and still-running sessions kept; swept tasks leave `show`/`ls` | `g1` (red with the sweep disabled) |
 | `doctor` flags an invalid `goneSessionRetention` | `g2` |
-| finished-task retention: in a connected session, a finished task's record, output and stderr are deleted after `finishedTaskRetention`; running tasks, lingering groups, agents and events stay; swept tasks leave `show`/`ls` | `g4` (red with the task sweep disabled) |
+| finished-task retention: in a connected session, a finished task's record, output and stderr are deleted after `finishedTaskRetention`; running tasks, lingering groups, agents and events stay; swept tasks leave `show`/`ls` | `g15` (red with the task sweep disabled) |
+| finished-task retention: a task whose files could not be deleted (e.g. an unwritable tasks dir) keeps its record for the next sweep to retry, instead of being forgotten while its files remain on disk | `g15b` |
 | `doctor` flags an invalid `finishedTaskRetention` | `g2` |
 | `status`: human uptime, counts incl. agents, protocol, `--json`; not running → exit 1, no spawn | `c6` |
 | `output --max-bytes` is a total cap (UTF-8 safe); SIGPIPE → exit 0, silent (output, ls, events, log); human timestamps in `log` | `c7` |
