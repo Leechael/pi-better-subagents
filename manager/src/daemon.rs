@@ -487,7 +487,9 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin>(
         if payload.len() > MAX_FRAME_SIZE as usize {
             continue;
         }
-        if write_frame(&mut w, payload).await.is_err() {
+        if let Err(e) = write_frame(&mut w, payload).await {
+            // The connection goes mute from here; its reader still runs.
+            eprintln!("pbs-manager: connection writer stopped: {e}");
             break;
         }
         if let Some((task, cursor)) = frame.output {
@@ -615,7 +617,13 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
         let frame = tokio::select! {
             f = read_frame(&mut rd) => match f {
                 Ok(Some(b)) => b,
-                _ => break, // EOF / io error / oversized frame
+                Ok(None) => break, // EOF: the client closed
+                Err(e) => {
+                    // io error / oversized frame: the client sees a drop
+                    let home = state.lock().unwrap().home.clone();
+                    lifecycle::log_line(&home, &format!("connection {conn_id} closed: {e}"));
+                    break;
+                }
             },
             _ = die.notified() => break, // rebound by a newer connection
         };
