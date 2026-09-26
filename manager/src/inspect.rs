@@ -513,10 +513,11 @@ fn under_dir(cwd: &str, dir: &str) -> bool {
 /// session's finished work stays inspectable by id (`show`) until its
 /// retention expires, but is no longer listed.
 ///
-/// The cheap filters (running/all, session, cwd) run first; only rows that
-/// survive them have an agent's real TIME filled in (a transcript read),
-/// so `--since` and the final order never cost a read for a row that was
-/// going to be dropped anyway.
+/// `--since` is parsed first — a bad duration must error before anything
+/// pays for a transcript read. The cheap filters (running/all, session,
+/// cwd) run next; only rows that survive them have an agent's real TIME
+/// filled in (a transcript read), so `--since` itself and the final order
+/// never cost a read for a row that was going to be dropped anyway.
 pub fn filter_rows(
     rows: Vec<Row>,
     o: &LsOpts,
@@ -525,6 +526,10 @@ pub fn filter_rows(
     agents: &[AgentRecord],
     home: &Path,
 ) -> Result<Vec<Row>, String> {
+    let since = match &o.since {
+        Some(s) => Some(now.saturating_sub(fmt::parse_duration(s)?)),
+        None => None,
+    };
     let dir = o.cwd.as_deref().map(normalize_dir);
     let mut rows: Vec<Row> = rows
         .into_iter()
@@ -544,10 +549,6 @@ pub fn filter_rows(
             }
         }
     }
-    let since = match &o.since {
-        Some(s) => Some(now.saturating_sub(fmt::parse_duration(s)?)),
-        None => None,
-    };
     rows.retain(|r| since.map_or(true, |s| r.active_at.unwrap_or(0) >= s));
     Ok(rows)
 }

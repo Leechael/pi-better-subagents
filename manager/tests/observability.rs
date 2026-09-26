@@ -678,6 +678,33 @@ fn c1c_status_and_doctor_never_read_agent_transcripts() {
     assert!(!out.stdout.contains("ch_0000c1c1"), "{}", out.stdout);
 }
 
+/// A bad `--since` must be rejected before filter_rows reads any surviving
+/// row's transcript: parsing it late, after the read, would make an invalid
+/// filter pay for work whose result it then discards.
+#[test]
+fn c1d_ls_since_is_validated_before_any_transcript_read() {
+    let home = Home::new("c1d");
+    let sid = "sess-c1d";
+    agent_fixture(
+        &home,
+        sid,
+        json!({"child_id":"ch_0000c1d1","session_id":sid,"name":"busy","agent":"w",
+        "status":"running","started_at":now_ms() - 5000}),
+    );
+    let dir = home.path.join("sessions").join(sid).join("agents");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("ch_0000c1d1.jsonl");
+    let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+    let _d = home.start_daemon();
+    let mut conn = home.connect();
+    hello_v2(&mut conn, sid, "/tmp");
+    // The running agent survives ls's cheap filters with no --all needed,
+    // so it would be a transcript-read candidate if --since parsed late.
+    let out = home.cli(&["ls", "--since", "10x"], S(3));
+    assert!(!out.status.success(), "bad --since must be rejected: {}{}", out.stdout, out.stderr);
+}
+
 #[test]
 fn c2_show_task_agent_and_run() {
     let home = Home::new("c2");
