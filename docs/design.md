@@ -94,7 +94,7 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 - shutdown 期间 manager 仍接受新连接,但立即拒绝其 `hello`(`E_INTERNAL` "manager is shutting down");客户端按 §3.1 第 6 步等该 manager 退出后 spawn 继任者,而不是卡到响应超时
 - 后台任务不允许比最后一个 pi 活得久。`pi --resume` 的 reattach 只在"还有其他 pi 活着"时成立
 - manager **永不自我复活**;只有客户端(扩展/CLI)在需要时 spawn
-- **manager 是所有任务的父进程,它以任何方式结束,任务都随之清理(lifeline)**:每个任务由 `pbs-manager __run <command>`(runner)作为进程组 leader 启动,runner 再在同一进程组里 exec `sh -c <command>`。runner 在 fd 3 持有 lifeline:一条只有 daemon 持有写端的 pipe 的读端。daemon 无论怎样结束(`shutdown`、`kill -9`、panic),内核都会关闭写端,runner 读到 EOF → 对自己的进程组 SIGTERM → 2s → SIGKILL。**没有崩溃恢复**:新 daemon 启动时不接管任何任务(见 §3.4)。
+- **manager 是所有任务的父进程,它以任何方式结束,任务都随之清理(lifeline)**:每个任务由 `pbs-manager __run <command>`(runner)作为进程组 leader 启动,runner 再以子进程启动同一进程组里的 `sh -c <command>`(`sh.spawn()`,runner 自己不 exec、留在组内)。runner 在 fd 3 持有 lifeline:一条只有 daemon 持有写端的 pipe 的读端。daemon 无论怎样结束(`shutdown`、`kill -9`、panic),内核都会关闭写端,runner 读到 EOF → 对自己的进程组 SIGTERM → 2s → SIGKILL。**保证只覆盖进程组成员**:命令若把某个后代移入新 session(如 `setsid`),它就脱离了该组,lifeline 管不到——已知边界,不做隔离。**没有崩溃恢复**:新 daemon 启动时不接管任何任务(见 §3.4)。
   - runner 在 fd 4 通过状态 pipe 上报命令的真实退出码/信号(`exit <code> <alone|linger>` 或 `signal <n> <alone|linger>`)。若命令留下了后台子进程(`cmd &`),runner 留下来当守护者(guardian),继续持有 lifeline,直到进程组只剩它自己;daemon 以"收到状态"为任务结束,以"runner 退出"为进程组已空。
   - runner 屏蔽 SIGTERM(子进程在 exec 前解除屏蔽),所以 stop/shutdown 的组 SIGTERM 只作用于命令,runner 能上报命令是怎么结束的;runner 自身只被 SIGKILL 带走,此时 daemon 退回用 runner 的 wait 状态。
   - lifeline 写端只有一个持有者(`task::lifeline()`,CLOEXEC),方便后续原地 exec 交接只处理一个 fd。
@@ -222,15 +222,17 @@ SIGTERM 进程组 → 2s → SIGKILL(发给进程组,leader 已退出也照发)�
 |---|---|---|
 | `task_started` | task_id, kind, command, pid, ts | 始终(推给 owning session) |
 | `output` | task_id, chunk, next_cursor | 仅 watch 后 |
-| `task_exited` | task_id, exit_code, signal, duration_ms, output_path, output_size, ts, end_reason | 始终 |
+| `task_exited` | task_id, exit_code, signal, duration_ms, output_path, output_size, ts, end_reason | 始终(崩溃扫描的孤儿标记除外,见下) |
 | `session_rebound` | — | 被替换的旧连接 |
+
+注:`task_exited` 的"始终"指 daemon 存活期间。崩溃扫描(§3.4)把仍 running 的记录标为 orphaned 时**不推任何事件**——旧 daemon 已死,没有可推的会话;客户端靠重连后的 `list`(扩展的 reconnect reconcile)或 `wait` 得知翻转,不要等一个不会来的事件。
 
 #### 事件日志(events.jsonl)
 
 - 文件:`<home>/sessions/<session_id>/events.jsonl`,只追加,一行一个 JSON 对象;无 session 的 daemon 事件写 `<home>/events.jsonl`
 - 每行 < 4 KiB(含换行):超长的字符串字段被截断(以 `…` 结尾)并加 `"truncated":true`;`src`/`type`/`ts` 不截断。每行用一次 O_APPEND `write` 写入,manager 与扩展并发追加也不会交错
 - 公共字段:`ts`(ms)、`src`(`"manager"` | `"extension"`)、`type`、`id?`(task/child id),加类型字段
-- manager 写:`session.connect {pi_pid, cwd, extension_version, protocol}`、`session.disconnect {reason: closed|rebound}`、`task.start {kind, command(≤200 字符), origin, pid}`、`task.background {after_ms}`、`task.stop {reason}`、`task.exit {exit_code, signal, end_reason, duration_ms}`(含 orphaned 与关闭时强制结束的任务)、`daemon.start {pid, version, protocol, readopted, orphaned, loaded}` / `daemon.shutdown {pid, killed_tasks}`(也写 manager.log)
+- manager 写:`session.connect {pi_pid, cwd, extension_version, protocol}`、`session.disconnect {reason: closed|rebound}`、`task.start {kind, command(≤200 字符), origin, pid}`、`task.background {after_ms}`、`task.stop {reason}`、`task.exit {exit_code, signal, end_reason, duration_ms}`(含 orphaned 与关闭时强制结束的任务)、`daemon.start {pid, version, protocol, orphaned, loaded}` / `daemon.shutdown {pid, killed_tasks}`(也写 manager.log)
 - 扩展写:`wake.emit {kind, ids[], batch}`、`wake.deliver {kind, mode: trigger|steer}`、`wake.dedupe {id}`、`monitor.drop {id, lines}`、`monitor.stop {id, reason}`、`agent.start {child_id, run_id, name, agent, model}`、`agent.settle {child_id, status, error?, duration_ms}`、`agent.stall {child_id}`、`agent.timeout {child_id}`、`decision.request/reply/timeout {child_id}`
 - 读者(CLI `events`/`show`/`sessions`)跳过无法解析、或缺 `ts`/`type` 的行
 - 保留:随 session 目录存放,v1 不轮转(deferred: rotation | impact: 超长 session 磁盘增长 | trigger: doctor 报告 sessions 目录 > 100MB)
@@ -511,7 +513,7 @@ You are an explorer agent. ... (body = system prompt 追加段)
 - 协议: hello/start/wait/output/stop/list/watch 全消息往返
 - 事件: task_exited 推送、watch 后 output 推送
 - 生命周期: 连接归零 → manager 退出且任务被清算;spawn lock 单例(第二个 daemon 拒绝启动)
-- 崩溃: kill -9 / panic manager → 所有任务及其子孙在 grace 内消失 → 重启后记录为 orphaned(manager-crash),不接管、不发信号
+- 崩溃: kill -9 / panic manager → 所有任务的进程组随之清理(SIGTERM;忽略 SIGTERM 的成员在 2s grace 期满后才被 SIGKILL,顽固组清理约 2s + 杀进程时间)→ 重启后仍 running 的记录标为 orphaned(manager-crash),不接管、不发信号
 - 输出: 大输出 cursor 增量读、UTF-8 lossy
 
 ### TS(`extension/tests/`)

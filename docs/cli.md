@@ -263,7 +263,7 @@ Runs the manager in the foreground (what auto-spawn uses); `--foreground` also l
 
 Asks the daemon to shut down gracefully: every running task and every leftover process group of a finished task gets SIGTERM, then SIGKILL after 2s; records end as `manager-shutdown`. Prints `manager shutting down`. The daemon also shuts itself down ~5s after its last client disconnects.
 
-The manager is the parent of every task and there is no crash recovery. Each task runs under a small runner (`pbs-manager __run`) that holds a lifeline to the daemon. If the daemon dies without shutting down (`kill -9`, a panic), every runner sees the lifeline break and takes its process group down: SIGTERM, then SIGKILL after 2s, background children included. The next daemon re-adopts nothing: it marks those records `orphaned` with `end_reason: manager-crash` and signals nothing.
+The manager is the parent of every task and there is no crash recovery. Each task runs under a small runner (`pbs-manager __run`) that holds a lifeline to the daemon. If the daemon dies without shutting down (`kill -9`, a panic), every runner sees the lifeline break and takes its process group down: SIGTERM, then SIGKILL after 2s, background children included. The next daemon re-adopts nothing and signals nothing: only records still persisted as `running` are marked `orphaned` with `end_reason: manager-crash`; a command that already exited (even if its guardian runner is still cleaning up leftover children) has a terminal record that stays unchanged.
 
 ## Exit codes
 

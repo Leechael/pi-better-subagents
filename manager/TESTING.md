@@ -66,16 +66,18 @@ concurrent copies of the integration suites.
 
 The daemon's own timers are the 5s idle grace, the 2s kill grace (stop
 reaper and graceful shutdown) and the 500ms leftover-group poll (now only a
-fallback, for a runner that died without reporting). The task runner's own
-timers (the 2s lifeline grace and the 100ms guardian poll) run in the
-runner process on real time, not on the daemon's clock. They go through `src/clock.rs`. In a normal build that
-is `tokio::time::sleep`. With the `test-clock` cargo feature **and**
-`PBS_TEST_CLOCK=manual` in the daemon's environment, they run on a manual
-clock instead:
+fallback, for a runner that died without reporting). Those are the only
+timers the manual clock covers; they go through `src/clock.rs`. The task
+runner's own timers (the 2s lifeline grace and the guardian poll — 100ms
+for the first second, then 1s backoff) run in the runner process on real
+time via `std::thread::sleep` and are never advanced by the manual clock.
+In a normal build clock.rs is `tokio::time::sleep`. With the `test-clock`
+cargo feature **and** `PBS_TEST_CLOCK=manual` in the daemon's environment,
+the daemon's timers run on a manual clock instead:
 
 - Virtual time starts at 0 and moves only on `clock_advance {ms}`.
   `clock_status` lists the pending timers by label (`idle`, `kill-grace`,
-  `shutdown-grace`, `adopt-poll`, `group-poll`) and time left.
+  `shutdown-grace`, `group-poll`) and time left.
 - Both requests exist only under the feature. They are sent as the first
   frame of a fresh connection, without hello, so they never count as an
   active connection and never cancel the idle timer.
@@ -193,7 +195,7 @@ States: `absent` → `starting` (claim) → `serving` (≥1 active conn) ⇄ `id
 | D1 | absent | N clients race to auto-spawn | serving | every client succeeds and is served by the same daemon (its session is in that daemon's `status`); exactly one process holds `manager.lock` (held while it runs, free once it exits); the process count converges to 1 within 2s (a redundant daemon exits "already running" without binding) | no | `d1` |
 | D2 | crashed | N clients race over stale files | serving | clients never delete files; exactly one reachable daemon; no client fails | no | **FIXED** `d2` |
 | D3 | absent | N `daemon` processes at once (no spawn lock) | 1 survivor | lifetime lock on manager.lock: losers exit 0 "already running" | no | **FIXED** `d3` |
-| D4 | crashed | restart | serving | lock holder removes stale files; T7/T8 applied; idle rule still applies to adopted tasks | `t12` | `d4` |
+| D4 | crashed | restart | serving | lock holder removes stale files; T7/T8 applied; no client is connected yet, so the 5s idle countdown is armed from boot (§3.2) | `t12` | `d4` |
 | D5 | serving | last client process SIGKILLed | idle → shutting_down after 5s → exited | nothing touched during the grace; then SIGTERM → 2s → SIGKILL (grandchildren too), records `killed`, socket + pid removed, exit 0 | `t09` (in-process close) | `d5` |
 | D6 | idle | hello within 5s | serving | countdown cancelled; restarts from zero when that client leaves | no | `d6`, `d6b` |
 | D7 | idle | only a silent (no hello) connection | exited | — | no | `d7` |
@@ -496,12 +498,14 @@ No removal turned a test red.
 ## Lifeline and runner (manager-lifeline)
 
 Principle: pbs-manager is the parent of every task. When it ends by any
-means, every task and its descendants go with it. There is no crash
+means, every task's process group goes with it (a descendant that escapes
+to a new session with `setsid` is outside the guarantee). There is no crash
 recovery.
 
 Every task runs under `pbs-manager __run` (`src/runner.rs`), the leader of
 its process group. The runner:
-- execs `sh -c` in the same group;
+- spawns `sh -c` as a child in the same group (it does not exec; it
+  stays alive as group leader);
 - holds the lifeline read end at fd 3; the daemon holds the only write end
   (`task::lifeline()`, close-on-exec);
 - reports the command's status on a status pipe at fd 4;
