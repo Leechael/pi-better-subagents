@@ -948,3 +948,31 @@ fn g3_no_daemon_means_nothing_is_running() {
     assert!(out.stdout.contains("orphaned") && out.stdout.contains("manager-crash"), "{}", out.stdout);
     assert!(!home.sock().exists(), "show must not start the daemon");
 }
+
+/// c9: the inspection commands keep working when the daemon holds more
+/// task records than fit in one 4 MiB frame (seen live: 9,585 records from
+/// nine days of history made `sessions` fail with "response exceeds the
+/// 4 MiB frame limit"). 50 records with 100 KB commands are ~5 MB.
+#[test]
+fn c9_inspection_works_past_one_frame_of_records() {
+    let home = Home::new("c9");
+    let sid = "sess-c9";
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, sid, "/tmp");
+    let pad = "x".repeat(100_000);
+    let ids: Vec<String> = (0..50).map(|i| start(&mut c, &format!(": {i} {pad}"), json!({})).0).collect();
+    for id in &ids {
+        // Per task: a `list` here would hit the very limit under test.
+        let w = c.request_ok(json!({"type":"wait","task_id":id,"budget_ms":5000}));
+        assert_eq!(w["done"], json!(true), "{id}: {w}");
+    }
+    let out = cli_ok(&home, &["sessions"]);
+    assert!(out.stdout.contains("50"), "sessions counts every task: {}", out.stdout);
+    let out = cli_ok(&home, &["ls", "--json"]);
+    let rows: Value = serde_json::from_str(&out.stdout).expect("ls --json");
+    assert_eq!(rows.as_array().map(|a| a.len()), Some(50), "ls lists every task");
+    let last = ids.last().unwrap();
+    let out = cli_ok(&home, &["show", last]);
+    assert!(out.stdout.contains(last.as_str()), "{}", out.stdout);
+}

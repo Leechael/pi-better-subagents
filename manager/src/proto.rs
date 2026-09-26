@@ -277,6 +277,13 @@ pub enum RequestKind {
         all: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+        /// Page the answer to fit a frame; `next` in the answer is the
+        /// `after` of the following page. Without it the whole list comes
+        /// in one frame, or not at all past 4 MiB.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        paged: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
     },
     Watch {
         task_id: String,
@@ -378,6 +385,9 @@ pub struct OutputOk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListOk {
     pub tasks: Vec<TaskRecord>,
+    /// More records follow a paged answer: pass this as the next `after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

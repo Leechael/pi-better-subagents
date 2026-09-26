@@ -205,8 +205,11 @@ SIGTERM 进程组 → 2s → SIGKILL(发给进程组,leader 已退出也照发)�
 ```json
 → {"type":"list", "all":false}
 ← {"ok":true, "tasks":[{...TaskRecord}]}
+→ {"type":"list", "all":true, "paged":true, "after":"<next>"}   // 分页
+← {"ok":true, "tasks":[...], "next":"<started_at>/<task_id>"}  // 无 next = 最后一页
 ```
 - extension 连接: 仅本 session; cli 连接: `all:true` 或显式 `session_id` 可看全部
+- 按 `(started_at, task_id)` 排序。不带 `paged` 时整表一帧返回,超过 4 MiB 帧上限则 `E_INTERNAL`;`paged:true` 时每页按帧预算装记录(至少一条),还有剩余就带 `next`,下一页以它作 `after`。游标是最后一条的 `started_at/task_id`,两页之间删掉的记录不会让后面错位。CLI 的 `sessions` / `ls` / `show` / `kill-session` 都分页取;不认识 `paged` 的旧 daemon 忽略它、不回 `next`,CLI 照样只取一次
 
 **watch / unwatch** — 订阅某任务的输出流事件:
 ```json

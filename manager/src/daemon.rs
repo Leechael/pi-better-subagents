@@ -1012,9 +1012,12 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         RequestKind::Stop { task_id, reason } => {
             respond(&tx, &id, handle_stop(&state, conn_id, &task_id, reason.as_deref())).await
         }
-        RequestKind::List { all, session_id } => {
-            respond(&tx, &id, handle_list(&state, conn_id, all, session_id)).await
-        }
+        RequestKind::List {
+            all,
+            session_id,
+            paged,
+            after,
+        } => respond(&tx, &id, handle_list(&state, conn_id, all, session_id, paged, after)).await,
         RequestKind::Watch { task_id } => {
             respond(&tx, &id, handle_watch(&state, conn_id, &task_id, true)).await
         }
@@ -1535,7 +1538,14 @@ fn handle_list(
     conn_id: u64,
     _all: bool,
     session_id: Option<String>,
+    paged: bool,
+    after: Option<String>,
 ) -> Result<ListOk, ProtoError> {
+    let after = match after.as_deref().map(parse_list_cursor) {
+        None => None,
+        Some(Some(c)) => Some(c),
+        Some(None) => return Err(ProtoError::new(E_BAD_REQUEST, "list: bad `after` cursor")),
+    };
     let st = state.lock().unwrap();
     let acc = access_for(&st, conn_id);
     let mut tasks: Vec<TaskRecord> = st
@@ -1553,8 +1563,39 @@ fn handle_list(
         })
         .map(|e| e.record.clone())
         .collect();
-    tasks.sort_by_key(|r| r.started_at);
-    Ok(ListOk { tasks })
+    // task_id breaks started_at ties, so pages have a total order.
+    tasks.sort_by(|a, b| (a.started_at, &a.task_id).cmp(&(b.started_at, &b.task_id)));
+    if !paged && after.is_none() {
+        return Ok(ListOk { tasks, next: None });
+    }
+    if let Some((at, tid)) = &after {
+        tasks.retain(|r| (r.started_at, &r.task_id) > (*at, tid));
+    }
+    // Fill a page up to the frame budget; always at least one record.
+    let mut size = 0usize;
+    let mut take = 0usize;
+    for r in &tasks {
+        let n = serde_json::to_vec(r).map(|v| v.len() + 1).unwrap_or(0);
+        if take > 0 && size + n > CHUNK_JSON_BUDGET {
+            break;
+        }
+        size += n;
+        take += 1;
+    }
+    let next = (take < tasks.len()).then(|| list_cursor(&tasks[take - 1]));
+    tasks.truncate(take);
+    Ok(ListOk { tasks, next })
+}
+
+/// A paged `list` resumes after `<started_at>/<task_id>` of the last record
+/// sent, so a record removed between pages cannot shift the rest.
+fn list_cursor(r: &TaskRecord) -> String {
+    format!("{}/{}", r.started_at, r.task_id)
+}
+
+fn parse_list_cursor(s: &str) -> Option<(u64, String)> {
+    let (at, tid) = s.split_once('/')?;
+    Some((at.parse().ok()?, tid.to_string()))
 }
 
 fn handle_watch(

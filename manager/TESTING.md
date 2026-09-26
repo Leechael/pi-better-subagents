@@ -11,7 +11,7 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 | `tests/protocol.rs` | black box | message round-trips, basic lifecycle (t01–t13) |
 | `tests/lifecycle_adversarial.rs` | black box | every cell of the lifecycle table below, adversarial conditions |
 | `tests/mutation_gaps.rs` | black box | behaviours found unguarded by cargo-mutants survivors (g1–g14) |
-| `tests/observability.rs` | black box | observability contract: protocol additions, events.jsonl, inspection CLI (p1–p3, e1–e4, c1–c8) |
+| `tests/observability.rs` | black box | observability contract: protocol additions, events.jsonl, inspection CLI (p1–p3, e1–e4, c1–c9) |
 | `tests/upgrade.rs` | black box | in-place upgrade: exec handover, rollback, restore failure, carried watches, N−1 hello (u1–u12) |
 | `tests/timing_canary.rs` | black box, real time | the actual 5s idle grace and 2s kill grace (always on the real clock) |
 | `tests/common/mod.rs` | helpers | wire client, isolated `--home`, process probes, crashable helper client, clock stepping (`Home::advance*`) |
@@ -495,6 +495,8 @@ No removal turned a test red.
 - deferred: Windows named-pipe path (design §3.1) has no tests; `sys.rs` is unix-only | impact: none until Windows ships | trigger: first Windows build
 - deferred: the extension's own connect path (TypeScript) is not changed to wait out a shutting-down manager the way the Rust client now does; the exact protocol to implement is design §3.1 step 6 | impact: an extension connecting in the ≤ 2s shutdown window gets `manager is shutting down` at once instead of a successor | trigger: extension side of this branch's merge (handed to the extension engineer)
 - resolved (ci-github-actions): `task_exited.output_size` and the terminal record now cover every byte. The exit watch waits for the pumps to drain before finalizing (restored after the rebase lost it, `t15`), and the output fanout no longer moves a finished record's `output_size` back to its own lagging cursor.
+- deferred: the extension's `list` (own session only) is not paged | impact: a single pi session with more than ~4 MiB of task records (thousands of tasks, or very long commands) gets `E_INTERNAL` from `task_list` and its reconnect reconcile | trigger: a session that long-lived, or `task_list` failing with the frame-limit error
+- deferred: one record larger than a frame (a command near 4 MiB) still fails a paged `list`, since a page always carries at least one record | impact: `ls`/`sessions`/`show` fail while that record is retained | trigger: a start request with a multi-MiB command
 - resolved (manager-lifeline): re-adoption by pid liveness is gone. A crashed daemon's tasks die with it (lifeline), and the next startup only marks their records; it never signals a recorded pid (`d4b`).
 
 ## Lifeline and runner (manager-lifeline)
