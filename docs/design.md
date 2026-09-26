@@ -22,7 +22,7 @@ pi (`@earendil-works/pi-coding-agent`) 刻意不内置 subagent、后台 bash、
 | 子代理进程模型 | v1 全部进程内 `createAgentSession`;执行层抽象 `ChildRunner` 接缝,未来可加 detached 后端 |
 | 进程管理 | 独立 Rust binary `pbs-manager`,全机单例,约定路径,session_id 命名空间隔离 |
 | manager 生命周期 | **与 pi 进程共存亡**: 活跃连接归零 → 杀掉剩余任务 → 退出。需要时经 lock 启动。不自我复活,spawn 权只在客户端 |
-| manager 语言 | Rust (tokio + clap + serde_json + interprocess + fd-lock) |
+| manager 语言 | Rust (tokio + usage-rs + serde_json + interprocess + fd-lock) |
 
 ### 研究来源(结论已内化,实现时不依赖)
 
@@ -316,7 +316,8 @@ pbs-manager shutdown
 manager/
 ├── Cargo.toml
 └── src/
-    ├── main.rs       # clap 分发: daemon | 客户端子命令
+    ├── main.rs       # 启动入口与子命令分发
+    ├── cli.rs        # usage-rs CLI 声明
     ├── daemon.rs     # listener、accept loop、连接注册、归零 shutdown
     ├── proto.rs      # 帧 codec + 消息 serde 类型
     ├── task.rs       # spawn(经 runner、进程组)、lifeline、输出 tee
@@ -331,7 +332,7 @@ manager/
     └── out.rs        # 管道关闭时静默退出 0 的 stdout
 ```
 
-依赖: tokio(full), clap(derive), serde + serde_json, interprocess(跨平台 socket), fd-lock(spawn lock), libc(仅经 `sys.rs` 封装进程组)。Windows 进程组用 Job Object(v1 可先 `taskkill /T`)。
+依赖: tokio(full), usage-rs(derive CLI parser), serde + serde_json, interprocess(跨平台 socket), fd-lock(spawn lock), libc(仅经 `sys.rs` 封装进程组)。Windows 进程组用 Job Object(v1 可先 `taskkill /T`)。
 
 **内存边界(§3.4 加固)**:
 - 内存 ring 硬上限 64KB(`RING_CAPACITY`);全量只落盘 `.output`

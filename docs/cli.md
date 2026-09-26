@@ -66,6 +66,7 @@ pbs-manager log [-f] [-n 100] [ID] [--stderr]
 pbs-manager tail <ID> [-n 100] [--stderr]
 pbs-manager output <id> [-f] [--max-bytes N]
 pbs-manager wait <id> [--budget-ms 20000]
+pbs-manager completion --shell <bash|zsh|fish>
 pbs-manager stop <id>
 pbs-manager kill-session <session_id>
 pbs-manager start [--session cli] [--kind shell|monitor] [--cwd DIR] [--timeout-ms N] [--background] '<cmd>'
@@ -87,6 +88,10 @@ Durations (`--since`): `500ms`, `30s`, `10m`, `2h`, `1d` (a bare number is secon
 A daemon started this way exits again ~5s after its last client leaves (§3.2).
 
 Output is pipe-friendly: when the reader goes away (`… | head`), the CLI exits quietly with status 0.
+
+### Shell completions
+
+Generate a dynamic completion script for bash, zsh, or fish with `pbs-manager completion --shell <shell>`. Install the returned script using the convention for your shell; keep `pbs-manager` on `PATH` because the script asks it for candidates as you type.
 
 ---
 

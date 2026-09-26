@@ -14,6 +14,7 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 | `tests/observability.rs` | black box | observability contract: protocol additions, events.jsonl, inspection CLI (p1–p3, e1–e4, c1–c9) |
 | `tests/upgrade.rs` | black box | in-place upgrade: exec handover, rollback, restore failure, carried watches, N−1 hello (u1–u12) |
 | `tests/timing_canary.rs` | black box, real time | the actual 5s idle grace and 2s kill grace (always on the real clock) |
+| `tests/cli.rs` | black box | CLI help/version, completion scripts, strict parser errors |
 | `tests/common/mod.rs` | helpers | wire client, isolated `--home`, process probes, crashable helper client, clock stepping (`Home::advance*`) |
 
 All black-box tests start the compiled binary with an isolated `--home`
