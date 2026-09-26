@@ -166,7 +166,8 @@ fn u1_upgrade_keeps_every_task_running() {
     assert_eq!(after["last_upgrade"]["ok"], true);
     assert_eq!(after["last_upgrade"]["trigger"], "cli");
     let human = home.cli(&["status"], s(10)).stdout;
-    let v = env!("CARGO_PKG_VERSION");
+    let v = before["version"].as_str().unwrap();
+    assert!(v.starts_with(concat!(env!("CARGO_PKG_VERSION"), "+")), "{v}");
     assert!(human.contains(&format!("upgrades: 1 (last: {v} -> {v}, cli, ")), "{human}");
     for p in sleeper_group.iter().chain(&leftover_group) {
         assert!(pid_alive(*p), "pid {p} died in the upgrade");

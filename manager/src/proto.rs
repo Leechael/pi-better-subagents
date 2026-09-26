@@ -438,6 +438,9 @@ pub struct StatusOk {
     /// The latest in-place upgrade attempt, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_upgrade: Option<UpgradeInfo>,
+    /// The daemon's binary: the file an in-place upgrade execs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
 }
 
 /// Outcome of an in-place upgrade attempt.

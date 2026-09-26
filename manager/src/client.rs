@@ -186,7 +186,7 @@ pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, Str
             session_id: Some(session_id.clone()),
             pi_pid: Some(std::process::id()),
             cwd: std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
-            extension_version: Some(format!("pbs-manager-cli/{}", env!("CARGO_PKG_VERSION"))),
+            extension_version: Some(format!("pbs-manager-cli/{}", crate::VERSION)),
             protocol: Some(PROTOCOL),
         },
     };

@@ -91,14 +91,15 @@ Output is pipe-friendly: when the reader goes away (`… | head`), the CLI exits
 ### `status`
 
 ```text
-version:  0.1.0 (protocol 2)
+version:  0.1.0+066598ae00 (protocol 2)
 pid:      4321
+binary:   /Users/me/.pi/agent/pbs/bin/pbs-manager
 uptime:   13m23s
 sessions: 2 (1 connected)
 tasks:    3 running, 8 finished (shells 2/5, agents 1/3)
 ```
 
-Counts include agents (running/finished shells and agents are also shown separately). `--json` prints the protocol `status` response plus `agent_counts`. With no daemon: `pbs-manager is not running` on stderr, exit 1.
+The version carries the commit the binary was built from, so two builds of 0.1.0 differ; `unknown` for a build outside a git checkout. `binary` is the daemon's file, the one an [`upgrade`](#upgrade) execs, which is not necessarily the CLI you ran. Counts include agents (running/finished shells and agents are also shown separately). `--json` prints the protocol `status` response plus `agent_counts`. With no daemon: `pbs-manager is not running` on stderr, exit 1.
 
 ### `sessions`
 

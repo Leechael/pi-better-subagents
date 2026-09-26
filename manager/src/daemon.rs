@@ -217,7 +217,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
         &format!(
             "daemon started pid={} version={} orphaned={} loaded={}",
             std::process::id(),
-            env!("CARGO_PKG_VERSION"),
+            crate::VERSION,
             scan.orphaned,
             scan.loaded
         ),
@@ -229,7 +229,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
         None,
         serde_json::json!({
             "pid": std::process::id(),
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": crate::VERSION,
             "protocol": PROTOCOL,
             "orphaned": scan.orphaned,
             "loaded": scan.loaded,
@@ -238,7 +238,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     if foreground {
         eprintln!(
             "pbs-manager {} listening on {} (pid {})",
-            env!("CARGO_PKG_VERSION"),
+            crate::VERSION,
             sock.display(),
             std::process::id()
         );
@@ -277,7 +277,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
         at: now_ms(),
         ok: true,
         from_version: snap.from_version.clone(),
-        to_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        to_version: Some(crate::VERSION.to_string()),
         error: None,
         trigger: snap.trigger.clone(),
     });
@@ -310,7 +310,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
         &format!(
             "upgraded in place: {} -> {} (pid {}, generation {}, {} live task(s))",
             snap.from_version,
-            env!("CARGO_PKG_VERSION"),
+            crate::VERSION,
             std::process::id(),
             snap.generation,
             live.len()
@@ -615,7 +615,7 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
         .send(encode_ok(
             &hello.id,
             &HelloOk {
-                version: env!("CARGO_PKG_VERSION").to_string(),
+                version: crate::VERSION.to_string(),
                 pid: std::process::id(),
                 started_at,
             },
@@ -1708,7 +1708,7 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         .count();
     let terminal = st.registry.tasks.len() - running;
     Ok(StatusOk {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: crate::VERSION.to_string(),
         pid: std::process::id(),
         uptime_ms: now_ms().saturating_sub(st.started_at_ms),
         sessions,
@@ -1716,6 +1716,7 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         protocol: PROTOCOL,
         generation: st.generation,
         last_upgrade: st.last_upgrade.clone(),
+        exe: crate::handover::exe_path().ok().map(|p| p.display().to_string()),
     })
 }
 
@@ -1735,7 +1736,7 @@ fn handle_upgrade(state: &Shared, conn_id: u64) -> Result<UpgradeOk, ProtoError>
         return Err(ProtoError::new(E_INTERNAL, "an upgrade is already in progress"));
     }
     Ok(UpgradeOk {
-        from_version: env!("CARGO_PKG_VERSION").to_string(),
+        from_version: crate::VERSION.to_string(),
         generation,
     })
 }

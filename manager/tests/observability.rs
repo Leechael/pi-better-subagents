@@ -775,7 +775,14 @@ fn c6_status_counts_uptime_and_not_running() {
     std::thread::sleep(MS(1100));
     let out = cli_ok(&home, &["status"]);
     let s = &out.stdout;
-    assert!(s.contains("version:  0.1.0 (protocol 2)"), "{s}");
+    // The version names the commit the binary was built from ("0.1.0" alone
+    // cannot tell builds apart), and status names the daemon's binary: the
+    // file an upgrade execs, which need not be the CLI's own.
+    let head = std::process::Command::new("git").args(["rev-parse", "--short=10", "HEAD"]).output().unwrap();
+    let head = String::from_utf8(head.stdout).unwrap();
+    assert!(s.contains(&format!("version:  0.1.0+{} (protocol 2)", head.trim())), "{s}");
+    let bin = std::fs::canonicalize(BIN).unwrap();
+    assert!(s.contains(&format!("binary:   {}", bin.display())), "{s}");
     let uptime = s.lines().find(|l| l.starts_with("uptime:")).unwrap();
     assert!(uptime.ends_with('s') && !uptime.contains('.'), "human uptime: {uptime}");
     assert!(s.contains("tasks:    1 running, 3 finished (shells 1/1, agents 0/2)"), "{s}");

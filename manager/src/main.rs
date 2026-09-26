@@ -22,10 +22,14 @@ mod task;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Package version plus the commit it was built from ("0.1.0+066598ae00"):
+/// every build of 0.1.0 would otherwise look the same in `status`.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PBS_GIT_SHA"));
+
 #[derive(Parser)]
 #[command(
     name = "pbs-manager",
-    version,
+    version = VERSION,
     about = "Process management daemon for pi-better-subagents"
 )]
 struct Cli {

@@ -1164,6 +1164,9 @@ pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
     }
     outln!("version:  {} (protocol {})", st.version, st.protocol);
     outln!("pid:      {}", st.pid);
+    if let Some(exe) = &st.exe {
+        outln!("binary:   {exe}");
+    }
     outln!("uptime:   {}", fmt::human_duration(st.uptime_ms));
     outln!(
         "sessions: {} ({} connected)",
