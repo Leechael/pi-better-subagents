@@ -617,6 +617,7 @@ it):
 | D22 | quiescing | exec fails | serving (old image) | descriptors back to close-on-exec, tasks resume with no byte lost, clients reconnect | `u5` |
 | D23 | restoring | the new image cannot restore | exited | the lifeline closes: every task and grandchild cleaned up (= a crash, no recovery) | `u6` |
 | D24 | serving, just restored | no client for longer than the 5 s idle grace | serving | the idle rule is held for the 30 s handover grace, then applies again | `u12` |
+| D26 | serving, protocol < 3 (a manager from before in-place upgrade) | `upgrade` (CLI) | serving, unchanged | the CLI sends no `upgrade`; it names the pid, version and protocol and says to restart once (`pbs-manager shutdown`) | `u13` |
 | S7 | connected | the manager upgrades | reconnects to the same pid | in-flight requests unanswered (resent by the client); `start` resent with its `key` returns the task it already started; protocol 1 / no-protocol hellos accepted | `u1`, `u2`, `u3` |
 | T17 | running / stop grace pending / timeout armed | upgrade | unchanged | later exits report the real code and signal; the timeout fires from the original start; a pending kill grace is re-armed with the time it had left | `u1`, `u8` |
 | T18 | running, watched (monitor) | upgrade | unchanged | the session's watch comes back on re-hello with exactly the bytes its connection had not been written; a UTF-8 character split across the handover arrives whole | `u1`, `u10`, `u11` |

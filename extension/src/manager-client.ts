@@ -17,7 +17,8 @@ import { realClock, type Clock, type ClockTimer } from "./clock";
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
 const EXTENSION_VERSION = "0.1.0";
-const OBSERVABILITY_PROTOCOL = 2;
+// 3: speaks in-place upgrade (resends on reconnect, start keys).
+const PROTOCOL = 3;
 const HELLO_TIMEOUT_MS = 5000;
 const RECONNECT_HELLO_TIMEOUT_MS = 25_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
@@ -657,7 +658,7 @@ export class ManagerClient {
           pi_pid: this.piPid,
           ...(this.cwd ? { cwd: this.cwd } : {}),
           extension_version: EXTENSION_VERSION,
-          protocol: OBSERVABILITY_PROTOCOL,
+          protocol: PROTOCOL,
         }),
       );
     });

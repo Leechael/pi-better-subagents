@@ -143,7 +143,7 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 ```
 - `extension` 必须带 `session_id` + `pi_pid`;此后该连接接收此 session 的事件
 - `cwd` 可选(向后兼容)。扩展在 hello 里带上 session cwd;manager 存入 session 并在 status/sessions 里返回。旧客户端省略该字段仍可握手
-- `extension_version`(字符串)、`protocol`(整数)可选:manager 按 session 存储,在 `status` 的 sessions 里返回,`doctor` 据此检查每个已连接 session 的协议与 manager 一致。`protocol` 为特性级别:1 = 原始 §3.3,2 = 可观测性契约(origin / mark_background / stop.reason / end_reason / events.jsonl)。缺省 = 旧扩展
+- `extension_version`(字符串)、`protocol`(整数)可选:manager 按 session 存储,在 `status` 的 sessions 里返回,`doctor` 据此检查每个已连接 session 的协议与 manager 一致。`protocol` 为特性级别:1 = 原始 §3.3,2 = 可观测性契约(origin / mark_background / stop.reason / end_reason / events.jsonl),3 = 原地升级(`upgrade`、status 的 `generation`/`last_upgrade`/`exe`、start key、重连后重发)。CLI 的 `upgrade` 遇到级别 < 3 的 manager 不发请求,直接提示重启一次。缺省 = 旧扩展
 - 同一 `session_id` 重复 hello: 新连接赢,旧连接收到 `{"type":"event","event":"session_rebound"}` 后由服务端关闭
 - `cli` 不带 session;可访问跨 session 的只读/管理操作
 
@@ -228,7 +228,7 @@ SIGTERM 进程组 → 2s → SIGKILL(发给进程组,leader 已退出也照发)�
 **status**(只读,cli 与 extension 均可):
 ```json
 → {"type":"status"}
-← {"ok":true, "version":"0.1.0", "pid":4321, "uptime_ms":3600000, "protocol":2,
+← {"ok":true, "version":"0.1.0+066598ae00", "pid":4321, "uptime_ms":3600000, "protocol":3,
    "sessions":[{"session_id":"...","pi_pid":1234,"connected":true,"cwd":"/path",
                 "extension_version":"0.3.0","protocol":2,"connected_at":1726...,"last_seen":1726...}],
    "task_counts":{"running":2,"terminal":5}}

@@ -505,3 +505,60 @@ fn u12_idle_rule_waits_for_clients_after_an_upgrade() {
         assert!(poll_true(s(5), || !pid_running(pid)), "shutdown killed the task");
     }
 }
+
+/// Serve `home`'s socket as a manager from before in-place upgrade: replies
+/// captured from the real daemon, then aged to protocol 2 (no upgrade
+/// fields; `upgrade` is an unknown request, as the 2026-09-23 build said).
+fn serve_pre_upgrade_manager(home: &Home) -> std::thread::JoinHandle<()> {
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    let hello_ok = c.request(json!({"type":"hello","client_kind":"cli","protocol":2}));
+    let mut status_ok = c.request(json!({"type":"status"}));
+    let unknown = c.request(json!({"type":"no_such_request"}));
+    assert_eq!(unknown["ok"], json!(false), "{unknown}");
+    c.request(json!({"type":"shutdown"}));
+    drop(c);
+    assert!(poll_true(s(10), || !home.sock().exists()), "the real daemon went away");
+
+    assert_eq!(status_ok["ok"], json!(true), "{status_ok}");
+    status_ok["protocol"] = json!(2);
+    status_ok["version"] = json!("0.1.0");
+    for k in ["generation", "last_upgrade", "exe"] {
+        status_ok.as_object_mut().unwrap().remove(k);
+    }
+    let mut upgrade_err = unknown.clone();
+    upgrade_err["error"]["message"] = json!("bad request: unknown variant `upgrade`, expected one of `hello`, `start`, `status`, `shutdown`");
+    let listener = std::os::unix::net::UnixListener::bind(home.sock()).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            let (hello_ok, status_ok, upgrade_err) = (hello_ok.clone(), status_ok.clone(), upgrade_err.clone());
+            std::thread::spawn(move || {
+                let mut c = Conn::new(stream);
+                while let Recv::Frame(req) = c.recv(Instant::now() + s(30)) {
+                    let mut reply = match req["type"].as_str() {
+                        Some("hello") => hello_ok.clone(),
+                        Some("status") => status_ok.clone(),
+                        _ => upgrade_err.clone(),
+                    };
+                    reply["id"] = req["id"].clone();
+                    c.send(&reply);
+                }
+            });
+        }
+    })
+}
+
+/// D26: `upgrade` against a manager too old to upgrade in place. Invariant:
+/// the CLI says what is running and what to do (restart once), instead of
+/// passing on the daemon's "unknown variant `upgrade`".
+#[test]
+fn u13_upgrade_explains_a_manager_that_predates_it() {
+    let home = Home::new("u13");
+    let _fake = serve_pre_upgrade_manager(&home);
+    let out = upgrade(&home);
+    assert_eq!(out.status.code(), Some(1), "{} {}", out.stdout, out.stderr);
+    assert!(!out.stderr.contains("unknown variant"), "{}", out.stderr);
+    assert!(out.stderr.contains("predates in-place upgrade"), "{}", out.stderr);
+    assert!(out.stderr.contains("pbs-manager shutdown"), "{}", out.stderr);
+}

@@ -15,8 +15,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const PROTO_VERSION: u32 = 1;
 /// Feature level of the protocol, exchanged in hello (`protocol`) and
 /// returned by `status`. 1 = original §3.3; 2 = observability contract
-/// (origin, mark_background, stop.reason, end_reason, events.jsonl).
-pub const PROTOCOL: u32 = 2;
+/// (origin, mark_background, stop.reason, end_reason, events.jsonl); 3 =
+/// in-place upgrade (`upgrade`, status `generation`/`last_upgrade`, start
+/// keys, resend on reconnect).
+pub const PROTOCOL: u32 = 3;
+/// The first protocol level whose manager understands `upgrade`.
+pub const PROTOCOL_UPGRADE: u32 = 3;
 /// §3.3: max frame 4 MiB.
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
 

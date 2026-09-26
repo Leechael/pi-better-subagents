@@ -432,6 +432,13 @@ pub async fn cmd_upgrade(home: &Path) -> Result<(), String> {
         return Ok(());
     };
     let before: StatusOk = conn.roundtrip(RequestKind::Status).await?;
+    if before.protocol < PROTOCOL_UPGRADE {
+        return Err(format!(
+            "the running manager (pid {}, {}, protocol {}) predates in-place upgrade, so it cannot upgrade itself. \
+             Restart it once: `pbs-manager shutdown` (stops its running tasks); the next client starts the installed binary",
+            before.pid, before.version, before.protocol
+        ));
+    }
     let asked = now_ms();
     let ok: UpgradeOk = conn.roundtrip(RequestKind::Upgrade).await?;
     drop(conn);

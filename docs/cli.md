@@ -91,7 +91,7 @@ Output is pipe-friendly: when the reader goes away (`… | head`), the CLI exits
 ### `status`
 
 ```text
-version:  0.1.0+066598ae00 (protocol 2)
+version:  0.1.0+066598ae00 (protocol 3)
 pid:      4321
 binary:   /Users/me/.pi/agent/pbs/bin/pbs-manager
 uptime:   13m23s

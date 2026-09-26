@@ -228,7 +228,7 @@ fn p3_hello_protocol_and_status() {
     let mut cli = home.connect();
     cli.hello_cli();
     let st = cli.request_ok(json!({"type":"status"}));
-    assert_eq!(st["protocol"], 2, "{st}");
+    assert_eq!(st["protocol"], 3, "{st}");
     let s = &st["sessions"][0];
     assert_eq!((s["protocol"].as_u64(), s["extension_version"].as_str()), (Some(2), Some("0.9.0-test")), "{st}");
     let since = s["connected_at"].as_u64().unwrap();
@@ -300,7 +300,7 @@ fn e1_manager_writes_session_and_task_events() {
         .collect();
     let dt: Vec<&str> = daemon.iter().map(|e| e["type"].as_str().unwrap()).collect();
     assert_eq!(dt, ["daemon.start", "daemon.shutdown"]);
-    assert_eq!(daemon[0]["protocol"], 2);
+    assert_eq!(daemon[0]["protocol"], 3);
 }
 
 /// Oversized fields are truncated so every line stays below 4 KiB.
@@ -780,7 +780,7 @@ fn c6_status_counts_uptime_and_not_running() {
     // file an upgrade execs, which need not be the CLI's own.
     let head = std::process::Command::new("git").args(["rev-parse", "--short=10", "HEAD"]).output().unwrap();
     let head = String::from_utf8(head.stdout).unwrap();
-    assert!(s.contains(&format!("version:  0.1.0+{} (protocol 2)", head.trim())), "{s}");
+    assert!(s.contains(&format!("version:  0.1.0+{} (protocol 3)", head.trim())), "{s}");
     let bin = std::fs::canonicalize(BIN).unwrap();
     assert!(s.contains(&format!("binary:   {}", bin.display())), "{s}");
     let uptime = s.lines().find(|l| l.starts_with("uptime:")).unwrap();
@@ -788,7 +788,7 @@ fn c6_status_counts_uptime_and_not_running() {
     assert!(s.contains("tasks:    1 running, 3 finished (shells 1/1, agents 0/2)"), "{s}");
     let out = cli_ok(&home, &["status", "--json"]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
-    assert_eq!(v["protocol"], 2);
+    assert_eq!(v["protocol"], 3);
     assert_eq!(v["agent_counts"], json!({"running":0,"terminal":2}));
 }
 
