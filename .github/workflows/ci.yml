@@ -20,6 +20,9 @@ jobs:
     defaults:
       run:
         working-directory: manager
+    env:
+      # A failed test copies its daemon's logs here (tests/common Home::drop).
+      PBS_TEST_ARTIFACTS: ${{ github.workspace }}/pbs-test-artifacts
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -30,6 +33,12 @@ jobs:
       - run: cargo test
       # Manual clock: the daemon's own timers are stepped by the tests.
       - run: cargo test --features test-clock
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: manager-logs-${{ matrix.os }}
+          path: pbs-test-artifacts
+          if-no-files-found: ignore
 
   extension:
     runs-on: ubuntu-latest
@@ -59,6 +68,8 @@ jobs:
     env:
       PBS_MANAGER_PATH: ${{ github.workspace }}/manager/target/release/pbs-manager
       PI_BIN: ${{ github.workspace }}/eval/node_modules/.bin/pi
+      # Keep every sandbox (/tmp/pbse-*) so a failure can be uploaded.
+      PBS_EVAL_KEEP: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -91,3 +102,13 @@ jobs:
         working-directory: eval
       - run: npm run test:e2e
         working-directory: eval
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-sandboxes-${{ matrix.os }}
+          path: |
+            /tmp/pbse-*/h/manager.log
+            /tmp/pbse-*/h/events.jsonl
+            /tmp/pbse-*/h/config.json
+            /tmp/pbse-*/faux-trace.jsonl
+          if-no-files-found: ignore
