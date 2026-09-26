@@ -36,8 +36,14 @@ use std::time::Duration;
 /// Grace between the group SIGTERM and SIGKILL when the lifeline breaks
 /// (the same 2 s as the daemon's stop/shutdown, §3.2).
 const LIFELINE_GRACE: Duration = Duration::from_secs(2);
-/// How often a guardian looks for remaining group members.
+/// How often a guardian looks for remaining group members. Every group
+/// enumeration walks the whole process table (on Linux, all of /proc), so
+/// once the group has held stable for a second the poll backs off.
 const GUARD_POLL: Duration = Duration::from_millis(100);
+/// Slow poll after `GUARD_STABLE_FOR` of a stable, non-empty group.
+const GUARD_POLL_SLOW: Duration = Duration::from_secs(1);
+/// How long the group must stay non-empty before the poll backs off.
+const GUARD_STABLE_FOR: Duration = Duration::from_secs(1);
 
 pub fn main(command: &OsStr) -> i32 {
     // Neither descriptor may reach the command.
@@ -84,8 +90,11 @@ pub fn main(command: &OsStr) -> i32 {
     if !alone_now {
         // Guardian: hold the lifeline until everything the command left
         // behind is gone (or the lifeline breaks and takes the group down).
+        let mut stable = Duration::ZERO;
         while !alone(me) {
-            std::thread::sleep(GUARD_POLL);
+            let poll = if stable >= GUARD_STABLE_FOR { GUARD_POLL_SLOW } else { GUARD_POLL };
+            std::thread::sleep(poll);
+            stable += poll;
         }
     }
     0
@@ -97,12 +106,13 @@ fn report(what: &str, alone: bool) {
 }
 
 /// No member of our group but us. If the group cannot be enumerated the
-/// runner cannot guard it, so it says "alone" and lets the daemon's own
-/// group probe take over rather than spin here forever.
+/// runner cannot prove the group empty, so it says "not alone": it keeps
+/// guarding (and the daemon keeps probing the group) rather than let a
+/// leftover escape both watchers.
 fn alone(me: u32) -> bool {
     match sys::group_members(me) {
         Ok(pids) => pids.iter().all(|p| *p == me),
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 
@@ -120,20 +130,28 @@ fn watch_lifeline(me: u32) {
     let _ = sys::signal_group(me, sys::SIGTERM);
     std::thread::sleep(LIFELINE_GRACE);
     // Then SIGKILL every other member, one by one, until we are alone: a
-    // process forked while a group signal is delivered can miss it.
-    for _ in 0..200 {
-        let others: Vec<u32> = match sys::group_members(me) {
-            Ok(pids) => pids.into_iter().filter(|p| *p != me).collect(),
-            Err(_) => {
-                let _ = sys::signal_group(me, sys::SIGKILL);
-                break;
+    // process forked while a group signal is delivered can miss it. The
+    // daemon is gone, so this runner is the last cleanup owner the group
+    // has: it must not exit (abandoning survivors) while members remain.
+    loop {
+        match sys::group_members(me) {
+            Ok(pids) => {
+                let others: Vec<u32> = pids.into_iter().filter(|p| *p != me).collect();
+                if others.is_empty() {
+                    break;
+                }
+                for p in others {
+                    let _ = sys::kill_pid(p, sys::SIGKILL);
+                }
             }
-        };
-        if others.is_empty() {
-            break;
-        }
-        for p in others {
-            let _ = sys::kill_pid(p, sys::SIGKILL);
+            Err(_) => {
+                // Cannot enumerate: group-SIGKILL and probe liveness; the
+                // group is gone when even the leader is.
+                let _ = sys::signal_group(me, sys::SIGKILL);
+                if !sys::group_alive(me) {
+                    break;
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(5));
     }
