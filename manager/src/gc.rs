@@ -55,6 +55,19 @@ fn config_duration(home: &Path, key: &str, default: u64) -> Result<u64, String> 
     }
 }
 
+/// Ids a sweep names in manager.log; the rest are counted. One sweep after
+/// a long gap removed 1,121 tasks, all on one line.
+pub const LOG_IDS: usize = 10;
+
+/// The first [`LOG_IDS`] ids, then `(+N more)`.
+pub fn log_ids(ids: &[String]) -> String {
+    let shown = ids[..ids.len().min(LOG_IDS)].join(" ");
+    match ids.len().saturating_sub(LOG_IDS) {
+        0 => shown,
+        more => format!("{shown} (+{more} more)"),
+    }
+}
+
 pub fn interval_ms(retention_ms: u64) -> u64 {
     retention_ms.clamp(MIN_INTERVAL_MS, MAX_INTERVAL_MS)
 }
@@ -127,6 +140,14 @@ pub fn sweep_at(home: &Path, keep: &HashSet<String>, retention_ms: u64, now: u64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_ids_names_the_first_few_and_counts_the_rest() {
+        let ids: Vec<String> = (1..=12).map(|i| format!("sh_{i}")).collect();
+        assert_eq!(log_ids(&ids[..3]), "sh_1 sh_2 sh_3");
+        assert_eq!(log_ids(&ids[..LOG_IDS]), ids[..LOG_IDS].join(" "));
+        assert_eq!(log_ids(&ids), format!("{} (+2 more)", ids[..LOG_IDS].join(" ")));
+    }
 
     fn home(tag: &str) -> std::path::PathBuf {
         let h = std::env::temp_dir().join(format!("pbs-gc-{tag}-{}", std::process::id()));

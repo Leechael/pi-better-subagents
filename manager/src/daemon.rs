@@ -947,7 +947,7 @@ fn run_task_gc(state: &Shared, retention_ms: u64) {
     }
     lifecycle::log_line(
         &home,
-        &format!("gc: removed {} finished task(s): {}", expired.len(), expired.join(" ")),
+        &format!("gc: removed {} finished task(s): {}", expired.len(), crate::gc::log_ids(&expired)),
     );
 }
 
@@ -975,7 +975,7 @@ fn run_session_gc(state: &Shared, retention_ms: u64) {
     st.sessions.retain(|sid, _| !gone.contains(sid));
     lifecycle::log_line(
         &home,
-        &format!("gc: removed {} gone session(s): {}", removed.len(), removed.join(" ")),
+        &format!("gc: removed {} gone session(s): {}", removed.len(), crate::gc::log_ids(&removed)),
     );
     crate::events::emit(
         &home,
