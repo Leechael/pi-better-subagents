@@ -217,6 +217,20 @@ pub struct ScanResult {
     pub loaded: usize,
 }
 
+/// Wait until process group `pgid` has no members at all, or `bound`
+/// elapses. Probe-only: `kill(-pgid, 0)`-style enumeration, never a signal.
+fn wait_group_gone(pgid: u32, bound: std::time::Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < bound {
+        match crate::sys::group_members(pgid) {
+            Ok(pids) if pids.is_empty() => return,
+            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            // Cannot enumerate: never block startup on it.
+            Err(_) => return,
+        }
+    }
+}
+
 /// Load every record. A record still "running" belonged to a daemon that
 /// died without shutting down; its runners saw the lifeline break and took
 /// their process groups down (§3.2), so there is nothing to re-adopt. The
@@ -232,6 +246,13 @@ pub fn scan_tasks(home: &Path, registry: &mut Registry) -> ScanResult {
             rec.output_size = rec.output_size.max(m.len());
         }
         if rec.status == TaskStatus::Running {
+            // The runner is taking the task's process group down (lifeline
+            // teardown, §3.2: SIGTERM, a 2 s grace, then SIGKILL until the
+            // group is empty). Wait for it, bounded: the orphan exit wake
+            // must not send the agent back into a command that is still
+            // running. Probing only — the recorded pid may since belong to
+            // an unrelated process, so nothing here ever signals it.
+            wait_group_gone(rec.pid, std::time::Duration::from_millis(3500));
             rec.status = TaskStatus::Orphaned;
             rec.end_reason = Some(crate::proto::end_reason::MANAGER_CRASH.to_string());
             let now = now_ms();
