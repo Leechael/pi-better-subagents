@@ -1781,7 +1781,7 @@ async fn run_output_fanout(
             let mut st = state.lock().unwrap();
             let watcher_ids: Vec<u64> = match st.registry.tasks.get_mut(&tid) {
                 Some(e) => {
-                    e.record.output_size = last_cursor; // monotonic (§3.4)
+                    e.record.output_size = e.record.output_size.max(last_cursor); // monotonic (§3.4)
                     e.delivered_cursor = chunk.next_cursor;
                     e.watchers.iter().copied().collect()
                 }
