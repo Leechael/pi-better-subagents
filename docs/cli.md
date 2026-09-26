@@ -32,11 +32,11 @@ The extension discovers the same path, or an override via `PBS_MANAGER_PATH` / `
 | `PBS_HOME` | Same, if `--home` is omitted |
 | (default) | `~/.pi/agent/pbs` |
 | `--no-pager` | Never page output (see below) |
-| `PBS_PAGER`, then `PAGER` | Pager for listings on a terminal; empty or `cat` = none |
+| `PBS_PAGER`, then `PAGER` | Pager for listings on a terminal; `cat` = none, empty = falls through |
 
 Priority: `--home` > `PBS_HOME` > default.
 
-**Pager.** When stdout is a terminal, `sessions`, `ls`, `show`, and `agent` / `events` / `log` without `-f` go through a pager, like git: `PBS_PAGER`, else `PAGER`, else `less`. A bare `less` runs as `less -FRX`, on top of any `LESS` you set, so output that fits one screen prints and returns at once; a pager given with its own arguments runs as given. Piped or redirected output is never paged, so scripts see plain text.
+**Pager.** When stdout is a terminal, `sessions`, `ls`, `show`, and `agent` / `events` / `log` without `-f` go through a pager, like git: `PBS_PAGER`, else `PAGER`, else `less`. An empty value is treated as unset and falls through to the next choice, so `PBS_PAGER=` lets `PAGER` take over. A bare `less` runs as `less -FRX`, on top of any `LESS` you set, so output that fits one screen prints and returns at once; a pager given with its own arguments runs as given. `cat` (from either variable) disables paging outright. Piped or redirected output is never paged, so scripts see plain text.
 
 Layout under home:
 

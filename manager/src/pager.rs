@@ -2,8 +2,8 @@
 //! through `PBS_PAGER`, else `PAGER`, else `less`. A bare `less` runs as
 //! `less -FRX` (on top of any LESS the person set, e.g. `-R`), so output that
 //! fits one screen prints as if no pager ran; a pager configured with its own
-//! arguments runs as given. An empty value or `cat` means no pager; so does
-//! `--no-pager`.
+//! arguments runs as given. An empty value is treated as unset and falls
+//! through to the next choice; `cat` means no pager, so does `--no-pager`.
 
 use std::os::fd::AsRawFd;
 use std::process::{Child, Command, Stdio};
@@ -13,6 +13,11 @@ pub struct Pager {
 }
 
 /// The pager command line, or None for no pager; `env` reads a variable.
+///
+/// An empty `PBS_PAGER` is treated like an unset one and falls through to
+/// `PAGER`, so `PBS_PAGER=` lets `PAGER` take over rather than disabling
+/// paging outright; `cat` (from either variable) is the explicit way to
+/// disable it.
 fn command(env: impl Fn(&str) -> Option<String>) -> Option<String> {
     let chosen = env("PBS_PAGER")
         .filter(|v| !v.is_empty())
