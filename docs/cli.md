@@ -117,13 +117,20 @@ Connected sessions only (a gone session is listed while it still runs something)
 ### `ls` / `list`
 
 ```text
-ID           KIND    SESSION   CWD        STATUS    STARTED  DUR    EXIT    REASON       TITLE
+$ pbs-manager ls
+ID           KIND    SESSION   CWD        STATUS    TIME     DUR    EXIT    REASON       TITLE
 sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  -       -            npm test
+ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -       -            review (worker) m1
+
+$ pbs-manager ls --all
+ID           KIND    SESSION   CWD        STATUS    TIME     DUR    EXIT    REASON       TITLE
+sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  -       -            npm test
+ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -       -            review (worker) m1
 mon_e1351cb1 monitor 0199aaaa  ~/src/app  killed    14:01:10 30s    SIGTERM stopped:tui  tail -f log
 ch_7d0e22a1  agent   0199aaaa  ~/src/app  failed    14:00:05 12s    -       model-error  broken (worker) m1
 ```
 
-Work of connected sessions, running and finished, plus anything still running in a gone session (a live process is never hidden). There is no `--all`: a gone session's finished work is reached by id (`show`) until its session's retention or the finished-task retention ends, whichever comes first. Filters: `--session PREFIX` (session id prefix), `--cwd DIR` (that directory or below; agents use their session's cwd), `--since DUR` (started within). `--json` prints an array of row objects (`id`, `kind`, `session_id`, `cwd`, `status`, `started_at`, `ended_at`, `duration_ms`, `exit_code`, `signal`, `end_reason`, `title`, plus `pid`/`origin`/`backgrounded_at`/`run_id`/`error` when known).
+By default only running work, anywhere (a live process is never hidden, even in a gone session). `-a`/`--all` adds the finished work of connected sessions; a gone session's finished work is reached by id (`show`) until its session's retention or the finished-task retention ends, whichever comes first. Running rows come first, then finished ones, each newest first. `TIME` is a task's start and an agent's **last transcript message** (a long-running agent that just spoke sorts as recent; its start is in `show`). Filters: `--session PREFIX` (session id prefix), `--cwd DIR` (that directory or below; agents use their session's cwd), `--since DUR` (TIME within). `--json` prints the rows in the same order as an array of objects (`id`, `kind`, `session_id`, `cwd`, `status`, `started_at`, `active_at` (= TIME), `ended_at`, `duration_ms`, `exit_code`, `signal`, `end_reason`, `title`, `running`, plus `pid`/`origin`/`backgrounded_at`/`run_id`/`error` when known).
 
 - `EXIT` is the exit code, a signal name (`SIGTERM`, `SIGKILL`, …), or `-`.
 - `REASON` is the task's `end_reason` (see below), or an agent record's `end_reason`.
