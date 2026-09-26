@@ -40,15 +40,10 @@ jobs:
           path: pbs-test-artifacts
           if-no-files-found: ignore
 
+  # No Windows job: the manager is unix-only, and the extension reaches it
+  # over a unix socket path (manager/TESTING.md, Deferrals).
   extension:
-    name: extension (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        # Windows only here: the manager (process groups, signals, unix
-        # pipes) is unix-only, so its tests and the e2e cannot build there.
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: extension
