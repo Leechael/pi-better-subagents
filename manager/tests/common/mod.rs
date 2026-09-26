@@ -79,6 +79,13 @@ pub struct Home {
 /// instead of sleeping. Without the feature every wait is real time.
 pub const MANUAL_CLOCK: bool = cfg!(feature = "test-clock");
 
+/// `PBS_TEST_OWNER` for every daemon a test starts: this test process.
+/// Test-clock daemons exit once it is gone (a killed test binary runs no
+/// `Drop`), since their manual timers would never idle them out.
+pub fn test_owner() -> String {
+    std::process::id().to_string()
+}
+
 impl Home {
     pub fn new(name: &str) -> Home {
         let path = std::env::temp_dir().join(format!("pbsx-{}-{name}", std::process::id()));
@@ -242,6 +249,7 @@ impl Home {
             .arg("--home")
             .arg(&self.path)
             .env("PBS_TEST_CLOCK", self.clock_env())
+            .env("PBS_TEST_OWNER", test_owner())
             .arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -265,6 +273,7 @@ impl Home {
         cmd.arg("--home")
             .arg(&self.path)
             .env("PBS_TEST_CLOCK", self.clock_env())
+            .env("PBS_TEST_OWNER", test_owner())
             .arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -422,6 +431,7 @@ pub fn run_cli_env(home: &Path, args: &[&str], timeout: Duration, env: &[(&str, 
         .arg("--home")
         .arg(home)
         .args(args)
+        .env("PBS_TEST_OWNER", test_owner())
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

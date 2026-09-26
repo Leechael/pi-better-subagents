@@ -86,6 +86,12 @@ the daemon's timers run on a manual clock instead:
   hello timeout, record timestamps.
 - The daemon keeps accepting during graceful shutdown (see D8/D8b). That is
   also what lets a test step the 2s grace that holds a shutdown open.
+- A manual-clock daemon never idles out by itself, so one left by a killed
+  test binary (Ctrl-C, a timeout; `Drop` does not run) would hold its tasks
+  forever. `tests/common` sets `PBS_TEST_OWNER` to the test's pid on every
+  daemon it starts. Under the feature the daemon polls that pid on real time
+  and exits (a crash, so the lifelines take every task down) once it is
+  gone (D4d).
 
 `tests/common` drives it:
 

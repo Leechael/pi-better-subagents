@@ -119,6 +119,7 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
                     .arg(&home.path)
                     .args(["start", "--session", sid, "--", "true"])
                     .env("PBS_TEST_CLOCK", clock)
+                    .env("PBS_TEST_OWNER", test_owner())
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -429,6 +430,31 @@ fn d4c_daemon_crash_takes_every_task_down() {
     assert_eq!(status.code(), Some(101), "{status:?}");
     drop(c);
     assert_crash_cleaned_up(&home, &f, crashed_at);
+}
+
+/// D4d: a manual-clock daemon exits once its test process is gone. Its idle
+/// and handover-grace timers only move when a test advances them, so a
+/// daemon left by a killed test binary (Ctrl-C, a timeout) would otherwise
+/// hold its tasks forever. The owner here is a stand-in process the test
+/// kills; its tasks then go down like after any crash.
+#[cfg(feature = "test-clock")]
+#[test]
+fn d4d_manual_clock_daemon_exits_when_its_test_owner_is_gone() {
+    let home = Home::new("d4d");
+    let mut owner = KillOnDrop(Some(std::process::Command::new("/bin/sleep").arg("300").spawn().unwrap()));
+    let owner_pid = owner.0.as_ref().unwrap().id().to_string();
+    let mut d1 = home.start_daemon_from(std::path::Path::new(BIN), &[("PBS_TEST_OWNER", &owner_pid)]);
+    let mut c = home.connect();
+    c.hello_ext("sess-crash");
+    let f = start_crash_fixture(&mut c);
+    let mut o = owner.0.take().unwrap();
+    o.kill().unwrap();
+    o.wait().unwrap();
+    let owner_gone_at = Instant::now();
+    let status = wait_child(&mut d1, S(3)).expect("daemon outlived its test owner");
+    assert!(!status.success(), "{status:?}");
+    drop(c);
+    assert_crash_cleaned_up(&home, &f, owner_gone_at);
 }
 
 /// D4b: a record left "running" is marked orphaned (manager-crash) at the
