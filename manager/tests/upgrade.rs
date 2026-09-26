@@ -130,10 +130,10 @@ fn u1_upgrade_keeps_every_task_running() {
 
     // Streams numbered lines for ~3 s, then exits 7.
     let (stream, stream_pid) = start(&mut c, "shell",
-        "i=0; while [ $i -lt 300 ]; do echo line-$i; i=$((i+1)); sleep 0.01; done; exit 7", json!({}));
+        "i=0; while [ $i -lt 300 ]; do echo line-$i; i=$((i+1)); if [ $((i % 10)) -eq 0 ]; then sleep 0.1; fi; done; exit 7", json!({}));
     // A monitor, auto-watched by this connection.
     let (mon, _) = start(&mut c, "monitor",
-        "i=0; while [ $i -lt 250 ]; do echo mon-$i; i=$((i+1)); sleep 0.02; done", json!({}));
+        "i=0; while [ $i -lt 250 ]; do echo mon-$i; i=$((i+1)); if [ $((i % 5)) -eq 0 ]; then sleep 0.1; fi; done", json!({}));
     let (sleeper, sleeper_pid) = start(&mut c, "shell", "sleep 300", json!({}));
     // Finishes at once, leaving a grandchild its runner guards.
     let (leftover, leftover_pid) = start(&mut c, "shell", "sleep 300 & exit 0", json!({}));
@@ -296,7 +296,7 @@ fn u5_failed_exec_rolls_back() {
     let mut c = home.connect();
     hello(&mut c, "sess-u5");
     let (t, pid) = start(&mut c, "monitor",
-        "i=0; while [ $i -lt 150 ]; do echo m-$i; i=$((i+1)); sleep 0.02; done", json!({}));
+        "i=0; while [ $i -lt 150 ]; do echo m-$i; i=$((i+1)); if [ $((i % 5)) -eq 0 ]; then sleep 0.1; fi; done", json!({}));
     std::thread::sleep(Duration::from_millis(500));
     let out = upgrade(&home);
     assert!(!out.status.success(), "{}", out.stdout);
@@ -410,7 +410,7 @@ fn u9_cli_wait_and_follow_survive_an_upgrade() {
     let mut c = home.connect();
     hello(&mut c, "sess-u9");
     let (t, _) = start(&mut c, "shell",
-        "i=0; while [ $i -lt 60 ]; do echo f-$i; i=$((i+1)); sleep 0.05; done; exit 3", json!({}));
+        "i=0; while [ $i -lt 60 ]; do echo f-$i; i=$((i+1)); if [ $((i % 2)) -eq 0 ]; then sleep 0.1; fi; done; exit 3", json!({}));
     let (h1, h2) = (home.path.clone(), home.path.clone());
     let (t1, t2) = (t.clone(), t.clone());
     let wait = std::thread::spawn(move || run_cli(&h1, &["wait", &t1, "--budget-ms", "20000"], s(30)));
@@ -459,7 +459,7 @@ fn u11_repeated_upgrades_under_output() {
     let mut c = home.connect();
     hello(&mut c, "sess-u11");
     let (t, _) = start(&mut c, "monitor",
-        "i=0; while [ $i -lt 400 ]; do echo r-$i; i=$((i+1)); sleep 0.01; done", json!({}));
+        "i=0; while [ $i -lt 400 ]; do echo r-$i; i=$((i+1)); if [ $((i % 10)) -eq 0 ]; then sleep 0.1; fi; done", json!({}));
     let mut events = Vec::new();
     for round in 1..=5u64 {
         let out = upgrade(&home);

@@ -72,9 +72,16 @@ export class NotifyCenter {
     this.scheduleFlush();
   }
 
-  /** Send a notification immediately, routed by idle/busy state. */
+  /**
+   * Send a notification immediately, routed by idle/busy state. A monitor's
+   * own notice (exit, timeout, stop) first delivers that monitor's coalesced
+   * events: they happened before it, and the model must not hear "exited"
+   * ahead of the lines the command printed.
+   */
   notify(message: NotifyMessage): void {
     if (this.disposed) return;
+    const wake = message.details as { kind?: string; id?: string } | undefined;
+    if (wake?.kind === "monitor" && typeof wake.id === "string") this.flushMonitor(wake.id);
     this.deliver(message);
   }
 
@@ -99,18 +106,22 @@ export class NotifyCenter {
   /** Flush coalesced monitor output when the parent agent settles. */
   flushMonitorEvents(): void {
     if (this.disposed || !this.deps.isIdle() || this.pendingMonitors.size === 0) return;
-    const pending = [...this.pendingMonitors.entries()];
-    this.pendingMonitors.clear();
-    for (const [taskId, item] of pending) {
-      const summary = item.eventCount > 1
-        ? `${item.eventCount} events · last: ${item.lastEvent}`
-        : item.lastEvent;
-      const wake = formatMonitorEvent(item.description, taskId, summary, undefined, {
-        eventCount: item.eventCount,
-        droppedLines: item.droppedLines,
-      });
-      this.deliver({ customType: wake.customType, content: wake.content, details: wake.details });
-    }
+    for (const taskId of [...this.pendingMonitors.keys()]) this.flushMonitor(taskId);
+  }
+
+  /** Deliver one monitor's coalesced events, if any, in the current mode. */
+  private flushMonitor(taskId: string): void {
+    const item = this.pendingMonitors.get(taskId);
+    if (!item) return;
+    this.pendingMonitors.delete(taskId);
+    const summary = item.eventCount > 1
+      ? `${item.eventCount} events · last: ${item.lastEvent}`
+      : item.lastEvent;
+    const wake = formatMonitorEvent(item.description, taskId, summary, undefined, {
+      eventCount: item.eventCount,
+      droppedLines: item.droppedLines,
+    });
+    this.deliver({ customType: wake.customType, content: wake.content, details: wake.details });
   }
 
   /** Flush any pending task exit notifications now. */

@@ -71,6 +71,29 @@ impl Conn {
     }
 }
 
+/// Every task record the daemon holds (for `session_id`, or all), fetched
+/// in frame-sized pages. A daemon without paging answers in one frame and
+/// sends no `next`, so this also works against it.
+pub async fn list_tasks(conn: &mut Conn, session_id: Option<String>) -> Result<Vec<TaskRecord>, String> {
+    let mut tasks = Vec::new();
+    let mut after = None;
+    loop {
+        let page: ListOk = conn
+            .roundtrip(RequestKind::List {
+                all: true,
+                session_id: session_id.clone(),
+                paged: true,
+                after: after.take(),
+            })
+            .await?;
+        tasks.extend(page.tasks);
+        match page.next {
+            Some(n) => after = Some(n),
+            None => return Ok(tasks),
+        }
+    }
+}
+
 /// A CLI connection that outlives an in-place upgrade of the daemon, which
 /// closes every connection and leaves requests in flight unanswered. Use it
 /// only for idempotent requests (`output`, `wait`, `list`, `status`): one
@@ -373,14 +396,9 @@ pub async fn cmd_stop(home: &Path, typed: &str) -> Result<(), String> {
 /// as documented (§3.3 has no cross-session shutdown message).
 pub async fn cmd_kill_session(home: &Path, session_id: &str) -> Result<(), String> {
     let mut conn = connect(home, &HelloMode::Cli).await?;
-    let res: ListOk = conn
-        .roundtrip(RequestKind::List {
-            all: true,
-            session_id: Some(session_id.to_string()),
-        })
-        .await?;
+    let tasks = list_tasks(&mut conn, Some(session_id.to_string())).await?;
     let mut stopped = 0usize;
-    for t in res.tasks {
+    for t in tasks {
         if t.status == TaskStatus::Running {
             let _: UnitOk = conn
                 .roundtrip(RequestKind::Stop {

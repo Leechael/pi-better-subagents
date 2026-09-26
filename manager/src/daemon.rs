@@ -11,7 +11,6 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
@@ -488,7 +487,9 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin>(
         if payload.len() > MAX_FRAME_SIZE as usize {
             continue;
         }
-        if write_frame(&mut w, payload).await.is_err() {
+        if let Err(e) = write_frame(&mut w, payload).await {
+            // The connection goes mute from here; its reader still runs.
+            eprintln!("pbs-manager: connection writer stopped: {e}");
             break;
         }
         if let Some((task, cursor)) = frame.output {
@@ -513,7 +514,20 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
     // ---- hello: must be the first message on the connection (§3.3) ----
     let first = match tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut rd)).await {
         Ok(Ok(Some(bytes))) => bytes,
-        _ => return, // timeout / EOF / io error before hello: never registered
+        // EOF before hello is a readiness probe; not worth a line.
+        Ok(Ok(None)) => return,
+        // Closed without an answer: say why, or a client that did send its
+        // hello only sees the connection drop.
+        Ok(Err(e)) => {
+            let home = state.lock().unwrap().home.clone();
+            lifecycle::log_line(&home, &format!("connection closed before hello: {e}"));
+            return;
+        }
+        Err(_) => {
+            let home = state.lock().unwrap().home.clone();
+            lifecycle::log_line(&home, &format!("connection closed: no hello within {HELLO_TIMEOUT:?}"));
+            return;
+        }
     };
     let hello = match parse_request(&first) {
         Ok(r) => r,
@@ -603,7 +617,13 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
         let frame = tokio::select! {
             f = read_frame(&mut rd) => match f {
                 Ok(Some(b)) => b,
-                _ => break, // EOF / io error / oversized frame
+                Ok(None) => break, // EOF: the client closed
+                Err(e) => {
+                    // io error / oversized frame: the client sees a drop
+                    let home = state.lock().unwrap().home.clone();
+                    lifecycle::log_line(&home, &format!("connection {conn_id} closed: {e}"));
+                    break;
+                }
             },
             _ = die.notified() => break, // rebound by a newer connection
         };
@@ -992,9 +1012,12 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
         RequestKind::Stop { task_id, reason } => {
             respond(&tx, &id, handle_stop(&state, conn_id, &task_id, reason.as_deref())).await
         }
-        RequestKind::List { all, session_id } => {
-            respond(&tx, &id, handle_list(&state, conn_id, all, session_id)).await
-        }
+        RequestKind::List {
+            all,
+            session_id,
+            paged,
+            after,
+        } => respond(&tx, &id, handle_list(&state, conn_id, all, session_id, paged, after)).await,
         RequestKind::Watch { task_id } => {
             respond(&tx, &id, handle_watch(&state, conn_id, &task_id, true)).await
         }
@@ -1515,7 +1538,14 @@ fn handle_list(
     conn_id: u64,
     _all: bool,
     session_id: Option<String>,
+    paged: bool,
+    after: Option<String>,
 ) -> Result<ListOk, ProtoError> {
+    let after = match after.as_deref().map(parse_list_cursor) {
+        None => None,
+        Some(Some(c)) => Some(c),
+        Some(None) => return Err(ProtoError::new(E_BAD_REQUEST, "list: bad `after` cursor")),
+    };
     let st = state.lock().unwrap();
     let acc = access_for(&st, conn_id);
     let mut tasks: Vec<TaskRecord> = st
@@ -1533,8 +1563,39 @@ fn handle_list(
         })
         .map(|e| e.record.clone())
         .collect();
-    tasks.sort_by_key(|r| r.started_at);
-    Ok(ListOk { tasks })
+    // task_id breaks started_at ties, so pages have a total order.
+    tasks.sort_by(|a, b| (a.started_at, &a.task_id).cmp(&(b.started_at, &b.task_id)));
+    if !paged && after.is_none() {
+        return Ok(ListOk { tasks, next: None });
+    }
+    if let Some((at, tid)) = &after {
+        tasks.retain(|r| (r.started_at, &r.task_id) > (*at, tid));
+    }
+    // Fill a page up to the frame budget; always at least one record.
+    let mut size = 0usize;
+    let mut take = 0usize;
+    for r in &tasks {
+        let n = serde_json::to_vec(r).map(|v| v.len() + 1).unwrap_or(0);
+        if take > 0 && size + n > CHUNK_JSON_BUDGET {
+            break;
+        }
+        size += n;
+        take += 1;
+    }
+    let next = (take < tasks.len()).then(|| list_cursor(&tasks[take - 1]));
+    tasks.truncate(take);
+    Ok(ListOk { tasks, next })
+}
+
+/// A paged `list` resumes after `<started_at>/<task_id>` of the last record
+/// sent, so a record removed between pages cannot shift the rest.
+fn list_cursor(r: &TaskRecord) -> String {
+    format!("{}/{}", r.started_at, r.task_id)
+}
+
+fn parse_list_cursor(s: &str) -> Option<(u64, String)> {
+    let (at, tid) = s.split_once('/')?;
+    Some((at.parse().ok()?, tid.to_string()))
 }
 
 fn handle_watch(
@@ -1761,7 +1822,7 @@ async fn run_output_fanout(
             let mut st = state.lock().unwrap();
             let watcher_ids: Vec<u64> = match st.registry.tasks.get_mut(&tid) {
                 Some(e) => {
-                    e.record.output_size = last_cursor; // monotonic (§3.4)
+                    e.record.output_size = e.record.output_size.max(last_cursor); // monotonic (§3.4)
                     e.delivered_cursor = chunk.next_cursor;
                     e.watchers.iter().copied().collect()
                 }
@@ -1945,11 +2006,13 @@ async fn run_exit_watch(state: Shared, tid: String) {
             FirstSeen::Report(Some(r)) => {
                 let outcome = Outcome { code: r.code, signal: r.signal };
                 let leftover = if r.linger { Leftover::Guarded } else { Leftover::None };
+                wait_tee_drained(&state, &tid).await;
                 finalize_exit(&state, &tid, outcome, leftover);
                 set_exit_phase(&state, &tid, registry::ExitPhase::AwaitRunnerExit);
             }
             FirstSeen::Report(None) => {
                 let s = runner.wait().await;
+                wait_tee_drained(&state, &tid).await;
                 finalize_exit(&state, &tid, Outcome::of(s), Leftover::Probe);
                 set_exit_phase(&state, &tid, registry::ExitPhase::Done);
                 return;
@@ -1957,9 +2020,7 @@ async fn run_exit_watch(state: Shared, tid: String) {
             FirstSeen::RunnerExit(s) => {
                 // A report written just before the runner exited may still
                 // be in the pipe; the write end is closed now, so this ends.
-                if let Some(tee) = &tee {
-                    wait_tee_drained(tee, &output).await;
-                }
+                wait_tee_drained(&state, &tid).await;
                 match read_status_line(&mut status_rx, &mut line).await {
                     Some(r) => {
                         let leftover = if r.linger { Leftover::Probe } else { Leftover::None };
@@ -1999,14 +2060,21 @@ fn set_exit_phase(state: &Shared, tid: &str, phase: registry::ExitPhase) {
 /// moments after the runner (and any leftover) closes its inherited write
 /// ends; a leftover that keeps the pipes open ends the wait early once
 /// output goes quiet. Capped: a stuck pump must not delay the exit event.
-async fn wait_tee_drained(tee: &Arc<AtomicUsize>, output: &Arc<Mutex<OutputState>>) {
+/// A parked pump (in-place upgrade) has finished too, so it never waits.
+async fn wait_tee_drained(state: &Shared, tid: &str) {
     let mut last = u64::MAX;
     let mut quiet = 0u32;
     for _ in 0..100 {
-        if tee.load(Ordering::SeqCst) == 0 {
-            return;
-        }
-        let size = output.lock().unwrap().total_size;
+        let size = {
+            let st = state.lock().unwrap();
+            let Some(e) = st.registry.tasks.get(tid) else { return };
+            match &e.tee {
+                Some(t) if !(t.stdout.is_finished() && t.stderr.is_finished()) => {
+                    e.output.lock().unwrap().total_size
+                }
+                _ => return,
+            }
+        };
         quiet = if size == last { quiet + 1 } else { 0 };
         if quiet >= 10 {
             return; // ~50 ms without new output

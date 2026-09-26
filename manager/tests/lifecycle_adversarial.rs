@@ -1746,3 +1746,29 @@ fn s6_rebound_connection_closes_while_tasks_run() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _sp = spawner.join().unwrap();
 }
+
+/// T15: a command that prints a burst right before it exits has all of it
+/// in the terminal record: the exit event's and the record's output_size,
+/// and task_output, cover every byte. The runner's status report can arrive
+/// while up to a pipe buffer per stream still sits unread by the tee.
+#[test]
+fn t15_output_printed_just_before_exit_is_all_recorded() {
+    let home = Home::new("t15");
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    c.hello_ext("sess-a");
+    const OUT: u64 = 1 << 20;
+    const ERR: u64 = 256 << 10;
+    let cmd = format!("head -c {OUT} /dev/zero | tr '\\0' o; head -c {ERR} /dev/zero | tr '\\0' e >&2");
+    let ids: Vec<String> = (0..8).map(|_| c.start(&cmd).0).collect();
+    for id in &ids {
+        let ev = c
+            .wait_event(S(20), |e| e["event"] == "task_exited" && e["task_id"] == json!(id))
+            .expect("task_exited");
+        assert_eq!(ev["output_size"], json!(OUT + ERR), "{id}: exit event output_size");
+        let rec = c.task(id).expect("record");
+        assert_eq!(rec["output_size"], json!(OUT + ERR), "{id}: record output_size");
+        let (_, end, _) = c.read_all_output(id, 1 << 20);
+        assert_eq!(end, OUT + ERR, "{id}: task_output");
+    }
+}

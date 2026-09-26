@@ -161,6 +161,30 @@ export class PiRpc {
     }
   }
 
+  /**
+   * Resolve once pi answers an RPC request, i.e. it has loaded its
+   * extensions and started the session (session_start ran, so the
+   * extension's background manager connect is under way). Returns the boot
+   * time in ms. Waits that follow (e.g. for the manager) must not also pay
+   * for pi's own startup, which is much slower on loaded CI runners.
+   */
+  async ready(timeoutMs: number): Promise<number> {
+    let timer: NodeJS.Timeout | undefined;
+    const fail = (why: string) => new Error(`pi not ready: ${why}; stderr: ${this.stderr.join("").slice(-2000)}`);
+    try {
+      await Promise.race([
+        this.send({ type: "get_state" }),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(fail(`no answer to get_state within ${timeoutMs}ms`)), timeoutMs);
+        }),
+        this.exited.then((code) => Promise.reject(fail(`exited with ${code}`))),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    return this.now();
+  }
+
   async stop(): Promise<void> {
     if (this.proc.exitCode !== null) return;
     this.proc.stdin.end();

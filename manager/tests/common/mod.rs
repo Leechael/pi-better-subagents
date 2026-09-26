@@ -226,6 +226,16 @@ impl Home {
             .into_iter()
             .find(|r| r["task_id"].as_str() == Some(task_id))
     }
+    /// The daemon's stderr (panics land here), appended to `daemon.stderr`
+    /// in the home so a failed test can keep it (see `Drop`).
+    fn daemon_stderr(&self) -> Stdio {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path.join("daemon.stderr"))
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null())
+    }
     /// Spawn `pbs-manager --home H daemon` as a direct child of the test.
     pub fn spawn_daemon(&self) -> Child {
         Command::new(BIN)
@@ -235,7 +245,7 @@ impl Home {
             .arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(self.daemon_stderr())
             .spawn()
             .expect("spawn daemon")
     }
@@ -258,7 +268,7 @@ impl Home {
             .arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(self.daemon_stderr());
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -295,6 +305,9 @@ impl Home {
 
 impl Drop for Home {
     fn drop(&mut self) {
+        if std::thread::panicking() && std::env::var_os("PBS_TEST_ARTIFACTS").is_some() {
+            self.dump_processes();
+        }
         for r in self.records() {
             if let Some(pid) = r["pid"].as_u64() {
                 kill_group(pid as u32, libc::SIGKILL);
@@ -309,7 +322,77 @@ impl Drop for Home {
         for pid in daemon_pids_for(&self.path) {
             kill_pid(pid, libc::SIGKILL);
         }
+        if std::thread::panicking() {
+            keep_failed_home(&self.path);
+        }
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+impl Home {
+    /// Before a failed test's processes are killed: what each task and the
+    /// daemon are doing (`ps` state and wait channel, stdio descriptors),
+    /// to `processes.txt` in the home. A task that stopped making progress
+    /// shows here whether it is blocked writing to a pipe, sleeping, or gone.
+    fn dump_processes(&self) {
+        let mut groups: Vec<String> = self
+            .records()
+            .iter()
+            .filter_map(|r| r["pid"].as_u64().map(|p| p.to_string()))
+            .collect();
+        let daemon = self.pidfile_pid().map(|p| p.to_string());
+        let ps = Command::new("ps")
+            .args(["-axo", "pid,ppid,pgid,stat,wchan,etime,command"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let mut report = String::new();
+        let mut pids = Vec::new();
+        for (i, line) in ps.lines().enumerate() {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            let hit = cols.len() > 2 && (groups.contains(&cols[2].to_string()) || daemon.as_deref() == Some(cols[0]));
+            if i == 0 || hit {
+                report.push_str(line);
+                report.push('\n');
+                if hit {
+                    pids.push(cols[0].to_string());
+                }
+            }
+        }
+        for pid in &pids {
+            let lsof = Command::new("lsof")
+                .args(["-a", "-p", pid, "-d", "0-2"])
+                .output()
+                .map(|o| format!("{}\n{}{}", o.status, String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
+                .unwrap_or_else(|e| format!("lsof: {e}"));
+            report.push_str(&format!("\n# lsof -p {pid} -d 0-2\n{lsof}"));
+        }
+        groups.sort();
+        let _ = fs::write(self.path.join("processes.txt"), format!("# task groups: {}\n{report}", groups.join(" ")));
+    }
+}
+
+/// A failed test's home is otherwise deleted with everything the daemon
+/// said. With `PBS_TEST_ARTIFACTS` set (CI uploads it), copy it there:
+/// logs, per-session events and task records; files over 1 MiB (large task
+/// output) and sockets are skipped.
+fn keep_failed_home(home: &Path) {
+    let Some(dir) = std::env::var_os("PBS_TEST_ARTIFACTS") else { return };
+    let Some(name) = home.file_name() else { return };
+    copy_small_files(home, &Path::new(&dir).join(name));
+}
+
+fn copy_small_files(src: &Path, dst: &Path) {
+    let Ok(entries) = fs::read_dir(src) else { return };
+    let _ = fs::create_dir_all(dst);
+    for e in entries.flatten() {
+        let Ok(t) = e.file_type() else { continue };
+        let (from, to) = (e.path(), dst.join(e.file_name()));
+        if t.is_dir() {
+            copy_small_files(&from, &to);
+        } else if t.is_file() && e.metadata().map(|m| m.len() <= 1 << 20).unwrap_or(false) {
+            let _ = fs::copy(&from, &to);
+        }
     }
 }
 
@@ -520,6 +603,8 @@ pub struct Conn {
     pub events: Vec<Value>,
     next_id: u64,
     pub closed: bool,
+    /// What made `closed` true: EOF, or the read error.
+    pub close_reason: String,
 }
 
 impl Conn {
@@ -531,6 +616,7 @@ impl Conn {
             events: Vec::new(),
             next_id: 0,
             closed: false,
+            close_reason: String::new(),
         }
     }
 
@@ -575,12 +661,19 @@ impl Conn {
                 .ok();
             let mut chunk = vec![0u8; 64 * 1024];
             match self.stream.read(&mut chunk) {
-                Ok(0) => self.closed = true,
+                Ok(0) => {
+                    self.closed = true;
+                    self.close_reason = format!("EOF from the daemon ({} bytes of a frame buffered)", self.buf.len());
+                }
                 Ok(k) => self.buf.extend_from_slice(&chunk[..k]),
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(_) => self.closed = true,
+                        || e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    self.closed = true;
+                    self.close_reason = format!("read error: {e} ({:?})", e.kind());
+                }
             }
         }
     }
@@ -626,9 +719,14 @@ impl Conn {
         }
     }
 
+    /// Send and wait for the answer: 10 s, or a request's own `budget_ms`
+    /// plus 5 s, so a `wait` that legitimately runs out its budget answers
+    /// `done:false` instead of looking like a daemon that stopped replying.
     pub fn request(&mut self, req: Value) -> Value {
-        let r = self.try_request(req.clone(), Duration::from_secs(10));
-        r.unwrap_or_else(|| panic!("no response to {req} within 10s (closed={})", self.closed))
+        let budget = req["budget_ms"].as_u64().map(|ms| Duration::from_millis(ms) + Duration::from_secs(5));
+        let limit = budget.unwrap_or_default().max(Duration::from_secs(10));
+        let r = self.try_request(req.clone(), limit);
+        r.unwrap_or_else(|| panic!("no response to {req} within {limit:?} (closed={} {})", self.closed, self.close_reason))
     }
 
     pub fn request_ok(&mut self, req: Value) -> Value {

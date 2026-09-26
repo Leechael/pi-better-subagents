@@ -198,7 +198,7 @@ fn main() {
     match args.next().as_deref() {
         Some("__run") => {
             let command = args.next().unwrap_or_default();
-            std::process::exit(runner::main(&command));
+            std::process::exit(runner::main(std::ffi::OsStr::new(&command)));
         }
         // An in-place upgrade asks the new binary this before exec'ing it.
         Some(handover::CHECK_ARG) => {

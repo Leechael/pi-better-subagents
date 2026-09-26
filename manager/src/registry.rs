@@ -11,7 +11,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use crate::task::RunnerProc;
 use tokio::net::unix::pipe;

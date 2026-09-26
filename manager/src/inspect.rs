@@ -161,13 +161,8 @@ pub async fn snapshot(home: &Path, live: Live) -> Result<Snapshot, String> {
     let (daemon, tasks) = match conn {
         Some(mut c) => {
             let st: StatusOk = c.roundtrip(RequestKind::Status).await?;
-            let list: ListOk = c
-                .roundtrip(RequestKind::List {
-                    all: true,
-                    session_id: None,
-                })
-                .await?;
-            (Some(st), list.tasks)
+            let tasks = client::list_tasks(&mut c, None).await?;
+            (Some(st), tasks)
         }
         // No daemon: every task died with it (lifeline, §3.2), so a record
         // still saying "running" is what the next daemon start marks orphaned.

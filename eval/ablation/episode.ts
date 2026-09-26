@@ -75,6 +75,7 @@ export async function runEpisode(opts: {
   const bg = [] as Array<{ kill(sig?: NodeJS.Signals): boolean }>;
   let error: string | undefined;
   try {
+    await pi.ready(60_000);
     await waitManagerReady(sb, 15_000);
     const helper = setup.background?.();
     if (helper) bg.push(helper);
