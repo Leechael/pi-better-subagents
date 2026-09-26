@@ -36,10 +36,27 @@ fn command(env: impl Fn(&str) -> Option<String>) -> Option<String> {
 /// immediately, at which point stdout writes look like a broken pipe and
 /// the listing silently vanishes (see [`crate::out::bytes`]); checking here
 /// keeps that case as "no pager ran" instead.
+///
+/// This only ever looks at the first word, so anything sh would treat
+/// differently is left alone rather than guessed at: an env-assignment
+/// prefix (`LESS=FRX less`), a `~` path (sh expands it, `is_file` doesn't),
+/// a shell keyword handing off to another command (`exec less`, `command
+/// less`), or shell metacharacters we're not going to parse. Those cases
+/// return true — "assume it runs, let sh find out" — so a valid pager isn't
+/// mistaken for a missing one.
 fn program_exists(cmd: &str) -> bool {
+    if cmd.contains(['$', '`', '|', ';', '&', '<', '>', '(', ')', '\'', '"']) {
+        return true;
+    }
     let Some(program) = cmd.split_whitespace().next() else {
         return false;
     };
+    if program.contains('=') || program.starts_with('~') {
+        return true;
+    }
+    if matches!(program, "exec" | "command" | "builtin" | "eval") {
+        return true;
+    }
     if program.contains('/') {
         return std::path::Path::new(program).is_file();
     }
@@ -114,5 +131,14 @@ mod tests {
         assert!(program_exists("sh -c whatever"));
         assert!(!program_exists("pbs-pager-does-not-exist-anywhere -R"));
         assert!(!program_exists(""));
+    }
+
+    #[test]
+    fn program_exists_defers_to_sh_on_syntax_it_cannot_resolve_itself() {
+        assert!(program_exists("LESS=FRX less"));
+        assert!(program_exists("~/bin/mypager"));
+        assert!(program_exists("exec less"));
+        assert!(program_exists("command less"));
+        assert!(program_exists("less | cat"));
     }
 }
