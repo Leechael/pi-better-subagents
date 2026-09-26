@@ -1463,8 +1463,21 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
                     finalize_exit(&state2, &tid, outcome, Leftover::Guarded);
                     // The runner exits once the group is empty.
                     let _ = child.wait().await;
+                    // A runner that died abnormally (e.g. SIGKILLed) may
+                    // leave descendants behind: the group is still ours to
+                    // kill (§3.2). Probe before clearing the flag; kill any
+                    // survivors and track the group until it empties.
+                    let survivors = crate::sys::group_has_others(pid);
+                    if survivors {
+                        kill_group_hard(pid).await;
+                    }
+                    let mut lingering = false;
                     if let Some(e) = state2.lock().unwrap().registry.tasks.get_mut(&tid) {
-                        e.group_lingering = false;
+                        e.group_lingering = survivors;
+                        lingering = survivors;
+                    }
+                    if lingering {
+                        spawn_group_watcher(&state2, &tid, pid);
                     }
                 } else {
                     finalize_exit(&state2, &tid, outcome, Leftover::None);
@@ -1485,10 +1498,14 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
                     wait_tee_drained(tee, &output).await;
                 }
                 match read_status_line(&mut status_rx, &mut line).await {
-                    Some(r) => {
-                        let leftover = if r.linger { Leftover::Probe } else { Leftover::None };
-                        finalize_exit(&state2, &tid, Outcome { code: r.code, signal: r.signal }, leftover);
-                    }
+                    // Probe even when the report said "alone": the group
+                    // may have been unenumerable for the runner.
+                    Some(r) => finalize_exit(
+                        &state2,
+                        &tid,
+                        Outcome { code: r.code, signal: r.signal },
+                        Leftover::Probe,
+                    ),
                     None => finalize_exit(&state2, &tid, Outcome::of(s), Leftover::Probe),
                 }
             }
