@@ -323,6 +323,27 @@ fn pid_alive(pid: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Like `pid_alive` but a zombie (exited, not yet reaped by its parent)
+/// counts as dead: after the daemon's SIGKILL the task processes re-parent
+/// to init, and a non-reaping PID 1 would otherwise keep `kill -0`
+/// succeeding until the deadline.
+fn pid_running(pid: u64) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output();
+    match out {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let s = s.trim();
+            !s.is_empty() && !s.starts_with('Z')
+        }
+        Err(_) => true,
+    }
+}
+
 /// Run a CLI invocation against the daemon at `home`, capturing output.
 fn run_cli(home: &Path, args: &[&str], timeout: Duration) -> (ExitStatus, String) {
     let mut child = Command::new(BIN)
@@ -761,7 +782,7 @@ fn t12_restart_after_crash_orphans_the_task() {
     d1.kill().expect("SIGKILL daemon");
     d1.wait().expect("reap daemon");
     let deadline = Instant::now() + Duration::from_secs(4);
-    while pid_alive(task_pid) || pid_alive(cmd_pid) {
+    while pid_running(task_pid) || pid_running(cmd_pid) {
         assert!(Instant::now() < deadline, "task (runner {task_pid}, command {cmd_pid}) survived the daemon's SIGKILL");
         std::thread::sleep(Duration::from_millis(50));
     }
