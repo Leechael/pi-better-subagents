@@ -213,13 +213,14 @@ States: `absent` → `starting` (claim) → `serving` (≥1 active conn) ⇄ `id
 | D16 | serving | Ctrl-C (SIGINT/SIGHUP) to the process group of the client that spawned it | serving | daemon was detached with setsid | no | `g2` |
 | D17 | any | `doctor` | unchanged | no daemon → removes stale files while holding the lock; live daemon → touches nothing, hello ok | no | `g13` |
 | D18 | serving | all watched tasks finished | serving | idle: no busy loop | no | `g10` |
+| D25 | starting | the startup scan outlasts the spawning client's 2s socket wait (a large home) | serving | the socket is bound before the scan; the client queues in the backlog and is served, not refused | no | `d25` |
 
-**Coverage:** 56 cells (C 10, S 6, T 20, D 20).
+**Coverage:** 57 cells (C 10, S 6, T 20, D 21).
 
 | | Covered | Partial | Uncovered | Violated by the code |
 |---|---|---|---|---|
 | Before (original code, original tests) | 7 | 10 (unit-level, status-only, or in-process close) | 38 | 8 (C10, T6b, T6c, T15, T16, D2, D3, D13) |
-| After (fixed code) | 56 | 0 | 0 | 0 |
+| After (fixed code) | 57 | 0 | 0 | 0 |
 
 ## Bugs found (all fixed)
 
@@ -273,6 +274,9 @@ fixtures in the contract's format, because the extension side may land later.
 | `sessions`: connected only, gone sessions hidden but `show`/`events` still reach them, counts, `--json`, no spawn | `c5` |
 | gone-session retention: swept after `goneSessionRetention`; connected and still-running sessions kept; swept tasks leave `show`/`ls` | `g1` (red with the sweep disabled) |
 | `doctor` flags an invalid `goneSessionRetention` | `g2` |
+| finished-task retention: in a connected session, a finished task's record, output and stderr are deleted after `finishedTaskRetention`; running tasks, lingering groups, agents and events stay; swept tasks leave `show`/`ls` | `g15` (red with the task sweep disabled) |
+| finished-task retention: a task whose files could not be deleted (e.g. an unwritable tasks dir) keeps its record for the next sweep to retry, instead of being forgotten while its files remain on disk | `g15b` |
+| `doctor` flags an invalid `finishedTaskRetention` | `g2` |
 | `status`: human uptime, counts incl. agents, protocol, `--json`; not running → exit 1, no spawn | `c6` |
 | `output --max-bytes` is a total cap (UTF-8 safe); SIGPIPE → exit 0, silent (output, ls, events, log); human timestamps in `log` | `c7` |
 | `doctor`: home missing (not created), config.json, managerPath, stale agent records, orphan pids, socket path length, exit status; protocol per session | `c8`, `protocol::t11`, `mutation_gaps::g13` |
@@ -616,11 +620,13 @@ it):
 | D22 | quiescing | exec fails | serving (old image) | descriptors back to close-on-exec, tasks resume with no byte lost, clients reconnect | `u5` |
 | D23 | restoring | the new image cannot restore | exited | the lifeline closes: every task and grandchild cleaned up (= a crash, no recovery) | `u6` |
 | D24 | serving, just restored | no client for longer than the 5 s idle grace | serving | the idle rule is held for the 30 s handover grace, then applies again | `u12` |
+| D26 | serving, protocol < 3 (a manager from before in-place upgrade) | `upgrade` (CLI) | serving, unchanged | the CLI sends no `upgrade`; it names the pid, version and protocol and says to restart once (`pbs-manager shutdown`) | `u13` |
+| D27 | serving | `upgrade` from a binary other than the daemon's (e.g. target/release against the installed copy) | as D19 | before asking, the CLI notes on stderr that the daemon execs the file at its own path and names this CLI's path and build; nothing to note from the daemon's own file | `u14` |
 | S7 | connected | the manager upgrades | reconnects to the same pid | in-flight requests unanswered (resent by the client); `start` resent with its `key` returns the task it already started; protocol 1 / no-protocol hellos accepted | `u1`, `u2`, `u3` |
 | T17 | running / stop grace pending / timeout armed | upgrade | unchanged | later exits report the real code and signal; the timeout fires from the original start; a pending kill grace is re-armed with the time it had left | `u1`, `u8` |
 | T18 | running, watched (monitor) | upgrade | unchanged | the session's watch comes back on re-hello with exactly the bytes its connection had not been written; a UTF-8 character split across the handover arrives whole | `u1`, `u10`, `u11` |
 
-**Coverage:** 65 cells (C 10, S 7, T 22, D 26).
+**Coverage:** 68 cells (C 10, S 7, T 22, D 29).
 
 Measured client-visible gap (from "quiescing" to the new image accepting,
 in `manager.log`, under the parallel suite): 30–46 ms. Connects during it

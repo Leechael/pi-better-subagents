@@ -181,12 +181,12 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
         }
     };
 
-    let mut registry = Registry::new(home.clone());
-    let scan = lifecycle::scan_tasks(&home, &mut registry);
-    let state: Shared = Arc::new(Mutex::new(DaemonState::new(home.clone(), registry, foreground)));
-
-    // The pid file first: whoever can connect may read it at once (identity
-    // is the lock, the pid file is informational).
+    // The pid file and the socket before the scan: a large home takes
+    // seconds to load, longer than a spawning client waits for the socket.
+    // A client that connects meanwhile queues in the listen backlog and is
+    // accepted once `serve` runs. The pid file first: whoever can connect
+    // may read it at once (identity is the lock, the pid file is
+    // informational).
     if let Err(e) = lifecycle::write_pid_file(&home, std::process::id()) {
         eprintln!("pbs-manager: cannot write pid file: {e}");
         return 1;
@@ -201,12 +201,23 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
             return 1;
         }
     };
+
+    let mut registry = Registry::new(home.clone());
+    // Test hook: stand in for a scan over a large home (thousands of records).
+    if cfg!(debug_assertions) {
+        if let Some(ms) = std::env::var("PBS_TEST_SLOW_SCAN_MS").ok().and_then(|v| v.parse().ok()) {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    }
+    let scan = lifecycle::scan_tasks(&home, &mut registry);
+    let state: Shared = Arc::new(Mutex::new(DaemonState::new(home.clone(), registry, foreground)));
+
     lifecycle::log_line(
         &home,
         &format!(
             "daemon started pid={} version={} orphaned={} loaded={}",
             std::process::id(),
-            env!("CARGO_PKG_VERSION"),
+            crate::VERSION,
             scan.orphaned,
             scan.loaded
         ),
@@ -218,7 +229,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
         None,
         serde_json::json!({
             "pid": std::process::id(),
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": crate::VERSION,
             "protocol": PROTOCOL,
             "orphaned": scan.orphaned,
             "loaded": scan.loaded,
@@ -227,7 +238,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     if foreground {
         eprintln!(
             "pbs-manager {} listening on {} (pid {})",
-            env!("CARGO_PKG_VERSION"),
+            crate::VERSION,
             sock.display(),
             std::process::id()
         );
@@ -266,7 +277,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
         at: now_ms(),
         ok: true,
         from_version: snap.from_version.clone(),
-        to_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        to_version: Some(crate::VERSION.to_string()),
         error: None,
         trigger: snap.trigger.clone(),
     });
@@ -299,7 +310,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
         &format!(
             "upgraded in place: {} -> {} (pid {}, generation {}, {} live task(s))",
             snap.from_version,
-            env!("CARGO_PKG_VERSION"),
+            crate::VERSION,
             std::process::id(),
             snap.generation,
             live.len()
@@ -604,7 +615,7 @@ async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
         .send(encode_ok(
             &hello.id,
             &HelloOk {
-                version: env!("CARGO_PKG_VERSION").to_string(),
+                version: crate::VERSION.to_string(),
                 pid: std::process::id(),
                 started_at,
             },
@@ -876,32 +887,95 @@ fn resume_carried_watches(state: &Shared, conn_id: u64, tx: &OutTx) {
     }
 }
 
-/// §3.2: sweep gone sessions at startup and then every
-/// `gc::interval_ms(retention)`. The retention is read once per daemon.
+/// §3.2: sweep gone sessions and finished tasks at startup and then every
+/// `gc::interval_ms` of the shorter retention. Retentions are read once per
+/// daemon.
 fn spawn_session_gc(state: &Shared) {
     let (home, clock) = {
         let st = state.lock().unwrap();
         (st.home.clone(), st.clock.clone())
     };
-    let retention = match crate::gc::retention_ms(&home) {
+    let read = |r: Result<u64, String>, default: u64| match r {
         Ok(ms) => ms,
         Err(e) => {
             lifecycle::log_line(&home, &format!("config: {e}; using the default 24h"));
-            crate::gc::DEFAULT_RETENTION_MS
+            default
         }
     };
+    let retention = read(crate::gc::retention_ms(&home), crate::gc::DEFAULT_RETENTION_MS);
+    let task_retention = read(crate::gc::task_retention_ms(&home), crate::gc::DEFAULT_TASK_RETENTION_MS);
     run_session_gc(state, retention);
+    run_task_gc(state, task_retention);
     let state2 = state.clone();
     tokio::spawn(async move {
-        let every = Duration::from_millis(crate::gc::interval_ms(retention));
+        let every = Duration::from_millis(crate::gc::interval_ms(retention.min(task_retention)));
         loop {
             clock.sleep("gc", every).await;
             if state2.lock().unwrap().shutdown {
                 break;
             }
             run_session_gc(&state2, retention);
+            run_task_gc(&state2, task_retention);
         }
     });
+}
+
+/// Delete the files of tasks that ended more than `retention_ms` ago and
+/// forget them, in every session. A task whose group still lingers is kept.
+fn run_task_gc(state: &Shared, retention_ms: u64) {
+    let (home, candidates) = {
+        let st = state.lock().unwrap();
+        let now = now_ms();
+        let candidates: Vec<TaskRecord> = st
+            .registry
+            .tasks
+            .values()
+            .filter(|e| !e.owns_live_group())
+            .filter(|e| e.record.ended_at.is_some_and(|t| now.saturating_sub(t) >= retention_ms))
+            .map(|e| e.record.clone())
+            .collect();
+        (st.home.clone(), candidates)
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    // Delete files with the state lock released, so an hourly sweep over a
+    // large home does not block every status/ls/output/tail handler for the
+    // whole batch. A task is forgotten only once its files are gone; a
+    // failed remove is retried on the next sweep instead of the record
+    // vanishing while the file it named stays behind, unreachable.
+    let removed: Vec<String> = candidates
+        .into_iter()
+        .filter(|r| {
+            let output = PathBuf::from(&r.output_path);
+            remove_file_if_present(&crate::task::stderr_path_for(&output))
+                && remove_file_if_present(&output)
+                && remove_file_if_present(&registry::task_json_path(&home, &r.session_id, &r.task_id))
+        })
+        .map(|r| r.task_id)
+        .collect();
+    if removed.is_empty() {
+        return;
+    }
+    {
+        let mut st = state.lock().unwrap();
+        for id in &removed {
+            st.registry.tasks.remove(id);
+        }
+    }
+    lifecycle::log_line(
+        &home,
+        &format!("gc: removed {} finished task(s): {}", removed.len(), crate::gc::log_ids(&removed)),
+    );
+}
+
+/// Remove a file, treating "already gone" as success.
+fn remove_file_if_present(path: &std::path::Path) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
 }
 
 fn run_session_gc(state: &Shared, retention_ms: u64) {
@@ -928,7 +1002,7 @@ fn run_session_gc(state: &Shared, retention_ms: u64) {
     st.sessions.retain(|sid, _| !gone.contains(sid));
     lifecycle::log_line(
         &home,
-        &format!("gc: removed {} gone session(s): {}", removed.len(), removed.join(" ")),
+        &format!("gc: removed {} gone session(s): {}", removed.len(), crate::gc::log_ids(&removed)),
     );
     crate::events::emit(
         &home,
@@ -1697,7 +1771,7 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         .count();
     let terminal = st.registry.tasks.len() - running;
     Ok(StatusOk {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: crate::VERSION.to_string(),
         pid: std::process::id(),
         uptime_ms: now_ms().saturating_sub(st.started_at_ms),
         sessions,
@@ -1705,6 +1779,7 @@ fn handle_status(state: &Shared, _conn_id: u64) -> Result<StatusOk, ProtoError> 
         protocol: PROTOCOL,
         generation: st.generation,
         last_upgrade: st.last_upgrade.clone(),
+        exe: crate::handover::exe_path().ok().map(|p| p.display().to_string()),
     })
 }
 
@@ -1724,7 +1799,7 @@ fn handle_upgrade(state: &Shared, conn_id: u64) -> Result<UpgradeOk, ProtoError>
         return Err(ProtoError::new(E_INTERNAL, "an upgrade is already in progress"));
     }
     Ok(UpgradeOk {
-        from_version: env!("CARGO_PKG_VERSION").to_string(),
+        from_version: crate::VERSION.to_string(),
         generation,
     })
 }

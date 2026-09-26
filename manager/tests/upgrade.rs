@@ -166,7 +166,8 @@ fn u1_upgrade_keeps_every_task_running() {
     assert_eq!(after["last_upgrade"]["ok"], true);
     assert_eq!(after["last_upgrade"]["trigger"], "cli");
     let human = home.cli(&["status"], s(10)).stdout;
-    let v = env!("CARGO_PKG_VERSION");
+    let v = before["version"].as_str().unwrap();
+    assert!(v.starts_with(concat!(env!("CARGO_PKG_VERSION"), "+")), "{v}");
     assert!(human.contains(&format!("upgrades: 1 (last: {v} -> {v}, cli, ")), "{human}");
     for p in sleeper_group.iter().chain(&leftover_group) {
         assert!(pid_alive(*p), "pid {p} died in the upgrade");
@@ -503,4 +504,83 @@ fn u12_idle_rule_waits_for_clients_after_an_upgrade() {
         assert!(wait_child(&mut d, s(10)).is_some(), "idle rule applies again after the grace");
         assert!(poll_true(s(5), || !pid_running(pid)), "shutdown killed the task");
     }
+}
+
+/// Serve `home`'s socket as a manager from before in-place upgrade: replies
+/// captured from the real daemon, then aged to protocol 2 (no upgrade
+/// fields; `upgrade` is an unknown request, as the 2026-09-23 build said).
+fn serve_pre_upgrade_manager(home: &Home) -> std::thread::JoinHandle<()> {
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    let hello_ok = c.request(json!({"type":"hello","client_kind":"cli","protocol":2}));
+    let mut status_ok = c.request(json!({"type":"status"}));
+    let unknown = c.request(json!({"type":"no_such_request"}));
+    assert_eq!(unknown["ok"], json!(false), "{unknown}");
+    c.request(json!({"type":"shutdown"}));
+    drop(c);
+    assert!(poll_true(s(10), || !home.sock().exists()), "the real daemon went away");
+
+    assert_eq!(status_ok["ok"], json!(true), "{status_ok}");
+    status_ok["protocol"] = json!(2);
+    status_ok["version"] = json!("0.1.0");
+    for k in ["generation", "last_upgrade", "exe"] {
+        status_ok.as_object_mut().unwrap().remove(k);
+    }
+    let mut upgrade_err = unknown.clone();
+    upgrade_err["error"]["message"] = json!("bad request: unknown variant `upgrade`, expected one of `hello`, `start`, `status`, `shutdown`");
+    let listener = std::os::unix::net::UnixListener::bind(home.sock()).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            let (hello_ok, status_ok, upgrade_err) = (hello_ok.clone(), status_ok.clone(), upgrade_err.clone());
+            std::thread::spawn(move || {
+                let mut c = Conn::new(stream);
+                while let Recv::Frame(req) = c.recv(Instant::now() + s(30)) {
+                    let mut reply = match req["type"].as_str() {
+                        Some("hello") => hello_ok.clone(),
+                        Some("status") => status_ok.clone(),
+                        _ => upgrade_err.clone(),
+                    };
+                    reply["id"] = req["id"].clone();
+                    c.send(&reply);
+                }
+            });
+        }
+    })
+}
+
+/// D26: `upgrade` against a manager too old to upgrade in place. Invariant:
+/// the CLI says what is running and what to do (restart once), instead of
+/// passing on the daemon's "unknown variant `upgrade`".
+#[test]
+fn u13_upgrade_explains_a_manager_that_predates_it() {
+    let home = Home::new("u13");
+    let _fake = serve_pre_upgrade_manager(&home);
+    let out = upgrade(&home);
+    assert_eq!(out.status.code(), Some(1), "{} {}", out.stdout, out.stderr);
+    assert!(!out.stderr.contains("unknown variant"), "{}", out.stderr);
+    assert!(out.stderr.contains("predates in-place upgrade"), "{}", out.stderr);
+    assert!(out.stderr.contains("pbs-manager shutdown"), "{}", out.stderr);
+}
+
+/// D27: `upgrade` run from a binary other than the daemon's (a fresh
+/// target/release while the daemon runs the installed copy). The daemon
+/// execs the file at its own path, so the CLI says which file that is before
+/// it asks; from the daemon's own binary there is nothing to point out.
+#[test]
+fn u14_upgrade_names_the_file_it_will_exec() {
+    let home = Home::new("u14");
+    let bin = home.install_copy();
+    let _d = home.start_daemon_from(&bin, &[]);
+    let out = upgrade(&home);
+    assert!(out.status.success(), "{} {}", out.stdout, out.stderr);
+    let note = format!("upgrades to the file at its own path, {}", bin.display());
+    assert!(out.stderr.contains(&note), "{}", out.stderr);
+    assert!(out.stderr.contains(BIN), "names this CLI: {}", out.stderr);
+
+    // The same subcommand, run from the daemon's own file.
+    let o = std::process::Command::new(&bin).arg("--home").arg(&home.path).arg("upgrade").output().unwrap();
+    let own = (o.status, String::from_utf8_lossy(&o.stderr).into_owned());
+    assert!(own.0.success(), "{}", own.1);
+    assert!(!own.1.contains("upgrades to the file"), "{}", own.1);
 }

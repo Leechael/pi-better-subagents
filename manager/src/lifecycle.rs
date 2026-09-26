@@ -76,7 +76,7 @@ pub fn read_pid_file(home: &Path) -> Option<PidFile> {
 pub fn write_pid_file(home: &Path, pid: u32) -> io::Result<()> {
     let pf = PidFile {
         pid,
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: crate::VERSION.to_string(),
         started_at: now_ms(),
     };
     let tmp = home.join("manager.pid.tmp");

@@ -228,7 +228,7 @@ fn p3_hello_protocol_and_status() {
     let mut cli = home.connect();
     cli.hello_cli();
     let st = cli.request_ok(json!({"type":"status"}));
-    assert_eq!(st["protocol"], 2, "{st}");
+    assert_eq!(st["protocol"], 3, "{st}");
     let s = &st["sessions"][0];
     assert_eq!((s["protocol"].as_u64(), s["extension_version"].as_str()), (Some(2), Some("0.9.0-test")), "{st}");
     let since = s["connected_at"].as_u64().unwrap();
@@ -300,7 +300,7 @@ fn e1_manager_writes_session_and_task_events() {
         .collect();
     let dt: Vec<&str> = daemon.iter().map(|e| e["type"].as_str().unwrap()).collect();
     assert_eq!(dt, ["daemon.start", "daemon.shutdown"]);
-    assert_eq!(daemon[0]["protocol"], 2);
+    assert_eq!(daemon[0]["protocol"], 3);
 }
 
 /// Oversized fields are truncated so every line stays below 4 KiB.
@@ -775,13 +775,24 @@ fn c6_status_counts_uptime_and_not_running() {
     std::thread::sleep(MS(1100));
     let out = cli_ok(&home, &["status"]);
     let s = &out.stdout;
-    assert!(s.contains("version:  0.1.0 (protocol 2)"), "{s}");
+    // The version names the commit the binary was built from ("0.1.0" alone
+    // cannot tell builds apart), and status names the daemon's binary: the
+    // file an upgrade execs, which need not be the CLI's own. Compare
+    // against the version embedded at build time (same as main.rs's
+    // VERSION), not a fresh `git rev-parse`: shelling out again would fail
+    // outside a git checkout, where build.rs already fell back to
+    // "unknown", and would drift from the built-from commit on any tree
+    // whose HEAD moved since the daemon binary was built.
+    let version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PBS_GIT_SHA"));
+    assert!(s.contains(&format!("version:  {version} (protocol 3)")), "{s}");
+    let bin = std::fs::canonicalize(BIN).unwrap();
+    assert!(s.contains(&format!("binary:   {}", bin.display())), "{s}");
     let uptime = s.lines().find(|l| l.starts_with("uptime:")).unwrap();
     assert!(uptime.ends_with('s') && !uptime.contains('.'), "human uptime: {uptime}");
     assert!(s.contains("tasks:    1 running, 3 finished (shells 1/1, agents 0/2)"), "{s}");
     let out = cli_ok(&home, &["status", "--json"]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
-    assert_eq!(v["protocol"], 2);
+    assert_eq!(v["protocol"], 3);
     assert_eq!(v["agent_counts"], json!({"running":0,"terminal":2}));
 }
 
@@ -922,6 +933,105 @@ fn g1_gone_sessions_are_swept_after_retention() {
     kill_group(busy_pid, 9);
 }
 
+/// Finished-task retention: in every session, connected or not, a finished
+/// task's files (record, output, stderr) are deleted `finishedTaskRetention`
+/// after it ended. A pi session left open for days otherwise keeps every
+/// command's output (9,671 records, ~100 MB after 9 days on 2026-09-26),
+/// and the daemon loads all of it at startup. Running tasks, leftover
+/// process groups, agents and the session's events stay.
+#[test]
+fn g15_finished_tasks_expire_in_a_connected_session() {
+    let home = Home::new("g4");
+    std::fs::create_dir_all(&home.path).unwrap();
+    std::fs::write(home.path.join("config.json"), r#"{"finishedTaskRetention":"0s"}"#).unwrap();
+    agent_fixture(&home, "sess-g4", json!({"child_id":"ch_0000g401","session_id":"sess-g4","name":"a","agent":"w","status":"completed"}));
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-g4", "/tmp");
+    let (running, running_pid) = start(&mut c, "sleep 300", json!({}));
+    let (leftover, leftover_pid) = start(&mut c, "sleep 300 & exit 0", json!({}));
+    let (done, _) = start(&mut c, "echo out; echo err >&2", json!({}));
+    c.wait_terminal(&done, S(3)).unwrap();
+    c.wait_terminal(&leftover, S(3)).unwrap();
+
+    let tasks = home.path.join("sessions/sess-g4/tasks");
+    let swept = poll_true(S(10), || {
+        home.advance("gc", 1_000);
+        !tasks.join(format!("{done}.json")).exists()
+    });
+    assert!(swept, "finished task not swept");
+    for ext in ["output", "stderr"] {
+        assert!(!tasks.join(format!("{done}.{ext}")).exists(), "{done}.{ext} left behind");
+    }
+    for id in [&running, &leftover] {
+        assert!(tasks.join(format!("{id}.json")).exists(), "{id} kept");
+    }
+    assert!(home.path.join("sessions/sess-g4/events.jsonl").exists(), "events kept");
+    assert!(home.path.join("sessions/sess-g4/agents/ch_0000g401.json").exists(), "agents kept");
+    assert!(pid_alive(running_pid), "sweeping never touches live processes");
+
+    assert!(!home.cli(&["show", &done], S(5)).status.success(), "swept task is gone from show");
+    let ls = cli_ok(&home, &["ls"]).stdout;
+    assert!(ls.contains(&running) && ls.contains(&leftover) && !ls.contains(&done), "{ls}");
+    let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
+    assert!(log.contains(&format!("gc: removed 1 finished task(s): {done}")), "{log}");
+    kill_group(running_pid, 9);
+    kill_group(leftover_pid, 9);
+}
+
+/// A sweep that cannot delete a finished task's files must not forget the
+/// task either: the record is the only thing that says the files still need
+/// deleting, so losing it while the files stay behind orphans them until a
+/// restart's startup scan (or forever, if nothing ever re-scans). Block the
+/// delete with an unwritable tasks dir, sweep, and check the record is still
+/// there; unblock it and check the next sweep finishes the job.
+#[test]
+fn g15b_finished_task_survives_a_failed_delete_for_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root ignores directory modes; nothing to assert
+    }
+    let home = Home::new("g4b");
+    std::fs::create_dir_all(&home.path).unwrap();
+    std::fs::write(home.path.join("config.json"), r#"{"finishedTaskRetention":"0s"}"#).unwrap();
+    let _d = home.start_daemon();
+    let mut c = home.connect();
+    hello_v2(&mut c, "sess-g4b", "/tmp");
+    let (done, _) = start(&mut c, "true", json!({}));
+    c.wait_terminal(&done, S(3)).unwrap();
+
+    let tasks_dir = home.path.join("sessions/sess-g4b/tasks");
+    // Restores the dir to writable even if an assertion below panics, so a
+    // failed run doesn't leave an unwritable dir behind for the Home's own
+    // cleanup (or a later test) to choke on.
+    struct RestorePerms(PathBuf);
+    impl Drop for RestorePerms {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    std::fs::set_permissions(&tasks_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let _restore = RestorePerms(tasks_dir.clone());
+    home.advance("gc", 1_000);
+    std::thread::sleep(MS(300));
+    // Assert survival *before* the dir goes writable again: once it does,
+    // the background sweep (polling at least once a second) can delete the
+    // record at any moment, racing these checks against the assertion below
+    // that it is still there.
+    assert!(tasks_dir.join(format!("{done}.json")).exists(), "record lost before its files could be deleted");
+    assert!(home.cli(&["show", &done], S(5)).status.success(), "swept from show while its files still exist");
+
+    std::fs::set_permissions(&tasks_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let swept = poll_true(S(10), || {
+        home.advance("gc", 1_000);
+        !tasks_dir.join(format!("{done}.json")).exists()
+    });
+    assert!(swept, "retry sweep never finished deleting the task");
+    for ext in ["output", "stderr"] {
+        assert!(!tasks_dir.join(format!("{done}.{ext}")).exists(), "{done}.{ext} left behind");
+    }
+}
+
 #[test]
 fn g2_doctor_flags_a_bad_retention() {
     let home = Home::new("g2");
@@ -933,6 +1043,10 @@ fn g2_doctor_flags_a_bad_retention() {
     std::fs::write(home.path.join("config.json"), r#"{"goneSessionRetention":"2h"}"#).unwrap();
     let out = home.cli(&["doctor"], S(10));
     assert!(out.stdout.contains("gone sessions kept 2h"), "{}", out.stdout);
+    std::fs::write(home.path.join("config.json"), r#"{"finishedTaskRetention":"later"}"#).unwrap();
+    let out = home.cli(&["doctor"], S(10));
+    assert_eq!(out.status.code(), Some(1), "{}", out.stdout);
+    assert!(out.stdout.contains("task retention") && out.stdout.contains("later"), "{}", out.stdout);
 }
 
 /// Between a daemon crash and the next daemon start, the disk still says

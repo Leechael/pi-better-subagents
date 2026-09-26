@@ -91,14 +91,15 @@ Output is pipe-friendly: when the reader goes away (`… | head`), the CLI exits
 ### `status`
 
 ```text
-version:  0.1.0 (protocol 2)
+version:  0.1.0+066598ae00 (protocol 3)
 pid:      4321
+binary:   /Users/me/.pi/agent/pbs/bin/pbs-manager
 uptime:   13m23s
 sessions: 2 (1 connected)
 tasks:    3 running, 8 finished (shells 2/5, agents 1/3)
 ```
 
-Counts include agents (running/finished shells and agents are also shown separately). `--json` prints the protocol `status` response plus `agent_counts`. With no daemon: `pbs-manager is not running` on stderr, exit 1.
+The version carries the commit the binary was built from, so two builds of 0.1.0 differ; `unknown` for a build outside a git checkout. `binary` is the daemon's file, the one an [`upgrade`](#upgrade) execs, which is not necessarily the CLI you ran. Counts include agents (running/finished shells and agents are also shown separately). `--json` prints the protocol `status` response plus `agent_counts`. With no daemon: `pbs-manager is not running` on stderr, exit 1.
 
 ### `sessions`
 
@@ -107,7 +108,7 @@ SESSION   PI_PID STATE     CWD         SINCE    LAST_SEEN RUNNING TASKS AGENTS
 0199aaaa  81234  connected ~/src/app   14:02:11 now       2       7     1
 ```
 
-Connected sessions only (a gone session is listed while it still runs something). When a pi session exits, it leaves the listings at once; its files stay on disk for `goneSessionRetention` (see below) so `show`, `agent` and `events --session` still reach it, and are then deleted. `SESSION` is the shortest unique prefix, at least 8 characters. `RUNNING` counts running tasks and agents; a record that says an agent is running while its session is gone is not counted (it cannot be alive).
+Connected sessions only (a gone session is listed while it still runs something). When a pi session exits, it leaves the listings at once; its files stay on disk for `goneSessionRetention` (see below) so `agent` and `events --session` still reach it, and are then deleted. A finished task's own record and output reach `show` for only `finishedTaskRetention` (see below), which can be shorter. `SESSION` is the shortest unique prefix, at least 8 characters. `RUNNING` counts running tasks and agents; a record that says an agent is running while its session is gone is not counted (it cannot be alive).
 
 ### `ls` / `list`
 
@@ -118,7 +119,7 @@ mon_e1351cb1 monitor 0199aaaa  ~/src/app  killed    14:01:10 30s    SIGTERM stop
 ch_7d0e22a1  agent   0199aaaa  ~/src/app  failed    14:00:05 12s    -       model-error  broken (worker) m1
 ```
 
-Work of connected sessions, running and finished, plus anything still running in a gone session (a live process is never hidden). There is no `--all`: a gone session's finished work is reached by id (`show`) until its retention ends. Filters: `--session PREFIX` (session id prefix), `--cwd DIR` (that directory or below; agents use their session's cwd), `--since DUR` (started within). `--json` prints an array of row objects (`id`, `kind`, `session_id`, `cwd`, `status`, `started_at`, `ended_at`, `duration_ms`, `exit_code`, `signal`, `end_reason`, `title`, plus `pid`/`origin`/`backgrounded_at`/`run_id`/`error` when known).
+Work of connected sessions, running and finished, plus anything still running in a gone session (a live process is never hidden). There is no `--all`: a gone session's finished work is reached by id (`show`) until its session's retention or the finished-task retention ends, whichever comes first. Filters: `--session PREFIX` (session id prefix), `--cwd DIR` (that directory or below; agents use their session's cwd), `--since DUR` (started within). `--json` prints an array of row objects (`id`, `kind`, `session_id`, `cwd`, `status`, `started_at`, `ended_at`, `duration_ms`, `exit_code`, `signal`, `end_reason`, `title`, plus `pid`/`origin`/`backgrounded_at`/`run_id`/`error` when known).
 
 - `EXIT` is the exit code, a signal name (`SIGTERM`, `SIGKILL`, …), or `-`.
 - `REASON` is the task's `end_reason` (see below), or an agent record's `end_reason`.
@@ -194,6 +195,7 @@ Health checks, one line each (`ok`, `fixed`, `warn`, `FAIL`), then `ok` or `N pr
 - stale agent records: an agent says running but its session is gone
 - orphan pids: a task still running with no manager to own it
 - session retention: `goneSessionRetention` in `config.json` is a valid duration
+- task retention: `finishedTaskRetention` in `config.json` is a valid duration
 - sessions dir size (warn above 100 MiB; events.jsonl has no rotation yet)
 
 ---
@@ -269,6 +271,7 @@ Replaces the running daemon, in place, with the binary now installed at its path
 upgraded in place: 0.1.0 -> 0.1.1 (pid 4321, generation 1, 3 running task(s) kept)
 ```
 
+- The daemon execs the file at **its own path** (`binary:` in `status`), not the CLI you run. Running `upgrade` from another file (say a fresh `target/release`) prints a note saying so; install the build to that path first.
 - The new binary is checked first (`__handover-check`). A missing, broken or incompatible binary stops the upgrade before anything is touched: `upgrade not done, still running 0.1.0: …` (exit 1).
 - If the switch itself cannot finish (quiesce over 5s, exec failure), the daemon keeps running the old binary and says why.
 - If the new binary cannot restore, it exits and every task is cleaned up, as in a crash (no crash recovery); `upgrade` reports `the manager (pid N) exited during the upgrade`.
@@ -297,6 +300,16 @@ A session is *gone* once its pi process disconnects. Gone sessions leave `ls` an
 ```
 
 in `<home>/config.json`; any duration (`30m`, `7d`, `0s` = at the next sweep). Default `24h`. An invalid value makes `doctor` fail and the daemon use the default.
+
+## Retention of finished tasks
+
+A connected session is never swept, so a pi session left open for days would keep every command's record and output, and the daemon loads all of them at startup. Independently of the session, a finished task's files (`<id>.json`, `.output`, `.stderr`) are deleted `finishedTaskRetention` after it ended, in every session, and the task leaves `ls` and `show`. A task whose process group still has members is kept until it empties. Agent records and transcripts and `events.jsonl` are not touched by this rule (only by the session retention above).
+
+```json
+{ "finishedTaskRetention": "24h" }
+```
+
+Same duration format, default and `doctor` check as `goneSessionRetention`. The sweep runs with the session sweep, at the shorter of the two cadences.
 
 ## Typical workflows
 

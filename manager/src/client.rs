@@ -186,7 +186,7 @@ pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, Str
             session_id: Some(session_id.clone()),
             pi_pid: Some(std::process::id()),
             cwd: std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
-            extension_version: Some(format!("pbs-manager-cli/{}", env!("CARGO_PKG_VERSION"))),
+            extension_version: Some(format!("pbs-manager-cli/{}", crate::VERSION)),
             protocol: Some(PROTOCOL),
         },
     };
@@ -424,6 +424,18 @@ pub async fn cmd_shutdown(home: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether two paths name the same file on disk, not just the same string.
+/// `current_exe()` does not always resolve symlinks (a symlinked install
+/// dir, `/tmp` vs `/private/tmp` on macOS, `..` segments), so comparing raw
+/// strings can call the same binary "not this CLI" over nothing but
+/// spelling. A path that cannot be canonicalized (deleted, unreadable) is
+/// compared as given rather than dropped, so the note still fires when the
+/// two really do differ.
+fn same_file_by_path(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
+
 /// `pbs-manager upgrade`: ask the running daemon to exec the binary now at
 /// its path, then report how it went (from the new image's status).
 pub async fn cmd_upgrade(home: &Path) -> Result<(), String> {
@@ -432,6 +444,26 @@ pub async fn cmd_upgrade(home: &Path) -> Result<(), String> {
         return Ok(());
     };
     let before: StatusOk = conn.roundtrip(RequestKind::Status).await?;
+    if before.protocol < PROTOCOL_UPGRADE {
+        return Err(format!(
+            "the running manager (pid {}, {}, protocol {}) predates in-place upgrade, so it cannot upgrade itself. \
+             Restart it once: `pbs-manager shutdown` (stops its running tasks); the next client starts the installed binary",
+            before.pid, before.version, before.protocol
+        ));
+    }
+    // The daemon execs the file at its own path, not this CLI: say so when
+    // they differ (a fresh target/release against the installed daemon).
+    let me = crate::handover::exe_path().ok();
+    if let (Some(exe), Some(me)) = (&before.exe, &me) {
+        if !same_file_by_path(Path::new(exe), me.as_path()) {
+            eprintln!(
+                "note: the manager upgrades to the file at its own path, {exe}, not this CLI ({}, {}). \
+                 To run this build, install it there first",
+                me.display(),
+                crate::VERSION
+            );
+        }
+    }
     let asked = now_ms();
     let ok: UpgradeOk = conn.roundtrip(RequestKind::Upgrade).await?;
     drop(conn);
@@ -808,6 +840,10 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
         Ok(ms) => r.ok("session retention", format!("gone sessions kept {}", crate::fmt::human_duration(ms))),
         Err(e) => r.fail("session retention", format!("{e}; the daemon uses the default 24h")),
     }
+    match crate::gc::task_retention_ms(home) {
+        Ok(ms) => r.ok("task retention", format!("finished tasks kept {}", crate::fmt::human_duration(ms))),
+        Err(e) => r.fail("task retention", format!("{e}; the daemon uses the default 24h")),
+    }
     if let Some((p, source)) = &manager_path {
         if Path::new(p).is_file() {
             r.ok("manager path", format!("{p} ({source})"));
@@ -910,7 +946,7 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
 
 #[cfg(test)]
 mod resolve_tests {
-    use super::{cut_utf8, humanize_log_line, resolve_task_id};
+    use super::{cut_utf8, humanize_log_line, resolve_task_id, same_file_by_path};
 
     #[test]
     fn exact_and_typo_prefix() {
@@ -938,5 +974,23 @@ mod resolve_tests {
         let l = humanize_log_line("[1790000000123] daemon started");
         assert!(l.ends_with("] daemon started") && l.contains(".123]") && !l.contains("1790000000123"), "{l}");
         assert_eq!(humanize_log_line("plain"), "plain");
+    }
+
+    #[test]
+    fn same_file_by_path_follows_symlinks() {
+        let dir = std::env::temp_dir().join(format!("pbs-same-file-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real");
+        std::fs::write(&real, b"x").unwrap();
+        let link = dir.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(same_file_by_path(&real, &link), "a symlink and its target are the same file");
+        let other = dir.join("other");
+        std::fs::write(&other, b"y").unwrap();
+        assert!(!same_file_by_path(&real, &other), "two distinct files are not the same file");
+        let missing = dir.join("missing");
+        assert!(!same_file_by_path(&real, &missing), "a real file differs from one that does not exist");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

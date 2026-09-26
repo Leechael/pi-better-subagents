@@ -143,7 +143,7 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
 ```
 - `extension` 必须带 `session_id` + `pi_pid`;此后该连接接收此 session 的事件
 - `cwd` 可选(向后兼容)。扩展在 hello 里带上 session cwd;manager 存入 session 并在 status/sessions 里返回。旧客户端省略该字段仍可握手
-- `extension_version`(字符串)、`protocol`(整数)可选:manager 按 session 存储,在 `status` 的 sessions 里返回,`doctor` 据此检查每个已连接 session 的协议与 manager 一致。`protocol` 为特性级别:1 = 原始 §3.3,2 = 可观测性契约(origin / mark_background / stop.reason / end_reason / events.jsonl)。缺省 = 旧扩展
+- `extension_version`(字符串)、`protocol`(整数)可选:manager 按 session 存储,在 `status` 的 sessions 里返回,`doctor` 据此检查每个已连接 session 的协议与 manager 一致。`protocol` 为特性级别:1 = 原始 §3.3,2 = 可观测性契约(origin / mark_background / stop.reason / end_reason / events.jsonl),3 = 原地升级(`upgrade`、status 的 `generation`/`last_upgrade`/`exe`、start key、重连后重发)。CLI 的 `upgrade` 遇到级别 < 3 的 manager 不发请求,直接提示重启一次。缺省 = 旧扩展
 - 同一 `session_id` 重复 hello: 新连接赢,旧连接收到 `{"type":"event","event":"session_rebound"}` 后由服务端关闭
 - `cli` 不带 session;可访问跨 session 的只读/管理操作
 
@@ -225,15 +225,25 @@ SIGTERM 进程组 → 2s → SIGKILL(发给进程组,leader 已退出也照发)�
 ← {"ok":true, "stopped":["sh_a","mon_b"]}
 ```
 
+**upgrade**(仅 cli,协议 ≥3):
+```json
+→ {"type":"upgrade"}
+← {"ok":true, "from_version":"0.1.0+066598ae00", "generation":0}
+```
+让 daemon 原地升级到自己路径上的当前文件(quiesce → exec → restore,同 pid),响应只确认"已开始",不代表升级成功。实际结果读 `status` 的 `generation`(每次成功升级 +1)与 `last_upgrade`(见下)。升级会把当前连接 quiesce 后关闭;CLI 按 §3.2 的重连规则重新连上同一 pid,`start` 带的 `key` 让重发的请求幂等。错误:非 cli 连接 → `E_FORBIDDEN`;manager 正在 shutdown,或已有一次升级在进行 → `E_INTERNAL`。协议 <3 的 manager 没有这个消息;CLI 提前从 `status.protocol` 判断,协议 <3 时不发送该请求,直接提示重启一次。
+
 **status**(只读,cli 与 extension 均可):
 ```json
 → {"type":"status"}
-← {"ok":true, "version":"0.1.0", "pid":4321, "uptime_ms":3600000, "protocol":2,
+← {"ok":true, "version":"0.1.0+066598ae00", "pid":4321, "uptime_ms":3600000, "protocol":3,
+   "generation":1, "exe":"/usr/local/bin/pbs-manager",
+   "last_upgrade":{"at":1726...,"ok":true,"from_version":"0.1.0+abc1234500",
+                    "to_version":"0.1.0+066598ae00","trigger":"cli"},
    "sessions":[{"session_id":"...","pi_pid":1234,"connected":true,"cwd":"/path",
                 "extension_version":"0.3.0","protocol":2,"connected_at":1726...,"last_seen":1726...}],
    "task_counts":{"running":2,"terminal":5}}
 ```
-`protocol` 为 manager 的协议级别;`connected_at` = 本 manager 首次见到该 session 的 hello(重连保持不变);`last_seen` = 最近一次请求或断开(连接中为当前时间)。
+`protocol` 为 manager 的协议级别;`connected_at` = 本 manager 首次见到该 session 的 hello(重连保持不变);`last_seen` = 最近一次请求或断开(连接中为当前时间)。`generation` 是这个 pid 经历过的原地升级次数,从 0 开始。`last_upgrade` 是最近一次升级尝试(成功或失败都记),不存在则省略该字段;`error` 字段(升级失败时才有)说明为什么没换,daemon 仍跑旧二进制;`trigger` 是 `"cli"`(`pbs-manager upgrade`)或 `"binary-changed"`(文件被换了,daemon 自己发现)。`exe` 是 daemon 自己的二进制路径:升级 `exec()` 的就是这个路径当前的文件,不一定是发请求的 CLI 自己的路径(`pbs-manager upgrade` 据此在两者不同时提示)。
 
 **shutdown** (cli): 触发与"连接归零"相同的 graceful shutdown。
 

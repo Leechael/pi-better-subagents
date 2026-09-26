@@ -67,7 +67,7 @@ pub fn exe_path() -> std::io::Result<PathBuf> {
 }
 
 pub fn check_line() -> String {
-    format!("{CHECK_PREFIX} {FORMAT} {}", env!("CARGO_PKG_VERSION"))
+    format!("{CHECK_PREFIX} {FORMAT} {}", crate::VERSION)
 }
 
 pub fn file_path(home: &Path) -> PathBuf {
@@ -195,7 +195,7 @@ pub fn request(state: &Shared, trigger: &str) -> bool {
     let state = state.clone();
     let trigger = trigger.to_string();
     tokio::spawn(async move {
-        let from = env!("CARGO_PKG_VERSION").to_string();
+        let from = crate::VERSION.to_string();
         let checked = match exe_path() {
             Ok(exe) => preflight(&exe).await.map(|v| (exe, v)),
             Err(e) => Err(format!("current_exe: {e}")),
@@ -230,7 +230,7 @@ pub async fn perform(state: &Shared, listener_fd: RawFd, lock_fd: RawFd, ready: 
     let (home, from_version) = {
         let mut st = state.lock().unwrap();
         st.upgrade_pending = false;
-        (st.home.clone(), env!("CARGO_PKG_VERSION").to_string())
+        (st.home.clone(), crate::VERSION.to_string())
     };
     crate::lifecycle::log_line(&home, &format!("upgrade: {from_version} -> {to_version} ({trigger}); quiescing"));
 
