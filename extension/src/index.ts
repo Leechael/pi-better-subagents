@@ -122,8 +122,15 @@ export default function (pi: ExtensionAPI): void {
     monitorRegistry?.reconcile(tasks);
     for (const task of workIndex.staleLive(tasks)) {
       const event = exitEventFromRecord(task);
-      if (notifyOnExit.has(task.task_id)) deliverExit(task.task_id, event);
-      else patchExited(task.task_id, event);
+      // Route through the gate: if the real task_exited is processed after
+      // this (a stop-triggered exit written after the list response, a
+      // reconnect replay), the consumed mark stashes it instead of waking
+      // the agent a second time.
+      if (notifyOnExit.has(task.task_id) && exitGate.onExit(task.task_id, event, false) === "notify") {
+        deliverExit(task.task_id, event);
+      } else {
+        patchExited(task.task_id, event);
+      }
     }
   };
   const eventLog = createExtensionEventLog(home, () => ctx?.sessionManager.getSessionId() ?? "", clock);
