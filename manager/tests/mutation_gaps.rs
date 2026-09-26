@@ -431,6 +431,7 @@ fn g14_guardian_runner_does_not_spin() {
     let before = cpu_ms(runner);
     std::thread::sleep(Duration::from_millis(1500));
     let used = cpu_ms(runner) - before;
-    kill_group(gc, libc::SIGKILL);
+    // gc is the background child's pid, not a process-group id.
+    kill_pid(gc, libc::SIGKILL);
     assert!(used < 150, "guardian runner used {used}ms CPU in 1.5s");
 }

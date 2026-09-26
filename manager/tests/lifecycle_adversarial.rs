@@ -401,11 +401,24 @@ fn d4c_daemon_crash_takes_every_task_down() {
 /// D4b: a record left "running" is marked orphaned (manager-crash) at the
 /// next startup, and its recorded pid is never signalled: pids are reused,
 /// and here it names a live process the daemon never started.
+/// Kills and reaps the child on every exit path, so a failing assertion
+/// cannot leak the fixture's process.
+struct KillOnDrop(Option<std::process::Child>);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
 #[test]
 fn d4b_startup_orphans_leftover_records_without_signalling() {
     let home = Home::new("d4b");
-    let mut bystander = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
-    let pid = bystander.id();
+    let mut bystander = KillOnDrop(Some(std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap()));
+    let pid = bystander.0.as_ref().unwrap().id();
     let dir = home.path.join("sessions/sess-a/tasks");
     std::fs::create_dir_all(&dir).unwrap();
     let out = dir.join("sh_0000d4b1.output");
@@ -421,11 +434,18 @@ fn d4b_startup_orphans_leftover_records_without_signalling() {
     let t = c.task("sh_0000d4b1").expect("listed");
     assert_eq!((t["status"].as_str(), t["end_reason"].as_str()), (Some("orphaned"), Some("manager-crash")), "{t}");
     assert_eq!(t["output_size"], 8, "output size recovered from the file");
-    std::thread::sleep(MS(300));
-    let alive = bystander.try_wait().unwrap().is_none();
-    let _ = bystander.kill();
-    let _ = bystander.wait();
-    assert!(alive, "the daemon signalled a pid from an old record");
+    // Watch the bystander over a window, not one instant: a scan signal
+    // delivered late (or a daemon scheduled slowly under CI load) would
+    // slip a bare sleep. Every wait here is a poll, per the suite rule.
+    let deadline = Instant::now() + S(1);
+    loop {
+        let alive = bystander.0.as_mut().unwrap().try_wait().unwrap().is_none();
+        assert!(alive, "the daemon signalled a pid from an old record");
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(MS(50));
+    }
 }
 
 // ===========================================================================
