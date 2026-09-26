@@ -13,6 +13,7 @@ mod gc;
 mod handover;
 mod inspect;
 mod lifecycle;
+mod pager;
 mod proto;
 mod registry;
 mod runner;
@@ -32,8 +33,23 @@ struct Cli {
     /// Base directory. Priority: --home flag > PBS_HOME env > ~/.pi/agent/pbs (§3.1).
     #[arg(long, global = true)]
     home: Option<PathBuf>,
+    /// Never page output. Otherwise listings on a terminal go through
+    /// PBS_PAGER, else PAGER, else `less` (LESS=FRX unless set).
+    #[arg(long, global = true)]
+    no_pager: bool,
     #[command(subcommand)]
     cmd: Sub,
+}
+
+impl Sub {
+    /// Listings and dumps a person reads; not a follow, not an action.
+    fn pages(&self) -> bool {
+        match self {
+            Sub::Sessions { .. } | Sub::List { .. } | Sub::Show { .. } => true,
+            Sub::Agent { follow, .. } | Sub::Events { follow, .. } | Sub::Log { follow, .. } => !follow,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -217,6 +233,7 @@ fn main() {
 async fn async_main() {
     let cli = Cli::parse();
     let home = lifecycle::resolve_home(cli.home.as_deref());
+    let pager = if !cli.no_pager && cli.cmd.pages() { pager::start() } else { None };
     let code = match cli.cmd {
         Sub::Daemon { foreground, handover } => daemon::run(home, foreground, handover).await,
         Sub::Status { json } => run_client(inspect::cmd_status(&home, json)).await,
@@ -296,6 +313,9 @@ async fn async_main() {
             run_client(client::cmd_wait(&home, &task_id, budget_ms)).await
         }
     };
+    if let Some(p) = pager {
+        p.finish();
+    }
     std::process::exit(code);
 }
 

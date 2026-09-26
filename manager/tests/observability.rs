@@ -558,6 +558,44 @@ fn c1_ls_columns_filters_json_and_cjk() {
     assert!(!bad.status.success());
 }
 
+/// Run the CLI with its stdout on a pseudo-terminal (script(1)), the way a
+/// person runs it, and return what reached the terminal.
+fn cli_on_tty(home: &Home, args: &[&str], env: &[(&str, &str)]) -> String {
+    let mut argv: Vec<String> = vec![BIN.into(), "--home".into(), home.path.to_string_lossy().into_owned()];
+    argv.extend(args.iter().map(|a| a.to_string()));
+    let mut cmd = std::process::Command::new("script");
+    if cfg!(target_os = "macos") {
+        cmd.arg("-q").arg("/dev/null").args(&argv);
+    } else {
+        let quoted: Vec<String> = argv.iter().map(|a| format!("'{}'", a.replace('\'', "'\\''"))).collect();
+        cmd.arg("-qec").arg(quoted.join(" ")).arg("/dev/null");
+    }
+    let out = cmd.envs(env.iter().copied()).stdin(std::process::Stdio::null()).output().expect("script(1)");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Pager: on a terminal, listings go through `PBS_PAGER` / `PAGER` (default
+/// `less -FRX`); never when stdout is not a terminal, with `--no-pager`, or
+/// when following.
+#[test]
+fn c10_pager_on_a_terminal_only() {
+    let home = Home::new("c10");
+    append_event(&home, "sess-c10", json!({"ts":now_ms(),"src":"manager","type":"task.start","id":"sh_0000c10a"}));
+    let pager = [("PBS_PAGER", "sed s/^/PAGED:/"), ("PAGER", "false")];
+
+    let paged = cli_on_tty(&home, &["events"], &pager);
+    assert!(paged.contains("PAGED:") && paged.contains("sh_0000c10a"), "{paged:?}");
+    let via_pager = cli_on_tty(&home, &["events"], &[("PBS_PAGER", ""), ("PAGER", "sed s/^/PAGER:/")]);
+    assert!(via_pager.contains("PAGER:"), "PAGER is the fallback: {via_pager:?}");
+
+    let plain = cli_on_tty(&home, &["--no-pager", "events"], &pager);
+    assert!(plain.contains("sh_0000c10a") && !plain.contains("PAGED:"), "{plain:?}");
+    let cat = cli_on_tty(&home, &["events"], &[("PBS_PAGER", "cat")]);
+    assert!(cat.contains("sh_0000c10a"), "{cat:?}");
+    let piped = run_cli_env(&home.path, &["events"], S(5), &pager);
+    assert!(piped.stdout.contains("sh_0000c10a") && !piped.stdout.contains("PAGED:"), "not a terminal: {}", piped.stdout);
+}
+
 #[test]
 fn c2_show_task_agent_and_run() {
     let home = Home::new("c2");
