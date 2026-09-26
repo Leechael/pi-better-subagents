@@ -10,6 +10,7 @@ import { realClock } from "./clock";
 import { ExitNotifyGate } from "./exit-notify-gate";
 import { createExtensionEventLog } from "./events";
 import { readFileTail } from "./file-tail";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -22,7 +23,7 @@ import { createAgentMessageTool, createContactSupervisorTool } from "./comms/too
 import { registerReplyCommand } from "./comms/reply-command";
 import { describeManagerSearch, getPbsHome, loadConfig, resolveManagerPath, resolveSubagentConfig } from "./config";
 import type { TaskExitInfo } from "./format";
-import { ManagerClient, type ManagerEvent } from "./manager-client";
+import { ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
 import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
 import { NotifyCenter } from "./notify";
 import { createChildBashTool } from "./subagent/child-bash";
@@ -102,6 +103,61 @@ export default function (pi: ExtensionAPI): void {
     });
   };
   /**
+   * Is the daemon process alive? The pid file can be stale (pid reuse), so
+   * this errs towards "alive": a false positive only delays the settle, a
+   * false negative would wake the agent while its command still runs.
+   */
+  const isDaemonAlive = async (): Promise<boolean> => {
+    try {
+      const pf = JSON.parse(await readFile(join(home, "manager.pid"), "utf8")) as { pid?: unknown };
+      if (typeof pf.pid !== "number" || pf.pid <= 0) return false;
+      try {
+        process.kill(pf.pid, 0);
+        return true;
+      } catch (e) {
+        return (e as NodeJS.ErrnoException).code === "EPERM"; // alive, not ours
+      }
+    } catch {
+      return false; // no pid file / unparseable: no daemon
+    }
+  };
+  /**
+   * This session's task records, straight from disk: the fallback for when
+   * the manager is unavailable. A record still "running" whose daemon is
+   * dead is what the next daemon start marks orphaned (manager-crash), so
+   * it settles here; a "running" record with a live daemon is left alone.
+   */
+  const loadDiskTasks = async (): Promise<TaskRecord[] | null> => {
+    const sid = ctx?.sessionManager.getSessionId();
+    if (!sid) return null;
+    const dir = join(home, "sessions", sid, "tasks");
+    let files: string[];
+    try {
+      files = await readdir(dir);
+    } catch {
+      return null;
+    }
+    const daemonAlive = await isDaemonAlive();
+    const out: TaskRecord[] = [];
+    for (const f of files) {
+      if (!f.endsWith(".json")) continue;
+      try {
+        const rec = JSON.parse(await readFile(join(dir, f), "utf8")) as TaskRecord;
+        // The persisted output_size lags the output file; the file is the truth.
+        try {
+          rec.output_size = Math.max(rec.output_size, (await stat(rec.output_path)).size);
+        } catch { /* output file gone */ }
+        if (rec.status === "running" && !daemonAlive) {
+          rec.status = "orphaned";
+          rec.end_reason = "manager-crash";
+          rec.ended_at ??= clock.now();
+        }
+        out.push(rec);
+      } catch { /* not a record */ }
+    }
+    return out;
+  };
+  /**
    * Settle everything the manager reports as ended that we still show live:
    * monitors in the registry and shell/monitor rows in the index. Runs when
    * the user or model looks (task_list, /tasks), after task_stop, after a
@@ -112,12 +168,19 @@ export default function (pi: ExtensionAPI): void {
    */
   const syncWithManager = async (): Promise<void> => {
     const c = client;
-    if (!c || !c.isAvailable()) return;
-    let tasks;
-    try {
-      tasks = await c.list(true);
-    } catch {
-      return;
+    let tasks: TaskRecord[];
+    if (c && c.isAvailable()) {
+      try {
+        tasks = await c.list(true);
+      } catch {
+        return;
+      }
+    } else {
+      // Unavailable (it crashed and every respawn attempt failed): settle
+      // from the records on disk instead of letting the model wait forever.
+      const disk = await loadDiskTasks();
+      if (!disk) return;
+      tasks = disk;
     }
     monitorRegistry?.reconcile(tasks);
     for (const task of workIndex.staleLive(tasks)) {
