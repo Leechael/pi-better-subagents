@@ -186,8 +186,9 @@ enum Sub {
 fn main() {
     // `__run` is every task's process-group leader (`runner`): plain
     // threads, no async runtime, and not a user-facing subcommand.
-    let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("__run") {
+    // args_os: the executable path or the command may not be UTF-8.
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(std::ffi::OsStr::new("__run")) {
         let command = args.next().unwrap_or_default();
         std::process::exit(runner::main(&command));
     }

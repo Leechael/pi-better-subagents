@@ -29,6 +29,7 @@
 //! group; the daemon then falls back to the runner's own wait status.
 
 use crate::sys::{self, RUNNER_LIFELINE_FD, RUNNER_STATUS_FD};
+use std::ffi::OsStr;
 use std::os::unix::process::ExitStatusExt;
 use std::time::Duration;
 
@@ -38,7 +39,7 @@ const LIFELINE_GRACE: Duration = Duration::from_secs(2);
 /// How often a guardian looks for remaining group members.
 const GUARD_POLL: Duration = Duration::from_millis(100);
 
-pub fn main(command: &str) -> i32 {
+pub fn main(command: &OsStr) -> i32 {
     // Neither descriptor may reach the command.
     let _ = sys::set_cloexec(RUNNER_LIFELINE_FD);
     let _ = sys::set_cloexec(RUNNER_STATUS_FD);
