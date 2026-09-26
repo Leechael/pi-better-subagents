@@ -479,6 +479,23 @@ fn d4b_startup_orphans_leftover_records_without_signalling() {
     }
 }
 
+/// D25: the startup scan of a large home outlasts the client's wait for the
+/// socket (9,671 records took over 2s on 2026-09-26). Invariant: the client
+/// that spawned the daemon is served, not told "did not create its socket
+/// within 2s" while the daemon then idles out with nobody connected.
+#[test]
+fn d25_slow_startup_scan_still_serves_the_spawning_client() {
+    let home = Home::new("d25");
+    let out = run_cli_env(
+        &home.path,
+        &["start", "true"],
+        S(20),
+        &[("PBS_TEST_SLOW_SCAN_MS", "3000"), ("PBS_TEST_CLOCK", "")],
+    );
+    assert!(out.status.success(), "stdout: {}\nstderr: {}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("task_id="), "{}", out.stdout);
+}
+
 // ===========================================================================
 // Connection loss -> 5s grace -> shutdown (C3, D5, D6, D7)
 // ===========================================================================

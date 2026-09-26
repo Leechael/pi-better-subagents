@@ -181,12 +181,12 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
         }
     };
 
-    let mut registry = Registry::new(home.clone());
-    let scan = lifecycle::scan_tasks(&home, &mut registry);
-    let state: Shared = Arc::new(Mutex::new(DaemonState::new(home.clone(), registry, foreground)));
-
-    // The pid file first: whoever can connect may read it at once (identity
-    // is the lock, the pid file is informational).
+    // The pid file and the socket before the scan: a large home takes
+    // seconds to load, longer than a spawning client waits for the socket.
+    // A client that connects meanwhile queues in the listen backlog and is
+    // accepted once `serve` runs. The pid file first: whoever can connect
+    // may read it at once (identity is the lock, the pid file is
+    // informational).
     if let Err(e) = lifecycle::write_pid_file(&home, std::process::id()) {
         eprintln!("pbs-manager: cannot write pid file: {e}");
         return 1;
@@ -201,6 +201,17 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
             return 1;
         }
     };
+
+    let mut registry = Registry::new(home.clone());
+    // Test hook: stand in for a scan over a large home (thousands of records).
+    if cfg!(debug_assertions) {
+        if let Some(ms) = std::env::var("PBS_TEST_SLOW_SCAN_MS").ok().and_then(|v| v.parse().ok()) {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    }
+    let scan = lifecycle::scan_tasks(&home, &mut registry);
+    let state: Shared = Arc::new(Mutex::new(DaemonState::new(home.clone(), registry, foreground)));
+
     lifecycle::log_line(
         &home,
         &format!(

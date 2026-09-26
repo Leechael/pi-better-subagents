@@ -213,6 +213,7 @@ States: `absent` → `starting` (claim) → `serving` (≥1 active conn) ⇄ `id
 | D16 | serving | Ctrl-C (SIGINT/SIGHUP) to the process group of the client that spawned it | serving | daemon was detached with setsid | no | `g2` |
 | D17 | any | `doctor` | unchanged | no daemon → removes stale files while holding the lock; live daemon → touches nothing, hello ok | no | `g13` |
 | D18 | serving | all watched tasks finished | serving | idle: no busy loop | no | `g10` |
+| D25 | starting | the startup scan outlasts the spawning client's 2s socket wait (a large home) | serving | the socket is bound before the scan; the client queues in the backlog and is served, not refused | no | `d25` |
 
 **Coverage:** 56 cells (C 10, S 6, T 20, D 20).
 
