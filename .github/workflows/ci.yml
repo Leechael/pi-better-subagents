@@ -24,8 +24,19 @@ jobs:
         with:
           workspaces: manager
       - run: sw_vers; sysctl kern.ipc.maxpipekva kern.ipc.pipekva hw.ncpu 2>&1 || true
-      - run: cargo test --test upgrade -- u1_ u5_ u11_ || true
-      - run: cargo test --test upgrade -- u1_ u5_ u11_ || true
+      - name: loop speed, plain vs through a pipe vs under pbs-manager
+        run: |
+          L='i=0; while [ $i -lt 100 ]; do echo m-$i; i=$((i+1)); sleep 0.02; done'
+          echo "plain:"; time sh -c "$L" > /dev/null
+          echo "piped:"; time sh -c "$L" | cat > /dev/null
+          echo "sleep only x100:"; time sh -c 'i=0; while [ $i -lt 100 ]; do i=$((i+1)); /bin/sleep 0.02; done'
+          echo "true x100:"; time sh -c 'i=0; while [ $i -lt 100 ]; do i=$((i+1)); /usr/bin/true; done'
+          cargo build -q
+          H=$(mktemp -d /tmp/pbsl.XXXX)
+          B=$PWD/target/debug/pbs-manager
+          id=$($B --home $H start "$L" | grep -oE 'sh_[0-9a-f]+')
+          echo "under pbs-manager:"; time $B --home $H wait $id
+          $B --home $H shutdown || true
       - run: cargo test --test upgrade -- u1_ u5_ u11_
       - uses: actions/upload-artifact@v4
         if: always()
