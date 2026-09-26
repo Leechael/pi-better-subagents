@@ -25,6 +25,24 @@ fn command(env: impl Fn(&str) -> Option<String>) -> Option<String> {
     }
 }
 
+/// Whether `cmd`'s program (its first word) is runnable: an absolute or
+/// relative path that exists, or a bare name found on `PATH`. A pager that
+/// isn't runnable would still let `/bin/sh -c` start and then exit almost
+/// immediately, at which point stdout writes look like a broken pipe and
+/// the listing silently vanishes (see [`crate::out::bytes`]); checking here
+/// keeps that case as "no pager ran" instead.
+fn program_exists(cmd: &str) -> bool {
+    let Some(program) = cmd.split_whitespace().next() else {
+        return false;
+    };
+    if program.contains('/') {
+        return std::path::Path::new(program).is_file();
+    }
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
+    })
+}
+
 /// Point stdout at a pager when stdout is a terminal. Returns None when no
 /// pager runs (not a terminal, disabled, or it failed to start).
 pub fn start() -> Option<Pager> {
@@ -33,6 +51,9 @@ pub fn start() -> Option<Pager> {
         return None;
     }
     let cmd = command(|k| std::env::var(k).ok())?;
+    if !program_exists(&cmd) {
+        return None;
+    }
     let mut c = Command::new("/bin/sh");
     c.arg("-c").arg(&cmd).stdin(Stdio::piped());
     let mut child = c.spawn().ok()?;
@@ -81,5 +102,12 @@ mod tests {
         assert_eq!(with(Some(""), Some("less -S")).as_deref(), Some("less -S"));
         assert_eq!(with(Some("most"), Some("less")).as_deref(), Some("most"));
         assert_eq!(with(Some("cat"), Some("less")), None);
+    }
+
+    #[test]
+    fn program_exists_checks_the_pager_will_actually_run() {
+        assert!(program_exists("sh -c whatever"));
+        assert!(!program_exists("pbs-pager-does-not-exist-anywhere -R"));
+        assert!(!program_exists(""));
     }
 }
