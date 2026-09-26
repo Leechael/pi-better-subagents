@@ -270,6 +270,7 @@ Replaces the running daemon, in place, with the binary now installed at its path
 upgraded in place: 0.1.0 -> 0.1.1 (pid 4321, generation 1, 3 running task(s) kept)
 ```
 
+- The daemon execs the file at **its own path** (`binary:` in `status`), not the CLI you run. Running `upgrade` from another file (say a fresh `target/release`) prints a note saying so; install the build to that path first.
 - The new binary is checked first (`__handover-check`). A missing, broken or incompatible binary stops the upgrade before anything is touched: `upgrade not done, still running 0.1.0: …` (exit 1).
 - If the switch itself cannot finish (quiesce over 5s, exec failure), the daemon keeps running the old binary and says why.
 - If the new binary cannot restore, it exits and every task is cleaned up, as in a crash (no crash recovery); `upgrade` reports `the manager (pid N) exited during the upgrade`.

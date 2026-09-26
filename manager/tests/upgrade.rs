@@ -562,3 +562,25 @@ fn u13_upgrade_explains_a_manager_that_predates_it() {
     assert!(out.stderr.contains("predates in-place upgrade"), "{}", out.stderr);
     assert!(out.stderr.contains("pbs-manager shutdown"), "{}", out.stderr);
 }
+
+/// D27: `upgrade` run from a binary other than the daemon's (a fresh
+/// target/release while the daemon runs the installed copy). The daemon
+/// execs the file at its own path, so the CLI says which file that is before
+/// it asks; from the daemon's own binary there is nothing to point out.
+#[test]
+fn u14_upgrade_names_the_file_it_will_exec() {
+    let home = Home::new("u14");
+    let bin = home.install_copy();
+    let _d = home.start_daemon_from(&bin, &[]);
+    let out = upgrade(&home);
+    assert!(out.status.success(), "{} {}", out.stdout, out.stderr);
+    let note = format!("upgrades to the file at its own path, {}", bin.display());
+    assert!(out.stderr.contains(&note), "{}", out.stderr);
+    assert!(out.stderr.contains(BIN), "names this CLI: {}", out.stderr);
+
+    // The same subcommand, run from the daemon's own file.
+    let o = std::process::Command::new(&bin).arg("--home").arg(&home.path).arg("upgrade").output().unwrap();
+    let own = (o.status, String::from_utf8_lossy(&o.stderr).into_owned());
+    assert!(own.0.success(), "{}", own.1);
+    assert!(!own.1.contains("upgrades to the file"), "{}", own.1);
+}

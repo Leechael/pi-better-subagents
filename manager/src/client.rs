@@ -439,6 +439,19 @@ pub async fn cmd_upgrade(home: &Path) -> Result<(), String> {
             before.pid, before.version, before.protocol
         ));
     }
+    // The daemon execs the file at its own path, not this CLI: say so when
+    // they differ (a fresh target/release against the installed daemon).
+    let me = crate::handover::exe_path().ok();
+    if let (Some(exe), Some(me)) = (&before.exe, &me) {
+        if Path::new(exe) != me.as_path() {
+            eprintln!(
+                "note: the manager upgrades to the file at its own path, {exe}, not this CLI ({}, {}). \
+                 To run this build, install it there first",
+                me.display(),
+                crate::VERSION
+            );
+        }
+    }
     let asked = now_ms();
     let ok: UpgradeOk = conn.roundtrip(RequestKind::Upgrade).await?;
     drop(conn);
