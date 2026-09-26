@@ -709,9 +709,14 @@ impl Conn {
         }
     }
 
+    /// Send and wait for the answer: 10 s, or a request's own `budget_ms`
+    /// plus 5 s, so a `wait` that legitimately runs out its budget answers
+    /// `done:false` instead of looking like a daemon that stopped replying.
     pub fn request(&mut self, req: Value) -> Value {
-        let r = self.try_request(req.clone(), Duration::from_secs(10));
-        r.unwrap_or_else(|| panic!("no response to {req} within 10s (closed={})", self.closed))
+        let budget = req["budget_ms"].as_u64().map(|ms| Duration::from_millis(ms) + Duration::from_secs(5));
+        let limit = budget.unwrap_or_default().max(Duration::from_secs(10));
+        let r = self.try_request(req.clone(), limit);
+        r.unwrap_or_else(|| panic!("no response to {req} within {limit:?} (closed={})", self.closed))
     }
 
     pub fn request_ok(&mut self, req: Value) -> Value {
