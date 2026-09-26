@@ -55,8 +55,9 @@ fn config_duration(home: &Path, key: &str, default: u64) -> Result<u64, String> 
     }
 }
 
-/// Ids a sweep names in manager.log; the rest are counted. One sweep after
-/// a long gap removed 1,121 tasks, all on one line.
+/// How many ids a sweep names individually in manager.log before falling
+/// back to just a count of the rest. One sweep after a long gap removed
+/// 1,121 tasks, all on one line.
 pub const LOG_IDS: usize = 10;
 
 /// The first [`LOG_IDS`] ids, then `(+N more)`.
