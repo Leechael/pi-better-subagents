@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use tokio::net::unix::pipe;
 use tokio::process::Child;
@@ -57,6 +58,9 @@ pub struct TaskEntry {
     /// Connection ids subscribed to output events (§3.3 watch).
     pub watchers: HashSet<u64>,
     pub timeout_ms: Option<u64>,
+    /// Tee pumps still running (stdout + stderr); taken by the exit watch so
+    /// the record only goes terminal once the command's output has drained.
+    pub tee_remaining: Option<Arc<AtomicUsize>>,
     /// The command exited but other members of its process group (children
     /// it backgrounded) are still alive, guarded by the runner. The group is
     /// still ours to kill on stop/shutdown (§3.2: background work must not
@@ -103,6 +107,7 @@ impl TaskEntry {
         output: Arc<Mutex<OutputState>>,
         chunks_rx: mpsc::Receiver<OutputChunk>,
         timeout_ms: Option<u64>,
+        tee_remaining: Arc<AtomicUsize>,
     ) -> Self {
         let (status_tx, _) = watch::channel(TaskStatus::Running);
         TaskEntry {
@@ -116,6 +121,7 @@ impl TaskEntry {
             kill_reason: None,
             watchers: HashSet::new(),
             timeout_ms,
+            tee_remaining: Some(tee_remaining),
             group_lingering: false,
         }
     }
@@ -135,6 +141,7 @@ impl TaskEntry {
             kill_reason: None,
             watchers: HashSet::new(),
             timeout_ms: None,
+            tee_remaining: None,
             group_lingering: false,
         }
     }
@@ -390,6 +397,7 @@ mod tests {
                 kill_reason: None,
                 watchers: HashSet::new(),
                 timeout_ms: None,
+                tee_remaining: None,
                 group_lingering: false,
             },
         );

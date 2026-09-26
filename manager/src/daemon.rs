@@ -6,7 +6,7 @@
 use crate::lifecycle::{self, Claim};
 use crate::proto::*;
 use crate::registry::{self, Access, Registry, TaskEntry};
-use crate::task::{self, SpawnedTask};
+use crate::task::{self, OutputState, SpawnedTask};
 use interprocess::local_socket::tokio::prelude::*; // traits for accept()/connect()
 use interprocess::local_socket::tokio::Stream;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName};
@@ -14,6 +14,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
@@ -811,7 +812,7 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
         pid,
         output,
         chunks,
-        tee_remaining: _,
+        tee_remaining,
     } = spawned;
 
     let now = now_ms();
@@ -854,7 +855,15 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
                 "pid": pid,
             }),
         );
-        let mut entry = TaskEntry::new_running(record, child, status, output, chunks, timeout_ms);
+        let mut entry = TaskEntry::new_running(
+            record,
+            child,
+            status,
+            output,
+            chunks,
+            timeout_ms,
+            tee_remaining,
+        );
         // A monitor exists to stream: its starter watches from spawn on, so a
         // command that prints and exits at once loses nothing to a late watch.
         if kind == TaskKind::Monitor {
@@ -1394,14 +1403,22 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
     let state2 = state.clone();
     let tid = task_id.to_string();
     tokio::spawn(async move {
-        let (child, status_rx, timeout_ms) = {
+        let (child, status_rx, timeout_ms, output, tee) = {
             let mut st = state2.lock().unwrap();
             match st.registry.tasks.get_mut(&tid) {
-                Some(e) => (e.child.take(), e.status_rx.take(), e.timeout_ms),
-                None => (None, None, None),
+                Some(e) => (
+                    e.child.take(),
+                    e.status_rx.take(),
+                    e.timeout_ms,
+                    Some(e.output.clone()),
+                    e.tee_remaining.take(),
+                ),
+                None => (None, None, None, None, None),
             }
         };
-        let (Some(mut child), Some(mut status_rx)) = (child, status_rx) else { return };
+        let (Some(mut child), Some(mut status_rx), Some(output)) = (child, status_rx, output) else {
+            return;
+        };
         let mut line = Vec::new();
         let first = {
             let wait = child.wait();
@@ -1439,6 +1456,9 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
         match first {
             FirstSeen::Report(Some(r)) => {
                 let outcome = Outcome { code: r.code, signal: r.signal };
+                if let Some(tee) = &tee {
+                    wait_tee_drained(tee, &output).await;
+                }
                 if r.linger {
                     finalize_exit(&state2, &tid, outcome, Leftover::Guarded);
                     // The runner exits once the group is empty.
@@ -1453,11 +1473,17 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
             }
             FirstSeen::Report(None) => {
                 let s = child.wait().await.ok();
+                if let Some(tee) = &tee {
+                    wait_tee_drained(tee, &output).await;
+                }
                 finalize_exit(&state2, &tid, Outcome::of(s), Leftover::Probe);
             }
             FirstSeen::RunnerExit(s) => {
                 // A report written just before the runner exited may still
                 // be in the pipe; the write end is closed now, so this ends.
+                if let Some(tee) = &tee {
+                    wait_tee_drained(tee, &output).await;
+                }
                 match read_status_line(&mut status_rx, &mut line).await {
                     Some(r) => {
                         let leftover = if r.linger { Leftover::Probe } else { Leftover::None };
@@ -1468,6 +1494,28 @@ fn spawn_exit_watch(state: &Shared, task_id: &str, pid: u32) {
             }
         }
     });
+}
+
+/// The record's terminal `output_size` is snapshotted at finalize, so the
+/// tee pumps must drain the command's last output first. EOF arrives
+/// moments after the runner (and any leftover) closes its inherited write
+/// ends; a leftover that keeps the pipes open ends the wait early once
+/// output goes quiet. Capped: a stuck pump must not delay the exit event.
+async fn wait_tee_drained(tee: &Arc<AtomicUsize>, output: &Arc<Mutex<OutputState>>) {
+    let mut last = u64::MAX;
+    let mut quiet = 0u32;
+    for _ in 0..100 {
+        if tee.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let size = output.lock().unwrap().total_size;
+        quiet = if size == last { quiet + 1 } else { 0 };
+        if quiet >= 10 {
+            return; // ~50 ms without new output
+        }
+        last = size;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// Map an observed exit to a terminal status, persist the record, wake
