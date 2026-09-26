@@ -603,6 +603,8 @@ pub struct Conn {
     pub events: Vec<Value>,
     next_id: u64,
     pub closed: bool,
+    /// What made `closed` true: EOF, or the read error.
+    pub close_reason: String,
 }
 
 impl Conn {
@@ -614,6 +616,7 @@ impl Conn {
             events: Vec::new(),
             next_id: 0,
             closed: false,
+            close_reason: String::new(),
         }
     }
 
@@ -658,12 +661,19 @@ impl Conn {
                 .ok();
             let mut chunk = vec![0u8; 64 * 1024];
             match self.stream.read(&mut chunk) {
-                Ok(0) => self.closed = true,
+                Ok(0) => {
+                    self.closed = true;
+                    self.close_reason = format!("EOF from the daemon ({} bytes of a frame buffered)", self.buf.len());
+                }
                 Ok(k) => self.buf.extend_from_slice(&chunk[..k]),
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(_) => self.closed = true,
+                        || e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    self.closed = true;
+                    self.close_reason = format!("read error: {e} ({:?})", e.kind());
+                }
             }
         }
     }
@@ -716,7 +726,7 @@ impl Conn {
         let budget = req["budget_ms"].as_u64().map(|ms| Duration::from_millis(ms) + Duration::from_secs(5));
         let limit = budget.unwrap_or_default().max(Duration::from_secs(10));
         let r = self.try_request(req.clone(), limit);
-        r.unwrap_or_else(|| panic!("no response to {req} within {limit:?} (closed={})", self.closed))
+        r.unwrap_or_else(|| panic!("no response to {req} within {limit:?} (closed={} {})", self.closed, self.close_reason))
     }
 
     pub fn request_ok(&mut self, req: Value) -> Value {
