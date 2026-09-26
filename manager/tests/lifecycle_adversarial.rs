@@ -212,7 +212,9 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
     );
 }
 
-/// CPU burners for race reproducers; killed on drop.
+/// CPU burners for race reproducers; killed on drop. Drop never runs when the
+/// test binary itself is killed (Ctrl-C, a timeout), so each burner also spins
+/// only while its parent is alive: an orphan exits instead of pinning a core.
 struct Burners(Vec<std::process::Child>);
 impl Burners {
     fn start() -> Burners {
@@ -221,7 +223,7 @@ impl Burners {
             (0..n)
                 .map(|_| {
                     std::process::Command::new("sh")
-                        .args(["-c", "while :; do :; done"])
+                        .args(["-c", "while kill -0 $PPID 2>/dev/null; do :; done"])
                         .spawn()
                         .unwrap()
                 })
