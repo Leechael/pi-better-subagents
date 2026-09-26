@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  manager:
+    name: manager (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: manager
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: manager
+      # Real time: the actual idle / kill graces (timing_canary included).
+      - run: cargo test
+      # Manual clock: the daemon's own timers are stepped by the tests.
+      - run: cargo test --features test-clock
+
+  extension:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+
+  # Real pi + real pbs-manager + the extension, driven by the faux model.
+  # No model credentials, no network: pi runs with --offline.
+  e2e:
+    name: e2e (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      PBS_MANAGER_PATH: ${{ github.workspace }}/manager/target/release/pbs-manager
+      PI_BIN: ${{ github.workspace }}/eval/node_modules/.bin/pi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: manager
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            extension/package-lock.json
+            eval/package-lock.json
+      - run: cargo build --release
+        working-directory: manager
+      # real-manager.test.ts skips itself when the binary is missing; a
+      # skipped integration suite must not pass as green.
+      - run: test -x "$PBS_MANAGER_PATH"
+      - run: npm ci
+        working-directory: extension
+      - run: npm ci
+        working-directory: eval
+      - run: npx vitest run tests/integration/real-manager.test.ts
+        working-directory: extension
+        env:
+          PBS_INTEG: "1"
+      - run: npm run typecheck
+        working-directory: eval
+      - run: npm run test:unit
+        working-directory: eval
+      - run: npm run test:e2e
+        working-directory: eval
