@@ -25,6 +25,20 @@ fn help_and_version_are_served_by_the_cli_framework() {
         help.contains("ls"),
         "the list alias should be discoverable: {help}"
     );
+    let status_at = help
+        .find("\n  status")
+        .expect("status command in help");
+    let daemon_at = help
+        .find("\n  daemon")
+        .expect("daemon command in help");
+    assert!(
+        status_at < daemon_at,
+        "commands should follow the docs quick-reference order: {help}"
+    );
+    assert!(
+        !help.contains("goneSessionRetention"),
+        "top-level help should stay short; details belong on subcommand --help: {help}"
+    );
     let daemon_help = run(&["daemon", "--help"]);
     assert!(
         daemon_help.status.success(),

@@ -17,12 +17,11 @@ use crate::VERSION;
     completion
 )]
 pub(crate) struct Cli {
-    /// Base directory. Priority: --home flag > PBS_HOME env > ~/.pi/agent/pbs (§3.1).
-    #[usage(long, global)]
+    /// Base directory (`--home` > `PBS_HOME` > `~/.pi/agent/pbs`).
+    #[usage(long, global, display_order = 1)]
     pub(crate) home: Option<PathBuf>,
-    /// Never page output. Otherwise listings on a terminal go through
-    /// PBS_PAGER, else PAGER, else `less` (LESS=FRX unless set).
-    #[usage(long, global)]
+    /// Never page output (else `PBS_PAGER` / `PAGER` / `less -FRX` on a TTY).
+    #[usage(long, global, display_order = 2)]
     pub(crate) no_pager: bool,
     #[usage(subcommand)]
     pub(crate) cmd: Sub,
@@ -43,32 +42,30 @@ impl Sub {
 
 #[derive(usage::Subcommands)]
 pub(crate) enum Sub {
-    /// Run the manager daemon in the foreground (this is what clients spawn).
-    Daemon {
-        /// Also log to stderr (for debugging).
-        #[usage(long)]
-        foreground: bool,
-        /// Internal: continue an in-place upgrade from this handover file.
-        #[usage(long, hide)]
-        handover: Option<PathBuf>,
-    },
-    /// Version, protocol, uptime, sessions, task and agent counts. Never
-    /// starts the daemon ("pbs-manager is not running", exit 1).
+    /// Version, protocol, uptime, sessions, task and agent counts.
+    ///
+    /// Never starts the daemon ("pbs-manager is not running", exit 1).
+    #[usage(display_order = 10)]
     Status {
+        /// Machine-readable JSON on stdout.
         #[usage(long)]
         json: bool,
     },
-    /// Connected pi sessions (a gone session only while it still runs
-    /// something). Gone sessions' records are kept for `goneSessionRetention`
-    /// (config.json, default 24h) and stay reachable via show/agent/events.
+    /// Connected pi sessions (and gone ones that still run work).
+    ///
+    /// Gone sessions' records are kept for `goneSessionRetention` (config.json,
+    /// default 24h) and stay reachable via show/agent/events.
+    #[usage(display_order = 20)]
     Sessions {
+        /// Machine-readable JSON on stdout.
         #[usage(long)]
         json: bool,
     },
-    /// Running tasks and agents, newest first. `--all` adds the finished
-    /// work of connected sessions, after the running group. An agent's time
-    /// is its last transcript message. Alias: `ls`.
-    #[usage(alias = "ls")]
+    /// Running tasks and agents, newest first. Alias: `ls`.
+    ///
+    /// `--all` adds finished work of connected sessions after the running
+    /// group. An agent's time is its last transcript message.
+    #[usage(alias = "ls", display_order = 30)]
     List {
         /// Also list finished work of connected sessions.
         #[usage(short, long)]
@@ -79,21 +76,26 @@ pub(crate) enum Sub {
         /// Only work whose cwd is this directory or below it.
         #[usage(long)]
         cwd: Option<String>,
-        /// Only work active within this long (e.g. 30s, 10m, 2h, 1d): a task's
-        /// start, an agent's last message.
+        /// Only work active within this long (e.g. 30s, 10m, 2h, 1d).
         #[usage(long)]
         since: Option<String>,
+        /// Machine-readable JSON on stdout.
         #[usage(long)]
         json: bool,
     },
     /// Everything about one task, monitor, agent (ch_…) or run (run_…).
+    #[usage(display_order = 40)]
     Show {
+        /// Task, monitor, agent, or run id (fuzzy match ok).
         id: String,
+        /// Machine-readable JSON on stdout.
         #[usage(long)]
         json: bool,
     },
     /// Render an agent's transcript (preamble hidden unless --full).
+    #[usage(display_order = 50)]
     Agent {
+        /// Agent id (`ch_…`; fuzzy match ok).
         id: String,
         /// Include the system prompt / agent preamble.
         #[usage(long)]
@@ -103,7 +105,9 @@ pub(crate) enum Sub {
         follow: bool,
     },
     /// Event log, merged and time-ordered across sessions.
+    #[usage(display_order = 60)]
     Events {
+        /// Keep following new events.
         #[usage(short = 'f', long)]
         follow: bool,
         /// Only sessions whose id starts with this prefix.
@@ -119,9 +123,47 @@ pub(crate) enum Sub {
         #[usage(long)]
         json: bool,
     },
-    /// Read a task's output through the protocol; -f follows. For an agent
-    /// id, prints its result.
+    /// Tail manager.log, or a task's output when an id is given.
+    ///
+    /// With an id: follows the merged `.output` file (use --stderr for the
+    /// stderr-only sibling). Without: tails manager.log.
+    #[usage(display_order = 70)]
+    Log {
+        /// Optional task id; when set, tails that task's output instead of manager.log.
+        task_id: Option<String>,
+        /// Keep following new lines.
+        #[usage(short = 'f', long)]
+        follow: bool,
+        /// Trailing lines to print before following (or as the whole dump).
+        #[usage(short = 'n', long, default = "100")]
+        lines: usize,
+        /// Tail `<task>.stderr` instead of the merged output (requires a task id).
+        #[usage(long)]
+        stderr: bool,
+    },
+    /// Follow a task's output (shortcut for `log -f <id>`).
+    ///
+    /// `-f` is accepted for muscle memory (`tail -f ID`) and is always on.
+    #[usage(display_order = 80)]
+    Tail {
+        /// Task id (fuzzy match ok).
+        task_id: String,
+        /// Accepted and ignored (follow is always on for `tail`).
+        #[usage(short = 'f', long)]
+        follow: bool,
+        /// Trailing lines to print before following.
+        #[usage(short = 'n', long, default = "100")]
+        lines: usize,
+        /// Tail stderr only (`<task>.stderr`).
+        #[usage(long)]
+        stderr: bool,
+    },
+    /// Read a task's output through the protocol; -f follows.
+    ///
+    /// For an agent id, prints its result.
+    #[usage(display_order = 90)]
     Output {
+        /// Task or agent id (fuzzy match ok).
         task_id: String,
         /// Follow the output stream.
         #[usage(short = 'f', long)]
@@ -130,51 +172,36 @@ pub(crate) enum Sub {
         #[usage(long)]
         max_bytes: Option<u64>,
     },
-    /// Stop a task (SIGTERM group -> 2s -> SIGKILL).
-    Stop { task_id: String },
-    /// Stop all running tasks of a session.
-    KillSession { session_id: String },
-    /// Health checks (daemon, socket, config, protocol, stale records,
-    /// orphan pids, disk use); fixes stale socket/pid files. Exit 1 on any
-    /// failure.
-    Doctor,
-    /// Gracefully shut the manager down (kills remaining tasks).
-    Shutdown,
-    /// Replace the running manager, in place, with the binary now installed
-    /// at its path: same pid, every task keeps running, clients reconnect.
-    /// The daemon also does this by itself when that file changes.
-    Upgrade,
-    /// Tail manager.log, or a task's output when TASK_ID is given.
-    /// With TASK_ID: follows the merged `.output` file (use --stderr for the
-    /// stderr-only sibling). Without TASK_ID: tails manager.log.
-    Log {
-        /// Optional task id. When set, tails that task's output instead of manager.log.
-        task_id: Option<String>,
-        #[usage(short = 'f', long)]
-        follow: bool,
-        /// Number of trailing lines to print before following (or as the whole dump).
-        #[usage(short = 'n', long, default = "100")]
-        lines: usize,
-        /// Tail the stderr-only file (`<task>.stderr`) instead of the merged output.
-        /// Requires TASK_ID.
-        #[usage(long)]
-        stderr: bool,
-    },
-    /// Follow a task's output in real time (shortcut for `log -f TASK_ID`).
-    /// `-f` is accepted for muscle memory (`tail -f ID`) and is always on.
-    Tail {
+    /// Budget-wait on a task's exit.
+    #[usage(display_order = 100)]
+    Wait {
+        /// Task id (fuzzy match ok).
         task_id: String,
-        /// Accepted and ignored (follow is always on for `tail`).
-        #[usage(short = 'f', long)]
-        follow: bool,
-        #[usage(short = 'n', long, default = "100")]
-        lines: usize,
-        /// Tail stderr only (`<task>.stderr`).
-        #[usage(long)]
-        stderr: bool,
+        /// Milliseconds to wait before giving up (default 20000).
+        #[usage(long, default = "20000")]
+        budget_ms: u64,
     },
-    /// Start a task (convenience for scripting/smoke tests; owns the task via
-    /// an extension-style session binding).
+    /// Print a shell completion script (bash, zsh, or fish).
+    #[usage(display_order = 110)]
+    Completion {
+        /// Which shell to generate for.
+        #[usage(long, choices("bash", "zsh", "fish"))]
+        shell: String,
+    },
+    /// Stop a task (SIGTERM group → 2s → SIGKILL).
+    #[usage(display_order = 120)]
+    Stop {
+        /// Task id (fuzzy match ok).
+        task_id: String,
+    },
+    /// Stop all running tasks of a session.
+    #[usage(display_order = 130)]
+    KillSession {
+        /// Session id.
+        session_id: String,
+    },
+    /// Start a task (scripting / smoke tests; extension-style session binding).
+    #[usage(display_order = 140)]
     Start {
         /// Session that owns the task.
         #[usage(long, default = "cli")]
@@ -182,29 +209,42 @@ pub(crate) enum Sub {
         /// Task kind: shell | monitor.
         #[usage(long, default = "shell")]
         kind: String,
+        /// Working directory for the command.
         #[usage(long)]
         cwd: Option<String>,
         /// Hard kill ceiling in ms (omit for no limit).
         #[usage(long)]
         timeout_ms: Option<u64>,
-        /// Semantic marker only (§3.3); manager behaviour is unchanged.
+        /// Semantic marker only; manager behaviour is unchanged.
         #[usage(long)]
         background: bool,
         /// Shell command string (run via `sh -c`).
         #[usage(double_dash = "automatic")]
         command: String,
     },
-    /// Budget-wait on a task's exit.
-    Wait {
-        task_id: String,
-        #[usage(long, default = "20000")]
-        budget_ms: u64,
-    },
-    /// Print a shell completion script.
-    Completion {
-        /// Which shell to generate for.
-        #[usage(long, choices("bash", "zsh", "fish"))]
-        shell: String,
+    /// Health checks; fixes stale socket/pid files. Exit 1 on any failure.
+    ///
+    /// Covers daemon, socket, config, protocol, stale records, orphan pids, disk use.
+    #[usage(display_order = 150)]
+    Doctor,
+    /// Gracefully shut the manager down (kills remaining tasks).
+    #[usage(display_order = 160)]
+    Shutdown,
+    /// Replace the running manager in place with the binary now on disk.
+    ///
+    /// Same pid, every task keeps running, clients reconnect. The daemon also
+    /// does this by itself when that file changes.
+    #[usage(display_order = 170)]
+    Upgrade,
+    /// Run the manager daemon in the foreground (what clients spawn).
+    #[usage(display_order = 180)]
+    Daemon {
+        /// Also log to stderr (for debugging).
+        #[usage(long)]
+        foreground: bool,
+        /// Internal: continue an in-place upgrade from this handover file.
+        #[usage(long, hide)]
+        handover: Option<PathBuf>,
     },
 }
 
