@@ -2,6 +2,7 @@
 name = "pbs-manager"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.91"
 description = "Cross-platform process management daemon for pi-better-subagents"
 license = "MIT"
 
