@@ -531,9 +531,16 @@ export default function (pi: ExtensionAPI): void {
       createSession,
       clock,
       stallMs: subagentConfig.stallMs,
+      stallRetries: subagentConfig.stallRetries,
+      stallRetryDelayMs: subagentConfig.stallRetryDelayMs,
       acquire: (req) => registry.admitChild(req.childId),
       onActivity: (childId) => {
         syncTranscript(childId);
+      },
+      onStall: (childId, attempt) => {
+        // One event per stall detection: an auto-resume follows unless the
+        // retry budget (stallRetries) is already spent.
+        logEvent("agent.stall", { child_id: childId, attempt });
       },
     });
     registry.setRunner(runner);
@@ -556,12 +563,12 @@ export default function (pi: ExtensionAPI): void {
         }
         if (["completed", "failed", "interrupted"].includes(c.status) && previousStatus !== c.status) {
           const error = c.result?.error;
-          if (error === "stalled") logEvent("agent.stall", { child_id: c.childId });
           if (error === "timeout") logEvent("agent.timeout", { child_id: c.childId });
           logEvent("agent.settle", {
             child_id: c.childId,
             status: c.status,
             ...(error ? { error } : {}),
+            ...(c.result?.stalls ? { stalls: c.result.stalls } : {}),
             duration_ms: c.result?.durationMs ?? Math.max(0, clock.now() - c.startedAt),
           });
         }
@@ -579,6 +586,10 @@ export default function (pi: ExtensionAPI): void {
           started_at: c.startedAt,
           ...(c.endedAt !== undefined ? { ended_at: c.endedAt } : {}),
           ...(c.result?.error ? { error: c.result.error } : {}),
+          ...(c.result?.attempts !== undefined && c.result.attempts > 1
+            ? { attempts: c.result.attempts }
+            : {}),
+          ...(c.result?.stalls ? { stalls: c.result.stalls } : {}),
           ...(c.prompt !== undefined ? { prompt_head: headOf(c.prompt) } : {}),
           ...(c.result?.text ? { result_tail: tailOf(c.result.text) } : {}),
         };

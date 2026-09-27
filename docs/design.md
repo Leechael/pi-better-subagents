@@ -264,13 +264,13 @@ SIGTERM 进程组 → 2s → SIGKILL(发给进程组,leader 已退出也照发)�
 - 每行 < 4 KiB(含换行):超长的字符串字段被截断(以 `…` 结尾)并加 `"truncated":true`;`src`/`type`/`ts` 不截断。每行用一次 O_APPEND `write` 写入,manager 与扩展并发追加也不会交错
 - 公共字段:`ts`(ms)、`src`(`"manager"` | `"extension"`)、`type`、`id?`(task/child id),加类型字段
 - manager 写:`session.connect {pi_pid, cwd, extension_version, protocol}`、`session.disconnect {reason: closed|rebound}`、`task.start {kind, command(≤200 字符), origin, pid}`、`task.background {after_ms}`、`task.stop {reason}`、`task.exit {exit_code, signal, end_reason, duration_ms}`(含 orphaned 与关闭时强制结束的任务)、`daemon.start {pid, version, protocol, orphaned, loaded}` / `daemon.shutdown {pid, killed_tasks}`(也写 manager.log)
-- 扩展写:`wake.emit {kind, ids[], batch}`、`wake.deliver {kind, mode: trigger|steer}`、`wake.dedupe {id}`、`monitor.drop {id, lines}`、`monitor.stop {id, reason}`、`agent.start {child_id, run_id, name, agent, model}`、`agent.settle {child_id, status, error?, duration_ms}`、`agent.stall {child_id}`、`agent.timeout {child_id}`、`decision.request/reply/timeout {child_id}`
+- 扩展写:`wake.emit {kind, ids[], batch}`、`wake.deliver {kind, mode: trigger|steer}`、`wake.dedupe {id}`、`monitor.drop {id, lines}`、`monitor.stop {id, reason}`、`agent.start {child_id, run_id, name, agent, model}`、`agent.settle {child_id, status, error?, stalls?, duration_ms}`、`agent.stall {child_id, attempt}`(**每次停滞检测**都写,含自动续跑前;不代表失败——判断失败以 `agent.settle` 的 error=stalled 为准)、`agent.timeout {child_id}`、`decision.request/reply/timeout {child_id}`
 - 读者(CLI `events`/`show`/`sessions`)跳过无法解析、或缺 `ts`/`type` 的行
 - 保留:随 session 目录存放,v1 不轮转(deferred: rotation | impact: 超长 session 磁盘增长 | trigger: doctor 报告 sessions 目录 > 100MB)
 
 #### Agent 记录(扩展所有,`<home>/sessions/<sid>/agents/`)
 
-- `<ch>.json`:`{child_id, run_id, session_id, name, agent, model?, status, started_at, ended_at?, error?, end_reason?(completed|failed|model-error|stalled|timeout|interrupted|disposed), prompt_head(仅任务 prompt,不含 agent preamble,≤2000), result_tail(≤2000), tool_calls, transcript}`
+- `<ch>.json`:`{child_id, run_id, session_id, name, agent, model?, status, started_at, ended_at?, error?, attempts?(总 generation 数,>1 才写), end_reason?(completed|failed|model-error|stalled|timeout|interrupted|disposed), prompt_head(仅任务 prompt,不含 agent preamble,≤2000), result_tail(≤2000), tool_calls, transcript}`
 - `<ch>.jsonl` transcript:每条消息一行 `{role, text, tool?, args?, isError?, ts}`,实时追加
 - CLI 只读这些文件(`ls`/`show`/`agent`/`log`);记录显示 running 但所属 session 未连接时,CLI 视为 `interrupted`,`doctor` 报为陈旧记录
 
@@ -470,7 +470,7 @@ subagent({
 - **child session isolation**: `createPiSessionFn` 显式传入 `DefaultResourceLoader({ cwd, agentDir, noExtensions:true, noSkills:true, noPromptTemplates:true, noThemes:true, noContextFiles:true })`;不加载 user/project extensions、skills、prompt templates、themes 或 context files。特别是不能加载父 extension,否则它的 session_start / before_agent_start 会把 parent wake guidelines 注入 child prompt。child 仍单独注入 `CHILD_BEHAVIOR_GUIDELINES`;没有配置开关。
 - **统一时钟与 generation timer ownership**: 扩展创建一个 `Clock` 并通过依赖注入传给时间相关服务。`ManualClock` 确定性地按 deadline、再按插入顺序执行同刻 timer;`advance()` 中新产生且已到期的 timer 也会运行, callback 内清除 timer 会阻止后续执行,大跨度 interval 每个到期点只触发一次。每个 child generation 有自己的 `TimerScope`; settle、interrupt、resume 或 dispose 时清除该 scope 的所有 timeout,避免过期 generation 影响后续状态。无需 Effect-TS;试点被拒绝的原因和数据见 `docs/decisions/effect-child-runner-pilot.md`。
 - 子代理 bash: `child-bash.ts` 禁后台变体——schema 无 `run_in_background`;execute 走 manager start + wait(timeout_ms 全程),到期 SIGKILL 并返回超时错误(不转后台);裸 sleep 拦截规则与主 bash 相同
-- 限制: 全局并发 8(跨 run);stall watchdog——子代理 10min 无任何事件 → abort 标记 `failed (stalled)`;session 级 spawn 预算 32 个子代理/小时,超限报错
+- 限制: 全局并发 8(跨 run);stall watchdog——子代理 `stallMs`(默认 5min)无任何事件 → abort 并在**同一会话**自动续跑(continuation prompt,保留 transcript),最多 `stallRetries`(默认 1)次,耗尽才标记 `failed (stalled)`;session 级 spawn 预算 32 个子代理/小时,超限报错
 - 管理 action: `list`(本 session 全部 run + 状态), `get`(run_id → 完整结果), `status`(run_id → 每子代理状态/耗时/最后事件), `interrupt`(abort 子代理或整 run), `steer`(运行中子代理 → `session.steer(message)`), `resume`(已结束子代理 → `session.prompt(message)` 续跑, 结果完成时再通知), **`models`(列出可指定的模型, 供调用前自查)**
 
 **模型解析**(pi 多 provider 已验证: `modelRegistry.getAvailable()` / `find(provider,id)`; 白名单 = settings `enabledModels` / `--models` → `ctx.scopedModels`):
@@ -661,6 +661,8 @@ export interface ChildResult {
   status: "completed"|"failed"|"interrupted";
   text: string;                 // getLastAssistantText() 或 "(no output)"
   error?: string;
+  attempts?: number;            // 总 generation 数(1 + resume + stall 重试);为 1 时省略
+  stalls?: number;              // 本 user turn 的停滞检测次数(>0 才有)
   durationMs: number;
 }
 export interface ChildRunRequest {

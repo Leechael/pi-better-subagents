@@ -43,6 +43,7 @@ describe("InProcessRunner", () => {
     const result = await handle.result;
     expect(result.status).toBe("completed");
     expect(result.text).toBe("all done");
+    expect(result.attempts).toBeUndefined(); // omitted on a clean first pass
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
     expect(factory.sessions[0].prompts).toEqual(["do the thing"]);
     expect(handle.status()).toBe("completed");
@@ -241,7 +242,7 @@ describe("InProcessRunner", () => {
     it("stall watchdog aborts after stallMs without events", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
-      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock });
+      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock, stallRetries: 0 });
       const handle = await runner.start(makeReq());
       clock.advanceBy(500);
       const result = await handle.result;
@@ -253,7 +254,7 @@ describe("InProcessRunner", () => {
     it("does not stall while a tool is executing", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
-      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock });
+      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock, stallRetries: 0 });
       const handle = await runner.start(makeReq());
       const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string }) => void }).emit.bind(
         factory.sessions[0],
@@ -269,7 +270,7 @@ describe("InProcessRunner", () => {
     it("stalls generation 2 after a timeout that landed mid-tool", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
-      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 50, clock });
+      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 50, clock, stallRetries: 0 });
       const handle = await runner.start(makeReq({ timeoutMs: 100 }));
       const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string }) => void }).emit.bind(
         factory.sessions[0],
@@ -288,7 +289,7 @@ describe("InProcessRunner", () => {
     it("pauses the stall watchdog while a supervisor decision is pending", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
-      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock });
+      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock, stallRetries: 0 });
       const handle = await runner.start(makeReq());
       const stallControl = handle as typeof handle & { pauseStall(): void; resumeStall(): void };
       stallControl.pauseStall();
@@ -304,7 +305,7 @@ describe("InProcessRunner", () => {
     it("session events reset the stall watchdog", async () => {
       const factory = new SessionFactory();
       factory.autoComplete = null;
-      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock });
+      const runner = new InProcessRunner({ createSession: factory.fn, stallMs: 500, clock, stallRetries: 0 });
       const handle = await runner.start(makeReq());
       const session = factory.sessions[0];
       clock.advanceBy(400);
@@ -326,6 +327,418 @@ describe("InProcessRunner", () => {
       factory.sessions[0].event();
       clock.advanceBy(1000);
       expect(handle.status()).toBe("completed"); // unchanged
+    });
+
+    it("auto-resumes on stall: retries on the same session and completes", async () => {
+      // The dogfood incident: the model stream stalled silently mid-response
+      // (one message out, then nothing). Expect: abort + auto-resume with a
+      // continuation prompt on the SAME session, then a normal completion.
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const stalls: Array<{ childId: string; attempt: number }> = [];
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 100,
+        clock,
+        onStall: (childId, attempt) => stalls.push({ childId, attempt }),
+      });
+      const handle = await runner.start(makeReq());
+      const session = factory.sessions[0];
+      clock.advanceBy(400);
+      session.event(); // text lands at t=400; then the stream goes silent
+      clock.advanceBy(500); // t=900: stall detected
+      expect(stalls).toEqual([{ childId: "ch_test0001", attempt: 1 }]);
+      expect(session.aborts).toBe(1);
+      // The aborted generation settles later; it must NOT complete the run.
+      await tick();
+      expect(handle.status()).toBe("running");
+      expect(session.prompts).toHaveLength(1);
+      // Retry fires after the delay.
+      clock.advanceBy(100); // t=1000
+      await tick();
+      expect(session.prompts).toHaveLength(2);
+      expect(session.prompts[1]).toContain("stalled with no activity");
+      expect(factory.sessions).toHaveLength(1); // same session, no re-admission
+      session.complete("all done");
+      const result = await handle.result;
+      expect(result.status).toBe("completed");
+      expect(result.text).toBe("all done");
+      expect(result.attempts).toBe(2);
+    });
+
+    it("settles failed (stalled) only after the retry budget is spent", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const stalls: number[] = [];
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 100,
+        stallRetries: 1,
+        clock,
+        onStall: (_childId, attempt) => stalls.push(attempt),
+      });
+      const handle = await runner.start(makeReq());
+      clock.advanceBy(500); // stall 1 at t=500 -> retry
+      expect(handle.status()).toBe("running");
+      clock.advanceBy(100); // retry generation starts at t=600
+      await tick();
+      clock.advanceBy(500); // stall 2 at t=1100 -> budget spent
+      const result = await handle.result;
+      expect(result.status).toBe("failed");
+      expect(result.error).toBe("stalled");
+      expect(result.attempts).toBe(2);
+      expect(stalls).toEqual([1, 2]);
+      expect(factory.sessions[0].aborts).toBe(2);
+    });
+
+    it("interrupt during the retry delay cancels the retry", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 100,
+        clock,
+      });
+      const handle = await runner.start(makeReq());
+      clock.advanceBy(500); // stalled, retry pending
+      expect(factory.sessions[0].aborts).toBe(1);
+      await handle.interrupt();
+      expect((await handle.result).status).toBe("interrupted");
+      clock.advanceBy(1000); // retry timer would fire now
+      await tick();
+      expect(factory.sessions[0].prompts).toHaveLength(1); // no retry prompt
+    });
+
+    it("a stall retry keeps the admission slot (no re-acquire, one release)", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      let acquired = 0;
+      let released = 0;
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 100,
+        clock,
+        acquire: async () => {
+          acquired++;
+          return () => {
+            released++;
+          };
+        },
+      });
+      const handle = await runner.start(makeReq());
+      clock.advanceBy(500);
+      clock.advanceBy(100);
+      await tick();
+      factory.sessions[0].complete("done");
+      const result = await handle.result;
+      expect(result.status).toBe("completed");
+      expect(acquired).toBe(1);
+      expect(released).toBe(1);
+    });
+
+    it("a completed stall retry re-arms the watchdog for the new generation", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 100,
+        clock,
+      });
+      const handle = await runner.start(makeReq());
+      clock.advanceBy(500); // stall 1 -> retry
+      clock.advanceBy(100);
+      await tick();
+      factory.sessions[0].event(); // retry generation is alive at t=1100
+      clock.advanceBy(400);
+      expect(handle.status()).toBe("running");
+      clock.advanceBy(100); // 500 silent in the retry generation
+      const result = await handle.result;
+      expect(result.status).toBe("failed");
+      expect(result.error).toBe("stalled");
+      expect(result.attempts).toBe(2);
+    });
+
+    it("retry waits for the abort before re-prompting (B1)", async () => {
+      // Real pi rejects prompt() while the aborted run is still active
+      // ("Agent is already processing"); the fake mirrors that. The abort
+      // here unwinds asynchronously, so a retry that prompts without
+      // awaiting the abort settles failed with the wrong error.
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      factory.configure = (session) => {
+        session.abortGateOpen = false;
+      };
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 100,
+        clock,
+      });
+      const handle = await runner.start(makeReq());
+      clock.advanceBy(500); // stall detected, abort pending behind the gate
+      expect(factory.sessions[0].aborts).toBe(1);
+      clock.advanceBy(100); // retry timer fires; abort still not resolved
+      await tick();
+      expect(factory.sessions[0].prompts).toHaveLength(1); // no premature prompt
+      factory.sessions[0].openAbortGate();
+      await tick();
+      expect(factory.sessions[0].prompts).toHaveLength(2); // retry re-prompts
+      factory.sessions[0].complete("recovered");
+      const result = await handle.result;
+      expect(result.status).toBe("completed");
+      expect(result.text).toBe("recovered");
+      expect(result.stalls).toBe(1);
+    });
+
+    it("an abort the hung stream never answers settles failed (stalled), no retry (B1)", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      factory.configure = (session) => {
+        session.hungAbort = true;
+      };
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 100,
+        clock,
+      });
+      const handle = await runner.start(makeReq());
+      clock.advanceBy(500); // stall; abort() never resolves
+      clock.advanceBy(100); // retry timer fires, bounded abort wait starts
+      expect(handle.status()).toBe("running");
+      clock.advanceBy(500); // bound (stallMs) expires: session is dead
+      await tick();
+      const result = await handle.result;
+      expect(result.status).toBe("failed");
+      expect(result.error).toBe("stalled");
+      expect(result.stalls).toBe(1);
+      expect(factory.sessions[0].prompts).toHaveLength(1); // no retry prompt
+    });
+
+    it("a timeout landing during the retry delay still fires (S1)", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 5_000,
+        clock,
+      });
+      const handle = await runner.start(makeReq({ timeoutMs: 800 }));
+      clock.advanceBy(500); // stall at t=500; retry would start t=5500
+      clock.advanceBy(300); // t=800: the turn budget is spent mid-delay
+      const result = await handle.result;
+      expect(result.status).toBe("interrupted");
+      expect(result.error).toBe("timeout");
+      clock.advanceBy(10_000);
+      await tick();
+      expect(factory.sessions[0].prompts).toHaveLength(1); // retry suppressed
+    });
+
+    it("a stall retry arms only the remaining timeout budget (S1)", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 100,
+        clock,
+      });
+      const handle = await runner.start(makeReq({ timeoutMs: 2000 }));
+      clock.advanceBy(500); // stall at t=500
+      clock.advanceBy(100); // retry generation at t=600; budget left: 1400
+      await tick();
+      // Keep the retry generation alive (its own stall watchdog is 500ms).
+      for (let i = 0; i < 3; i++) {
+        clock.advanceBy(400);
+        factory.sessions[0].event();
+      } // t=1800, last event at 1800
+      clock.advanceBy(199); // t=1999
+      expect(handle.status()).toBe("running");
+      clock.advanceBy(1); // t=2000: turn budget spent
+      const result = await handle.result;
+      expect(result.status).toBe("interrupted");
+      expect(result.error).toBe("timeout");
+    });
+
+    it("dispose during the retry delay cancels the retry (S5)", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 100,
+        clock,
+      });
+      const handle = await runner.start(makeReq());
+      clock.advanceBy(500); // stalled, retry pending
+      handle.dispose();
+      expect((await handle.result).error).toBe("disposed");
+      clock.advanceBy(1000);
+      await tick();
+      expect(factory.sessions[0].prompts).toHaveLength(1); // no retry prompt
+    });
+
+    it("user resume() resets the stall budget (S3)", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 100,
+        clock,
+      });
+      const handle = await runner.start(makeReq());
+      clock.advanceBy(500); // turn 1 stalls at t=500
+      clock.advanceBy(100); // retry at t=600
+      await tick();
+      factory.sessions[0].complete("first");
+      const first = await handle.result;
+      expect(first.stalls).toBe(1);
+
+      await handle.resume("again"); // turn 2 gets a fresh stall budget
+      clock.advanceBy(500); // turn 2 stalls: attempt 1 of the new budget
+      expect(handle.status()).toBe("running"); // a retry is scheduled, not terminal
+      clock.advanceBy(100);
+      await tick();
+      factory.sessions[0].complete("second");
+      const second = await handle.result;
+      expect(second.status).toBe("completed");
+      expect(second.text).toBe("second");
+      expect(second.attempts).toBe(4);
+      expect(second.stalls).toBe(1); // per-user-turn count
+    });
+
+    it("steer/followUp during the restart window are rejected (N1)", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 100,
+        clock,
+      });
+      const handle = await runner.start(makeReq());
+      clock.advanceBy(500); // stalled, retry pending
+      await expect(handle.steer("focus")).rejects.toThrow(/restarting after a stall/);
+      await expect(handle.followUp("more")).rejects.toThrow(/restarting after a stall/);
+      clock.advanceBy(100);
+      await tick();
+      factory.sessions[0].complete("done");
+      expect((await handle.result).status).toBe("completed");
+    });
+
+    it("late events from the aborted generation do not break the retry (S5)", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetryDelayMs: 100,
+        clock,
+      });
+      const handle = await runner.start(makeReq());
+      clock.advanceBy(500); // stall detected
+      const emit = (factory.sessions[0] as unknown as { emit: (e: { type: string }) => void }).emit.bind(
+        factory.sessions[0],
+      );
+      emit({ type: "agent_end" }); // late unwind event from the dead generation
+      emit({ type: "message_end" });
+      clock.advanceBy(100);
+      await tick();
+      factory.sessions[0].complete("done");
+      const result = await handle.result;
+      expect(result.status).toBe("completed");
+      expect(result.stalls).toBe(1);
+    });
+
+    it("queue wait does not consume the timeout budget (R1)", async () => {
+      // runStartedAt is set before admission; the timeout budget must not
+      // start until the admission slot and the session exist. Regression:
+      // a child queued longer than timeoutMs was settled timeout before its
+      // first prompt.
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      let releaseAdmission: (() => void) | null = null;
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        clock,
+        acquire: () =>
+          new Promise<() => void>((resolve) => {
+            releaseAdmission = () => resolve(() => {});
+          }),
+      });
+      const startPromise = runner.start(makeReq({ timeoutMs: 1000 }));
+      await tick(); // reach the admission wait
+      clock.advanceBy(1001); // queued past the full budget
+      releaseAdmission!();
+      const handle = await startPromise;
+      // The full budget starts after admission: the child gets a real run.
+      expect(factory.sessions[0].prompts).toHaveLength(1);
+      clock.advanceBy(999);
+      expect(handle.status()).toBe("running");
+      clock.advanceBy(1);
+      const result = await handle.result;
+      expect(result.status).toBe("interrupted");
+      expect(result.error).toBe("timeout");
+    });
+
+    it("resume after a terminal stall waits for the in-flight abort", async () => {
+      // Terminal stall (budget 0) settles while its abort is still
+      // unwinding. A resume issued in that window must not re-prompt until
+      // the abort finishes — real pi rejects prompt() while the aborted run
+      // is still active.
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      factory.configure = (session) => {
+        session.abortGateOpen = false;
+      };
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetries: 0,
+        clock,
+      });
+      const handle = await runner.start(makeReq());
+      clock.advanceBy(500); // stall → failed(stalled), abort pending at the gate
+      const first = await handle.result;
+      expect(first.error).toBe("stalled");
+
+      const resumePromise = handle.resume("try again");
+      await tick();
+      expect(factory.sessions[0].prompts).toHaveLength(1); // waits for the abort
+      factory.sessions[0].openAbortGate();
+      await resumePromise;
+      expect(factory.sessions[0].prompts).toHaveLength(2);
+      factory.sessions[0].complete("recovered");
+      const second = await handle.result;
+      expect(second.status).toBe("completed");
+      expect(second.text).toBe("recovered");
+    });
+
+    it("resume rejects when the abort never completes (hung session)", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      factory.configure = (session) => {
+        session.hungAbort = true;
+      };
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetries: 0,
+        clock,
+      });
+      const handle = await runner.start(makeReq());
+      clock.advanceBy(500); // stall → failed(stalled), abort never resolves
+      expect((await handle.result).error).toBe("stalled");
+      const resumePromise = handle.resume("try again");
+      clock.advanceBy(500); // bound (stallMs) expires
+      await expect(resumePromise).rejects.toThrow(/did not go idle/);
     });
 
     it("lastEventAt tracks session events", async () => {

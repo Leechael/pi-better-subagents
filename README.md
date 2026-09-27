@@ -93,6 +93,7 @@ You are a reviewer… (body = system prompt segment)
   "managerPath": null,
   "logLevel": "info",
   "subagent": { "budgetMs": 45000, "timeoutMs": 1800000, "stallMs": 300000,
+                "stallRetries": 1, "stallRetryDelayMs": 5000,
                 "decisionTimeoutMs": 600000,
                 "concurrency": 4, "maxConcurrentChildren": 8, "spawnBudgetPerHour": 32 }
 }
@@ -103,6 +104,8 @@ Timeouts are staggered so they do not fire together:
 | Key | Default | Meaning |
 |---|---|---|
 | `stallMs` | 300000 (5 min) | No session events. Paused during `tool_execution_start`…`end` and while a `need_decision` is pending. Streaming providers emit `message_update` on `thinking_delta` / `text_delta` (pi agent-loop), which resets this. Not every provider streams partial thinking, so 2 min can kill a slow reasoning turn; 5 min is the default. |
+| `stallRetries` | 1 | Auto-resumes after a stall: the aborted generation is retried on the same session with a continuation prompt (transcript preserved). `0` restores the pre-fix behavior (settle `failed (stalled)` at once). |
+| `stallRetryDelayMs` | 5000 | Pause between the stall abort and the retry prompt. Gives a flaked provider stream time to recover before the retry. |
 | `decisionTimeoutMs` | 600000 (10 min) | Parent did not reply to `need_decision`. |
 | `timeoutMs` | 1800000 (30 min) | Hard cap on one child generation. |
 

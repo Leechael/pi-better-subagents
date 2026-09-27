@@ -32,6 +32,14 @@ export interface ChildResult {
   warning?: string;
   /** Set when the model itself stopped with an error (provider failure). */
   endReason?: "model-error";
+  /**
+   * Total generations run (1 + resumes + stall retries). Omitted when 1.
+   * Note: a user resume() also increments this; use `stalls` to count
+   * stall retries specifically.
+   */
+  attempts?: number;
+  /** Stall detections in the user turn that produced this result. */
+  stalls?: number;
   durationMs: number;
 }
 
