@@ -43,6 +43,7 @@ describe("InProcessRunner", () => {
     const result = await handle.result;
     expect(result.status).toBe("completed");
     expect(result.text).toBe("all done");
+    expect(result.attempts).toBeUndefined(); // omitted on a clean first pass
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
     expect(factory.sessions[0].prompts).toEqual(["do the thing"]);
     expect(handle.status()).toBe("completed");
@@ -685,6 +686,59 @@ describe("InProcessRunner", () => {
       const result = await handle.result;
       expect(result.status).toBe("interrupted");
       expect(result.error).toBe("timeout");
+    });
+
+    it("resume after a terminal stall waits for the in-flight abort", async () => {
+      // Terminal stall (budget 0) settles while its abort is still
+      // unwinding. A resume issued in that window must not re-prompt until
+      // the abort finishes — real pi rejects prompt() while the aborted run
+      // is still active.
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      factory.configure = (session) => {
+        session.abortGateOpen = false;
+      };
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetries: 0,
+        clock,
+      });
+      const handle = await runner.start(makeReq());
+      clock.advanceBy(500); // stall → failed(stalled), abort pending at the gate
+      const first = await handle.result;
+      expect(first.error).toBe("stalled");
+
+      const resumePromise = handle.resume("try again");
+      await tick();
+      expect(factory.sessions[0].prompts).toHaveLength(1); // waits for the abort
+      factory.sessions[0].openAbortGate();
+      await resumePromise;
+      expect(factory.sessions[0].prompts).toHaveLength(2);
+      factory.sessions[0].complete("recovered");
+      const second = await handle.result;
+      expect(second.status).toBe("completed");
+      expect(second.text).toBe("recovered");
+    });
+
+    it("resume rejects when the abort never completes (hung session)", async () => {
+      const factory = new SessionFactory();
+      factory.autoComplete = null;
+      factory.configure = (session) => {
+        session.hungAbort = true;
+      };
+      const runner = new InProcessRunner({
+        createSession: factory.fn,
+        stallMs: 500,
+        stallRetries: 0,
+        clock,
+      });
+      const handle = await runner.start(makeReq());
+      clock.advanceBy(500); // stall → failed(stalled), abort never resolves
+      expect((await handle.result).error).toBe("stalled");
+      const resumePromise = handle.resume("try again");
+      clock.advanceBy(500); // bound (stallMs) expires
+      await expect(resumePromise).rejects.toThrow(/did not go idle/);
     });
 
     it("lastEventAt tracks session events", async () => {

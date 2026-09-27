@@ -55,6 +55,16 @@ export interface ResolvedSubagentConfig {
   spawnBudgetPerHour: number;
 }
 
+/**
+ * Largest delay (ms) Node's setTimeout accepts without overflow. Larger
+ * configured values would clamp to ~1ms and fire immediately — cap instead.
+ */
+export const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+function capTimerDelay(value: number): number {
+  return Math.min(Math.floor(value), MAX_TIMER_DELAY_MS);
+}
+
 export const DEFAULT_SUBAGENT_CONFIG: ResolvedSubagentConfig = {
   budgetMs: 45000,
   timeoutMs: 1_800_000,
@@ -74,12 +84,14 @@ export function resolveSubagentConfig(config: PbsConfig): ResolvedSubagentConfig
   resolved.budgetMs = config.subagentBudgetMs > 0 ? config.subagentBudgetMs : resolved.budgetMs;
   if (typeof section.budgetMs === "number" && section.budgetMs > 0) resolved.budgetMs = section.budgetMs;
   if (typeof section.timeoutMs === "number" && section.timeoutMs > 0) resolved.timeoutMs = section.timeoutMs;
-  if (typeof section.stallMs === "number" && section.stallMs > 0) resolved.stallMs = section.stallMs;
+  if (typeof section.stallMs === "number" && section.stallMs > 0) {
+    resolved.stallMs = capTimerDelay(section.stallMs);
+  }
   if (typeof section.stallRetries === "number" && section.stallRetries >= 0) {
     resolved.stallRetries = Math.floor(section.stallRetries);
   }
   if (typeof section.stallRetryDelayMs === "number" && section.stallRetryDelayMs >= 0) {
-    resolved.stallRetryDelayMs = Math.floor(section.stallRetryDelayMs);
+    resolved.stallRetryDelayMs = capTimerDelay(section.stallRetryDelayMs);
   }
   if (typeof section.decisionTimeoutMs === "number" && section.decisionTimeoutMs > 0) {
     resolved.decisionTimeoutMs = section.decisionTimeoutMs;
@@ -162,12 +174,14 @@ export function loadConfig(home: string = getPbsHome()): PbsConfig {
     const subagent: PbsSubagentConfig = {};
     if (typeof section.budgetMs === "number" && section.budgetMs > 0) subagent.budgetMs = section.budgetMs;
     if (typeof section.timeoutMs === "number" && section.timeoutMs > 0) subagent.timeoutMs = section.timeoutMs;
-    if (typeof section.stallMs === "number" && section.stallMs > 0) subagent.stallMs = section.stallMs;
+    if (typeof section.stallMs === "number" && section.stallMs > 0) {
+      subagent.stallMs = capTimerDelay(section.stallMs);
+    }
     if (typeof section.stallRetries === "number" && section.stallRetries >= 0) {
       subagent.stallRetries = Math.floor(section.stallRetries);
     }
     if (typeof section.stallRetryDelayMs === "number" && section.stallRetryDelayMs >= 0) {
-      subagent.stallRetryDelayMs = Math.floor(section.stallRetryDelayMs);
+      subagent.stallRetryDelayMs = capTimerDelay(section.stallRetryDelayMs);
     }
     if (typeof section.decisionTimeoutMs === "number" && section.decisionTimeoutMs > 0) {
       subagent.decisionTimeoutMs = section.decisionTimeoutMs;

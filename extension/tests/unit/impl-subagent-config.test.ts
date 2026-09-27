@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_SUBAGENT_CONFIG, resolveSubagentConfig } from "../../src/config";
+import {
+  DEFAULT_SUBAGENT_CONFIG,
+  MAX_TIMER_DELAY_MS,
+  resolveSubagentConfig,
+} from "../../src/config";
 import type { PbsConfig } from "../../src/config";
 
 function makeConfig(subagent?: PbsConfig["subagent"]): PbsConfig {
@@ -31,6 +35,16 @@ describe("resolveSubagentConfig stall retries", () => {
   it("allows 0 retries (settle stalled immediately, the pre-fix behavior)", () => {
     const resolved = resolveSubagentConfig(makeConfig({ stallRetries: 0 }));
     expect(resolved.stallRetries).toBe(0);
+  });
+
+  it("caps timer delays at the Node setTimeout maximum (P2)", () => {
+    // Beyond ~2^31-1ms Node clamps setTimeout to ~1ms, which would fire the
+    // retry almost immediately instead of waiting — cap instead.
+    const resolved = resolveSubagentConfig(
+      makeConfig({ stallMs: 1e308, stallRetryDelayMs: 1e308 }),
+    );
+    expect(resolved.stallMs).toBe(MAX_TIMER_DELAY_MS);
+    expect(resolved.stallRetryDelayMs).toBe(MAX_TIMER_DELAY_MS);
   });
 
   it("floors fractional values and ignores negatives", () => {

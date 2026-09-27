@@ -132,6 +132,14 @@ class InProcessChildHandle implements DisposableChildHandle {
   private settledFlag = false;
   private resolveResult!: (result: ChildResult) => void;
   private resultPromise: Promise<ChildResult>;
+  /**
+   * One-shot waiters resolved by the NEXT settle() — an interrupt/dispose/
+   * timeout landing during an abort wait unwinds the waiter instead of
+   * leaking it when the abort hangs forever. Waiters are per-wait: a settle
+   * that already happened must not poison a later wait (resume runs after
+   * the previous turn's settle by definition).
+   */
+  private settleWaiters: Array<() => void> = [];
   private timeoutTimer: ClockTimer | null = null;
   private stallTimer: ClockTimer | null = null;
   private retryTimer: { scope: TimerScope; id: ClockTimer } | null = null;
@@ -246,6 +254,19 @@ class InProcessChildHandle implements DisposableChildHandle {
     }
     if (!this.session) {
       throw new Error(`subagent ${this.req.childId} has no session to resume`);
+    }
+    // Drain a stall/timeout abort that is still unwinding (real pi rejects
+    // prompt() while the aborted run is active). Bounded: a hung abort means
+    // the session is dead and cannot be resumed.
+    const pendingAbort = this.abortPromise;
+    this.abortPromise = null;
+    if (pendingAbort && !(await this.awaitAbortBounded(pendingAbort))) {
+      throw new Error(
+        `subagent ${this.req.childId} session did not go idle after the abort; cannot resume`,
+      );
+    }
+    if (this.disposed) {
+      throw new Error(`subagent ${this.req.childId} has been disposed`);
     }
     // A new user turn gets a fresh stall budget and a fresh timeout budget.
     this.stallAttempts = 0;
@@ -478,13 +499,18 @@ class InProcessChildHandle implements DisposableChildHandle {
     this.clearTimers();
     // Generations run: 1 + resumes + stall retries. Forensics for the
     // incident class this exists for (a stalled child that needed retries).
-    if (result.attempts === undefined) result.attempts = this.generation;
+    // Omitted on the first generation so a clean run keeps a lean shape.
+    if (result.attempts === undefined && this.generation > 1) {
+      result.attempts = this.generation;
+    }
     // durationMs covers the whole user turn (launch/resume -> settle),
     // including time lost to stalls and retry delays. dispose keeps its 0.
     if (result.error !== "disposed") result.durationMs = this.now() - this.runStartedAt;
     if (result.stalls === undefined && this.stallAttempts > 0) {
       result.stalls = this.stallAttempts;
     }
+    const waiters = this.settleWaiters.splice(0);
+    for (const wake of waiters) wake();
     // Surface non-fatal setup caveats (e.g. agent-def model fallback) once.
     if (result.warning === undefined && this.session?.warning) {
       result.warning = this.session.warning;
@@ -546,7 +572,9 @@ class InProcessChildHandle implements DisposableChildHandle {
         error: "timeout",
         durationMs: this.now() - this.runStartedAt,
       });
-      void this.session?.abort().catch(() => {});
+      // Track the abort: a quick user resume() must wait for it before
+      // re-prompting, or real pi rejects the prompt ("already processing").
+      this.abortPromise = this.session ? this.session.abort().catch(() => {}) : null;
     }, remaining) ?? null;
   }
 
@@ -615,35 +643,43 @@ class InProcessChildHandle implements DisposableChildHandle {
     if (this.settledFlag || this.disposed || gen !== this.generation) return;
     const abort = this.abortPromise;
     this.abortPromise = null;
-    if (abort) {
-      let boundTimer: ClockTimer | null = null;
-      const bound = new Promise<"timeout">((resolve) => {
-        const scope = this.timerScope;
-        if (!scope) {
-          resolve("timeout");
-          return;
-        }
-        boundTimer = scope.setTimeout(() => resolve("timeout"), this.stallMs);
+    if (abort && !(await this.awaitAbortBounded(abort))) {
+      // Bound expired: the hung stream ignored the abort and the session is
+      // dead, so the retry is skipped.
+      this.settle(gen, {
+        status: "failed",
+        text: this.partialText(),
+        error: "stalled",
+        durationMs: this.now() - this.runStartedAt,
       });
-      // Note: if interrupt()/dispose() lands during this race, clearTimers
-      // disposes the scope and the bound never fires; a hung abort then
-      // leaves this async fn pending forever. Harmless — the result is
-      // already settled and the closure holds no resources — but not
-      // garbage-collectable until the abort settles.
-      const outcome = await Promise.race([abort.then(() => "aborted" as const), bound]);
-      if (boundTimer !== null) this.timerScope?.clearTimeout(boundTimer);
-      if (outcome === "timeout") {
-        this.settle(gen, {
-          status: "failed",
-          text: this.partialText(),
-          error: "stalled",
-          durationMs: this.now() - this.runStartedAt,
-        });
-        return;
-      }
+      return;
     }
     if (this.settledFlag || this.disposed || gen !== this.generation) return;
     await this.beginGeneration(stallRetryPrompt(this.stallMs), false, true);
+  }
+
+  /**
+   * Await an abort with a bound (stallMs). Resolves true when the abort
+   * finished, false on bound expiry or after settle() — the settled signal
+   * is raced in so an interrupt/dispose/timeout during the wait unwinds this
+   * closure even when the abort hangs forever (no handle-graph leak).
+   * Uses the raw clock, not a TimerScope: callers may run after settle,
+   * when the generation scope is already disposed.
+   */
+  private async awaitAbortBounded(abort: Promise<void>): Promise<boolean> {
+    let boundTimer: ClockTimer | null = null;
+    const bound = new Promise<false>((resolve) => {
+      boundTimer = this.clock.setTimeout(() => resolve(false), this.stallMs);
+    });
+    let waiter: (() => void) | null = null;
+    const settledDuringWait = new Promise<false>((resolve) => {
+      waiter = () => resolve(false);
+      this.settleWaiters.push(waiter);
+    });
+    const ok = await Promise.race([abort.then(() => true as const), bound, settledDuringWait]);
+    if (boundTimer !== null) this.clock.clearTimeout(boundTimer);
+    if (waiter !== null) this.settleWaiters = this.settleWaiters.filter((w) => w !== waiter);
+    return ok;
   }
 
   private clearRetryTimer(): void {

@@ -662,6 +662,7 @@ export interface ChildResult {
   text: string;                 // getLastAssistantText() 或 "(no output)"
   error?: string;
   attempts?: number;            // 总 generation 数(1 + resume + stall 重试);为 1 时省略
+  stalls?: number;              // 本 user turn 的停滞检测次数(>0 才有)
   durationMs: number;
 }
 export interface ChildRunRequest {
