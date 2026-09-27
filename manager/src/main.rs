@@ -167,7 +167,7 @@ async fn async_main() {
                 "fish" => usage::complete::Shell::Fish,
                 _ => unreachable!("shell is constrained by the CLI definition"),
             };
-            print!("{}", Cli::completion_script(shell));
+            out::bytes(Cli::completion_script(shell).as_bytes());
             0
         }
     };
