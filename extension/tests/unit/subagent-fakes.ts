@@ -33,13 +33,28 @@ export class FakeChildSession implements ChildSessionAdapter {
   autoComplete: string | null = null;
   /** When set, prompt() rejects with this error. */
   promptError: Error | null = null;
+  /**
+   * Mirrors real pi (agent-session): prompt() rejects while a run is still
+   * active. Disable only for tests that specifically exercise queueing.
+   */
+  rejectPromptWhileStreaming = true;
+  /** When true, abort() never takes the session idle (hung stream ignores abort). */
+  hungAbort = false;
+  /** When closed, abort() blocks until openAbortGate() (async abort unwind). */
+  abortGateOpen = true;
 
   private readonly listeners = new Set<(e: { type: string }) => void>();
   private idleWaiters: (() => void)[] = [];
+  private abortGateWaiters: (() => void)[] = [];
 
   async prompt(text: string): Promise<void> {
     this.prompts.push(text);
     if (this.promptError) throw this.promptError;
+    if (this.rejectPromptWhileStreaming && this.streaming) {
+      throw new Error(
+        "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+      );
+    }
     this.streaming = true;
     this.emit({ type: "message_start" });
     if (this.autoComplete !== null) {
@@ -77,8 +92,23 @@ export class FakeChildSession implements ChildSessionAdapter {
 
   async abort(): Promise<void> {
     this.aborts++;
+    if (this.hungAbort) {
+      // The hung stream never unwinds: abort() never resolves.
+      await new Promise<never>(() => {});
+      return;
+    }
+    if (!this.abortGateOpen) {
+      await new Promise<void>((resolve) => this.abortGateWaiters.push(resolve));
+    }
     this.streaming = false;
     const waiters = this.idleWaiters.splice(0);
+    for (const w of waiters) w();
+  }
+
+  /** Release a pending abort() blocked by abortGateOpen = false. */
+  openAbortGate(): void {
+    this.abortGateOpen = true;
+    const waiters = this.abortGateWaiters.splice(0);
     for (const w of waiters) w();
   }
 

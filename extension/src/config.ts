@@ -28,6 +28,10 @@ export interface PbsSubagentConfig {
   timeoutMs?: number;
   /** Stall watchdog: abort a child with no events for this long (ms). Paused during tools and need_decision. */
   stallMs?: number;
+  /** Auto-resume attempts after a stall before the run settles failed (stalled). Default 1. */
+  stallRetries?: number;
+  /** Pause between the stall abort and the retry prompt (ms). Default 5000. */
+  stallRetryDelayMs?: number;
   /** need_decision wait for the parent (ms). Independent of stallMs and timeoutMs. */
   decisionTimeoutMs?: number;
   /** Default per-run worker pool concurrency. */
@@ -43,6 +47,8 @@ export interface ResolvedSubagentConfig {
   budgetMs: number;
   timeoutMs: number;
   stallMs: number;
+  stallRetries: number;
+  stallRetryDelayMs: number;
   decisionTimeoutMs: number;
   concurrency: number;
   maxConcurrentChildren: number;
@@ -53,6 +59,8 @@ export const DEFAULT_SUBAGENT_CONFIG: ResolvedSubagentConfig = {
   budgetMs: 45000,
   timeoutMs: 1_800_000,
   stallMs: 300_000,
+  stallRetries: 1,
+  stallRetryDelayMs: 5_000,
   decisionTimeoutMs: 600_000,
   concurrency: 4,
   maxConcurrentChildren: 8,
@@ -67,6 +75,12 @@ export function resolveSubagentConfig(config: PbsConfig): ResolvedSubagentConfig
   if (typeof section.budgetMs === "number" && section.budgetMs > 0) resolved.budgetMs = section.budgetMs;
   if (typeof section.timeoutMs === "number" && section.timeoutMs > 0) resolved.timeoutMs = section.timeoutMs;
   if (typeof section.stallMs === "number" && section.stallMs > 0) resolved.stallMs = section.stallMs;
+  if (typeof section.stallRetries === "number" && section.stallRetries >= 0) {
+    resolved.stallRetries = Math.floor(section.stallRetries);
+  }
+  if (typeof section.stallRetryDelayMs === "number" && section.stallRetryDelayMs >= 0) {
+    resolved.stallRetryDelayMs = Math.floor(section.stallRetryDelayMs);
+  }
   if (typeof section.decisionTimeoutMs === "number" && section.decisionTimeoutMs > 0) {
     resolved.decisionTimeoutMs = section.decisionTimeoutMs;
   }
@@ -149,6 +163,12 @@ export function loadConfig(home: string = getPbsHome()): PbsConfig {
     if (typeof section.budgetMs === "number" && section.budgetMs > 0) subagent.budgetMs = section.budgetMs;
     if (typeof section.timeoutMs === "number" && section.timeoutMs > 0) subagent.timeoutMs = section.timeoutMs;
     if (typeof section.stallMs === "number" && section.stallMs > 0) subagent.stallMs = section.stallMs;
+    if (typeof section.stallRetries === "number" && section.stallRetries >= 0) {
+      subagent.stallRetries = Math.floor(section.stallRetries);
+    }
+    if (typeof section.stallRetryDelayMs === "number" && section.stallRetryDelayMs >= 0) {
+      subagent.stallRetryDelayMs = Math.floor(section.stallRetryDelayMs);
+    }
     if (typeof section.decisionTimeoutMs === "number" && section.decisionTimeoutMs > 0) {
       subagent.decisionTimeoutMs = section.decisionTimeoutMs;
     }

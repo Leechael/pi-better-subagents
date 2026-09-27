@@ -18,6 +18,10 @@ export interface AgentChildRecord {
   /** Resolved model id when known (param override or agent definition). */
   model?: string;
   status: "pending" | "running" | "completed" | "failed" | "interrupted";
+  /** Total generations run (1 + resumes + stall retries); omitted when 1. */
+  attempts?: number;
+  /** Stall detections in the final user turn. */
+  stalls?: number;
   started_at: number;
   ended_at?: number;
   error?: string;
