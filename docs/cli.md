@@ -83,7 +83,7 @@ Durations (`--since`): `500ms`, `30s`, `10m`, `2h`, `1d` (a bare number is secon
 
 | Starts the daemon when none runs | Never starts it |
 |---|---|
-| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (prints "pbs-manager is not running", exit 1), `sessions` and `show` (read the disk instead), `agent`, `events`, `log`, `tail`, `doctor`, `shutdown` (prints "pbs-manager is not running", exit 0) |
+| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (prints "pbs-manager is not running", exit 1), `sessions` and `show` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `doctor`, `shutdown` (prints "pbs-manager is not running", exit 0) |
 
 A daemon started this way exits again ~5s after its last client leaves (§3.2).
 
