@@ -192,26 +192,43 @@ export interface TaskOutputDetails {
 
 const DEFAULT_OUTPUT_BYTES = 65536;
 
+const END_TURN_HINT =
+  'The task is still running. End your turn; a <pbs-wake> arrives when it finishes.';
+
 export function createTaskOutputTool(
   deps: TaskToolsDeps,
 ): ToolDefinition<typeof taskOutputParameters, TaskOutputDetails> {
+  // total_size at the last read of each running task. A repeat read that finds
+  // the same size is polling: the prompt forbids it, but models still loop.
+  const lastRunningSize = new Map<string, number>();
+  const guardPoll = (id: string, running: boolean, size: number) => {
+    if (running && lastRunningSize.get(id) === size) {
+      throw new Error(`No new output from ${id} since your last read. ${END_TURN_HINT}`);
+    }
+    if (running) lastRunningSize.set(id, size);
+    else lastRunningSize.delete(id);
+  };
   return {
     name: "task_output",
     label: "Task Output",
     description:
       "Read output of a background task. Without a cursor, returns the tail of the output " +
-      "plus the current file pointer; pass the returned next_cursor as cursor for incremental reads.",
+      "plus the current file pointer; pass the returned next_cursor as cursor for incremental reads. " +
+      "Not a way to wait: a running task wakes you when it finishes, so end your turn instead of calling this again.",
     promptSnippet: "Read background task output",
     parameters: taskOutputParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const agentText = agentTextFor(deps, params.task_id);
       if (agentText !== undefined) {
-        const body = agentText || "(no output yet)";
+        const status = deps.getIndex?.()?.get(params.task_id)?.status ?? "unknown";
+        const running = status === "pending" || status === "running";
+        guardPoll(params.task_id, running, agentText.length);
+        const body = (agentText || "(no output yet)") + (running ? `\n\n${END_TURN_HINT}` : "");
         return {
           content: [{ type: "text", text: body }],
           details: {
             task_id: params.task_id,
-            status: deps.getIndex?.()?.get(params.task_id)?.status ?? "unknown",
+            status,
             exit_code: null,
             cursor: 0,
             next_cursor: 0,
@@ -233,6 +250,8 @@ export function createTaskOutputTool(
       }
 
       const res = await client.output(params.task_id, cursor, maxBytes);
+      const running = res.status === "running";
+      guardPoll(params.task_id, running, res.total_size);
       const details: TaskOutputDetails = {
         task_id: params.task_id,
         status: res.status,
@@ -245,7 +264,8 @@ export function createTaskOutputTool(
       const footer =
         `\n\n[task ${params.task_id} status=${res.status}` +
         ` exit_code=${res.exit_code === null ? "null" : res.exit_code}` +
-        ` cursor=${cursor} next_cursor=${res.next_cursor} total_size=${res.total_size}]`;
+        ` cursor=${cursor} next_cursor=${res.next_cursor} total_size=${res.total_size}]` +
+        (running ? `\n${END_TURN_HINT}` : "");
       return { content: [{ type: "text", text: body + footer }], details };
     },
   };
