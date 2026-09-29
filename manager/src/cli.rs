@@ -40,12 +40,15 @@ impl Sub {
     }
 }
 
+// Help sections follow docs/cli.md. `completion` stays with the built-in
+// `help` under Commands: a heading equal to that default title would merge
+// into it, and the ungrouped section is always rendered first.
 #[derive(usage::Subcommands)]
 pub(crate) enum Sub {
     /// Version, protocol, uptime, sessions, task and agent counts.
     ///
     /// Never starts the daemon ("pbs-manager is not running", exit 1).
-    #[usage(display_order = 10)]
+    #[usage(display_order = 10, help_heading = "Inspection")]
     Status {
         /// Machine-readable JSON on stdout.
         #[usage(long)]
@@ -55,7 +58,7 @@ pub(crate) enum Sub {
     ///
     /// Gone sessions' records are kept for `goneSessionRetention` (config.json,
     /// default 24h) and stay reachable via show/agent/events.
-    #[usage(display_order = 20)]
+    #[usage(display_order = 20, help_heading = "Inspection")]
     Sessions {
         /// Machine-readable JSON on stdout.
         #[usage(long)]
@@ -65,7 +68,7 @@ pub(crate) enum Sub {
     ///
     /// `--all` adds finished work of connected sessions after the running
     /// group. An agent's time is its last transcript message.
-    #[usage(alias = "ls", display_order = 30)]
+    #[usage(alias = "ls", display_order = 30, help_heading = "Inspection")]
     List {
         /// Also list finished work of connected sessions.
         #[usage(short, long)]
@@ -84,7 +87,7 @@ pub(crate) enum Sub {
         json: bool,
     },
     /// Everything about one task, monitor, agent (ch_…) or run (run_…).
-    #[usage(display_order = 40)]
+    #[usage(display_order = 40, help_heading = "Inspection")]
     Show {
         /// Task, monitor, agent, or run id (fuzzy match ok).
         id: String,
@@ -93,7 +96,7 @@ pub(crate) enum Sub {
         json: bool,
     },
     /// Render an agent's transcript (preamble hidden unless --full).
-    #[usage(display_order = 50)]
+    #[usage(display_order = 50, help_heading = "Inspection")]
     Agent {
         /// Agent id (`ch_…`; fuzzy match ok).
         id: String,
@@ -105,7 +108,7 @@ pub(crate) enum Sub {
         follow: bool,
     },
     /// Event log, merged and time-ordered across sessions.
-    #[usage(display_order = 60)]
+    #[usage(display_order = 60, help_heading = "Inspection")]
     Events {
         /// Keep following new events.
         #[usage(short = 'f', long)]
@@ -127,7 +130,7 @@ pub(crate) enum Sub {
     ///
     /// With an id: follows the merged `.output` file (use --stderr for the
     /// stderr-only sibling). Without: tails manager.log.
-    #[usage(display_order = 70)]
+    #[usage(display_order = 70, help_heading = "Inspection")]
     Log {
         /// Optional task id; when set, tails that task's output instead of manager.log.
         task_id: Option<String>,
@@ -144,7 +147,7 @@ pub(crate) enum Sub {
     /// Follow a task's output (shortcut for `log -f <id>`).
     ///
     /// `-f` is accepted for muscle memory (`tail -f ID`) and is always on.
-    #[usage(display_order = 80)]
+    #[usage(display_order = 80, help_heading = "Inspection")]
     Tail {
         /// Task id (fuzzy match ok).
         task_id: String,
@@ -161,7 +164,7 @@ pub(crate) enum Sub {
     /// Read a task's output through the protocol; -f follows.
     ///
     /// For an agent id, prints its result.
-    #[usage(display_order = 90)]
+    #[usage(display_order = 90, help_heading = "Acting on tasks")]
     Output {
         /// Task or agent id (fuzzy match ok).
         task_id: String,
@@ -173,7 +176,7 @@ pub(crate) enum Sub {
         max_bytes: Option<u64>,
     },
     /// Budget-wait on a task's exit.
-    #[usage(display_order = 100)]
+    #[usage(display_order = 100, help_heading = "Acting on tasks")]
     Wait {
         /// Task id (fuzzy match ok).
         task_id: String,
@@ -189,19 +192,19 @@ pub(crate) enum Sub {
         shell: String,
     },
     /// Stop a task (SIGTERM group → 2s → SIGKILL).
-    #[usage(display_order = 120)]
+    #[usage(display_order = 120, help_heading = "Acting on tasks")]
     Stop {
         /// Task id (fuzzy match ok).
         task_id: String,
     },
     /// Stop all running tasks of a session.
-    #[usage(display_order = 130)]
+    #[usage(display_order = 130, help_heading = "Acting on tasks")]
     KillSession {
         /// Session id.
         session_id: String,
     },
     /// Start a task (scripting / smoke tests; extension-style session binding).
-    #[usage(display_order = 140)]
+    #[usage(display_order = 140, help_heading = "Acting on tasks")]
     Start {
         /// Session that owns the task.
         #[usage(long, default = "cli")]
@@ -225,19 +228,19 @@ pub(crate) enum Sub {
     /// Health checks; fixes stale socket/pid files. Exit 1 on any failure.
     ///
     /// Covers daemon, socket, config, protocol, stale records, orphan pids, disk use.
-    #[usage(display_order = 150)]
+    #[usage(display_order = 150, help_heading = "Inspection")]
     Doctor,
     /// Gracefully shut the manager down (kills remaining tasks).
-    #[usage(display_order = 160)]
+    #[usage(display_order = 160, help_heading = "Daemon")]
     Shutdown,
     /// Replace the running manager in place with the binary now on disk.
     ///
     /// Same pid, every task keeps running, clients reconnect. The daemon also
     /// does this by itself when that file changes.
-    #[usage(display_order = 170)]
+    #[usage(display_order = 170, help_heading = "Daemon")]
     Upgrade,
     /// Run the manager daemon in the foreground (what clients spawn).
-    #[usage(display_order = 180)]
+    #[usage(display_order = 180, help_heading = "Daemon")]
     Daemon {
         /// Also log to stderr (for debugging).
         #[usage(long)]

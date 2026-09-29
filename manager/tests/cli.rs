@@ -9,6 +9,24 @@ fn run(args: &[&str]) -> Output {
         .expect("run pbs-manager")
 }
 
+/// Body of one help section, from the heading through the blank line before the next.
+fn help_section<'a>(help: &'a str, heading: &str) -> &'a str {
+    let marker = format!("\n{heading}:\n");
+    let start = help
+        .find(&marker)
+        .unwrap_or_else(|| panic!("{heading} missing from help:\n{help}"));
+    let body = &help[start + marker.len()..];
+    let end = body.find("\n\n").unwrap_or(body.len());
+    &body[..end]
+}
+
+fn section_has_command(section: &str, name: &str) -> bool {
+    section.lines().any(|line| {
+        let rest = line.trim_start().strip_prefix(name);
+        rest.is_some_and(|rest| rest.starts_with(|c: char| c.is_whitespace()))
+    })
+}
+
 #[test]
 fn help_and_version_are_served_by_the_cli_framework() {
     let help = run(&["--help"]);
@@ -25,15 +43,42 @@ fn help_and_version_are_served_by_the_cli_framework() {
         help.contains("ls"),
         "the list alias should be discoverable: {help}"
     );
-    let status_at = help
-        .find("\n  status")
-        .expect("status command in help");
-    let daemon_at = help
-        .find("\n  daemon")
-        .expect("daemon command in help");
+    let commands = help_section(&help, "Commands");
+    let inspection = help_section(&help, "Inspection");
+    let acting = help_section(&help, "Acting on tasks");
+    let daemon = help_section(&help, "Daemon");
     assert!(
-        status_at < daemon_at,
-        "commands should follow the docs quick-reference order: {help}"
+        commands.contains("completion") && commands.contains("help"),
+        "ungrouped commands stay with the built-in help: {help}"
+    );
+    for name in ["status", "sessions", "list", "show", "agent", "events", "log", "tail", "doctor"]
+    {
+        assert!(
+            section_has_command(inspection, name),
+            "{name} should be under Inspection: {help}"
+        );
+    }
+    for name in ["output", "wait", "stop", "kill-session", "start"] {
+        assert!(
+            section_has_command(acting, name),
+            "{name} should be under Acting on tasks: {help}"
+        );
+    }
+    for name in ["shutdown", "upgrade", "daemon"] {
+        assert!(
+            section_has_command(daemon, name),
+            "{name} should be under Daemon: {help}"
+        );
+    }
+    let status_at = inspection.find("status").expect("status");
+    let doctor_at = inspection.find("doctor").expect("doctor");
+    assert!(status_at < doctor_at, "inspection order: {help}");
+    assert!(
+        help.find("\nCommands:\n").unwrap()
+            < help.find("\nInspection:\n").unwrap()
+            && help.find("\nInspection:\n").unwrap() < help.find("\nActing on tasks:\n").unwrap()
+            && help.find("\nActing on tasks:\n").unwrap() < help.find("\nDaemon:\n").unwrap(),
+        "section order: {help}"
     );
     assert!(
         !help.contains("goneSessionRetention"),
