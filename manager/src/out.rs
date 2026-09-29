@@ -3,7 +3,9 @@
 //! Rust ignores SIGPIPE, so `pbs-manager output ID | head` used to make
 //! `println!` panic (exit 101) once `head` closed the pipe. Every CLI line goes
 //! through [`line`]/[`bytes`] instead: a broken pipe ends the process
-//! silently with status 0, like a well-behaved Unix filter.
+//! silently with status 0, like a well-behaved Unix filter. Any other write
+//! failure (a full disk, for instance) is reported and exits 1, so a
+//! truncated completion script is not a successful run.
 
 use std::io::{ErrorKind, Write};
 
@@ -14,6 +16,8 @@ pub fn bytes(b: &[u8]) {
         if e.kind() == ErrorKind::BrokenPipe {
             std::process::exit(0);
         }
+        eprintln!("pbs-manager: {e}");
+        std::process::exit(1);
     }
 }
 

@@ -23,7 +23,7 @@ fn help_section<'a>(help: &'a str, heading: &str) -> &'a str {
 fn section_has_command(section: &str, name: &str) -> bool {
     section.lines().any(|line| {
         let rest = line.trim_start().strip_prefix(name);
-        rest.is_some_and(|rest| rest.starts_with(|c: char| c.is_whitespace()))
+        rest.is_some_and(|rest| rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace()))
     })
 }
 
