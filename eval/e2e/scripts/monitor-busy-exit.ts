@@ -1,7 +1,7 @@
 /**
  * A `grep -m1`-style monitor: one line, then exit, both arriving while the
  * model is still writing its reply (here, a 3s response). Real-model eval
- * batches 2–4 had the exit notice ahead of the event in 31 of 157 monitors:
+ * batches 2–4 had the exit notice ahead of the event in 25 of 125 monitors:
  * the event is steered in at the next turn_start, and the no-turn exit
  * notice was appended at the turn_end before it.
  */

@@ -293,7 +293,7 @@ describe("faux e2e", { concurrency: true }, () => {
     const exitedWakes = ws.filter((w) => w.wake.status === "exited");
     assert.equal(exitedWakes.length, 1, explain(ep));
     // The exit notice never precedes the monitor's own lines (batches 2–4 of the
-    // real-model eval had it first in 31 of 157 monitors).
+    // real-model eval had it first in 25 of 125 monitors).
     const firstEvent = ws.findIndex((w) => w.wake.status === "event");
     assert.ok(firstEvent >= 0 && firstEvent < ws.indexOf(exitedWakes[0]), `exit before its event\n${explain(ep)}`);
     // `echo noop` ends in milliseconds; the exit must not wait on anything.

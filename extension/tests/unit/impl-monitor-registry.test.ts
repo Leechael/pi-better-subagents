@@ -232,7 +232,7 @@ describe("MonitorRegistry exit right after an event", () => {
 
   // Batches 2–4: sent at once with triggerTurn: false while the model was
   // writing, the exit was appended at that turn's end, ahead of the event
-  // steered in at the next turn's start (31 of 157 monitors).
+  // steered in at the next turn's start (25 of 125 monitors).
   it("a clean exit inside the batch window: one wake, exit held until that run settles", async () => {
     const { center, registry, exit, turns, exitMsg, sent } = await setup();
     registry.handleOutput("mon_1", "READY token=AB12\n");
