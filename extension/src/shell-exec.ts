@@ -121,3 +121,16 @@ export function formatFinishedOutput(raw: CollectedOutput, outputPath: string): 
 export function appendStatus(text: string, status: string): string {
   return text ? `${text}\n\n${status}` : status;
 }
+
+/**
+ * Status line for a finished task with no exit code: it was killed (its
+ * timeout, a stop, a crash). Reported as success, a model took a 1s timeout
+ * kill for a command still running (eval batch 4).
+ */
+export async function killedStatus(client: ManagerClient, taskId: string, timeoutSeconds: number | undefined): Promise<string> {
+  const record = (await client.list(true).catch(() => [])).find((t) => t.task_id === taskId);
+  if (record?.end_reason === "timeout" && timeoutSeconds !== undefined) {
+    return `Command timed out after ${timeoutSeconds} seconds`;
+  }
+  return `Command was killed${record?.signal ? ` (${record.signal})` : ""}`;
+}

@@ -35,6 +35,7 @@ import {
   bareSleepError,
   collectOutput,
   formatFinishedOutput,
+  killedStatus,
   SHELL_MAX_BYTES,
   SHELL_MAX_LINES,
   withAbort,
@@ -358,14 +359,7 @@ export function createBashOverride(
         throw new Error(appendStatus(text, `Command exited with code ${exitCode}`));
       }
       if (exitCode === null) {
-        // No exit code: the process was killed (our timeout, a stop, a
-        // crash). Reported as success, the model took a 1s timeout kill for a
-        // command still running (eval batch 4).
-        const record = (await client.list(true).catch(() => [])).find((t) => t.task_id === start.task_id);
-        if (record?.end_reason === "timeout" && input.timeout !== undefined) {
-          throw new Error(appendStatus(text, `Command timed out after ${input.timeout} seconds`));
-        }
-        throw new Error(appendStatus(text, `Command was killed${record?.signal ? ` (${record.signal})` : ""}`));
+        throw new Error(appendStatus(text, await killedStatus(client, start.task_id, input.timeout)));
       }
       return { content: [{ type: "text", text }], details };
     },

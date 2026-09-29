@@ -30,6 +30,7 @@ import {
   bareSleepError,
   collectOutput,
   formatFinishedOutput,
+  killedStatus,
   SHELL_MAX_BYTES,
   SHELL_MAX_LINES,
   withAbort,
@@ -166,6 +167,9 @@ export function createChildBashTool(
       const exitCode = waitResult.exit_code ?? null;
       if (exitCode !== 0 && exitCode !== null) {
         throw new Error(appendStatus(text, `Command exited with code ${exitCode}`));
+      }
+      if (exitCode === null) {
+        throw new Error(appendStatus(text, await killedStatus(client, start.task_id, input.timeout)));
       }
       const finalDetails = details
         ? { ...details, task_id: start.task_id }
