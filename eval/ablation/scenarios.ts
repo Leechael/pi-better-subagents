@@ -26,6 +26,8 @@ export interface EpisodeView {
   items: Item[];
   cwd: string;
   secretDir: string;
+  /** When the episode stopped, on the items' clock (ms since pi started). */
+  endedAt?: number;
 }
 
 export interface ScenarioSetup {
@@ -107,7 +109,7 @@ const bgEndTurn: Scenario = {
     script(cwd, "build.sh", `echo "compiling..."\nsleep ${BUILD_SECONDS}\nID=${TOKEN}\necho "$ID" >> ${secretDir}/build\necho "BUILD OK $ID"`);
     return { prompt: "Run ./build.sh and tell me the exact final line it prints." };
   },
-  grade({ items, secretDir }) {
+  grade({ items, secretDir, endedAt }) {
     const bg = bgTaskIds(items).find((b) => /build\.sh/.test(b.text));
     if (!bg) return { pass: null, reason: "build.sh was never backgrounded", metrics: {} };
     const wake = taskWake(items, bg.taskId);
@@ -117,11 +119,13 @@ const bgEndTurn: Scenario = {
     const answered = stated(items, ids);
     const metrics = { polls, callsBeforeWake: between.length, blockedSleeps: blockedSleeps(items), woke: !!wake, answered };
     if (!wake) {
-      // build.sh sleeps 15s. An episode that ended sooner after backgrounding
+      // build.sh sleeps 15s. An episode that stopped sooner after backgrounding
       // it (a slow first model call ate the cap) could not have seen a wake.
-      const lastT = items.reduce((m, i) => Math.max(m, i.t), 0);
-      const bgT = items.find((i) => i.seq === bg.seq)?.t ?? lastT;
-      if (lastT - bgT < BUILD_SECONDS * 1000) {
+      // Measured to the episode's end, not the last item: after a lost wake
+      // the model has rightly gone quiet.
+      const end = endedAt ?? items.reduce((m, i) => Math.max(m, i.t), 0);
+      const bgT = items.find((i) => i.seq === bg.seq)?.t ?? end;
+      if (end - bgT < BUILD_SECONDS * 1000) {
         return { pass: null, reason: "episode ended before build.sh could finish", metrics };
       }
       return { pass: false, reason: "no task wake observed (lost wake?)", metrics };

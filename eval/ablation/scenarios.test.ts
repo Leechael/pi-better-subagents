@@ -61,15 +61,17 @@ describe("bg-end-turn with no wake", () => {
   // at 73s and the 75s episode cap came before the 15s build could finish.
   it("is INVALID when the episode ended before the build could finish", () => {
     seq = 0;
-    const items = [call(71, "c1", "bash", { command: "./build.sh" }), backgrounded(73, "c1", "sh_1"), say(75, "running")];
-    const r = grade({ items, ...episode() });
+    const items = [call(71, "c1", "bash", { command: "./build.sh" }), backgrounded(73, "c1", "sh_1"), say(74, "running")];
+    const r = grade({ items, ...episode(), endedAt: 75_000 });
     assert.equal(r.pass, null, r.reason);
   });
 
+  // A lost wake looks like this: the model ends its turn as told, and
+  // nothing follows until the episode cap.
   it("is a FAIL when the build had time to finish and no wake came", () => {
     seq = 0;
-    const items = [call(3, "c1", "bash", { command: "./build.sh" }), backgrounded(5, "c1", "sh_1"), say(6, "waiting"), say(75, "still waiting")];
-    const r = grade({ items, ...episode() });
+    const items = [call(3, "c1", "bash", { command: "./build.sh" }), backgrounded(5, "c1", "sh_1"), say(6, "waiting")];
+    const r = grade({ items, ...episode(), endedAt: 75_000 });
     assert.equal(r.pass, false);
     assert.match(r.reason, /no task wake/);
   });
