@@ -212,6 +212,15 @@
       ]
     },
     {
+      "id": "result.monitor-started-instruction",
+      "kind": "text",
+      "surface": "tool result: monitor start (monitor.ts MONITOR_STARTED_INSTRUCTION), model-facing (the row shows the first line only)",
+      "text": "\nEach event wakes you with a <pbs-wake kind=\"monitor\">; do not check on it. If nothing else is left to do, reply to the user now with no tool call.",
+      "affects": [
+        "monitor-not-sleep"
+      ]
+    },
+    {
       "id": "result.subagent-bg-instruction",
       "kind": "text",
       "surface": "tool result: subagent backgroundedText (subagent/tool.ts)",

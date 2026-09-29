@@ -31,6 +31,10 @@ const SATURATION_MIN_BATCHES = 10;
  * turn spent acknowledging "exited" (eval batch 1, 2026-09-29).
  */
 const EXIT_AFTER_EVENT_MS = 2_000;
+
+/** Model-facing, after the start line. The transcript row shows the first line only. */
+export const MONITOR_STARTED_INSTRUCTION =
+  'Each event wakes you with a <pbs-wake kind="monitor">; do not check on it. If nothing else is left to do, reply to the user now with no tool call.';
 /**
  * Events for ids the registry does not know yet. The manager streams a monitor
  * from spawn, so output and even the exit can arrive before `start()` has the
@@ -477,7 +481,7 @@ export function createMonitorTool(
         content: [
           {
             type: "text",
-            text: `Monitor started · task ${taskId} · ${timeoutText}`,
+            text: `Monitor started · task ${taskId} · ${timeoutText}\n${MONITOR_STARTED_INSTRUCTION}`,
           },
         ],
         details: { task_id: taskId, timeout_ms: timeoutMs },
@@ -494,9 +498,10 @@ export function createMonitorTool(
         .filter((c): c is { type: "text"; text: string } => c.type === "text")
         .map((c) => c.text)
         .join("\n");
+      const firstLine = text.split("\n")[0];
       const failed = context.isError || /\b(failed|killed|orphaned|error)\b/i.test(text);
       const { color, glyph } = statusGlyph(failed ? "failed" : "completed", failed);
-      const line = `${theme.fg(color as "error", glyph)} ${text}${expanded ? "" : theme.fg("dim", "  · manage via /tasks")}`;
+      const line = `${theme.fg(color as "error", glyph)} ${firstLine}${expanded ? "" : theme.fg("dim", "  · manage via /tasks")}`;
       return toolComponent([line]) as never;
     },
   };

@@ -43,3 +43,37 @@ describe("monitor tool description", () => {
     expect(d).toMatch(/tail -n \+1 -F/);
   });
 });
+
+// Eval batch 4: gpt-6-luna and k3-256k armed a monitor, then checked on it
+// once with task_list before waiting. The first "don't check" they saw was
+// in that check's result; the monitor's own result said nothing.
+describe("monitor start result", () => {
+  it("says the event will wake the model and not to check on it", async () => {
+    const registry = {
+      start: async () => ({ taskId: "mon_1", timeoutMs: 60_000 }),
+    } as unknown as MonitorRegistry;
+    const res = await createMonitorTool(registry).execute(
+      "t",
+      { command: "tail -F log | grep -m1 READY", description: "ready" },
+      undefined as never,
+      undefined as never,
+      {} as never,
+    );
+    const text = (res.content[0] as { text: string }).text;
+    expect(text).toMatch(/^Monitor started · task mon_1 · timeout 60s/);
+    expect(text).toMatch(/<pbs-wake kind="monitor">/);
+    expect(text).toMatch(/no tool call/);
+  });
+
+  it("keeps the transcript row to the first line", () => {
+    const registry = new MonitorRegistry({ getClient: () => null, sessionEnv: () => ({}), getNotifyCenter: () => null, trackTask: () => {} });
+    const theme = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t };
+    const row = (createMonitorTool(registry).renderResult as Function)(
+      { content: [{ type: "text", text: "Monitor started · task mon_1 · timeout 60s\nEvents arrive as …" }] },
+      { expanded: false, isPartial: false },
+      theme,
+      { isError: false },
+    ) as { render(width: number): string[] };
+    expect(row.render(200).join("\n")).not.toContain("Events arrive");
+  });
+});
