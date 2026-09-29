@@ -156,6 +156,15 @@
       ]
     },
     {
+      "id": "tooldesc.monitor-follow",
+      "kind": "text",
+      "surface": "tool declaration: monitor.description",
+      "text": "It must keep running and follow its source, e.g. `tail -n +1 -F file | grep --line-buffered PATTERN`; a command that reads once and exits (a plain grep or cat) only reports what is there now. Add `-m1` to grep to stop after the first match. ",
+      "affects": [
+        "monitor-not-sleep"
+      ]
+    },
+    {
       "id": "tooldesc.monitor-silence",
       "kind": "text",
       "surface": "tool declaration: monitor.description",

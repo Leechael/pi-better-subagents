@@ -433,6 +433,9 @@ export function createMonitorTool(
       "Start a background monitor process whose stdout lines are injected back to you as " +
       "<pbs-wake kind=\"monitor\"> messages (batched over 200ms, rate-limited). " +
       "The command must be line-buffered: each event must be a single line. " +
+      "It must keep running and follow its source, e.g. `tail -n +1 -F file | grep --line-buffered PATTERN`; " +
+      "a command that reads once and exits (a plain grep or cat) only reports what is there now. " +
+      "Add `-m1` to grep to stop after the first match. " +
       "Silence is not success: write the command so failures also produce lines " +
       "(e.g. grep for both success and error patterns). " +
       "Events arrive as system wakes (not new user messages). Handle each <pbs-wake kind=\"monitor\"> before other work. Do not poll.",

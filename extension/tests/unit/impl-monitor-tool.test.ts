@@ -27,3 +27,19 @@ describe("monitor tool result rendering", () => {
     expect(text).not.toContain("↓");
   });
 });
+
+// Eval batch 1: gpt-6-luna armed a plain `grep` on the log, which exited at
+// once, then stacked three monitors and filled the wait with reads.
+describe("monitor tool description", () => {
+  it("says the command must keep following its source", () => {
+    const registry = new MonitorRegistry({
+      getClient: () => null,
+      sessionEnv: () => ({}),
+      getNotifyCenter: () => null,
+      trackTask: () => {},
+    });
+    const d = createMonitorTool(registry).description;
+    expect(d).toMatch(/keep running/);
+    expect(d).toMatch(/tail -n \+1 -F/);
+  });
+});
