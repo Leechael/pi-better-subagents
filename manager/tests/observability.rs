@@ -1117,7 +1117,11 @@ fn g15_finished_tasks_expire_in_a_connected_session() {
     assert!(home.path.join("sessions/sess-g4/agents/ch_0000g401.json").exists(), "agents kept");
     assert!(pid_alive(running_pid), "sweeping never touches live processes");
 
-    assert!(!home.cli(&["show", &done], S(5)).status.success(), "swept task is gone from show");
+    // The json file goes before the in-memory record: `run_task_gc` deletes
+    // with the state lock released, then forgets. `show` talks to the daemon,
+    // so a check in that window still finds the task. Wait the forget out.
+    let forgotten = poll_true(S(5), || !home.cli(&["show", &done], S(5)).status.success());
+    assert!(forgotten, "swept task is gone from show");
     let ls = cli_ok(&home, &["ls", "-a"]).stdout;
     assert!(ls.contains(&running) && ls.contains(&leftover) && !ls.contains(&done), "{ls}");
     let log = std::fs::read_to_string(home.path.join("manager.log")).unwrap_or_default();
