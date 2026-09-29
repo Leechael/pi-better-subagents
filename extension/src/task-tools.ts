@@ -86,9 +86,9 @@ function formatTaskLine(task: TaskRecord, now: number): string {
 }
 
 const END_TURN_HINT =
-  'The task is still running. End your turn; a <pbs-wake> arrives when it finishes.';
+  'The task is still running. Reply to the user now with no tool call; a <pbs-wake> arrives when it finishes.';
 const LIST_END_TURN_HINT =
-  "Running work wakes you with a <pbs-wake> when it finishes. End your turn instead of checking again.";
+  "Running work wakes you with a <pbs-wake> when it finishes. Reply to the user now with no tool call instead of checking again.";
 
 const taskListParameters = Type.Object({
   all: Type.Optional(
@@ -222,7 +222,7 @@ export function createTaskOutputTool(
     description:
       "Read output of a background task. Without a cursor, returns the tail of the output " +
       "plus the current file pointer; pass the returned next_cursor as cursor for incremental reads. " +
-      "Not a way to wait: a running task wakes you when it finishes, so end your turn instead of calling this again.",
+      "Not a way to wait: a running task wakes you when it finishes, so reply with no tool call instead of calling this again.",
     promptSnippet: "Read background task output",
     parameters: taskOutputParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {

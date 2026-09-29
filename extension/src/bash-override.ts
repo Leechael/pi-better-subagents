@@ -242,7 +242,7 @@ export function createBashOverride(
     promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
     promptGuidelines: [
       "You can inspect PI_* environment variables for current model and session details.",
-      "Long-running bash commands are moved to the background automatically; do not poll or sleep to wait for them. End your turn and resume from the task wake when it arrives.",
+      "Long-running bash commands are moved to the background automatically; do not poll or sleep to wait for them. End your turn (a reply with no tool call) and resume from the task wake when it arrives.",
     ],
     parameters: bashParameters,
     renderResult(result, { expanded }, theme, context) {

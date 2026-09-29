@@ -13,7 +13,7 @@
       "id": "guidelines.end-turn-after-bg",
       "kind": "text",
       "surface": "system section pi-better-subagents: BEHAVIOR_GUIDELINES (behavior-guidelines.ts)",
-      "text": "Long-running bash commands are automatically moved to the background. After you background a command, end your turn — do not poll with task_output/task_list, and never sleep to wait. Each command notifies on its own via <pbs-wake kind=\"task\"> (with <command> and <preview>), even while other commands are still running. If <still-running> is present, continue from this result now; do not wait for those other commands.",
+      "text": "Long-running bash commands are automatically moved to the background. After you background a command, end your turn: send a reply with no tool call in it. Saying you will wait while calling another tool does not end it. Do not poll with task_output/task_list, and never sleep to wait. Each command notifies on its own via <pbs-wake kind=\"task\"> (with <command> and <preview>), even while other commands are still running. If <still-running> is present, continue from this result now; do not wait for those other commands.",
       "affects": [
         "bg-end-turn",
         "no-fabrication",
@@ -204,7 +204,7 @@
       "id": "result.bash-bg-instruction",
       "kind": "text",
       "surface": "tool result: formatBackgroundNotice (format.ts), model-facing (the ⏵ row is renderResult only)",
-      "text": "\nYou will be notified when it completes, even if other commands are still running. Do not poll or sleep — end your turn and continue from the <pbs-wake kind=\"task\"> when it arrives.",
+      "text": "\nYou will be notified when it completes, even if other commands are still running. Do not poll or sleep: reply to the user now with no tool call, and continue from the <pbs-wake kind=\"task\"> when it arrives.",
       "affects": [
         "bg-end-turn",
         "no-fabrication",

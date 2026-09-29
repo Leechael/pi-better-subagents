@@ -144,7 +144,7 @@ export function formatBackgroundNotice(
   // Model-facing. The transcript row is drawn by the bash tool's renderResult.
   return [
     `Command "${displayCommand(command)}" moved to background (task_id: ${taskId}). Output: ${outputPath}.`,
-    'You will be notified when it completes, even if other commands are still running. Do not poll or sleep — end your turn and continue from the <pbs-wake kind="task"> when it arrives.',
+    'You will be notified when it completes, even if other commands are still running. Do not poll or sleep: reply to the user now with no tool call, and continue from the <pbs-wake kind="task"> when it arrives.',
   ].join("\n");
 }
 

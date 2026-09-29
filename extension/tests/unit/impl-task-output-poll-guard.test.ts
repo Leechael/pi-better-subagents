@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { ManagerClient, OutputResponse } from "../../src/manager-client";
+import { BEHAVIOR_GUIDELINES } from "../../src/behavior-guidelines";
 import { ManualClock } from "../../src/clock";
+import { formatBackgroundNotice } from "../../src/format";
 import { createTaskListTool, createTaskOutputTool } from "../../src/task-tools";
 import { WorkIndex } from "../../src/work-index";
 
@@ -36,14 +38,14 @@ describe("task_output poll guard", () => {
   it("tells the model to end its turn when a running task has nothing yet", async () => {
     const { read } = setup();
     const text = await read();
-    expect(text).toMatch(/end your turn/i);
+    expect(text).toMatch(/with no tool call/i);
     expect(text).toMatch(/pbs-wake/);
   });
 
   it("refuses a repeat read of a running task with no new output", async () => {
     const { read } = setup();
     await read();
-    await expect(read()).rejects.toThrow(/end your turn/i);
+    await expect(read()).rejects.toThrow(/with no tool call/i);
   });
 
   it("allows another read once the task has written more", async () => {
@@ -69,7 +71,7 @@ describe("task_output poll guard", () => {
   it("tracks tasks separately", async () => {
     const { read } = setup();
     await read("sh_1");
-    await expect(read("sh_2")).resolves.toMatch(/end your turn/i);
+    await expect(read("sh_2")).resolves.toMatch(/with no tool call/i);
   });
 
   it("never blocks reads of a finished task", async () => {
@@ -88,7 +90,7 @@ describe("task_output poll guard", () => {
     const tool = createTaskOutputTool({ getClient: () => null, getIndex: () => index });
     const read = () => tool.execute("t", { task_id: "ch_1" }, undefined as never, undefined as never, {} as never);
     const first = await read();
-    expect((first.content[0] as { text: string }).text).toMatch(/end your turn/i);
+    expect((first.content[0] as { text: string }).text).toMatch(/with no tool call/i);
     await expect(read()).rejects.toThrow(/no new output/i);
   });
 
@@ -111,14 +113,32 @@ describe("task_list while work runs", () => {
   }
 
   it("tells the model to end its turn when something is still running", async () => {
-    expect(await list("running")).toMatch(/end your turn/i);
+    expect(await list("running")).toMatch(/with no tool call/i);
   });
 
   it("tells the model to end its turn when something is queued", async () => {
-    expect(await list("pending")).toMatch(/end your turn/i);
+    expect(await list("pending")).toMatch(/with no tool call/i);
   });
 
   it("says nothing extra when everything has finished", async () => {
-    expect(await list("completed")).not.toMatch(/end your turn/i);
+    expect(await list("completed")).not.toMatch(/with no tool call/i);
+  });
+});
+
+// Eval batch 2 (2026-09-29): kimi-for-coding wrote "I'll end my turn now" and
+// called another tool in the same message, three times. "End your turn" never
+// said what that means in practice: a reply with no tool call.
+describe("wait instructions say what ending the turn means", () => {
+  it("in the system guidelines", () => {
+    expect(BEHAVIOR_GUIDELINES).toMatch(/no tool call/);
+    expect(BEHAVIOR_GUIDELINES).toMatch(/does not end/);
+  });
+
+  it("in the background notice", () => {
+    expect(formatBackgroundNotice("sh_1", "./build.sh", "/tmp/out")).toMatch(/with no tool call/);
+  });
+
+  it("in the task_output description", () => {
+    expect(createTaskOutputTool({ getClient: () => null }).description).toMatch(/no tool call/);
   });
 });
