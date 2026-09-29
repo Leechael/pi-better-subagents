@@ -4,6 +4,8 @@
  *
  * - idle  -> pi.sendMessage(msg, { triggerTurn: true })
  * - busy  -> pi.sendMessage(msg, { deliverAs: "steer" })
+ * - passive -> pi.sendMessage(msg, { triggerTurn: false }): appended to the
+ *   session (after the current turn, if one is running), starting none
  * - task exit notifications are coalesced over a 200ms window into one
  *   <pbs-wake kind="task"> payload, and the same task/event pair is only
  *   ever delivered once.
@@ -78,11 +80,11 @@ export class NotifyCenter {
    * events: they happened before it, and the model must not hear "exited"
    * ahead of the lines the command printed.
    */
-  notify(message: NotifyMessage): void {
+  notify(message: NotifyMessage, opts: { passive?: boolean } = {}): void {
     if (this.disposed) return;
     const wake = message.details as { kind?: string; id?: string } | undefined;
     if (wake?.kind === "monitor" && typeof wake.id === "string") this.flushMonitor(wake.id);
-    this.deliver(message);
+    this.deliver(message, opts.passive);
   }
 
   /** Deliver monitor output immediately when idle, otherwise coalesce per monitor. */
@@ -166,7 +168,7 @@ export class NotifyCenter {
     });
   }
 
-  private deliver(message: NotifyMessage): void {
+  private deliver(message: NotifyMessage, passive = false): void {
     const msg = { ...message, display: true };
     const details = message.details as { kind?: string; id?: string; taskId?: string; tasks?: { id: string }[]; children?: { childId: string }[]; childId?: string; from?: string; eventCount?: number } | undefined;
     if (details?.kind) {
@@ -181,9 +183,11 @@ export class NotifyCenter {
         batch: ids.length > 1 || (details.kind === "monitor" && (details.eventCount ?? 0) > 1),
       });
     }
-    const mode = this.deps.isIdle() ? "trigger" : "steer";
+    const mode = passive ? "passive" : this.deps.isIdle() ? "trigger" : "steer";
     this.deps.logEvent?.("wake.deliver", { kind: details?.kind ?? "unknown", mode });
-    if (mode === "trigger") {
+    if (mode === "passive") {
+      this.deps.sendMessage(msg, { triggerTurn: false });
+    } else if (mode === "trigger") {
       this.deps.sendMessage(msg, { triggerTurn: true });
     } else {
       this.deps.sendMessage(msg, { deliverAs: "steer" });

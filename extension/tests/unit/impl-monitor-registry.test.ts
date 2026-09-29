@@ -197,3 +197,75 @@ describe("MonitorRegistry early exit (manual testing, 2026-09-24)", () => {
     expect(index.staleLive(tasks)).toEqual([]);
   });
 });
+
+// Eval batch 1 (2026-09-29): a `tail -F | grep -m1` monitor exits right after
+// its event. The exit arrived as a second wake, so the model answered, then
+// spent a turn acknowledging "monitor exited" (every model, every run).
+describe("MonitorRegistry exit right after an event", () => {
+  async function setup() {
+    const clock = new ManualClock();
+    const sent: { details?: unknown; opts: { triggerTurn?: boolean; deliverAs?: string } }[] = [];
+    const manager = {
+      ensureAvailable: async () => true,
+      isAvailable: () => true,
+      start: async () => ({ task_id: "mon_1", pid: 1 }),
+      watch: async () => {},
+      stop: async () => {},
+    } as unknown as ManagerClient;
+    const center = new NotifyCenter({ sendMessage: (m, opts) => sent.push({ ...m, opts }), isIdle: () => true, clock });
+    const registry = new MonitorRegistry({
+      getClient: () => manager,
+      sessionEnv: () => ({}),
+      getNotifyCenter: () => center,
+      trackTask: () => {},
+      clock,
+    });
+    await registry.start({ command: "tail -F log | grep -m1 READY", description: "ready" }, { cwd: "/tmp" } as ExtensionContext);
+    const exit = (code: number) =>
+      registry.handleExit("mon_1", { event: "task_exited", task_id: "mon_1", exit_code: code, duration_ms: 10 });
+    const turns = () => sent.filter((m) => m.opts.triggerTurn !== false);
+    const exitMsg = () => sent.find((m) => (m.details as { status?: string }).status === "exited");
+    return { clock, registry, exit, sent, turns, exitMsg };
+  }
+
+  it("a clean exit inside the batch window: one wake, exit appended without a turn", async () => {
+    const { registry, exit, turns, exitMsg } = await setup();
+    registry.handleOutput("mon_1", "READY token=AB12\n");
+    exit(0);
+    expect(turns()).toHaveLength(1);
+    expect(JSON.stringify(turns()[0].details)).toContain("READY token=AB12");
+    expect(exitMsg()?.opts).toEqual({ triggerTurn: false });
+  });
+
+  it("a clean exit shortly after a delivered event adds no turn", async () => {
+    const { clock, registry, exit, turns, exitMsg } = await setup();
+    registry.handleOutput("mon_1", "READY token=AB12\n");
+    clock.advanceBy(300);
+    clock.advanceBy(1_000);
+    exit(0);
+    expect(turns()).toHaveLength(1);
+    expect(exitMsg()?.opts).toEqual({ triggerTurn: false });
+  });
+
+  it("a failed exit still wakes", async () => {
+    const { registry, exit, turns, exitMsg } = await setup();
+    registry.handleOutput("mon_1", "READY token=AB12\n");
+    exit(1);
+    expect(turns()).toHaveLength(2);
+    expect(exitMsg()?.opts.triggerTurn).toBe(true);
+  });
+
+  it("a clean exit long after the last event still wakes", async () => {
+    const { clock, registry, exit, turns } = await setup();
+    registry.handleOutput("mon_1", "tick\n");
+    clock.advanceBy(10_000);
+    exit(0);
+    expect(turns()).toHaveLength(2);
+  });
+
+  it("a clean exit with no event at all still wakes", async () => {
+    const { exit, turns } = await setup();
+    exit(0);
+    expect(turns()).toHaveLength(1);
+  });
+});

@@ -272,6 +272,12 @@ describe("faux e2e", { concurrency: true }, () => {
   it("(c2) a monitor that exits at once ends with an exit wake, not a timeout", async () => {
     const ep = await runFaux({
       script: "monitor-fast-exit.ts",
+      // A clean exit right after its event starts no turn of its own; the
+      // user's next message is when the model sees it.
+      midway: {
+        when: (items) => wakes(items).some((w) => w.wake.status === "exited"),
+        act: (_sandbox, pi) => pi.prompt("anything still running?"),
+      },
       until: (items) =>
         toolResults(items).some((r) => r.toolName === "task_list") ||
         wakes(items).some((w) => w.wake.status === "timeout"),

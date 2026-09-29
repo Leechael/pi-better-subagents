@@ -26,6 +26,12 @@ const SATURATION_WINDOW_MS = 30_000;
 const SATURATION_DROP_RATIO = 0.5;
 const SATURATION_MIN_BATCHES = 10;
 /**
+ * A clean exit this soon after an event was caused by it (`grep -m1`). Its
+ * notice is appended without starting a turn: as a wake it cost every such monitor a
+ * turn spent acknowledging "exited" (eval batch 1, 2026-09-29).
+ */
+const EXIT_AFTER_EVENT_MS = 2_000;
+/**
  * Events for ids the registry does not know yet. The manager streams a monitor
  * from spawn, so output and even the exit can arrive before `start()` has the
  * task id (same socket read as the start response). Bounded: unrelated shell
@@ -65,6 +71,7 @@ interface MonitorEntry {
   cursor: number;
   recovering: boolean;
   queuedOutput: { chunk: string; cursor?: number }[];
+  lastEventAt?: number;
 }
 
 export class MonitorRegistry {
@@ -222,6 +229,11 @@ export class MonitorRegistry {
     this.deps.onExited?.(taskId, event);
     if (alreadyStopped) return true; // timeout/saturation notice already sent
     const exitCode = event.exit_code ?? null;
+    const causedByEvent =
+      exitCode === 0 &&
+      !event.signal &&
+      entry.lastEventAt !== undefined &&
+      this.clock.now() - entry.lastEventAt <= EXIT_AFTER_EVENT_MS;
     const duration =
       typeof event.duration_ms === "number" ? `${(event.duration_ms / 1000).toFixed(1)}s` : "unknown duration";
     this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: event.end_reason ?? "exited" });
@@ -233,6 +245,7 @@ export class MonitorRegistry {
         "exited",
         { droppedLines: entry.droppedLinesPending },
       ),
+      { passive: causedByEvent },
     );
     this.deps.toast?.(
       `Monitor "${entry.description}" exited (code ${exitCode === null ? "?" : exitCode})`,
@@ -303,6 +316,7 @@ export class MonitorRegistry {
     }
     const droppedLines = entry.droppedLinesPending;
     entry.droppedLinesPending = 0;
+    entry.lastEventAt = now;
     this.deps.getNotifyCenter()?.notifyMonitorEvent(entry.description, entry.taskId, text, droppedLines);
   }
 

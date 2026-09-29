@@ -41,7 +41,7 @@ export interface FauxRunOptions {
   /** Quiet window after settling. */
   quietMs?: number;
   /** Do something to the environment once `when` holds (before `until`). */
-  midway?: { when: (items: Item[]) => boolean; act: (sandbox: Sandbox) => void };
+  midway?: { when: (items: Item[]) => boolean; act: (sandbox: Sandbox, pi: PiRpc) => void | Promise<void> };
 }
 
 export function readTrace(path: string): FauxCall[] {
@@ -78,7 +78,7 @@ export async function runFaux(opts: FauxRunOptions): Promise<FauxEpisode> {
       const { when, act } = opts.midway;
       try {
         await pi.waitFor((evs) => when(itemsFromEvents(evs)), 15_000, "midway condition");
-        act(sandbox);
+        await act(sandbox, pi);
       } catch (err) {
         // Fail in-band: a rejection here would leave the caller without an
         // episode, so its after() hook never cleans up the sandbox (or the
