@@ -25,7 +25,7 @@ import { EVAL_DIR } from "../lib/paths.ts";
 import { runEpisode } from "./episode.ts";
 import { isAblatable, loadManifest, resolveVariant, type Variant, variantAffects } from "./manifest.ts";
 import { getScenario, type Scenario, SCENARIOS } from "./scenarios.ts";
-import { stopDecision, type StopDecision } from "./stats.ts";
+import { setupBroken, stopDecision, type StopDecision } from "./stats.ts";
 
 export interface ResultRecord {
   v: 1;
@@ -175,6 +175,7 @@ async function main(): Promise<void> {
       k,
     );
     // Invalid episodes / errors: cap total attempts so a broken setup cannot loop forever.
+    if (d === "continue" && setupBroken({ attempts: attempts(c.key), scored: s.length })) return "done";
     if (d === "continue" && attempts(c.key) + (inflight.get(c.key) ?? 0) >= 2 * k) return "done";
     return d;
   };
@@ -236,6 +237,9 @@ async function main(): Promise<void> {
             if (d !== "continue" && decisions.get(cell.key) !== d) {
               decisions.set(cell.key, d);
               if (d !== "done") console.log(`  ⏹ ${cell.key}: early stop (${d})`);
+              else if (setupBroken({ attempts: attempts(cell.key), scored: scored(cell.key).length })) {
+                console.log(`  ⏹ ${cell.key}: gave up, no scored episode in ${attempts(cell.key)} attempts`);
+              }
             }
             pump();
             if ([...inflight.values()].every((n) => n === 0) && (!next() || launched >= maxEpisodes)) resolveAll();
