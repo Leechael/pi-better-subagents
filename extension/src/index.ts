@@ -8,6 +8,7 @@
 import { applyBehaviorGuidelines } from "./behavior-guidelines";
 import { realClock } from "./clock";
 import { ExitNotifyGate } from "./exit-notify-gate";
+import { ExitWatchdog } from "./exit-watchdog";
 import { createExtensionEventLog } from "./events";
 import { readFileTail } from "./file-tail";
 import { readdir, readFile, stat } from "node:fs/promises";
@@ -196,6 +197,16 @@ export default function (pi: ExtensionAPI): void {
       }
     }
   };
+  // Settle on our own while a wake is pending: the agent was told to end its
+  // turn, so nothing else may look before the wake is due.
+  const exitWatchdog = new ExitWatchdog({
+    clock,
+    hasPending: () => notifyOnExit.size > 0,
+    tick: async () => {
+      await client?.ensureAvailable().catch(() => false);
+      await syncWithManager();
+    },
+  });
   const eventLog = createExtensionEventLog(home, () => ctx?.sessionManager.getSessionId() ?? "", clock);
   const logEvent = (type: string, fields?: Record<string, unknown>) => eventLog.write(type, fields);
 
@@ -244,6 +255,7 @@ export default function (pi: ExtensionAPI): void {
 
   const markNotifyOnExit = (taskId: string) => {
     notifyOnExit.add(taskId);
+    exitWatchdog.arm();
     void client?.markBackground(taskId).catch(() => {});
     const prior = exitGate.mark(taskId);
     if (prior) {
@@ -652,6 +664,7 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
+    exitWatchdog.dispose();
     fleetWidget?.dispose();
     fleetWidget = null;
     subagentRegistry?.disposeAll();
