@@ -267,6 +267,7 @@ describe("faux e2e", { concurrency: true }, () => {
     const detail = monWakes.map((w) => `${w.seq} ${w.wake.status} ${JSON.stringify(w.wake.body)}`).join("\n");
     assert.deepEqual(lines, Array.from({ length: 30 }, (_, i) => `m-${i + 1}`), `${detail}\n${explain(ep)}`);
     assert.equal(monWakes.filter((w) => w.wake.status === "exited").length, 1, explain(ep));
+    assert.equal(monWakes.at(-1)?.wake.status, "exited", `exit before its last event\n${explain(ep)}`);
   });
 
   it("(c2) a monitor that exits at once ends with an exit wake, not a timeout", async () => {
@@ -291,6 +292,10 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.equal(ws.filter((w) => w.wake.status === "timeout").length, 0, `stuck until timeout\n${explain(ep)}`);
     const exitedWakes = ws.filter((w) => w.wake.status === "exited");
     assert.equal(exitedWakes.length, 1, explain(ep));
+    // The exit notice never precedes the monitor's own lines (batches 2–4 of the
+    // real-model eval had it first in 31 of 157 monitors).
+    const firstEvent = ws.findIndex((w) => w.wake.status === "event");
+    assert.ok(firstEvent >= 0 && firstEvent < ws.indexOf(exitedWakes[0]), `exit before its event\n${explain(ep)}`);
     // `echo noop` ends in milliseconds; the exit must not wait on anything.
     assert.ok(exitedWakes[0].t - monitorResult.t < 2000, `exit wake late\n${explain(ep)}`);
     const lines = ws.filter((w) => w.wake.status === "event").flatMap((w) => w.wake.body.split("\n"));
@@ -298,6 +303,22 @@ describe("faux e2e", { concurrency: true }, () => {
     const listing = toolResults(ep.items).find((r) => r.toolName === "task_list");
     assert.ok(listing, explain(ep));
     assert.doesNotMatch(listing.text, new RegExp(`${taskId}[^\n]*running`), `still listed as running\n${explain(ep)}`);
+  });
+
+  it("(c3) a monitor that prints and exits while the agent is busy: event first, exit starts no turn", async () => {
+    const ep = await runFaux({
+      script: "monitor-busy-exit.ts",
+      until: (items) => wakes(items).some((w) => w.wake.status === "exited"),
+      quietMs: 1500,
+    });
+    episodes.push(ep);
+    const monitorResult = toolResults(ep.items).find((r) => r.toolName === "monitor");
+    assert.ok(monitorResult && !monitorResult.isError, explain(ep));
+    const ws = wakes(ep.items).filter((w) => w.wake.taskIds[0] === String(monitorResult.details?.task_id));
+    const event = ws.find((w) => w.wake.status === "event");
+    const exited = ws.find((w) => w.wake.status === "exited");
+    assert.ok(event && exited, explain(ep));
+    assert.ok(event.seq < exited.seq, `exit before its event\n${explain(ep)}`);
   });
 
   it(

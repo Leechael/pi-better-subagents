@@ -151,6 +151,7 @@ describe("MonitorRegistry early exit (manual testing, 2026-09-24)", () => {
     const { clock, registry, center, exited, wakes } = setup();
     await registry.start({ command: "echo noop", description: "noop" }, { cwd: "/tmp" } as ExtensionContext);
     clock.advanceBy(1_000);
+    center.settled(); // the run the "noop" event started is over; the exit notice follows it
     expect(registry.has("mon_fast")).toBe(false);
     expect(registry.listActive()).toEqual([]);
     expect(exited).toEqual(["mon_fast"]);
@@ -225,22 +226,41 @@ describe("MonitorRegistry exit right after an event", () => {
       registry.handleExit("mon_1", { event: "task_exited", task_id: "mon_1", exit_code: code, duration_ms: 10 });
     const turns = () => sent.filter((m) => m.opts.triggerTurn !== false);
     const exitMsg = () => sent.find((m) => (m.details as { status?: string }).status === "exited");
-    return { clock, registry, exit, sent, turns, exitMsg };
+    return { center, clock, registry, exit, sent, turns, exitMsg };
   }
 
-  it("a clean exit inside the batch window: one wake, exit appended without a turn", async () => {
-    const { registry, exit, turns, exitMsg } = await setup();
+  // Batches 2–4: sent at once with triggerTurn: false while the model was
+  // writing, the exit was appended at that turn's end, ahead of the event
+  // steered in at the next turn's start (31 of 157 monitors).
+  it("a clean exit inside the batch window: one wake, exit held until that run settles", async () => {
+    const { center, registry, exit, turns, exitMsg, sent } = await setup();
     registry.handleOutput("mon_1", "READY token=AB12\n");
     exit(0);
     expect(turns()).toHaveLength(1);
     expect(JSON.stringify(turns()[0].details)).toContain("READY token=AB12");
+    expect(exitMsg()).toBeUndefined();
+    center.settled();
+    expect(exitMsg()?.opts).toEqual({ triggerTurn: false });
+    expect(sent.indexOf(exitMsg()!)).toBeGreaterThan(sent.indexOf(turns()[0]));
+  });
+
+  it("a clean exit shortly after a delivered event adds no turn, and follows the event", async () => {
+    const { center, clock, registry, exit, turns, exitMsg } = await setup();
+    registry.handleOutput("mon_1", "READY token=AB12\n");
+    clock.advanceBy(300);
+    clock.advanceBy(1_000);
+    exit(0);
+    expect(exitMsg()).toBeUndefined();
+    center.settled();
+    expect(turns()).toHaveLength(1);
     expect(exitMsg()?.opts).toEqual({ triggerTurn: false });
   });
 
-  it("a clean exit shortly after a delivered event adds no turn", async () => {
-    const { clock, registry, exit, turns, exitMsg } = await setup();
+  it("a clean exit after the event's run already settled is appended at once", async () => {
+    const { center, clock, registry, exit, turns, exitMsg } = await setup();
     registry.handleOutput("mon_1", "READY token=AB12\n");
     clock.advanceBy(300);
+    center.settled();
     clock.advanceBy(1_000);
     exit(0);
     expect(turns()).toHaveLength(1);

@@ -4,8 +4,11 @@
  *
  * - idle  -> pi.sendMessage(msg, { triggerTurn: true })
  * - busy  -> pi.sendMessage(msg, { deliverAs: "steer" })
- * - passive -> pi.sendMessage(msg, { triggerTurn: false }): appended to the
- *   session (after the current turn, if one is running), starting none
+ * - passive -> held until the agent settles, then
+ *   pi.sendMessage(msg, { triggerTurn: false }): appended, starting no turn.
+ *   Sent at once while the model was writing, pi appended it at that turn's
+ *   end, while a wake steered in at the same moment waits for the next turn's
+ *   start: a monitor's exit landed before its own event (eval batches 2–4).
  * - task exit notifications are coalesced over a 200ms window into one
  *   <pbs-wake kind="task"> payload, and the same task/event pair is only
  *   ever delivered once.
@@ -51,6 +54,9 @@ export class NotifyCenter {
   private readonly seen = new Set<string>();
   private timer: ClockTimer | null = null;
   private disposed = false;
+  /** A wake started or steered a run that has not settled yet. */
+  private runPending = false;
+  private held: NotifyMessage[] = [];
 
   constructor(deps: NotifyCenterDeps) {
     this.deps = deps;
@@ -84,7 +90,26 @@ export class NotifyCenter {
     if (this.disposed) return;
     const wake = message.details as { kind?: string; id?: string } | undefined;
     if (wake?.kind === "monitor" && typeof wake.id === "string") this.flushMonitor(wake.id);
-    this.deliver(message, opts.passive);
+    if (!opts.passive) {
+      this.deliver(message);
+    } else if (this.runPending || !this.deps.isIdle()) {
+      this.held.push(message);
+    } else {
+      this.deliver(message, true);
+    }
+  }
+
+  /**
+   * The agent settled: the run any earlier wake started is over. Flush
+   * coalesced monitor output, then, unless that started another run, the
+   * held passive notices.
+   */
+  settled(): void {
+    if (this.disposed) return;
+    this.runPending = false;
+    this.flushMonitorEvents();
+    if (this.runPending) return;
+    for (const message of this.held.splice(0)) this.deliver(message, true);
   }
 
   /** Deliver monitor output immediately when idle, otherwise coalesce per monitor. */
@@ -138,6 +163,7 @@ export class NotifyCenter {
     this.clearTimer();
     this.pendingExits = [];
     this.pendingMonitors.clear();
+    this.held = [];
   }
 
   private scheduleFlush(): void {
@@ -185,6 +211,7 @@ export class NotifyCenter {
     }
     const mode = passive ? "passive" : this.deps.isIdle() ? "trigger" : "steer";
     this.deps.logEvent?.("wake.deliver", { kind: details?.kind ?? "unknown", mode });
+    if (mode !== "passive") this.runPending = true;
     if (mode === "passive") {
       this.deps.sendMessage(msg, { triggerTurn: false });
     } else if (mode === "trigger") {
