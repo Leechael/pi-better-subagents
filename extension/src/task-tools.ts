@@ -83,6 +83,11 @@ function formatTaskLine(task: TaskRecord, now: number): string {
   );
 }
 
+const END_TURN_HINT =
+  'The task is still running. End your turn; a <pbs-wake> arrives when it finishes.';
+const LIST_END_TURN_HINT =
+  "Running work wakes you with a <pbs-wake> when it finishes. End your turn instead of checking again.";
+
 const taskListParameters = Type.Object({
   all: Type.Optional(
     Type.Boolean({ description: "Also include finished work (default: running only). Always limited to this session." }),
@@ -108,12 +113,14 @@ export function createTaskListTool(
       const now = (deps.clock ?? realClock).now();
       const lines: string[] = [];
       const seen = new Set<string>();
+      let running = false;
 
       const pushItem = (item: WorkItem) => {
         if (seen.has(item.id)) return;
         if (!params.all && item.status !== "running" && item.status !== "pending") return;
         seen.add(item.id);
         const age = formatAge(item.startedAt, item.endedAt, now);
+        running ||= item.status === "running" || item.status === "pending";
         lines.push(`${item.id} [${item.kind}] ${item.status} (${age}) "${item.title}"`);
       };
 
@@ -126,6 +133,7 @@ export function createTaskListTool(
         // Sync-waited shells are not in the index and must not be listed as workers.
         if (task.kind === "shell" && !index?.get(task.task_id)) continue;
         seen.add(task.task_id);
+        running ||= task.status === "running";
         lines.push(formatTaskLine(task, now));
       }
 
@@ -145,6 +153,7 @@ export function createTaskListTool(
         for (const rec of disk) {
           if (liveIds.has(rec.child_id) || seen.has(rec.child_id)) continue;
           if (!params.all && !isAgentStatusActive(rec.status)) continue;
+          running ||= isAgentStatusActive(rec.status);
           agentLines.push(
             `${rec.child_id} [agent] ${rec.status} (run=${rec.run_id}) "${formatAgentCommand(rec).replace(/^agent:/, "")}"` +
               (rec.error ? ` — error: ${rec.error}` : ""),
@@ -161,7 +170,7 @@ export function createTaskListTool(
       const header = `${lines.length + agentLines.length} background item(s):`;
       const body = [...lines, ...agentLines];
       return {
-        content: [{ type: "text", text: [header, ...body].join("\n") }],
+        content: [{ type: "text", text: [header, ...body, ...(running ? ["", LIST_END_TURN_HINT] : [])].join("\n") }],
         details: { tasks, agents: agentLines },
       };
     },
@@ -191,9 +200,6 @@ export interface TaskOutputDetails {
 }
 
 const DEFAULT_OUTPUT_BYTES = 65536;
-
-const END_TURN_HINT =
-  'The task is still running. End your turn; a <pbs-wake> arrives when it finishes.';
 
 export function createTaskOutputTool(
   deps: TaskToolsDeps,

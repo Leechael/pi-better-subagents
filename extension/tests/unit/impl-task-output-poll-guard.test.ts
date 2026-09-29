@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ManagerClient, OutputResponse } from "../../src/manager-client";
 import { ManualClock } from "../../src/clock";
-import { createTaskOutputTool } from "../../src/task-tools";
+import { createTaskListTool, createTaskOutputTool } from "../../src/task-tools";
 import { WorkIndex } from "../../src/work-index";
 
 // Manual testing (2026-09-29): with a prek hook and `gh pr checks --watch`
@@ -95,5 +95,26 @@ describe("task_output poll guard", () => {
   it("says in its description that it is not a way to wait", () => {
     const tool = createTaskOutputTool({ getClient: () => null });
     expect(tool.description).toMatch(/not.*wait/i);
+  });
+});
+
+// Eval batch 1: gpt-6-luna's checks before the wake all went through
+// task_list, which answered "running (4s)" and nothing else.
+describe("task_list while work runs", () => {
+  async function list(status: "running" | "completed") {
+    const index = new WorkIndex({ clock: new ManualClock(5_000) });
+    index.upsert({ id: "sh_1", kind: "shell", status, title: "./build.sh", startedAt: 0, countsAsWorker: true });
+    const client = { ensureAvailable: async () => true, isAvailable: () => true, list: async () => [] } as unknown as ManagerClient;
+    const tool = createTaskListTool({ getClient: () => client, getIndex: () => index });
+    const res = await tool.execute("t", { all: true }, undefined as never, undefined as never, {} as never);
+    return (res.content[0] as { text: string }).text;
+  }
+
+  it("tells the model to end its turn when something is still running", async () => {
+    expect(await list("running")).toMatch(/end your turn/i);
+  });
+
+  it("says nothing extra when everything has finished", async () => {
+    expect(await list("completed")).not.toMatch(/end your turn/i);
   });
 });
