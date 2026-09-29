@@ -1,0 +1,46 @@
+/**
+ * Eval batch 4 (2026-09-30): gpt-6-luna ran `./gen.sh` with `timeout: 1`. The
+ * manager killed it after 1s and bash returned "generating..." as a success,
+ * so the model believed it was still running. The local fallback already
+ * reported "Command timed out"; the manager path treated a signal kill
+ * (exit_code null) as exit 0.
+ */
+import { describe, expect, it, vi } from "vitest";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createBashOverride } from "../../src/bash-override";
+import { DEFAULT_CONFIG } from "../../src/config";
+import type { ManagerClient, TaskRecord } from "../../src/manager-client";
+
+function run(record: Partial<TaskRecord>, params: { command: string; timeout?: number }) {
+  const client = {
+    ensureAvailable: vi.fn(async () => true),
+    start: vi.fn(async () => ({ task_id: "sh_1", pid: 1 })),
+    wait: vi.fn(async () => ({ done: true, exit_code: null })),
+    output: vi.fn(async () => ({ chunk: "generating...\n", next_cursor: 14, status: "killed", exit_code: null, total_size: 14 })),
+    list: vi.fn(async () => [{ task_id: "sh_1", status: "killed", exit_code: null, ...record }]),
+    stop: vi.fn(async () => {}),
+  } as unknown as ManagerClient;
+  const tool = createBashOverride({
+    getClient: () => client,
+    config: { ...DEFAULT_CONFIG, foregroundBudgetMs: 50 },
+    home: "/tmp/pbs-test",
+    sessionId: () => "s",
+    sessionEnv: () => ({}),
+    trackTask: vi.fn(),
+    markNotifyOnExit: vi.fn(),
+  });
+  const ctx = { cwd: "/tmp", sessionManager: { getSessionId: () => "s", getSessionFile: () => null } } as unknown as ExtensionContext;
+  return tool.execute("tc", params, undefined, undefined, ctx);
+}
+
+describe("bash on the manager path, command killed", () => {
+  it("reports a timeout kill as a timeout, keeping the output", async () => {
+    await expect(run({ end_reason: "timeout", signal: "SIGTERM" }, { command: "./gen.sh", timeout: 1 })).rejects.toThrow(
+      /generating\.\.\.[\s\S]*timed out after 1 second/,
+    );
+  });
+
+  it("reports any other kill as killed, with the signal", async () => {
+    await expect(run({ signal: "SIGKILL" }, { command: "./gen.sh" })).rejects.toThrow(/killed \(SIGKILL\)/);
+  });
+});

@@ -305,6 +305,15 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.doesNotMatch(listing.text, new RegExp(`${taskId}[^\n]*running`), `still listed as running\n${explain(ep)}`);
   });
 
+  it("(b2) a command killed by its own timeout is reported as timed out", async () => {
+    const ep = await runFaux({ script: "bash-timeout.ts", until: (items) => toolResults(items).some((r) => r.toolName === "bash") });
+    episodes.push(ep);
+    const r = toolResults(ep.items).find((x) => x.toolName === "bash");
+    assert.ok(r, explain(ep));
+    assert.equal(r.isError, true, `killed command reported as success: ${r.text}\n${explain(ep)}`);
+    assert.match(r.text, /started[\s\S]*timed out after 1 seconds/, explain(ep));
+  });
+
   it("(c3) a monitor that prints and exits while the agent is busy: event first, exit starts no turn", async () => {
     const ep = await runFaux({
       script: "monitor-busy-exit.ts",
