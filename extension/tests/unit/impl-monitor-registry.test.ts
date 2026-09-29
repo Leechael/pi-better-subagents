@@ -4,6 +4,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ManagerClient } from "../../src/manager-client";
 import { MonitorRegistry } from "../../src/monitor";
 import { NotifyCenter } from "../../src/notify";
+import { createTaskStopTool } from "../../src/task-tools";
 import type { PbsWake } from "../../src/wake";
 
 describe("MonitorRegistry saturation", () => {
@@ -287,5 +288,49 @@ describe("MonitorRegistry exit right after an event", () => {
     const { exit, turns } = await setup();
     exit(0);
     expect(turns()).toHaveLength(1);
+  });
+});
+
+// Eval batch 2: kimi-for-coding stopped its own monitor with task_stop; the
+// lines still buffered and the SIGTERM exit then cost it two more turns.
+describe("MonitorRegistry monitor stopped by the model", () => {
+  it("delivers leftover lines and the exit without starting a turn", async () => {
+    const clock = new ManualClock();
+    const sent: { details?: unknown; opts: { triggerTurn?: boolean; deliverAs?: string } }[] = [];
+    const manager = {
+      ensureAvailable: async () => true,
+      isAvailable: () => true,
+      start: async () => ({ task_id: "mon_1", pid: 1 }),
+      watch: async () => {},
+      stop: async () => {},
+    } as unknown as ManagerClient;
+    const center = new NotifyCenter({ sendMessage: (m, opts) => sent.push({ ...m, opts }), isIdle: () => true, clock });
+    const registry = new MonitorRegistry({
+      getClient: () => manager,
+      sessionEnv: () => ({}),
+      getNotifyCenter: () => center,
+      trackTask: () => {},
+      clock,
+    });
+    await registry.start({ command: "tail -F out | grep .", description: "watch" }, { cwd: "/tmp" } as ExtensionContext);
+    registry.handleOutput("mon_1", "compiling...\n");
+    registry.noteStopRequested("mon_1");
+    registry.handleExit("mon_1", { event: "task_exited", task_id: "mon_1", exit_code: null, signal: "SIGTERM", duration_ms: 10 });
+    center.settled();
+    expect(sent.filter((m) => m.opts.triggerTurn !== false)).toHaveLength(0);
+    const statuses = sent.map((m) => (m.details as { status?: string }).status ?? "event");
+    expect(statuses).toEqual(["event", "exited"]);
+  });
+
+  it("task_stop on a monitor tells the registry before stopping it", async () => {
+    const order: string[] = [];
+    const client = {
+      ensureAvailable: async () => true,
+      isAvailable: () => true,
+      stop: async (id: string) => { order.push(`stop ${id}`); },
+    } as unknown as ManagerClient;
+    const tool = createTaskStopTool({ getClient: () => client, noteStopRequested: (id) => order.push(`note ${id}`) });
+    await tool.execute("t", { task_id: "mon_1" }, undefined as never, undefined as never, {} as never);
+    expect(order).toEqual(["note mon_1", "stop mon_1"]);
   });
 });

@@ -86,10 +86,10 @@ export class NotifyCenter {
    * events: they happened before it, and the model must not hear "exited"
    * ahead of the lines the command printed.
    */
-  notify(message: NotifyMessage, opts: { passive?: boolean } = {}): void {
+  notify(message: NotifyMessage, opts: { passive?: boolean; quietEvents?: boolean } = {}): void {
     if (this.disposed) return;
     const wake = message.details as { kind?: string; id?: string } | undefined;
-    if (wake?.kind === "monitor" && typeof wake.id === "string") this.flushMonitor(wake.id);
+    if (wake?.kind === "monitor" && typeof wake.id === "string") this.flushMonitor(wake.id, opts.quietEvents);
     if (!opts.passive) {
       this.deliver(message);
     } else if (this.runPending || !this.deps.isIdle()) {
@@ -137,7 +137,7 @@ export class NotifyCenter {
   }
 
   /** Deliver one monitor's coalesced events, if any, in the current mode. */
-  private flushMonitor(taskId: string): void {
+  private flushMonitor(taskId: string, quiet = false): void {
     const item = this.pendingMonitors.get(taskId);
     if (!item) return;
     this.pendingMonitors.delete(taskId);
@@ -148,7 +148,9 @@ export class NotifyCenter {
       eventCount: item.eventCount,
       droppedLines: item.droppedLines,
     });
-    this.deliver({ customType: wake.customType, content: wake.content, details: wake.details });
+    const message = { customType: wake.customType, content: wake.content, details: wake.details };
+    if (quiet) this.notify(message, { passive: true });
+    else this.deliver(message);
   }
 
   /** Flush any pending task exit notifications now. */

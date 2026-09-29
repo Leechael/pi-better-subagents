@@ -25,6 +25,8 @@ export interface TaskToolsDeps {
   clock?: Clock;
   /** Settle work the manager reports as ended (lost exit events). */
   syncWithManager?: () => Promise<unknown>;
+  /** task_stop on a monitor: its leftover lines and exit should not wake the model. */
+  noteStopRequested?: (taskId: string) => void;
 }
 
 function requireClient(deps: TaskToolsDeps): Promise<ManagerClient> {
@@ -304,6 +306,7 @@ export function createTaskStopTool(
         };
       }
       const client = await requireClient(deps);
+      deps.noteStopRequested?.(params.task_id);
       try {
         await client.stop(params.task_id, "tool");
       } finally {

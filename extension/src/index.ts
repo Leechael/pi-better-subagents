@@ -319,7 +319,13 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool(createBashOverride(deps));
   pi.registerTool(createTaskListTool({ ...deps, getIndex: () => workIndex }));
   pi.registerTool(createTaskOutputTool({ ...deps, getIndex: () => workIndex }));
-  pi.registerTool(createTaskStopTool({ ...deps, getIndex: () => workIndex }));
+  pi.registerTool(
+    createTaskStopTool({
+      ...deps,
+      getIndex: () => workIndex,
+      noteStopRequested: (id) => monitorRegistry?.noteStopRequested(id),
+    }),
+  );
   pi.registerTool(createMonitorTool(monitorRegistry));
   registerTasksCommand(pi, {
     getRegistry: () => subagentRegistry,

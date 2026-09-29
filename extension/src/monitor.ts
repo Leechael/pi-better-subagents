@@ -72,6 +72,8 @@ interface MonitorEntry {
   recovering: boolean;
   queuedOutput: { chunk: string; cursor?: number }[];
   lastEventAt?: number;
+  /** The model asked to stop it (task_stop): what is left is not news. */
+  stopRequested?: boolean;
 }
 
 export class MonitorRegistry {
@@ -211,6 +213,12 @@ export class MonitorRegistry {
     if (deliver.byteLength > 0) entry.batcher.push(deliver.toString("utf8"));
   }
 
+  /** task_stop is about to stop this monitor at the model's request. */
+  noteStopRequested(taskId: string): void {
+    const entry = this.entries.get(taskId);
+    if (entry) entry.stopRequested = true;
+  }
+
   /**
    * Handle the manager's task_exited event. Returns true when it closed a
    * known monitor; an unknown id is kept briefly in case `start()` is about to
@@ -245,7 +253,7 @@ export class MonitorRegistry {
         "exited",
         { droppedLines: entry.droppedLinesPending },
       ),
-      { passive: causedByEvent },
+      { passive: causedByEvent || entry.stopRequested === true, quietEvents: entry.stopRequested === true },
     );
     this.deps.toast?.(
       `Monitor "${entry.description}" exited (code ${exitCode === null ? "?" : exitCode})`,
@@ -317,6 +325,14 @@ export class MonitorRegistry {
     const droppedLines = entry.droppedLinesPending;
     entry.droppedLinesPending = 0;
     entry.lastEventAt = now;
+    if (entry.stopRequested) {
+      // Lines still buffered when the model stopped it: record, do not wake.
+      this.deps.getNotifyCenter()?.notify(
+        formatMonitorEvent(entry.description, entry.taskId, text, undefined, { droppedLines }),
+        { passive: true },
+      );
+      return;
+    }
     this.deps.getNotifyCenter()?.notifyMonitorEvent(entry.description, entry.taskId, text, droppedLines);
   }
 
