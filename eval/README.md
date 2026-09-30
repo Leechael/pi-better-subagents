@@ -49,7 +49,7 @@ pi -ne --list-models
 
 ### What a run is made of
 
-A run is a grid of **cells**, one per (model × variant × scenario), each repeated `k` times. Every repeat is one **episode**: a fresh pi session given one scenario's task, graded PASS / FAIL / INVALID.
+A run is a grid of **cells**, one per (model × variant × scenario), each repeated `k` times. By default (`--pairs affected`) a variant is paired only with the scenarios in its `affects`; `--pairs all` gives the full cross product. Every repeat is one **episode**: a fresh pi session given one scenario's task, graded PASS / FAIL / INVALID.
 
 | Flag | Chooses | Default |
 |---|---|---|
@@ -89,10 +89,11 @@ Everything lands under `eval/results/` (gitignored):
 The runner resumes from `results.jsonl`: a cell with k scored episodes is skipped. That is also why two versions of the extension need separate files, or the second run skips everything:
 
 ```bash
-git -C .. worktree add .worktree/main main
-PBS_EVAL_EXTENSION=../.worktree/main/extension \
-  node ablation/run.ts --tier full --models <a> --transcripts --results results/main/results.jsonl --yes
-node ablation/report.ts --results results/main/results.jsonl
+# <rev>: the version to compare against (a branch or SHA not checked out in another worktree)
+git -C .. worktree add --detach .worktree/base <rev>
+PBS_EVAL_EXTENSION=../.worktree/base/extension \
+  node ablation/run.ts --tier full --models <a> --transcripts --results results/base/results.jsonl --yes
+node ablation/report.ts --results results/base/results.jsonl
 ```
 
 ### Cost and early stopping
