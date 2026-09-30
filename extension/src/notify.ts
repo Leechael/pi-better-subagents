@@ -49,7 +49,7 @@ export class NotifyCenter {
   private pendingExits: TaskExitInfo[] = [];
   private readonly pendingMonitors = new Map<
     string,
-    { description: string; eventCount: number; lastEvent: string; droppedLines: number }
+    { description: string; eventCount: number; lastEvent: string; droppedLines: number; quiet: boolean }
   >();
   private readonly seen = new Set<string>();
   private timer: ClockTimer | null = null;
@@ -112,11 +112,16 @@ export class NotifyCenter {
     for (const message of this.held.splice(0)) this.deliver(message, true);
   }
 
-  /** Deliver monitor output immediately when idle, otherwise coalesce per monitor. */
-  notifyMonitorEvent(description: string, taskId: string, event: string, droppedLines = 0): void {
+  /**
+   * Deliver monitor output immediately when idle, otherwise coalesce per
+   * monitor. `quiet`: output of a monitor the model stopped; it is only
+   * coalesced, and its summary is delivered without a turn (with the exit
+   * notice, or at settle), pending events of that monitor included.
+   */
+  notifyMonitorEvent(description: string, taskId: string, event: string, droppedLines = 0, opts: { quiet?: boolean } = {}): void {
     if (this.disposed) return;
     const pending = this.pendingMonitors.get(taskId);
-    if (this.deps.isIdle() && !pending) {
+    if (this.deps.isIdle() && !pending && !opts.quiet) {
       const wake = formatMonitorEvent(description, taskId, event, undefined, { droppedLines });
       this.deliver({ customType: wake.customType, content: wake.content, details: wake.details });
       return;
@@ -126,8 +131,9 @@ export class NotifyCenter {
       eventCount: (pending?.eventCount ?? 0) + 1,
       lastEvent: event,
       droppedLines: (pending?.droppedLines ?? 0) + droppedLines,
+      quiet: (pending?.quiet ?? false) || opts.quiet === true,
     });
-    if (this.deps.isIdle()) this.flushMonitorEvents();
+    if (this.deps.isIdle() && !opts.quiet) this.flushMonitorEvents();
   }
 
   /** Flush coalesced monitor output when the parent agent settles. */
@@ -149,7 +155,7 @@ export class NotifyCenter {
       droppedLines: item.droppedLines,
     });
     const message = { customType: wake.customType, content: wake.content, details: wake.details };
-    if (quiet) this.notify(message, { passive: true });
+    if (quiet || item.quiet) this.notify(message, { passive: true });
     else this.deliver(message);
   }
 

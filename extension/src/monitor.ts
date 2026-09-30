@@ -213,10 +213,18 @@ export class MonitorRegistry {
     if (deliver.byteLength > 0) entry.batcher.push(deliver.toString("utf8"));
   }
 
-  /** task_stop is about to stop this monitor at the model's request. */
-  noteStopRequested(taskId: string): void {
+  /**
+   * task_stop is about to stop this monitor at the model's request. Returns
+   * an undo for a stop that fails: the monitor keeps running and must keep
+   * waking the model.
+   */
+  noteStopRequested(taskId: string): (() => void) | undefined {
     const entry = this.entries.get(taskId);
-    if (entry) entry.stopRequested = true;
+    if (!entry) return undefined;
+    entry.stopRequested = true;
+    return () => {
+      entry.stopRequested = false;
+    };
   }
 
   /**
@@ -237,9 +245,12 @@ export class MonitorRegistry {
     this.deps.onExited?.(taskId, event);
     if (alreadyStopped) return true; // timeout/saturation notice already sent
     const exitCode = event.exit_code ?? null;
+    // A clean exit soon after an event is the command finishing on it
+    // (grep -m1), unless someone stopped it (TUI stop: end_reason "tui").
     const causedByEvent =
       exitCode === 0 &&
       !event.signal &&
+      (event.end_reason ?? "exited") === "exited" &&
       entry.lastEventAt !== undefined &&
       this.clock.now() - entry.lastEventAt <= EXIT_AFTER_EVENT_MS;
     const duration =
@@ -319,21 +330,18 @@ export class MonitorRegistry {
       const droppedLines = text.split("\n").length;
       this.deps.logEvent?.("monitor.drop", { id: entry.taskId, lines: droppedLines });
       entry.droppedLinesPending += droppedLines;
-      if (entry.saturation.isSaturated(now)) void this.autoStop(entry);
+      // Already stopping at the model's request: no rate-limit stop or wake.
+      if (entry.saturation.isSaturated(now) && !entry.stopRequested) void this.autoStop(entry);
       return;
     }
     const droppedLines = entry.droppedLinesPending;
     entry.droppedLinesPending = 0;
     entry.lastEventAt = now;
-    if (entry.stopRequested) {
-      // Lines still buffered when the model stopped it: record, do not wake.
-      this.deps.getNotifyCenter()?.notify(
-        formatMonitorEvent(entry.description, entry.taskId, text, undefined, { droppedLines }),
-        { passive: true },
-      );
-      return;
-    }
-    this.deps.getNotifyCenter()?.notifyMonitorEvent(entry.description, entry.taskId, text, droppedLines);
+    // Lines still buffered when the model stopped it: recorded, coalesced
+    // with that monitor's other pending output, and never a wake.
+    this.deps.getNotifyCenter()?.notifyMonitorEvent(entry.description, entry.taskId, text, droppedLines, {
+      quiet: entry.stopRequested === true,
+    });
   }
 
   /** Timeout reached: stop the process and notify (§4.4). */

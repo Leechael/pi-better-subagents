@@ -329,8 +329,103 @@ describe("MonitorRegistry monitor stopped by the model", () => {
       isAvailable: () => true,
       stop: async (id: string) => { order.push(`stop ${id}`); },
     } as unknown as ManagerClient;
-    const tool = createTaskStopTool({ getClient: () => client, noteStopRequested: (id) => order.push(`note ${id}`) });
+    const tool = createTaskStopTool({ getClient: () => client, noteStopRequested: (id) => { order.push(`note ${id}`); } });
     await tool.execute("t", { task_id: "mon_1" }, undefined as never, undefined as never, {} as never);
     expect(order).toEqual(["note mon_1", "stop mon_1"]);
+  });
+});
+
+// cubic review on #19 (2026-09-29/30).
+describe("MonitorRegistry stop handling, from review", () => {
+  async function setup(opts: { idle?: () => boolean; stop?: () => Promise<void> } = {}) {
+    const clock = new ManualClock();
+    const sent: { details?: unknown; opts: { triggerTurn?: boolean; deliverAs?: string } }[] = [];
+    const stops: string[] = [];
+    const manager = {
+      ensureAvailable: async () => true,
+      isAvailable: () => true,
+      start: async () => ({ task_id: "mon_1", pid: 1 }),
+      watch: async () => {},
+      stop: opts.stop ?? (async (_id: string, reason: string) => { stops.push(reason); }),
+    } as unknown as ManagerClient;
+    const center = new NotifyCenter({ sendMessage: (m, o) => sent.push({ ...m, opts: o }), isIdle: opts.idle ?? (() => true), clock });
+    const registry = new MonitorRegistry({
+      getClient: () => manager,
+      sessionEnv: () => ({}),
+      getNotifyCenter: () => center,
+      trackTask: () => {},
+      clock,
+    });
+    await registry.start({ command: "tail -F out | grep --line-buffered .", description: "watch", persistent: true }, { cwd: "/tmp" } as ExtensionContext);
+    const turns = () => sent.filter((m) => m.opts.triggerTurn !== false);
+    const statuses = () => sent.map((m) => (m.details as { status?: string }).status ?? "event");
+    return { clock, center, registry, sent, stops, turns, statuses };
+  }
+
+  // The earlier test ran with an idle agent and nothing pending, so nothing
+  // was ever held. Here the model is mid-run: an event is coalesced, the
+  // model stops the monitor, more lines are still buffered, then it exits.
+  it("a busy agent that stops its monitor gets no turn, one coalesced event, then the exit", async () => {
+    let idle = false;
+    const { clock, center, registry, turns, statuses, sent } = await setup({ idle: () => idle });
+    registry.handleOutput("mon_1", "line a\n");
+    clock.advanceBy(300);
+    registry.noteStopRequested("mon_1");
+    registry.handleOutput("mon_1", "line b\n");
+    clock.advanceBy(300);
+    registry.handleOutput("mon_1", "line c\n");
+    clock.advanceBy(300);
+    registry.handleExit("mon_1", { event: "task_exited", task_id: "mon_1", exit_code: null, signal: "SIGTERM", duration_ms: 10 });
+    idle = true;
+    center.settled();
+    expect(turns()).toHaveLength(0);
+    expect(statuses()).toEqual(["event", "exited"]);
+    expect(JSON.stringify(sent[0].details)).toContain("line c");
+  });
+
+  it("a stop that fails leaves the monitor waking the model", async () => {
+    const { clock, registry, turns } = await setup();
+    const undo = registry.noteStopRequested("mon_1");
+    undo?.();
+    registry.handleOutput("mon_1", "line a\n");
+    clock.advanceBy(300);
+    expect(turns()).toHaveLength(1);
+  });
+
+  it("task_stop rolls the note back when the stop fails", async () => {
+    const order: string[] = [];
+    const client = {
+      ensureAvailable: async () => true,
+      isAvailable: () => true,
+      stop: async () => { throw new Error("manager gone"); },
+    } as unknown as ManagerClient;
+    const tool = createTaskStopTool({
+      getClient: () => client,
+      noteStopRequested: (id) => { order.push(`note ${id}`); return () => order.push(`undo ${id}`); },
+    });
+    await expect(tool.execute("t", { task_id: "mon_1" }, undefined as never, undefined as never, {} as never)).rejects.toThrow();
+    expect(order).toEqual(["note mon_1", "undo mon_1"]);
+  });
+
+  it("output dropped after the model stopped the monitor does not trigger the rate-limit stop", async () => {
+    const { clock, registry, stops, turns } = await setup();
+    registry.noteStopRequested("mon_1");
+    for (let i = 0; i < 151; i++) {
+      registry.handleOutput("mon_1", `line ${i}\n`);
+      clock.advanceBy(200);
+      await Promise.resolve();
+    }
+    expect(stops).not.toContain("rate-limit");
+    expect(turns()).toHaveLength(0);
+  });
+
+  it("a clean exit right after an event, but stopped from the TUI, still wakes", async () => {
+    const { center, clock, registry, turns, statuses } = await setup();
+    registry.handleOutput("mon_1", "line a\n");
+    clock.advanceBy(300);
+    center.settled();
+    registry.handleExit("mon_1", { event: "task_exited", task_id: "mon_1", exit_code: 0, end_reason: "tui", duration_ms: 10 });
+    expect(statuses()).toEqual(["event", "exited"]);
+    expect(turns()).toHaveLength(2);
   });
 });
