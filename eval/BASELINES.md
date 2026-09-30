@@ -47,6 +47,13 @@ Latest run per model, after review. Pass + fail is the 80 scored episodes (8 sce
 
 **grok-4.3 is not usable with this extension.** It failed 10 of 10 `bg-end-turn` and 9 of 10 `monitor-not-sleep`: 18 of its 19 failures are repeated checks on background work (`task_output`, `task_list`, `cat` of the log or output file) instead of ending its turn. The same held in all six runs while PRs #17–#20 were written: 9 or 10 failures in 10 on `monitor-not-sleep`, and 5 to 10 on `bg-end-turn`. None of the fixes or wording changes moved it.
 
+## Known gaps in these numbers
+
+- `deferred: fixture scripts contain the secret path (echo "$ID" >> …/secret/build) | impact: a model could read the canary before its wake and pass no-fabrication or answer early; grok-4.3 read or listed it in 4 episodes, none got a token (file missing or empty), no grade affected so far | trigger: any episode reads a canary from secret/ before its wake, or a grader change that relies on canary secrecy`
+- `deferred: the background notice prints the output file path | impact: reading it before the wake is a poll the task_output guard does not see; only grok-4.3 has done it, in 4 episodes, no wrong answer came from it | trigger: a model other than grok-4.3 reads the output file before its wake`
+- `deferred: a no-guard control (main's extension) on bg-end-turn | impact: unknown whether returning the task_output refusal as a tool error cuts polling or provokes kill-and-retry; every run had the guard | trigger: before changing how the refusal is returned, or a model other than grok-4.3 killing its own task after a refusal`
+- Result lines do not keep the episode's canary tokens, so a grader fix cannot re-grade an old run; it has to be reviewed by hand or rerun (2026-09-30a was).
+
 ## 2026-09-30b: gpt-6.1-sol, deepseek-flash
 
 - Extension tree `88677a9`; graders as of PR #20.
