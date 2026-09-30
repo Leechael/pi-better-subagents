@@ -55,15 +55,15 @@ describe("task_output poll guard", () => {
     await expect(read()).rejects.toThrow(/no new output/i);
   });
 
-  // cubic review on #17: once caught up, re-reading an earlier window
-  // (cursor 0 after a tail read) is not waiting and must not be refused;
-  // reading from the end again is.
-  it("allows re-reading earlier output, refuses a caught-up cursor read", async () => {
+  // Batch 5/6 transcripts: models poll a running task with `cursor: 0` (53
+  // such reads, 29 refused by this guard, mostly grok-4.3). Exempting reads
+  // of an earlier window, as a review suggested, let every one of them
+  // through once the task had printed a line.
+  it("refuses a repeat cursor-0 read of a running task with no new output", async () => {
     const { read, write } = setup();
-    write("line 1\nline 2\n");
-    await read();
-    expect(await read("sh_1", 0)).toContain("line 1");
-    await expect(read("sh_1", 14)).rejects.toThrow(/no new output/i);
+    write("compiling...\n");
+    await read("sh_1", 0);
+    await expect(read("sh_1", 0)).rejects.toThrow(/no new output/i);
   });
 
   it("tracks tasks separately", async () => {
