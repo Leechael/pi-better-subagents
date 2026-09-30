@@ -101,7 +101,7 @@ describe("task_output poll guard", () => {
 // Eval batch 1: gpt-6-luna's checks before the wake all went through
 // task_list, which answered "running (4s)" and nothing else.
 describe("task_list while work runs", () => {
-  async function list(status: "running" | "completed") {
+  async function list(status: "running" | "pending" | "completed") {
     const index = new WorkIndex({ clock: new ManualClock(5_000) });
     index.upsert({ id: "sh_1", kind: "shell", status, title: "./build.sh", startedAt: 0, countsAsWorker: true });
     const client = { ensureAvailable: async () => true, isAvailable: () => true, list: async () => [] } as unknown as ManagerClient;
@@ -112,6 +112,10 @@ describe("task_list while work runs", () => {
 
   it("tells the model to end its turn when something is still running", async () => {
     expect(await list("running")).toMatch(/end your turn/i);
+  });
+
+  it("tells the model to end its turn when something is queued", async () => {
+    expect(await list("pending")).toMatch(/end your turn/i);
   });
 
   it("says nothing extra when everything has finished", async () => {

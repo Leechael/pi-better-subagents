@@ -292,6 +292,13 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.equal(ws.filter((w) => w.wake.status === "timeout").length, 0, `stuck until timeout\n${explain(ep)}`);
     const exitedWakes = ws.filter((w) => w.wake.status === "exited");
     assert.equal(exitedWakes.length, 1, explain(ep));
+    // The exit started no turn: the model's next response answers the user's
+    // message, not the wake (cubic review: without this, the old
+    // triggerTurn delivery passed too).
+    const exitSeq = exitedWakes[0].seq;
+    const nextUser = ep.items.find((i) => i.kind === "user" && i.seq > exitSeq);
+    const nextAssistant = ep.items.find((i) => i.kind === "assistant" && i.seq > exitSeq);
+    assert.ok(nextUser && nextAssistant && nextUser.seq < nextAssistant.seq, `exit started a turn\n${explain(ep)}`);
     // The exit notice never precedes the monitor's own lines (batches 2–4 of the
     // real-model eval had it first in 25 of 125 monitors).
     const firstEvent = ws.findIndex((w) => w.wake.status === "event");
