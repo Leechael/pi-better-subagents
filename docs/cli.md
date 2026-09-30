@@ -1,6 +1,6 @@
-# pbs-manager CLI
+# pi-famulus CLI
 
-Standalone operations manual for the `pbs-manager` binary.
+Standalone operations manual for the `pi-famulus` binary.
 
 The pi extension talks to the daemon over a socket. These subcommands are the human and scripting surface for inspection, debugging, and smoke tests. Human-readable tables are **not** a wire contract; use `--json` (on `status`, `sessions`, `ls`, `show`, `events`) for scripts.
 
@@ -10,33 +10,35 @@ From the CLI alone you can answer: what is each session doing and where (cwd), w
 
 ```bash
 cd manager && cargo build --release
-mkdir -p ~/.pi/agent/pbs/bin
+mkdir -p ~/.pi/agent/pi-famulus/bin
 # Use `install` (or cp→mv) so the path gets a new inode. Overwriting the
 # existing file in place invalidates macOS's code-signing cache and the next
 # exec is SIGKILL'd (`killed`, exit 137) even when `codesign -vv` still says valid.
-install -m 755 target/release/pbs-manager ~/.pi/agent/pbs/bin/pbs-manager
-export PATH="$HOME/.pi/agent/pbs/bin:$PATH"
+install -m 755 target/release/pi-famulus ~/.pi/agent/pi-famulus/bin/pi-famulus
+export PATH="$HOME/.pi/agent/pi-famulus/bin:$PATH"
 ```
 
-If you already hit `killed` after a reinstall, fix with another atomic replace (same `install` line above), or `cp …/pbs-manager …/pbs-manager.new && mv …/pbs-manager.new …/pbs-manager`.
+If you already hit `killed` after a reinstall, fix with another atomic replace (same `install` line above), or `cp …/pi-famulus …/pi-famulus.new && mv …/pi-famulus.new …/pi-famulus`.
 
-**Upgrading while pi sessions run work:** just `install` the new binary. A running daemon notices within a few seconds and upgrades itself in place (see [`upgrade`](#upgrade)); `pbs-manager upgrade` does it now and reports the result. Nothing running is interrupted and no pi session needs a restart; reload or reopen pi sessions only when you also want the new extension code.
+**One-time name transition:** switching installation names is a breaking change, not an in-place upgrade. Wait for work to finish or stop it, close the sessions using the previous installation, and wait for its daemon to exit. Reinstall at the paths above and migrate **configuration only** to `~/.pi/agent/pi-famulus/config.json`, updating explicit paths and environment overrides, then reopen sessions. Do not move the runtime state/history tree: records contain absolute output/transcript paths, and moving a directory does not rewrite them. Keep previous history separately if needed.
 
-The extension discovers the same path, or an override via `PBS_MANAGER_PATH` / `managerPath` in config.
+**Subsequent same-name upgrades while pi sessions run work:** just `install` the new binary. A running daemon notices within a few seconds and upgrades itself in place (see [`upgrade`](#upgrade)); `pi-famulus upgrade` does it now and reports the result. Nothing running is interrupted and no pi session needs a restart; reload or reopen pi sessions only when you also want the new extension code. This applies to compatible builds under the same name and home, not the one-time transition above.
+
+The extension discovers the same path, or an override via `PI_FAMULUS_MANAGER_PATH` / `managerPath` in config.
 
 ## Global options
 
 | Flag / env | Meaning |
 |---|---|
 | `--home <dir>` | State directory for this invocation |
-| `PBS_HOME` | Same, if `--home` is omitted |
-| (default) | `~/.pi/agent/pbs` |
+| `PI_FAMULUS_HOME` | Same, if `--home` is omitted |
+| (default) | `~/.pi/agent/pi-famulus` |
 | `--no-pager` | Never page output (see below) |
-| `PBS_PAGER`, then `PAGER` | Pager for listings on a terminal; `cat` = none, empty = falls through |
+| `PI_FAMULUS_PAGER`, then `PAGER` | Pager for listings on a terminal; `cat` = none, empty = falls through |
 
-Priority: `--home` > `PBS_HOME` > default.
+Priority: `--home` > `PI_FAMULUS_HOME` > default.
 
-**Pager.** When stdout is a terminal, `sessions`, `ls`, `show`, and `agent` / `events` / `log` without `-f` go through a pager, like git: `PBS_PAGER`, else `PAGER`, else `less`. An empty value is treated as unset and falls through to the next choice, so `PBS_PAGER=` lets `PAGER` take over. A bare `less` runs as `less -FRX`, on top of any `LESS` you set, so output that fits one screen prints and returns at once; a pager given with its own arguments runs as given. `cat` (from either variable) disables paging outright. Piped or redirected output is never paged, so scripts see plain text.
+**Pager.** When stdout is a terminal, `sessions`, `ls`, `show`, and `agent` / `events` / `log` without `-f` go through a pager, like git: `PI_FAMULUS_PAGER`, else `PAGER`, else `less`. An empty value is treated as unset and falls through to the next choice, so `PI_FAMULUS_PAGER=` lets `PAGER` take over. A bare `less` runs as `less -FRX`, on top of any `LESS` you set, so output that fits one screen prints and returns at once; a pager given with its own arguments runs as given. `cat` (from either variable) disables paging outright. Piped or redirected output is never paged, so scripts see plain text.
 
 Layout under home:
 
@@ -56,23 +58,23 @@ sessions/<session_id>/agents/<child_id>.{json,jsonl}   # written by the extensio
 ## Quick reference
 
 ```bash
-pbs-manager status [--json]
-pbs-manager sessions [--json]
-pbs-manager ls [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # alias of list
-pbs-manager show <id> [--json]
-pbs-manager agent <ch_id> [--full] [-f]
-pbs-manager events [-f] [--session PREFIX] [--id ID] [--since DUR] [--json]
-pbs-manager log [-f] [-n 100] [ID] [--stderr]
-pbs-manager tail <ID> [-n 100] [--stderr]
-pbs-manager output <id> [-f] [--max-bytes N]
-pbs-manager wait <id> [--budget-ms 20000]
-pbs-manager completion --shell <bash|zsh|fish>
-pbs-manager stop <id>
-pbs-manager kill-session <session_id>
-pbs-manager start [--session cli] [--kind shell|monitor] [--cwd DIR] [--timeout-ms N] [--background] '<cmd>'
-pbs-manager doctor
-pbs-manager shutdown
-pbs-manager daemon [--foreground]
+pi-famulus status [--json]
+pi-famulus sessions [--json]
+pi-famulus ls [--session PREFIX] [--cwd DIR] [--since DUR] [--json]   # alias of list
+pi-famulus show <id> [--json]
+pi-famulus agent <ch_id> [--full] [-f]
+pi-famulus events [-f] [--session PREFIX] [--id ID] [--since DUR] [--json]
+pi-famulus log [-f] [-n 100] [ID] [--stderr]
+pi-famulus tail <ID> [-n 100] [--stderr]
+pi-famulus output <id> [-f] [--max-bytes N]
+pi-famulus wait <id> [--budget-ms 20000]
+pi-famulus completion --shell <bash|zsh|fish>
+pi-famulus stop <id>
+pi-famulus kill-session <session_id>
+pi-famulus start [--session cli] [--kind shell|monitor] [--cwd DIR] [--timeout-ms N] [--background] '<cmd>'
+pi-famulus doctor
+pi-famulus shutdown
+pi-famulus daemon [--foreground]
 ```
 
 Ids: `sh_…` shell, `mon_…` monitor, `ch_…` agent (subagent child), `run_…` subagent run. Every command that takes an id accepts it **fuzzily**: exact, a unique prefix/suffix/substring (`e1351cb1`, `mon_e135`), or a unique near-miss within edit distance 2 (`cmon_…` → `mon_…`); a fuzzy match prints `note: resolved '…' → '…'` on stderr. Ambiguous input lists up to five candidates. An unknown id prints one line with the closest known id: `unknown id 'x' (did you mean 'y'?)`.
@@ -83,7 +85,7 @@ Durations (`--since`): `500ms`, `30s`, `10m`, `2h`, `1d` (a bare number is secon
 
 | Starts the daemon when none runs | Never starts it |
 |---|---|
-| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (prints "pbs-manager is not running", exit 1), `sessions` and `show` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `doctor`, `shutdown` (prints "pbs-manager is not running", exit 0) |
+| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (prints "pi-famulus is not running", exit 1), `sessions` and `show` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `doctor`, `shutdown` (prints "pi-famulus is not running", exit 0) |
 
 A daemon started this way exits again ~5s after its last client leaves (§3.2).
 
@@ -91,7 +93,7 @@ Output is pipe-friendly: when the reader goes away (`… | head`), the CLI exits
 
 ### Shell completions
 
-Generate a dynamic completion script for bash, zsh, or fish with `pbs-manager completion --shell <shell>`. Install the returned script using the convention for your shell; keep `pbs-manager` on `PATH` because the script asks it for candidates as you type.
+Generate a dynamic completion script for bash, zsh, or fish with `pi-famulus completion --shell <shell>`. Install the returned script using the convention for your shell; keep `pi-famulus` on `PATH` because the script asks it for candidates as you type.
 
 ---
 
@@ -102,13 +104,13 @@ Generate a dynamic completion script for bash, zsh, or fish with `pbs-manager co
 ```text
 version:  0.1.0+066598ae00 (protocol 3)
 pid:      4321
-binary:   /Users/me/.pi/agent/pbs/bin/pbs-manager
+binary:   /Users/me/.pi/agent/pi-famulus/bin/pi-famulus
 uptime:   13m23s
 sessions: 2 (1 connected)
 tasks:    3 running, 8 finished (shells 2/5, agents 1/3)
 ```
 
-The version carries the commit the binary was built from, so two builds of 0.1.0 differ; `unknown` for a build outside a git checkout. `binary` is the daemon's file, the one an [`upgrade`](#upgrade) execs, which is not necessarily the CLI you ran. Counts include agents (running/finished shells and agents are also shown separately). `--json` prints the protocol `status` response plus `agent_counts`. With no daemon: `pbs-manager is not running` on stderr, exit 1.
+The version carries the commit the binary was built from, so two builds of 0.1.0 differ; `unknown` for a build outside a git checkout. `binary` is the daemon's file, the one an [`upgrade`](#upgrade) execs, which is not necessarily the CLI you ran. Counts include agents (running/finished shells and agents are also shown separately). `--json` prints the protocol `status` response plus `agent_counts`. With no daemon: `pi-famulus is not running` on stderr, exit 1.
 
 ### `sessions`
 
@@ -122,12 +124,12 @@ Connected sessions only (a gone session is listed while it still runs something)
 ### `ls` / `list`
 
 ```text
-$ pbs-manager ls
+$ pi-famulus ls
 ID           KIND    SESSION   CWD        STATUS    TIME     DUR    EXIT    REASON       TITLE
 sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  -       -            npm test
 ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -       -            review (worker) m1
 
-$ pbs-manager ls --all
+$ pi-famulus ls --all
 ID           KIND    SESSION   CWD        STATUS    TIME     DUR    EXIT    REASON       TITLE
 sh_3f2a91c0  shell   0199aaaa  ~/src/app  running   14:03:22 1m04s  -       -            npm test
 ch_9a41c7e2  agent   0199aaaa  ~/src/app  running   14:02:50 3m10s  -       -            review (worker) m1
@@ -156,9 +158,9 @@ Everything about one id, any kind:
 ### `agent`
 
 ```bash
-pbs-manager agent ch_7d0e22a1          # conversation, preamble hidden
-pbs-manager agent ch_7d0e22a1 --full   # include system prompt / agent preamble
-pbs-manager agent ch_7d0e22a1 -f       # keep following
+pi-famulus agent ch_7d0e22a1          # conversation, preamble hidden
+pi-famulus agent ch_7d0e22a1 --full   # include system prompt / agent preamble
+pi-famulus agent ch_7d0e22a1 -f       # keep following
 ```
 
 Renders the transcript `sessions/<sid>/agents/<ch>.jsonl` (one JSON object per message: `role`, `text`, `tool`, `args`, `isError`, `ts`). Without `--full`, `system` messages and lines marked `"preamble":true` are hidden, and the first user message is shown as the task prompt (`prompt_head` from the agent record).
@@ -177,12 +179,12 @@ What is logged: see design §3.3 "Event log". The manager writes `session.connec
 ### `log` / `tail`
 
 ```bash
-pbs-manager log                    # last 100 lines of manager.log, local timestamps
-pbs-manager log -f
-pbs-manager log sh_a1b2c3d4        # task's merged stdout+stderr
-pbs-manager log -f sh_a1b2c3d4 --stderr
-pbs-manager log ch_7d0e22a1        # agent: rendered transcript
-pbs-manager tail sh_a1b2c3d4       # = log -f; -f is accepted and ignored
+pi-famulus log                    # last 100 lines of manager.log, local timestamps
+pi-famulus log -f
+pi-famulus log sh_a1b2c3d4        # task's merged stdout+stderr
+pi-famulus log -f sh_a1b2c3d4 --stderr
+pi-famulus log ch_7d0e22a1        # agent: rendered transcript
+pi-famulus tail sh_a1b2c3d4       # = log -f; -f is accepted and ignored
 ```
 
 | Flag | Meaning |
@@ -205,7 +207,7 @@ Health checks, one line each (`ok`, `fixed`, `warn`, `FAIL`), then `ok` or `N pr
 
 - home exists (doctor never creates it)
 - socket path length fits a unix socket (103 bytes on macOS, 107 on Linux)
-- `config.json` parses; the manager path from `PBS_MANAGER_PATH` or `managerPath` exists
+- `config.json` parses; the manager path from `PI_FAMULUS_MANAGER_PATH` or `managerPath` exists
 - daemon: running exactly when it holds `manager.lock` (the recorded pid is not trusted; it may belong to another process after a crash). Running → probe the socket. Not running → take the lock and remove stale socket/pid files (`fixed`, not a failure)
 - protocol: every connected session announced the manager's protocol
 - stale agent records: an agent says running but its session is gone
@@ -221,9 +223,9 @@ Health checks, one line each (`ok`, `fixed`, `warn`, `FAIL`), then `ok` or `N pr
 ### `output`
 
 ```bash
-pbs-manager output sh_a1b2c3d4
-pbs-manager output sh_a1b2c3d4 -f              # follow until finished and caught up
-pbs-manager output sh_a1b2c3d4 --max-bytes 4096
+pi-famulus output sh_a1b2c3d4
+pi-famulus output sh_a1b2c3d4 -f              # follow until finished and caught up
+pi-famulus output sh_a1b2c3d4 --max-bytes 4096
 ```
 
 The same byte stream the extension sees (§3.3 cursor reads; chunks never split a UTF-8 character). `--max-bytes N` prints **at most N bytes in total**; a character that would cross the limit is left out. For an agent id, prints the agent's result.
@@ -231,7 +233,7 @@ The same byte stream the extension sees (§3.3 cursor reads; chunks never split 
 ### `wait`
 
 ```bash
-pbs-manager wait sh_a1b2c3d4 --budget-ms 5000
+pi-famulus wait sh_a1b2c3d4 --budget-ms 5000
 ```
 
 | Outcome | Printed line |
@@ -255,9 +257,9 @@ Stops every running task of a session (list + stop, reason `cli`).
 Convenience spawn for scripting and smoke tests. Binds the task to an extension-style session (default `cli`).
 
 ```bash
-pbs-manager start 'echo hello'
-pbs-manager start --session my-sess --cwd /tmp --timeout-ms 60000 'sleep 5 && echo done'
-pbs-manager start --kind monitor --background 'while true; do date; sleep 1; done'
+pi-famulus start 'echo hello'
+pi-famulus start --session my-sess --cwd /tmp --timeout-ms 60000 'sleep 5 && echo done'
+pi-famulus start --kind monitor --background 'while true; do date; sleep 1; done'
 ```
 
 | Flag | Default | Notes |
@@ -291,21 +293,21 @@ upgraded in place: 0.1.0 -> 0.1.1 (pid 4321, generation 1, 3 running task(s) kep
 - The new binary is checked first (`__handover-check`). A missing, broken or incompatible binary stops the upgrade before anything is touched: `upgrade not done, still running 0.1.0: …` (exit 1).
 - If the switch itself cannot finish (quiesce over 5s, exec failure), the daemon keeps running the old binary and says why.
 - If the new binary cannot restore, it exits and every task is cleaned up, as in a crash (no crash recovery); `upgrade` reports `the manager (pid N) exited during the upgrade`.
-- With no daemon running: `pbs-manager is not running; the next client starts the installed binary` (exit 0).
+- With no daemon running: `pi-famulus is not running; the next client starts the installed binary` (exit 0).
 - The daemon does the same by itself when the file at its path changes and settles (checked every 2s). `status` then shows `upgrades: 2 (last: 0.1.0 -> 0.1.1, binary-changed, 3m ago)`, or `upgrades: 1 (last attempt failed 2m ago, cli: …)`; nothing while there has been no upgrade. `status --json` has `generation` and `last_upgrade` (`trigger: "cli"` or `"binary-changed"`).
 
 ### `shutdown`
 
 Asks the daemon to shut down gracefully: every running task and every leftover process group of a finished task gets SIGTERM, then SIGKILL after 2s; records end as `manager-shutdown`. Prints `manager shutting down`. The daemon also shuts itself down ~5s after its last client disconnects.
 
-The manager is the parent of every task and there is no crash recovery. Each task runs under a small runner (`pbs-manager __run`) that holds a lifeline to the daemon. If the daemon dies without shutting down (`kill -9`, a panic), every runner sees the lifeline break and takes its process group down: SIGTERM, then SIGKILL after 2s, background children included. The next daemon re-adopts nothing and signals nothing: only records still persisted as `running` are marked `orphaned` with `end_reason: manager-crash`; a command that already exited (even if its guardian runner is still cleaning up leftover children) has a terminal record that stays unchanged.
+The manager is the parent of every task and there is no crash recovery. Each task runs under a small runner (`pi-famulus __run`) that holds a lifeline to the daemon. If the daemon dies without shutting down (`kill -9`, a panic), every runner sees the lifeline break and takes its process group down: SIGTERM, then SIGKILL after 2s, background children included. The next daemon re-adopts nothing and signals nothing: only records still persisted as `running` are marked `orphaned` with `end_reason: manager-crash`; a command that already exited (even if its guardian runner is still cleaning up leftover children) has a terminal record that stays unchanged.
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Success, including `wait` budget expiry, `stop` on a finished task, `shutdown` with no daemon, and a reader closing the pipe |
-| `1` | Error (`pbs-manager: …` on stderr), `status` with no daemon, a `doctor` check failed |
+| `1` | Error (`pi-famulus: …` on stderr), `status` with no daemon, a `doctor` check failed |
 
 ## Retention of gone sessions
 
@@ -331,23 +333,23 @@ Same duration format, default and `doctor` check as `goneSessionRetention`. The 
 
 ```bash
 # What is running, where, and why did the last thing stop?
-pbs-manager ls
-pbs-manager ls --since 10m
-pbs-manager show e1351cb1
+pi-famulus ls
+pi-famulus ls --since 10m
+pi-famulus show e1351cb1
 
 # What did a subagent do?
-pbs-manager ls | grep agent
-pbs-manager show ch_7d0e22a1
-pbs-manager agent ch_7d0e22a1
+pi-famulus ls | grep agent
+pi-famulus show ch_7d0e22a1
+pi-famulus agent ch_7d0e22a1
 
 # Why didn't a notification arrive?
-pbs-manager events --id sh_3f2a91c0
+pi-famulus events --id sh_3f2a91c0
 
 # Smoke-start and watch
-line=$(pbs-manager start 'for i in 1 2 3; do echo $i; sleep 1; done')
+line=$(pi-famulus start 'for i in 1 2 3; do echo $i; sleep 1; done')
 id=${line#task_id=}; id=${id%% *}
-pbs-manager tail "$id"
+pi-famulus tail "$id"
 
 # Health
-pbs-manager doctor
+pi-famulus doctor
 ```

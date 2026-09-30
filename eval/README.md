@@ -4,26 +4,26 @@ Two layers, one harness:
 
 | Layer | What it tests | Model | Cost |
 |---|---|---|---|
-| **E2E** (`e2e/`) | The code: real `pi` + real `pbs-manager` + this extension, driven by a scripted faux model | faux | free |
+| **E2E** (`e2e/`) | The code: real `pi` + real `pi-famulus` + this extension, driven by a scripted faux model | faux | free |
 | **Ablation** (`ablation/`) | The model: remove one prompt segment or mechanism at a time and measure the pass-rate drop on small behavioral probes | real models | see below |
 
-Every episode spawns the installed `pi` in RPC mode (`pi --mode rpc -ne -ns -np -nc --no-session --offline -e ../extension …`) in a temp cwd with its own `PBS_HOME` (own manager socket, `config.json`, task logs). RPC mode rather than `-p`: print mode exits as soon as the first run settles, so later wakes would never be seen.
+Every episode spawns the installed `pi` in RPC mode (`pi --mode rpc -ne -ns -np -nc --no-session --offline -e ../extension …`) in a temp cwd with its own `PI_FAMULUS_HOME` (own manager socket, `config.json`, task logs). RPC mode rather than `-p`: print mode exits as soon as the first run settles, so later wakes would never be seen.
 
 ## Prerequisites
 
 - Node ≥ 22.18 (runs `.ts` directly; no build step)
 - `pi` on `PATH` (tested with 0.87) — override with `PI_BIN`
-- `cargo`: `pbs-manager` is built from `../manager` into `eval/.cache/target` on first use (never inside `manager/`); override with `PBS_MANAGER_PATH`
+- `cargo`: `pi-famulus` is built from `../manager` into `eval/.cache/target` on first use (never inside `manager/`); override with `PI_FAMULUS_MANAGER_PATH`
 - `tmux` for the TUI test
 - `npm install` in `eval/` is only needed for `npm run typecheck`
 
-Extension under test: `../extension` (override with `PBS_EVAL_EXTENSION`).
+Extension under test: `../extension` (override with `PI_FAMULUS_EVAL_EXTENSION`).
 
 ## E2E (free)
 
 ```bash
 npm run test:e2e      # faux scenarios + ablation-harness self-test   (~15s)
-npm run test:tui      # PBS_E2E_TUI=1: tmux-driven interactive pi, asserts no line wider than the pane
+npm run test:tui      # PI_FAMULUS_E2E_TUI=1: tmux-driven interactive pi, asserts no line wider than the pane
 npm run test:unit     # wake adapter, Wilson/early-stopping stats, report verdicts
 npm run test:graders  # real-model graders run on scripted good/bad behaviors (~2 min)
 npm run typecheck
@@ -31,7 +31,7 @@ npm run typecheck
 
 `test:graders` proves each grader can go both green and red (a grader that cannot fail is a placebo). The `supervisor-reply/send` case deliberately takes ~2 minutes: the child stays blocked until the episode cap.
 
-Faux scripts live in `e2e/scripts/`; the DSL is `e2e/faux-dsl.ts`. Scripts run inside the pi process, and every model call (with its full context) is traced, so tests can assert what the model actually saw. `PBS_EVAL_KEEP=1` keeps sandboxes.
+Faux scripts live in `e2e/scripts/`; the DSL is `e2e/faux-dsl.ts`. Scripts run inside the pi process, and every model call (with its full context) is traced, so tests can assert what the model actually saw. `PI_FAMULUS_EVAL_KEEP=1` keeps sandboxes.
 
 ## Ablation (real models)
 
@@ -41,7 +41,7 @@ Per-model results, and when they must be rerun: [BASELINES.md](BASELINES.md).
 
 `eval/models.json` lists model specs exactly as `pi --model` takes them (`provider/id[:thinking]`); the first entry is the smoke model. Override per run with `--models a,b`.
 
-Always spell out the thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Episodes isolate `PBS_HOME` but not pi's own config, so a spec without one runs at `defaultThinkingLevel` from `~/.pi/agent/settings.json`: results then depend on whose machine ran them. The spec, level included, is the model key in `results.jsonl`, so `x:low` and `x:high` are separate cells and can be compared in one report.
+Always spell out the thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Episodes isolate `PI_FAMULUS_HOME` but not pi's own config, so a spec without one runs at `defaultThinkingLevel` from `~/.pi/agent/settings.json`: results then depend on whose machine ran them. The spec, level included, is the model key in `results.jsonl`, so `x:low` and `x:high` are separate cells and can be compared in one report.
 
 The eval never reads keys or `auth.json`. Each episode is the user's own `pi --model <spec>`, which resolves credentials (including OAuth refresh) the normal way. Models are validated against what pi can authenticate (RPC `get_available_models`) before anything runs. See what is available:
 
@@ -88,12 +88,12 @@ Everything lands under `eval/results/` (gitignored):
 - `results/results.jsonl`: one line per episode (model, variant, scenario, pass, reason, metrics, usage). `report.ts` reads this.
 - `results/transcripts/<label>.jsonl`: the event stream per episode, with `--transcripts`. Each result line's `transcriptPath` points at its file.
 
-The runner resumes from `results.jsonl`: a cell with k scored episodes is skipped. That is also why two versions of the extension need separate files, or the second run skips everything:
+The runner resumes from `results.jsonl`: a cell with k scored episodes is skipped. That is also why two versions of the extension need separate files, or the second run skips everything. The name transition changes model-visible prompt/wake text, so use an independent `--results` file when evaluating it; do not resume or mix episodes from a previous prompt version:
 
 ```bash
 # <rev>: the version to compare against (a branch or SHA not checked out in another worktree)
 git -C .. worktree add --detach .worktree/base <rev>
-PBS_EVAL_EXTENSION=../.worktree/base/extension \
+PI_FAMULUS_EVAL_EXTENSION=../.worktree/base/extension \
   node ablation/run.ts --tier full --models <a> --transcripts --results results/base/results.jsonl --yes
 node ablation/report.ts --results results/base/results.jsonl
 ```
@@ -136,18 +136,18 @@ Segment verdicts:
 
 The ablation harness is a separate pi extension loaded after ours; the extension itself is never edited.
 
-- `before_agent_start` edits `systemPromptOptions` in place (the `pi-better-subagents` section, `<rules>` guidelines). These persist, so wake-triggered turns are ablated too.
-- `context_with_system` strips segments from every request: tool declarations, tool results, and wakes (the shared `PBS_WAKE_LEAD_IN`, `<reply-with>`). Non-destructive: the session keeps the original text.
+- `before_agent_start` edits `systemPromptOptions` in place (the `pi-famulus` section, `<rules>` guidelines). These persist, so wake-triggered turns are ablated too.
+- `context_with_system` strips segments from every request: tool declarations, tool results, and wakes (the shared `FAMULUS_WAKE_LEAD_IN`, `<reply-with>`). Non-destructive: the session keeps the original text.
 - `tool_call` disables the bare-sleep guard (`mech.sleep-block`); `mech.autobg` is disabled via `config.json`.
 
-Segment texts must match the source exactly. Where possible they are read from the extension (`textFrom`, e.g. `wake.PBS_WAKE_LEAD_IN`) instead of copied. `npm run test:e2e` fails on any drift, and verifies every removal happened and that no removed text is still visible.
+Segment texts must match the source exactly. Where possible they are read from the extension (`textFrom`, e.g. `wake.FAMULUS_WAKE_LEAD_IN`) instead of copied. `npm run test:e2e` fails on any drift, and verifies every removal happened and that no removed text is still visible.
 
 **Not ablatable externally:** anything only child sessions see (`child.guidelines` = `CHILD_BEHAVIOR_GUIDELINES`, child tool descriptions). By design, children load no extensions, so no hook runs there. These segments are drift-guarded in child calls but never scheduled. Wake delivery itself (triggerTurn vs steer routing, coalescing) has no interception hook either.
 
 ## Layout
 
 ```
-lib/        rpc.ts (pi RPC driver) · sandbox.ts · transcript.ts · wake-adapter.ts (only module that parses <pbs-wake>) · models.ts · paths.ts
+lib/        rpc.ts (pi RPC driver) · sandbox.ts · transcript.ts · wake-adapter.ts (only module that parses <pi-famulus-wake>) · models.ts · paths.ts
 harness/    faux-ext.ts (scripted model) · ablation-ext.ts
 e2e/        faux.test.ts · ablation-harness.test.ts · tui.test.ts · faux-dsl.ts · scripts/
 ablation/   manifest.json · scenarios.ts · graders.ts · episode.ts · run.ts · report.ts · stats.ts · judge.ts · fixtures/
