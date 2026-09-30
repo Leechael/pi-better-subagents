@@ -251,7 +251,10 @@ export function createTaskOutputTool(
 
       const res = await client.output(params.task_id, cursor, maxBytes);
       const running = res.status === "running";
-      guardPoll(params.task_id, running, res.total_size);
+      // Re-reading an earlier window is not waiting; only a read that starts
+      // at the end (a tail read, or a cursor already caught up) is guarded.
+      const rereadsOlder = params.cursor !== undefined && params.cursor < res.total_size;
+      if (!rereadsOlder) guardPoll(params.task_id, running, res.total_size);
       const details: TaskOutputDetails = {
         task_id: params.task_id,
         status: res.status,

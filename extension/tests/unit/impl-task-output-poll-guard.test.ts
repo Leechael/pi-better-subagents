@@ -21,8 +21,9 @@ describe("task_output poll guard", () => {
       }),
     } as unknown as ManagerClient;
     const tool = createTaskOutputTool({ getClient: () => client });
-    const read = async (id = "sh_1") => {
-      const res = await tool.execute("t", { task_id: id }, undefined as never, undefined as never, {} as never);
+    const read = async (id = "sh_1", cursor?: number) => {
+      const params = cursor === undefined ? { task_id: id } : { task_id: id, cursor };
+      const res = await tool.execute("t", params, undefined as never, undefined as never, {} as never);
       return (res.content[0] as { text: string }).text;
     };
     const write = (text: string) => {
@@ -52,6 +53,17 @@ describe("task_output poll guard", () => {
     write("line 2\n");
     expect(await read()).toContain("line 2");
     await expect(read()).rejects.toThrow(/no new output/i);
+  });
+
+  // cubic review on #17: once caught up, re-reading an earlier window
+  // (cursor 0 after a tail read) is not waiting and must not be refused;
+  // reading from the end again is.
+  it("allows re-reading earlier output, refuses a caught-up cursor read", async () => {
+    const { read, write } = setup();
+    write("line 1\nline 2\n");
+    await read();
+    expect(await read("sh_1", 0)).toContain("line 1");
+    await expect(read("sh_1", 14)).rejects.toThrow(/no new output/i);
   });
 
   it("tracks tasks separately", async () => {
