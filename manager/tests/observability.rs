@@ -933,7 +933,9 @@ fn c6_status_counts_uptime_and_not_running() {
     let version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PBS_GIT_SHA"));
     assert!(s.contains(&format!("version:  {version} (protocol 3)")), "{s}");
     let bin = std::fs::canonicalize(BIN).unwrap();
-    assert!(s.contains(&format!("binary:   {}", bin.display())), "{s}");
+    // Fresh /tmp targets can be reported as /tmp or /private/tmp on macOS.
+    let reported_bin = s.lines().find_map(|line| line.strip_prefix("binary:   ")).expect("binary path");
+    assert_eq!(std::fs::canonicalize(reported_bin).unwrap(), bin, "{s}");
     let uptime = s.lines().find(|l| l.starts_with("uptime:")).unwrap();
     assert!(uptime.ends_with('s') && !uptime.contains('.'), "human uptime: {uptime}");
     assert!(s.contains("tasks:    1 running, 3 finished (shells 1/1, agents 0/2)"), "{s}");
