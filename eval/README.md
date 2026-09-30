@@ -37,6 +37,8 @@ Faux scripts live in `e2e/scripts/`; the DSL is `e2e/faux-dsl.ts`. Scripts run i
 
 ### Models and auth
 
+Per-model results, and when they must be rerun: [BASELINES.md](BASELINES.md).
+
 `eval/models.json` lists model specs exactly as `pi --model` takes them (`provider/id[:thinking]`); the first entry is the smoke model. Override per run with `--models a,b`.
 
 Always spell out the thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Episodes isolate `PBS_HOME` but not pi's own config, so a spec without one runs at `defaultThinkingLevel` from `~/.pi/agent/settings.json`: results then depend on whose machine ran them. The spec, level included, is the model key in `results.jsonl`, so `x:low` and `x:high` are separate cells and can be compared in one report.
