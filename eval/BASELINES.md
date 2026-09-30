@@ -11,6 +11,8 @@ Rerun this before merging any change to:
 
 Rerun every model in the table below, at the thinking level listed. Write to a new results file, so the runner does not skip cells scored by an earlier version. Then add a section here, newest first, and update the summary.
 
+**All scenarios, or only the affected ones.** Rerun all eight when the change reaches every episode (guidelines, a tool description, wake text, how every wake is delivered). When it reaches only a path that some scenarios exercise, rerun those (`--scenarios a,b`), and say in the run's section which path changed, why the other scenarios cannot reach it, and how you checked (for example, counting the tool calls that lead there in the previous run's transcripts). The summary then combines runs; its Runs column names each one.
+
 ```bash
 cd eval
 node ablation/run.ts --tier smoke --k 10 --transcripts \
