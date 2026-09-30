@@ -431,8 +431,11 @@ pub fn replace_binary(dst: &Path, src: &Path) {
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                panic!("{}: still ETXTBSY after 10 s of retries (a writer never exec'd?)", tmp.display())
+            }
             r => {
-                r.expect("run the copied binary");
+                r.unwrap_or_else(|e| panic!("run the copied binary {}: {e}", tmp.display()));
                 break;
             }
         }
