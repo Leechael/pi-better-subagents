@@ -92,7 +92,9 @@ export function createSandbox(opts: SandboxOptions = {}): Sandbox {
       if (!opts.keep && !process.env.PBS_EVAL_KEEP) {
         try {
           rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-        } catch {}
+        } catch (err) {
+          console.error(`sandbox cleanup: left ${root}: ${(err as Error).message}`);
+        }
       }
     },
   };
