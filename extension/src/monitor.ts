@@ -32,9 +32,18 @@ const SATURATION_MIN_BATCHES = 10;
  */
 const EXIT_AFTER_EVENT_MS = 2_000;
 
-/** Model-facing, after the start line. The transcript row shows the first line only. */
+/**
+ * Model-facing, after the start line. The transcript row shows the first line only.
+ * After Claude Code's monitor start result: say everything that will arrive,
+ * so there is nothing left to verify, and name the polls. With "do not check
+ * on it", models still called task_list once while "waiting" (eval
+ * 2026-09-30c: 5 of the 6 FAILs outside grok). Its "Keep working" was tried
+ * and dropped: gpt-6-luna started duplicate monitors (eval 2026-09-30d).
+ */
 export const MONITOR_STARTED_INSTRUCTION =
-  'Each event wakes you with a <pbs-wake kind="monitor">; do not check on it. If nothing else is left to do, reply to the user now with no tool call.';
+  'You will get a <pbs-wake kind="monitor"> for each event, and a notice when it exits or times out. ' +
+  "Do not poll it (task_list, task_output, or reading what it watches) or sleep. " +
+  "If nothing else is left to do, reply to the user now with no tool call.";
 /**
  * Events for ids the registry does not know yet. The manager streams a monitor
  * from spawn, so output and even the exit can arrive before `start()` has the

@@ -215,7 +215,7 @@
       "id": "result.monitor-started-instruction",
       "kind": "text",
       "surface": "tool result: monitor start (monitor.ts MONITOR_STARTED_INSTRUCTION), model-facing (the row shows the first line only)",
-      "text": "\nEach event wakes you with a <pbs-wake kind=\"monitor\">; do not check on it. If nothing else is left to do, reply to the user now with no tool call.",
+      "text": "\nYou will get a <pbs-wake kind=\"monitor\"> for each event, and a notice when it exits or times out. Do not poll it (task_list, task_output, or reading what it watches) or sleep. If nothing else is left to do, reply to the user now with no tool call.",
       "affects": [
         "monitor-not-sleep"
       ]

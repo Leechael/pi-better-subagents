@@ -65,6 +65,25 @@ describe("monitor start result", () => {
     expect(text).toMatch(/no tool call/);
   });
 
+  // Eval 2026-09-30c: with "do not check on it", models still called
+  // task_list or task_output once. Claude Code's start result says what will
+  // arrive and names the polls.
+  it("says what will arrive and names the polls", async () => {
+    const registry = {
+      start: async () => ({ taskId: "mon_1", timeoutMs: 60_000 }),
+    } as unknown as MonitorRegistry;
+    const res = await createMonitorTool(registry).execute(
+      "t",
+      { command: "tail -F log | grep -m1 READY", description: "ready" },
+      undefined as never,
+      undefined as never,
+      {} as never,
+    );
+    const text = (res.content[0] as { text: string }).text;
+    expect(text).toMatch(/when it exits or times out/);
+    expect(text).toMatch(/task_list, task_output/);
+  });
+
   it("keeps the transcript row to the first line", () => {
     const registry = new MonitorRegistry({ getClient: () => null, sessionEnv: () => ({}), getNotifyCenter: () => null, trackTask: () => {} });
     const theme = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t };
