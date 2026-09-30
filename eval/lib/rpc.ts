@@ -2,7 +2,7 @@
  * Drive a real `pi --mode rpc` subprocess and record its event stream.
  *
  * RPC mode (not print mode) is required: print mode exits as soon as the
- * first agent run settles, so wakes that arrive later (<pbs-wake> task,
+ * first agent run settles, so wakes that arrive later (<pi-famulus-wake> task,
  * monitor, subagent-handover…) would never be observed.
  */
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";

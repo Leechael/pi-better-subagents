@@ -1,15 +1,15 @@
 {
-  "name": "pi-better-subagents-eval",
+  "name": "pi-famulus-eval",
   "private": true,
   "type": "module",
-  "description": "E2E (faux model) and prompt-ablation (real model) evaluation for pi-better-subagents",
+  "description": "E2E (faux model) and prompt-ablation (real model) evaluation for pi-famulus",
   "engines": {
     "node": ">=22.18"
   },
   "scripts": {
     "test:e2e": "node --test --test-concurrency=4 e2e/faux.test.ts e2e/ablation-harness.test.ts",
     "test:graders": "node --test ablation/graders.test.ts",
-    "test:tui": "PBS_E2E_TUI=1 node --test e2e/tui.test.ts",
+    "test:tui": "PI_FAMULUS_E2E_TUI=1 node --test e2e/tui.test.ts",
     "test:unit": "node --test lib/wake-adapter.test.ts ablation/stats.test.ts ablation/report.test.ts ablation/scenarios.test.ts",
     "eval:smoke": "node ablation/run.ts --tier smoke",
     "eval:full": "node ablation/run.ts --tier full",

@@ -15,7 +15,7 @@ describe("monitor tool result rendering", () => {
       bg: (_color: string, text: string) => text,
     };
     const result = (tool.renderResult as Function)(
-      { isError: true, content: [{ type: "text", text: "pbs-manager is not available" }] },
+      { isError: true, content: [{ type: "text", text: "pi-famulus is not available" }] },
       { expanded: false, isPartial: false },
       theme,
       { isError: true },
@@ -61,7 +61,7 @@ describe("monitor start result", () => {
     );
     const text = (res.content[0] as { text: string }).text;
     expect(text).toMatch(/^Monitor started · task mon_1 · timeout 60s/);
-    expect(text).toMatch(/<pbs-wake kind="monitor">/);
+    expect(text).toMatch(/<pi-famulus-wake kind="monitor">/);
     expect(text).toMatch(/no tool call/);
   });
 

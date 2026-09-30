@@ -1,6 +1,6 @@
 //! CLI stdout that exits quietly with status 0 when the reader goes away.
 //!
-//! Rust ignores SIGPIPE, so `pbs-manager output ID | head` used to make
+//! Rust ignores SIGPIPE, so `pi-famulus output ID | head` used to make
 //! `println!` panic (exit 101) once `head` closed the pipe. Every CLI line goes
 //! through [`line`]/[`bytes`] instead: a broken pipe ends the process
 //! silently with status 0, like a well-behaved Unix filter. Any other write
@@ -16,7 +16,7 @@ pub fn bytes(b: &[u8]) {
         if e.kind() == ErrorKind::BrokenPipe {
             std::process::exit(0);
         }
-        eprintln!("pbs-manager: {e}");
+        eprintln!("pi-famulus: {e}");
         std::process::exit(1);
     }
 }

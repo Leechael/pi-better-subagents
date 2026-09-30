@@ -29,7 +29,7 @@ describe("wait done:false and task_exited in one read", () => {
   });
 
   it("still delivers the wake when the exit is processed before the mark", async () => {
-    home = mkdtempSync(join(tmpdir(), "pbs-exit-race-"));
+    home = mkdtempSync(join(tmpdir(), "pi-famulus-exit-race-"));
     const socketPath = join(home, "manager.sock");
     server = net.createServer((socket) => {
       let buf = Buffer.alloc(0);

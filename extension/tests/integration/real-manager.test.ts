@@ -1,11 +1,11 @@
 /**
- * End-to-end integration: TS ManagerClient <-> real pbs-manager binary.
+ * End-to-end integration: TS ManagerClient <-> real pi-famulus binary.
  *
  * Opt-in (spawns real processes, takes ~10s including the idle-reaper check):
- *   PBS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts
+ *   PI_FAMULUS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts
  *
- * Uses the release binary at ../../manager/target/release/pbs-manager unless
- * PBS_MANAGER_PATH overrides it. Runs in an isolated PBS_HOME under tmpdir.
+ * Uses the release binary at ../../manager/target/release/pi-famulus unless
+ * PI_FAMULUS_MANAGER_PATH overrides it. Runs in an isolated Famulus home under tmpdir.
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -13,20 +13,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { ManagerClient, type ManagerEvent } from "../../src/manager-client";
-import { pbsPaths } from "../../src/config";
+import { famulusPaths } from "../../src/config";
 
-const RUN = process.env.PBS_INTEG === "1";
+const RUN = process.env.PI_FAMULUS_INTEG === "1";
 const BIN =
-  process.env.PBS_MANAGER_PATH ??
-  join(__dirname, "../../../manager/target/release/pbs-manager");
+  process.env.PI_FAMULUS_MANAGER_PATH ??
+  join(__dirname, "../../../manager/target/release/pi-famulus");
+if (RUN && !existsSync(BIN)) {
+  throw new Error(`Requested pi-famulus integration binary does not exist: ${BIN}`);
+}
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-describe.skipIf(!RUN || !existsSync(BIN))("real pbs-manager integration", () => {
-  const home = mkdtempSync(join(tmpdir(), "pbs-integ-"));
-  const paths = pbsPaths(home);
+describe.skipIf(!RUN)("real pi-famulus integration", () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-famulus-integ-"));
+  const paths = famulusPaths(home);
   const events: ManagerEvent[] = [];
   let client: ManagerClient;
 

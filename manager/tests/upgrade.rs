@@ -278,6 +278,13 @@ fn u4_bad_binary_is_refused_before_anything_changes() {
     c.request_ok(json!({"type":"list"}));
     assert!(event_text(&c.events, &t).len() > before, "monitor kept streaming on the same connection");
     assert!(pid_alive(pid));
+    // A successful check with a foreign marker is not an upgrade target.
+    std::fs::write(&bad, "#!/bin/sh\necho foreign-handover 1 0.1.0\n").unwrap();
+    replace_binary(&bin, &bad);
+    let out = upgrade(&home);
+    assert!(!out.status.success() && out.stderr.contains("gave no handover answer"), "{}", out.stderr);
+    assert_eq!(status(&home)["generation"], 0);
+    assert!(pid_alive(pid));
     // A file that is not executable is refused the same way.
     replace_binary(&bin, std::path::Path::new(BIN));
     std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
@@ -288,12 +295,12 @@ fn u4_bad_binary_is_refused_before_anything_changes() {
 }
 
 /// exec itself failing after the quiesce: everything resumes on the old
-/// image with no byte lost (test hook PBS_TEST_EXEC_PATH).
+/// image with no byte lost (test hook PI_FAMULUS_TEST_EXEC_PATH).
 #[test]
 fn u5_failed_exec_rolls_back() {
     let home = Home::new("u5");
     let bin = home.install_copy();
-    let _d = home.start_daemon_from(&bin, &[("PBS_TEST_EXEC_PATH", "/nonexistent/pbs-manager")]);
+    let _d = home.start_daemon_from(&bin, &[("PI_FAMULUS_TEST_EXEC_PATH", "/nonexistent/pi-famulus")]);
     let mut c = home.connect();
     hello(&mut c, "sess-u5");
     let (t, pid) = start(&mut c, "monitor",
@@ -323,7 +330,7 @@ fn u5_failed_exec_rolls_back() {
 fn u6_failed_restore_cleans_up_like_a_crash() {
     let home = Home::new("u6");
     let bin = home.install_copy();
-    let d = home.start_daemon_from(&bin, &[("PBS_TEST_FAIL_RESTORE", "1")]);
+    let d = home.start_daemon_from(&bin, &[("PI_FAMULUS_TEST_FAIL_RESTORE", "1")]);
     let mut c = home.connect();
     hello(&mut c, "sess-u6");
     let (task_id, pid) = start(&mut c, "shell", "sleep 300 & sleep 300", json!({}));
@@ -564,7 +571,7 @@ fn u13_upgrade_explains_a_manager_that_predates_it() {
     assert_eq!(out.status.code(), Some(1), "{} {}", out.stdout, out.stderr);
     assert!(!out.stderr.contains("unknown variant"), "{}", out.stderr);
     assert!(out.stderr.contains("predates in-place upgrade"), "{}", out.stderr);
-    assert!(out.stderr.contains("pbs-manager shutdown"), "{}", out.stderr);
+    assert!(out.stderr.contains("pi-famulus shutdown"), "{}", out.stderr);
 }
 
 /// D27: `upgrade` run from a binary other than the daemon's (a fresh

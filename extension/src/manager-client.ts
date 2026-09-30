@@ -1,5 +1,5 @@
 /**
- * pbs-manager unix socket client (design doc §4.1, protocol §3.3).
+ * pi-famulus unix socket client (design doc §4.1, protocol §3.3).
  *
  * - Implements the §3.1 startup flow: connect -> spawn via lock -> zombie cleanup.
  * - Request/response multiplexing over a single long-lived connection.
@@ -12,7 +12,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
-import { pbsPaths } from "./config";
+import { famulusPaths } from "./config";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024; // 4 MiB (§3.3)
@@ -171,7 +171,7 @@ class FrameDecoder {
     while (this.buf.length >= 4) {
       const len = this.buf.readUInt32BE(0);
       if (len > MAX_FRAME_BYTES) {
-        throw new Error(`pbs-manager frame too large: ${len} bytes`);
+        throw new Error(`pi-famulus frame too large: ${len} bytes`);
       }
       if (this.buf.length < 4 + len) break;
       const payload = this.buf.subarray(4, 4 + len).toString("utf8");
@@ -447,7 +447,7 @@ export class ManagerClient {
   // -------------------------------------------------------------------------
 
   private async connectFlow(allowZombieRetry: boolean, helloTimeoutMs = HELLO_TIMEOUT_MS): Promise<void> {
-    const paths = pbsPaths(this.home);
+    const paths = famulusPaths(this.home);
     try {
       await this.connectAndHello(paths.socket, helloTimeoutMs);
       return;
@@ -543,9 +543,9 @@ export class ManagerClient {
 
   private spawnManager(): void {
     if (!this.managerPath) {
-      throw new Error("pbs-manager binary not found (set managerPath in config.json or PBS_MANAGER_PATH)");
+      throw new Error("pi-famulus binary not found (set managerPath in config.json or PI_FAMULUS_MANAGER_PATH)");
     }
-    // Pass --home explicitly: relying on PBS_HOME env inheritance breaks when
+    // Pass --home explicitly: relying on PI_FAMULUS_HOME env inheritance breaks when
     // this.home came from an explicit override rather than the environment.
     const child = spawn(this.managerPath, ["--home", this.home, "daemon"], {
       detached: true,
@@ -571,7 +571,7 @@ export class ManagerClient {
         if (ok) return;
       }
       if (this.now() >= deadline) {
-        throw new Error("timed out waiting for pbs-manager socket");
+        throw new Error("timed out waiting for pi-famulus socket");
       }
       await delay(this.clock, SOCKET_READY_POLL_MS);
     }
@@ -735,14 +735,14 @@ export class ManagerClient {
             if (pending === entry) this.pending.delete(id);
           }
           this.queuedRequests.delete(entry);
-          reject(new Error(`pbs-manager request timed out: ${type}`));
+          reject(new Error(`pi-famulus request timed out: ${type}`));
         }, effectiveTimeoutMs),
       };
       if (this.socket && this.state === "connected") this.sendPending(entry);
       else if (retryable && (this.reconnecting || this.connecting)) this.queuedRequests.add(entry);
       else {
         this.clock.clearTimeout(entry.timer);
-        reject(new Error("pbs-manager not connected"));
+        reject(new Error("pi-famulus not connected"));
       }
     });
   }
@@ -769,7 +769,7 @@ export class ManagerClient {
       if (entry.retryable && !this.intentionalClose && !this.rebound) continue;
       this.pending.delete(id);
       this.clock.clearTimeout(entry.timer);
-      entry.reject(new Error("pbs-manager connection lost"));
+      entry.reject(new Error("pi-famulus connection lost"));
     }
     if (this.helloWaiter) {
       this.helloWaiter.reject(new Error("connection closed during hello"));
@@ -799,7 +799,7 @@ export class ManagerClient {
         await this.connectFlow(true, RECONNECT_HELLO_TIMEOUT_MS);
         this.state = "connected";
         this.resendPending();
-        this.log("reconnected to pbs-manager");
+        this.log("reconnected to pi-famulus");
         for (const handler of this.reconnectHandlers) {
           try {
             handler();
@@ -816,8 +816,8 @@ export class ManagerClient {
     this.state = "unavailable";
     this.lastFailureAt = this.now();
     this.lastFailureMessage = "reconnect exhausted";
-    this.failAllPending(new Error("pbs-manager reconnect exhausted"));
-    this.log("giving up on pbs-manager; bash falls back to local execution");
+    this.failAllPending(new Error("pi-famulus reconnect exhausted"));
+    this.log("giving up on pi-famulus; bash falls back to local execution");
   }
 
   private failAllPending(err: Error): void {

@@ -9,7 +9,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { readPreview } from "../../src/index";
 import { readTaskFileTail } from "../../src/tui/task-output-paths";
 
-const PATH = join(tmpdir(), `pbs-sparse-tail-${process.pid}`);
+const PATH = join(tmpdir(), `pi-famulus-sparse-tail-${process.pid}`);
 const SPARSE_BYTES = 1024 * 1024 * 1024; // 1 GiB
 const MARKER = "TAIL_MARKER_OK";
 

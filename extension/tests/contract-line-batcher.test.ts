@@ -9,16 +9,16 @@
  *
  * Contract under test (Appendix A, verbatim):
  *   export interface LineBatcherOptions {
- *     flushMs?: number;          // 合批窗口, 默认 200
- *     maxLineChars?: number;     // 单行 cap, 默认 500
- *     maxBatchChars?: number;    // 单批 cap, 默认 3000
+ *     flushMs?: number;          // batching window, default 200
+ *     maxLineChars?: number;     // per-line cap, default 500
+ *     maxBatchChars?: number;    // per-batch cap, default 3000
  *     onFlush: (text: string) => void;
  *   }
  *   export class LineBatcher {
  *     constructor(opts: LineBatcherOptions);
  *     push(chunk: string): void;
- *     flush(): void;             // 立即发出当前缓冲(若有非空内容)
- *     dispose(): void;           // 清定时器
+ *     flush(): void;             // emit the current buffer immediately if nonempty
+ *     dispose(): void;           // clear timers
  *   }
  */
 import { describe, it, expect, beforeEach } from "vitest";
@@ -41,7 +41,7 @@ describe("LineBatcher (contract: design.md §4.4 + Appendix A)", () => {
     const b = new LineBatcher({ onFlush, clock });
     b.push("hello ");
     b.push("world\n");
-    // 合批窗口: nothing is emitted synchronously
+    // Batching window: nothing is emitted synchronously
     expect(batches).toHaveLength(0);
     clock.advanceBy(200);
     expect(batches).toHaveLength(1);
@@ -129,7 +129,7 @@ describe("LineBatcher (contract: design.md §4.4 + Appendix A)", () => {
     b.dispose();
   });
 
-  it("flush() on an empty buffer is a no-op (若有非空内容)", () => {
+  it("flush() on an empty buffer is a no-op", () => {
     const { batches, onFlush } = collect();
     const b = new LineBatcher({ onFlush, clock });
     b.flush();

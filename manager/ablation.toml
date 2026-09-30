@@ -1,4 +1,4 @@
-# Code-ablation manifest for pbs-manager.
+# Code-ablation manifest for pi-famulus.
 #
 # Each entry removes (or neuters) one load-bearing mechanism with a literal
 # find/replace on a *temporary copy* of manager/, then runs the listed tests.

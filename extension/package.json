@@ -1,5 +1,5 @@
 {
-  "name": "pi-better-subagents",
+  "name": "pi-famulus",
   "version": "0.1.0",
   "description": "Subagents, monitoring, and auto-backgrounding bash for pi",
   "type": "module",

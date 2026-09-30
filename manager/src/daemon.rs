@@ -161,7 +161,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
         return run_restored(home, path).await;
     }
     if let Err(e) = std::fs::create_dir_all(&home) {
-        eprintln!("pbs-manager: cannot create {}: {e}", home.display());
+        eprintln!("pi-famulus: cannot create {}: {e}", home.display());
         return 1;
     }
     // §3.1: the lifetime lock on manager.lock decides who the daemon is; the
@@ -170,13 +170,13 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
         Ok(Claim::Acquired(guard)) => guard,
         Ok(Claim::AlreadyRunning { pid }) => {
             match pid {
-                Some(pid) => println!("pbs-manager already running (pid {pid})"),
-                None => println!("pbs-manager already running (starting up)"),
+                Some(pid) => println!("pi-famulus already running (pid {pid})"),
+                None => println!("pi-famulus already running (starting up)"),
             }
             return 0;
         }
         Err(e) => {
-            eprintln!("pbs-manager: daemon lock failed: {e}");
+            eprintln!("pi-famulus: daemon lock failed: {e}");
             return 1;
         }
     };
@@ -188,7 +188,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     // may read it at once (identity is the lock, the pid file is
     // informational).
     if let Err(e) = lifecycle::write_pid_file(&home, std::process::id()) {
-        eprintln!("pbs-manager: cannot write pid file: {e}");
+        eprintln!("pi-famulus: cannot write pid file: {e}");
         return 1;
     }
     // Bind the well-known socket (§3.1). A plain tokio UnixListener: the
@@ -197,7 +197,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     let listener = match tokio::net::UnixListener::bind(&sock) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("pbs-manager: cannot listen on {}: {e}", sock.display());
+            eprintln!("pi-famulus: cannot listen on {}: {e}", sock.display());
             return 1;
         }
     };
@@ -205,7 +205,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     let mut registry = Registry::new(home.clone());
     // Test hook: stand in for a scan over a large home (thousands of records).
     if cfg!(debug_assertions) {
-        if let Some(ms) = std::env::var("PBS_TEST_SLOW_SCAN_MS").ok().and_then(|v| v.parse().ok()) {
+        if let Some(ms) = std::env::var("PI_FAMULUS_TEST_SLOW_SCAN_MS").ok().and_then(|v| v.parse().ok()) {
             std::thread::sleep(Duration::from_millis(ms));
         }
     }
@@ -237,7 +237,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
     );
     if foreground {
         eprintln!(
-            "pbs-manager {} listening on {} (pid {})",
+            "pi-famulus {} listening on {} (pid {})",
             crate::VERSION,
             sock.display(),
             std::process::id()
@@ -258,7 +258,7 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
             // No crash recovery (§3.2): exiting closes the lifeline and
             // every runner takes its group down.
             lifecycle::log_line(&home, &format!("upgrade: restore failed: {e}; exiting"));
-            eprintln!("pbs-manager: upgrade restore failed: {e}");
+            eprintln!("pi-famulus: upgrade restore failed: {e}");
             std::process::exit(1);
         }
     };
@@ -502,7 +502,7 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin>(
         }
         if let Err(e) = write_frame(&mut w, payload).await {
             // The connection goes mute from here; its reader still runs.
-            eprintln!("pbs-manager: connection writer stopped: {e}");
+            eprintln!("pi-famulus: connection writer stopped: {e}");
             break;
         }
         if let Some((task, cursor)) = frame.output {
@@ -1115,14 +1115,14 @@ async fn dispatch(state: Shared, conn_id: u64, req: Request, tx: OutTx) {
     }
 }
 
-/// Test-only: exit once the test process named by `PBS_TEST_OWNER` is gone.
+/// Test-only: exit once the test process named by `PI_FAMULUS_TEST_OWNER` is gone.
 /// A manual-clock daemon never idles out on its own (only the test advances
 /// its timers), so one left by a killed test binary would otherwise run, and
 /// hold its tasks, forever. Exiting without a shutdown is a crash: every
 /// runner's lifeline breaks and takes its group down. Polls in real time.
 #[cfg(feature = "test-clock")]
 fn spawn_test_owner_watch(home: &std::path::Path) {
-    let Some(owner) = std::env::var("PBS_TEST_OWNER").ok().and_then(|v| v.parse::<u32>().ok()) else {
+    let Some(owner) = std::env::var("PI_FAMULUS_TEST_OWNER").ok().and_then(|v| v.parse::<u32>().ok()) else {
         return;
     };
     let home = home.to_path_buf();
@@ -1142,7 +1142,7 @@ fn handle_clock(state: &Shared, req: &RequestKind) -> Result<crate::clock::Clock
     let Some(m) = clock.manual() else {
         return Err(ProtoError::new(
             E_BAD_REQUEST,
-            "manual clock not enabled (start the daemon with PBS_TEST_CLOCK=manual)",
+            "manual clock not enabled (start the daemon with PI_FAMULUS_TEST_CLOCK=manual)",
         ));
     };
     Ok(match req {

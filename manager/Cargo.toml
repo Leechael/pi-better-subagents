@@ -1,9 +1,9 @@
 [package]
-name = "pbs-manager"
+name = "pi-famulus"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.91"
-description = "Cross-platform process management daemon for pi-better-subagents"
+description = "Cross-platform process management daemon for pi-famulus"
 license = "MIT"
 
 [dependencies]
@@ -19,7 +19,7 @@ libc = "0.2"
 # Test-only: the daemon's own timers (idle grace, SIGKILL escalation,
 # re-adopt / leftover-group polls) can run on a manual clock, advanced with
 # the `clock_advance` debug request, when the daemon starts with
-# PBS_TEST_CLOCK=manual. Never enable in release builds.
+# PI_FAMULUS_TEST_CLOCK=manual. Never enable in release builds.
 test-clock = []
 
 # Thin LTO over the default codegen units: an incremental release build

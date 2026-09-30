@@ -31,7 +31,7 @@ export interface ChildHandle {
   resolvedModel?(): string | undefined;
 }
 
-import type { PbsWake } from "../wake";
+import type { FamulusWake } from "../wake";
 
 // ---------- comms contract (appendix B, verbatim) ----------
 
@@ -42,7 +42,7 @@ export interface CommsHost {
   ): { handle: ChildHandle; runId: string; name: string; status: ChildStatus } | undefined;
   listChildren(): { childId: string; runId: string; name: string; status: ChildStatus }[];
   sameRun(childIdA: string, childIdB: string): boolean;
-  notifySupervisor(wake: { content: string; details: PbsWake }): void;
+  notifySupervisor(wake: { content: string; details: FamulusWake }): void;
 }
 
 export interface MailboxEntry {

@@ -1,27 +1,27 @@
 /**
  * Extension configuration loading (design doc §4.9).
  *
- * Config file: <pbs-home>/config.json
- * Base directory resolution: PBS_HOME env > ~/.pi/agent/pbs
+ * Config file: <famulus-home>/config.json
+ * Base directory resolution: PI_FAMULUS_HOME env > ~/.pi/agent/pi-famulus
  */
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 
-export interface PbsConfig {
+export interface FamulusConfig {
   /** Foreground budget for bash before auto-backgrounding (ms). */
   foregroundBudgetMs: number;
   /** Foreground budget for subagent runs (ms). Reserved for M3. */
   subagentBudgetMs: number;
-  /** Explicit path to the pbs-manager binary, or null for auto-resolution. */
+  /** Explicit path to the pi-famulus binary, or null for auto-resolution. */
   managerPath: string | null;
   logLevel: "debug" | "info" | "warn" | "error";
   /** Optional M3 subagent tuning section (design doc §4.6 limits). */
-  subagent?: PbsSubagentConfig;
+  subagent?: FamulusSubagentConfig;
 }
 
 /** Optional `subagent` section of config.json; every field defaults (see resolveSubagentConfig). */
-export interface PbsSubagentConfig {
+export interface FamulusSubagentConfig {
   /** Sync-wait budget before a run is moved to background (ms). Overrides top-level subagentBudgetMs. */
   budgetMs?: number;
   /** Default per-child hard timeout (ms). */
@@ -78,7 +78,7 @@ export const DEFAULT_SUBAGENT_CONFIG: ResolvedSubagentConfig = {
 };
 
 /** Merge defaults <- top-level subagentBudgetMs <- subagent section. */
-export function resolveSubagentConfig(config: PbsConfig): ResolvedSubagentConfig {
+export function resolveSubagentConfig(config: FamulusConfig): ResolvedSubagentConfig {
   const section = config.subagent ?? {};
   const resolved = { ...DEFAULT_SUBAGENT_CONFIG };
   resolved.budgetMs = config.subagentBudgetMs > 0 ? config.subagentBudgetMs : resolved.budgetMs;
@@ -108,22 +108,22 @@ export function resolveSubagentConfig(config: PbsConfig): ResolvedSubagentConfig
   return resolved;
 }
 
-export const DEFAULT_CONFIG: PbsConfig = {
+export const DEFAULT_CONFIG: FamulusConfig = {
   foregroundBudgetMs: 20000,
   subagentBudgetMs: 45000,
   managerPath: null,
   logLevel: "info",
 };
 
-/** Resolve the pbs base directory. PBS_HOME overrides the default. */
-export function getPbsHome(env: NodeJS.ProcessEnv = process.env): string {
-  const override = env.PBS_HOME;
+/** Resolve the pi-famulus base directory. PI_FAMULUS_HOME overrides the default. */
+export function getFamulusHome(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.PI_FAMULUS_HOME;
   if (override && override.trim().length > 0) return override;
-  return join(homedir(), ".pi", "agent", "pbs");
+  return join(homedir(), ".pi", "agent", "pi-famulus");
 }
 
-/** Well-known paths inside the pbs home directory (design doc §3.1). */
-export function pbsPaths(home: string) {
+/** Well-known paths inside the pi-famulus home directory (design doc §3.1). */
+export function famulusPaths(home: string) {
   return {
     home,
     socket: join(home, "manager.sock"),
@@ -141,8 +141,8 @@ export function taskOutputPath(home: string, sessionId: string, taskId: string):
 }
 
 /** Load config.json, tolerating missing/malformed files and unknown fields. */
-export function loadConfig(home: string = getPbsHome()): PbsConfig {
-  const path = pbsPaths(home).config;
+export function loadConfig(home: string = getFamulusHome()): FamulusConfig {
+  const path = famulusPaths(home).config;
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(path, "utf8"));
@@ -171,7 +171,7 @@ export function loadConfig(home: string = getPbsHome()): PbsConfig {
   }
   if (typeof obj.subagent === "object" && obj.subagent !== null) {
     const section = obj.subagent as Record<string, unknown>;
-    const subagent: PbsSubagentConfig = {};
+    const subagent: FamulusSubagentConfig = {};
     if (typeof section.budgetMs === "number" && section.budgetMs > 0) subagent.budgetMs = section.budgetMs;
     if (typeof section.timeoutMs === "number" && section.timeoutMs > 0) subagent.timeoutMs = section.timeoutMs;
     if (typeof section.stallMs === "number" && section.stallMs > 0) {
@@ -201,8 +201,8 @@ export function loadConfig(home: string = getPbsHome()): PbsConfig {
 }
 
 /**
- * Resolve the pbs-manager binary path.
- * Priority: config.managerPath > PBS_MANAGER_PATH env > <home>/bin/pbs-manager > PATH.
+ * Resolve the pi-famulus binary path.
+ * Priority: config.managerPath > PI_FAMULUS_MANAGER_PATH env > <home>/bin/pi-famulus > PATH.
  * Returns null when no candidate exists.
  */
 /**
@@ -211,31 +211,31 @@ export function loadConfig(home: string = getPbsHome()): PbsConfig {
  * those are silently skipped by resolveManagerPath.
  */
 export function describeManagerSearch(
-  config: PbsConfig,
-  home: string = getPbsHome(),
+  config: FamulusConfig,
+  home: string = getFamulusHome(),
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   const tried: string[] = [];
   if (config.managerPath) tried.push(`config managerPath ${config.managerPath}${existsSync(config.managerPath) ? "" : " (missing, ignored)"}`);
-  if (env.PBS_MANAGER_PATH) tried.push(`PBS_MANAGER_PATH ${env.PBS_MANAGER_PATH}${existsSync(env.PBS_MANAGER_PATH) ? "" : " (missing, ignored)"}`);
-  tried.push(join(home, "bin", "pbs-manager"));
-  tried.push("pbs-manager on PATH");
+  if (env.PI_FAMULUS_MANAGER_PATH) tried.push(`PI_FAMULUS_MANAGER_PATH ${env.PI_FAMULUS_MANAGER_PATH}${existsSync(env.PI_FAMULUS_MANAGER_PATH) ? "" : " (missing, ignored)"}`);
+  tried.push(join(home, "bin", "pi-famulus"));
+  tried.push("pi-famulus on PATH");
   return tried.join("; ");
 }
 
 export function resolveManagerPath(
-  config: PbsConfig,
-  home: string = getPbsHome(),
+  config: FamulusConfig,
+  home: string = getFamulusHome(),
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
   if (config.managerPath && existsSync(config.managerPath)) return config.managerPath;
-  const envPath = env.PBS_MANAGER_PATH;
+  const envPath = env.PI_FAMULUS_MANAGER_PATH;
   if (envPath && existsSync(envPath)) return envPath;
-  const bundled = join(home, "bin", "pbs-manager");
+  const bundled = join(home, "bin", "pi-famulus");
   if (existsSync(bundled)) return bundled;
   for (const dir of (env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
-    const candidate = join(dir, "pbs-manager");
+    const candidate = join(dir, "pi-famulus");
     try {
       accessSync(candidate, constants.X_OK);
       return candidate;

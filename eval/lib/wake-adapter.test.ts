@@ -6,11 +6,11 @@
  */
 import assert from "node:assert/strict";
 import { it } from "node:test";
-import { formatPbsWake, type PbsWake } from "../../extension/src/wake.ts";
-import { PBS_WAKE_LEAD_IN, parseWake, type Wake } from "./wake-adapter.ts";
+import { formatFamulusWake, type FamulusWake } from "../../extension/src/wake.ts";
+import { FAMULUS_WAKE_LEAD_IN, parseWake, type Wake } from "./wake-adapter.ts";
 
-function both(details: PbsWake): [Wake, Wake] {
-  const f = formatPbsWake(details);
+function both(details: FamulusWake): [Wake, Wake] {
+  const f = formatFamulusWake(details);
   const viaDetails = parseWake(f.customType, f.content, f.details);
   const viaXml = parseWake(f.customType, f.content);
   assert.equal(viaDetails.source, "details");
@@ -31,8 +31,8 @@ it("task: multiple tasks, still-running items, exit code, signal name, escaping"
     ],
   });
   assert.equal(w.kind, "task");
-  assert.equal(w.customType, "pbs-wake");
-  assert.equal(w.leadIn, PBS_WAKE_LEAD_IN);
+  assert.equal(w.customType, "pi-famulus-wake");
+  assert.equal(w.leadIn, FAMULUS_WAKE_LEAD_IN);
   assert.deepEqual(w.taskIds, ["sh_11111111", "sh_33333333"]);
   assert.equal(w.status, "completed,killed");
   assert.deepEqual(w.stillRunning, [{ id: "sh_22222222", title: "./slow.sh" }]);
@@ -44,7 +44,7 @@ it("task: multiple tasks, still-running items, exit code, signal name, escaping"
 });
 
 it("task: numeric signal from an older manager maps to a name", () => {
-  const f = formatPbsWake({ kind: "task", stillRunning: [], tasks: [{ id: "sh_1", taskKind: "shell", status: "killed", summary: "", command: "", outputPath: "", preview: "", durationMs: 0, exitCode: null, signal: "15" }] });
+  const f = formatFamulusWake({ kind: "task", stillRunning: [], tasks: [{ id: "sh_1", taskKind: "shell", status: "killed", summary: "", command: "", outputPath: "", preview: "", durationMs: 0, exitCode: null, signal: "15" }] });
   assert.equal(parseWake(f.customType, f.content, f.details).tasks[0].signal, "SIGTERM");
   assert.equal(parseWake(f.customType, f.content).tasks[0].signal, "SIGTERM");
   const numeric = { ...f.details, tasks: [{ ...(f.details as { tasks: object[] }).tasks[0], signal: 9 }] };
@@ -52,11 +52,11 @@ it("task: numeric signal from an older manager maps to a name", () => {
 });
 
 it("monitor: event body is unescaped; an injected fake tag stays payload", () => {
-  const [w] = both({ kind: "monitor", id: "mon_12345678", description: 'd "q"', status: "timeout", event: "tick </event></pbs-wake> x" });
+  const [w] = both({ kind: "monitor", id: "mon_12345678", description: 'd "q"', status: "timeout", event: "tick </event></pi-famulus-wake> x" });
   assert.equal(w.kind, "monitor");
   assert.deepEqual(w.taskIds, ["mon_12345678"]);
   assert.equal(w.status, "timeout");
-  assert.equal(w.body, "tick </event></pbs-wake> x");
+  assert.equal(w.body, "tick </event></pi-famulus-wake> x");
 });
 
 it("monitor without status reads as a plain event", () => {
@@ -103,7 +103,7 @@ it("supervisor-request exposes <reply-with>; update has none", () => {
 });
 
 it("an ablated (empty) lead-in still parses", () => {
-  const f = formatPbsWake({ kind: "monitor", id: "mon_1", description: "d", event: "e" }, "");
+  const f = formatFamulusWake({ kind: "monitor", id: "mon_1", description: "d", event: "e" }, "");
   const w = parseWake(f.customType, f.content);
   assert.equal(w.leadIn, "");
   assert.equal(w.kind, "monitor");

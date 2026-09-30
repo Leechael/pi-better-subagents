@@ -12,7 +12,7 @@ afterEach(() => {
 
 describe("extension event log", () => {
   it("appends timestamped extension events to the session events.jsonl", () => {
-    const home = mkdtempSync(join(tmpdir(), "pbs-events-"));
+    const home = mkdtempSync(join(tmpdir(), "pi-famulus-events-"));
     dirs.push(home);
     const clock = new ManualClock(1234);
     const log = createExtensionEventLog(home, () => "session-a", clock);
@@ -23,7 +23,7 @@ describe("extension event log", () => {
   });
 
   it("skips events without a session and caps each serialized row below 4 KiB", () => {
-    const home = mkdtempSync(join(tmpdir(), "pbs-events-"));
+    const home = mkdtempSync(join(tmpdir(), "pi-famulus-events-"));
     dirs.push(home);
     createExtensionEventLog(home, () => "", new ManualClock()).write("agent.settle");
     expect(existsSync(join(home, "sessions"))).toBe(false);

@@ -1,4 +1,4 @@
-/** Run one faux-model episode against real pi + real pbs-manager + our extension. */
+/** Run one faux-model episode against real pi + real pi-famulus + our extension. */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { FAUX_EXT } from "../lib/paths.ts";
@@ -29,7 +29,7 @@ export interface FauxEpisode {
 export interface FauxRunOptions {
   script: string;
   prompt?: string;
-  pbsConfig?: Record<string, unknown>;
+  famulusConfig?: Record<string, unknown>;
   /** Extra extensions after the faux harness (e.g. the ablation harness). */
   extensions?: string[];
   env?: Record<string, string>;
@@ -53,13 +53,13 @@ export function readTrace(path: string): FauxCall[] {
 }
 
 export async function runFaux(opts: FauxRunOptions): Promise<FauxEpisode> {
-  const sandbox = createSandbox({ pbsConfig: opts.pbsConfig });
+  const sandbox = createSandbox({ famulusConfig: opts.famulusConfig });
   const pi = new PiRpc({
     cwd: sandbox.cwd,
     env: {
       ...sandbox.env,
-      PBS_FAUX_SCRIPT: join(SCRIPTS, opts.script),
-      PBS_FAUX_TRACE: sandbox.tracePath,
+      PI_FAMULUS_FAUX_SCRIPT: join(SCRIPTS, opts.script),
+      PI_FAMULUS_FAUX_TRACE: sandbox.tracePath,
       ...(opts.env ?? {}),
     },
     model: "faux/faux-1",

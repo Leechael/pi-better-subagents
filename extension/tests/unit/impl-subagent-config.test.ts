@@ -4,9 +4,9 @@ import {
   MAX_TIMER_DELAY_MS,
   resolveSubagentConfig,
 } from "../../src/config";
-import type { PbsConfig } from "../../src/config";
+import type { FamulusConfig } from "../../src/config";
 
-function makeConfig(subagent?: PbsConfig["subagent"]): PbsConfig {
+function makeConfig(subagent?: FamulusConfig["subagent"]): FamulusConfig {
   return {
     foregroundBudgetMs: 20000,
     subagentBudgetMs: 45000,

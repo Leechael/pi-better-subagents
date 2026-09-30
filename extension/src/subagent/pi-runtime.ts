@@ -1,5 +1,5 @@
 /**
- * pi runtime bridge (design doc §4.6 "pi 运行时隔离铁律").
+ * pi runtime bridge (design doc §4.6 "pi runtime isolation rules").
  *
  * This is the ONLY module that loads `@earendil-works/pi-coding-agent` at
  * runtime, and only via dynamic `await import(...)`. Everything else in

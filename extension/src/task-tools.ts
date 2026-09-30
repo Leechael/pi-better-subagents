@@ -33,12 +33,12 @@ function requireClient(deps: TaskToolsDeps): Promise<ManagerClient> {
   const client = deps.getClient();
   if (!client) {
     return Promise.reject(
-      new Error("pbs-manager is not available in this session; task tools are disabled"),
+      new Error("pi-famulus is not available in this session; task tools are disabled"),
     );
   }
   return client.ensureAvailable().then((ok) => {
     if (!ok) {
-      throw new Error("pbs-manager is not available in this session; task tools are disabled");
+      throw new Error("pi-famulus is not available in this session; task tools are disabled");
     }
     return client;
   });
@@ -86,9 +86,9 @@ function formatTaskLine(task: TaskRecord, now: number): string {
 }
 
 const END_TURN_HINT =
-  'The task is still running. Reply to the user now with no tool call; a <pbs-wake> arrives when it finishes.';
+  'The task is still running. Reply to the user now with no tool call; a <pi-famulus-wake> arrives when it finishes.';
 const LIST_END_TURN_HINT =
-  "Running work wakes you with a <pbs-wake> when it finishes. Reply to the user now with no tool call instead of checking again.";
+  "Running work wakes you with a <pi-famulus-wake> when it finishes. Reply to the user now with no tool call instead of checking again.";
 
 const taskListParameters = Type.Object({
   all: Type.Optional(

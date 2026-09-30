@@ -7,8 +7,8 @@ import { call, type FauxScript, say } from "../faux-dsl.ts";
 
 const LONG = "x".repeat(160);
 const WIDE = "宽字符测试".repeat(12);
-/** PBS_TUI_LONG_DESC=1: a monitor description wider than the pane (crash repro). */
-const description = process.env.PBS_TUI_LONG_DESC === "1" ? `watch ${WIDE} ${LONG}` : "watch 宽字符 lines";
+/** PI_FAMULUS_TUI_LONG_DESC=1: a monitor description wider than the pane (crash repro). */
+const description = process.env.PI_FAMULUS_TUI_LONG_DESC === "1" ? `watch ${WIDE} ${LONG}` : "watch 宽字符 lines";
 
 const script: FauxScript = {
   steps: [

@@ -89,7 +89,7 @@ fn g2_autospawned_daemon_survives_sigint_to_spawning_group() {
 
 /// Kills: lifecycle.rs log_line, daemon.rs graceful_shutdown reason logging.
 /// §3.2 requires the kill reason "manager_shutdown"; TaskRecord's field set is
-/// fixed, so manager.log (surfaced by `pbs-manager log`) is where it lives.
+/// fixed, so manager.log (surfaced by `pi-famulus log`) is where it lives.
 #[test]
 fn g3_manager_log_records_shutdown_reason() {
     let home = Home::new("g3");

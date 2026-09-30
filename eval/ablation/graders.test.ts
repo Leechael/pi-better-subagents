@@ -1,6 +1,6 @@
 /**
  * Anti-placebo check for the real-model graders: run the real episode
- * pipeline (sandbox, pi, pbs-manager, ablation harness) with scripted faux
+ * pipeline (sandbox, pi, pi-famulus, ablation harness) with scripted faux
  * behaviors and assert each grader passes the good behavior and fails the
  * bad one for the intended reason. No model cost.
  *
@@ -23,7 +23,7 @@ async function episode(scenarioId: string, behavior: string) {
     variant: baseline,
     scenario: getScenario(scenarioId),
     extensions: [FAUX_EXT],
-    env: { PBS_FAUX_SCRIPT: FIXTURE, PBS_FAUX_BEHAVIOR: `${scenarioId}/${behavior}` },
+    env: { PI_FAMULUS_FAUX_SCRIPT: FIXTURE, PI_FAMULUS_FAUX_BEHAVIOR: `${scenarioId}/${behavior}` },
   });
   return r;
 }

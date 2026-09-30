@@ -1,6 +1,6 @@
 //! Shared black-box scaffolding for the adversarial lifecycle suites.
 //!
-//! Everything here talks to the compiled `pbs-manager` binary over its unix
+//! Everything here talks to the compiled `pi-famulus` binary over its unix
 //! socket (u32 BE length + JSON, design doc §3.3). Nothing links against the
 //! crate's internals; `serde_json` and `libc` are already regular dependencies
 //! of the package, so integration tests can use them without new
@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-pub const BIN: &str = env!("CARGO_BIN_EXE_pbs-manager");
+pub const BIN: &str = env!("CARGO_BIN_EXE_pi-famulus");
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 pub const PATH_ENV: &str = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin";
 
@@ -79,7 +79,7 @@ pub struct Home {
 /// instead of sleeping. Without the feature every wait is real time.
 pub const MANUAL_CLOCK: bool = cfg!(feature = "test-clock");
 
-/// `PBS_TEST_OWNER` for every daemon a test starts: this test process.
+/// `PI_FAMULUS_TEST_OWNER` for every daemon a test starts: this test process.
 /// Test-clock daemons exit once it is gone (a killed test binary runs no
 /// `Drop`), since their manual timers would never idle them out.
 pub fn test_owner() -> String {
@@ -88,7 +88,7 @@ pub fn test_owner() -> String {
 
 impl Home {
     pub fn new(name: &str) -> Home {
-        let path = std::env::temp_dir().join(format!("pbsx-{}-{name}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("pi-famulus-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("create test home");
         Home {
@@ -243,13 +243,13 @@ impl Home {
             .map(Stdio::from)
             .unwrap_or_else(|_| Stdio::null())
     }
-    /// Spawn `pbs-manager --home H daemon` as a direct child of the test.
+    /// Spawn `pi-famulus --home H daemon` as a direct child of the test.
     pub fn spawn_daemon(&self) -> Child {
         Command::new(BIN)
             .arg("--home")
             .arg(&self.path)
-            .env("PBS_TEST_CLOCK", self.clock_env())
-            .env("PBS_TEST_OWNER", test_owner())
+            .env("PI_FAMULUS_TEST_CLOCK", self.clock_env())
+            .env("PI_FAMULUS_TEST_OWNER", test_owner())
             .arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -262,7 +262,7 @@ impl Home {
     pub fn install_copy(&self) -> PathBuf {
         let dir = self.path.join("bin");
         fs::create_dir_all(&dir).unwrap();
-        let dst = dir.join("pbs-manager");
+        let dst = dir.join("pi-famulus");
         replace_binary(&dst, Path::new(BIN));
         dst
     }
@@ -272,8 +272,8 @@ impl Home {
         let mut cmd = Command::new(bin);
         cmd.arg("--home")
             .arg(&self.path)
-            .env("PBS_TEST_CLOCK", self.clock_env())
-            .env("PBS_TEST_OWNER", test_owner())
+            .env("PI_FAMULUS_TEST_CLOCK", self.clock_env())
+            .env("PI_FAMULUS_TEST_OWNER", test_owner())
             .arg("daemon")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -308,13 +308,13 @@ impl Home {
     /// Run a CLI subcommand with a hard deadline.
     /// Run a CLI subcommand; a daemon it auto-spawns uses this home's clock.
     pub fn cli(&self, args: &[&str], timeout: Duration) -> CliOut {
-        run_cli_env(&self.path, args, timeout, &[("PBS_TEST_CLOCK", self.clock_env())])
+        run_cli_env(&self.path, args, timeout, &[("PI_FAMULUS_TEST_CLOCK", self.clock_env())])
     }
 }
 
 impl Drop for Home {
     fn drop(&mut self) {
-        if std::thread::panicking() && std::env::var_os("PBS_TEST_ARTIFACTS").is_some() {
+        if std::thread::panicking() && std::env::var_os("PI_FAMULUS_TEST_ARTIFACTS").is_some() {
             self.dump_processes();
         }
         for r in self.records() {
@@ -382,11 +382,11 @@ impl Home {
 }
 
 /// A failed test's home is otherwise deleted with everything the daemon
-/// said. With `PBS_TEST_ARTIFACTS` set (CI uploads it), copy it there:
+/// said. With `PI_FAMULUS_TEST_ARTIFACTS` set (CI uploads it), copy it there:
 /// logs, per-session events and task records; files over 1 MiB (large task
 /// output) and sockets are skipped.
 fn keep_failed_home(home: &Path) {
-    let Some(dir) = std::env::var_os("PBS_TEST_ARTIFACTS") else { return };
+    let Some(dir) = std::env::var_os("PI_FAMULUS_TEST_ARTIFACTS") else { return };
     let Some(name) = home.file_name() else { return };
     copy_small_files(home, &Path::new(&dir).join(name));
 }
@@ -452,7 +452,7 @@ pub fn run_cli_env(home: &Path, args: &[&str], timeout: Duration, env: &[(&str, 
         .arg("--home")
         .arg(home)
         .args(args)
-        .env("PBS_TEST_OWNER", test_owner())
+        .env("PI_FAMULUS_TEST_OWNER", test_owner())
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -586,7 +586,7 @@ pub fn rss_bytes(pid: u32) -> Option<u64> {
         .map(|kib| kib * 1024)
 }
 
-/// Pids of `pbs-manager ... daemon` processes whose command line names `home`
+/// Pids of `pi-famulus ... daemon` processes whose command line names `home`
 /// (i.e. daemons auto-spawned by a CLI client with `--home <home>`).
 pub fn daemon_pids_for(home: &Path) -> Vec<u32> {
     let Ok(o) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
@@ -599,9 +599,9 @@ pub fn daemon_pids_for(home: &Path) -> Vec<u32> {
             let l = l.trim();
             let (pid, cmd) = l.split_once(' ')?;
             let cmd = cmd.trim();
-            // Exact token match: "pbsx-1-d1" must not match "pbsx-1-d15".
+            // Exact token match: "pi-famulus-test-1-d1" must not match "pi-famulus-test-1-d15".
             let words: Vec<&str> = cmd.split_whitespace().collect();
-            if cmd.contains("pbs-manager")
+            if cmd.contains("pi-famulus")
                 && words.iter().any(|w| *w == home_s)
                 && words.iter().any(|w| *w == "daemon")
             {
@@ -917,9 +917,9 @@ impl HelperClient {
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .env("PBSX_HELPER_HOME", home)
-            .env("PBSX_HELPER_SESSION", session)
-            .env("PBSX_HELPER_CMDS", commands.join("\n"))
+            .env("PI_FAMULUS_TEST_HELPER_HOME", home)
+            .env("PI_FAMULUS_TEST_HELPER_SESSION", session)
+            .env("PI_FAMULUS_TEST_HELPER_CMDS", commands.join("\n"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -933,13 +933,13 @@ impl HelperClient {
             let n = rd.read_line(&mut line).expect("helper stdout");
             assert!(n > 0, "helper exited before READY; lines={lines:?}");
             let line = line.trim().to_string();
-            if let Some(i) = line.find("PBSX_TASK ") {
-                let rest = &line[i + "PBSX_TASK ".len()..];
+            if let Some(i) = line.find("PI_FAMULUS_TEST_HELPER_TASK ") {
+                let rest = &line[i + "PI_FAMULUS_TEST_HELPER_TASK ".len()..];
                 let mut it = rest.split_whitespace();
                 let id = it.next().unwrap().to_string();
                 let pid: u32 = it.next().unwrap().parse().unwrap();
                 tasks.push((id, pid));
-            } else if line.contains("PBSX_READY") {
+            } else if line.contains("PI_FAMULUS_TEST_HELPER_READY") {
                 break;
             }
             lines.push(line);
@@ -968,11 +968,11 @@ impl Drop for HelperClient {
 /// Body of the helper process. Returns immediately unless re-exec'd by
 /// `HelperClient::spawn`.
 pub fn helper_main() {
-    let Ok(home) = std::env::var("PBSX_HELPER_HOME") else {
+    let Ok(home) = std::env::var("PI_FAMULUS_TEST_HELPER_HOME") else {
         return;
     };
-    let session = std::env::var("PBSX_HELPER_SESSION").unwrap();
-    let cmds = std::env::var("PBSX_HELPER_CMDS").unwrap_or_default();
+    let session = std::env::var("PI_FAMULUS_TEST_HELPER_SESSION").unwrap();
+    let cmds = std::env::var("PI_FAMULUS_TEST_HELPER_CMDS").unwrap_or_default();
     let stream = UnixStream::connect(Path::new(&home).join("manager.sock")).expect("helper connect");
     let mut c = Conn::new(stream);
     let h = c.hello_ext(&session);
@@ -980,9 +980,9 @@ pub fn helper_main() {
     let mut out = std::io::stdout();
     for cmd in cmds.split('\n').filter(|s| !s.is_empty()) {
         let (id, pid) = c.start(cmd);
-        writeln!(out, "PBSX_TASK {id} {pid}").unwrap();
+        writeln!(out, "PI_FAMULUS_TEST_HELPER_TASK {id} {pid}").unwrap();
     }
-    writeln!(out, "PBSX_READY").unwrap();
+    writeln!(out, "PI_FAMULUS_TEST_HELPER_READY").unwrap();
     out.flush().unwrap();
     loop {
         std::thread::sleep(Duration::from_secs(3600));

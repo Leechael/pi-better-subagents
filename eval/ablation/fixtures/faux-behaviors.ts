@@ -1,6 +1,6 @@
 /**
  * Scripted "model behaviors" used to prove the real-model graders can go
- * both green and red (graders.test.ts). Selected by PBS_FAUX_BEHAVIOR.
+ * both green and red (graders.test.ts). Selected by PI_FAMULUS_FAUX_BEHAVIOR.
  * Runs inside pi via harness/faux-ext.ts.
  */
 import { call, type FauxScript, type FauxStep, lastInputText, say, textOf } from "../../e2e/faux-dsl.ts";
@@ -171,7 +171,7 @@ const behaviors: Record<string, FauxScript> = {
   },
 };
 
-const key = process.env.PBS_FAUX_BEHAVIOR ?? "";
+const key = process.env.PI_FAMULUS_FAUX_BEHAVIOR ?? "";
 const script = behaviors[key];
-if (!script) throw new Error(`unknown PBS_FAUX_BEHAVIOR ${key}`);
+if (!script) throw new Error(`unknown PI_FAMULUS_FAUX_BEHAVIOR ${key}`);
 export default script;

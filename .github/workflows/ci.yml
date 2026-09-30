@@ -22,7 +22,7 @@ jobs:
         working-directory: manager
     env:
       # A failed test copies its daemon's logs here (tests/common Home::drop).
-      PBS_TEST_ARTIFACTS: ${{ github.workspace }}/pbs-test-artifacts
+      PI_FAMULUS_TEST_ARTIFACTS: ${{ github.workspace }}/pi-famulus-test-artifacts
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,7 +37,7 @@ jobs:
         if: failure()
         with:
           name: manager-logs-${{ matrix.os }}
-          path: pbs-test-artifacts
+          path: pi-famulus-test-artifacts
           if-no-files-found: ignore
 
   # No Windows job: the manager is unix-only, and the extension reaches it
@@ -58,7 +58,7 @@ jobs:
       - run: npx tsc --noEmit
       - run: npx vitest run
 
-  # Real pi + real pbs-manager + the extension, driven by the faux model.
+  # Real pi + real pi-famulus + the extension, driven by the faux model.
   # No model credentials, no network: pi runs with --offline.
   e2e:
     name: e2e (${{ matrix.os }})
@@ -68,10 +68,10 @@ jobs:
         os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     env:
-      PBS_MANAGER_PATH: ${{ github.workspace }}/manager/target/release/pbs-manager
+      PI_FAMULUS_MANAGER_PATH: ${{ github.workspace }}/manager/target/release/pi-famulus
       PI_BIN: ${{ github.workspace }}/eval/node_modules/.bin/pi
-      # Keep every sandbox (/tmp/pbse-*) so a failure can be uploaded.
-      PBS_EVAL_KEEP: "1"
+      # Keep every sandbox (/tmp/pi-famulus-eval-*) so a failure can be uploaded.
+      PI_FAMULUS_EVAL_KEEP: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -87,9 +87,9 @@ jobs:
             eval/package-lock.json
       - run: cargo build --release
         working-directory: manager
-      # real-manager.test.ts skips itself when the binary is missing; a
-      # skipped integration suite must not pass as green.
-      - run: test -x "$PBS_MANAGER_PATH"
+      # Require the exact release artifact before running real integration;
+      # a missing or misnamed binary must not pass as green.
+      - run: test -x "$PI_FAMULUS_MANAGER_PATH"
       - run: npm ci
         working-directory: extension
       - run: npm ci
@@ -97,7 +97,7 @@ jobs:
       - run: npx vitest run tests/integration/real-manager.test.ts
         working-directory: extension
         env:
-          PBS_INTEG: "1"
+          PI_FAMULUS_INTEG: "1"
       - run: npm run typecheck
         working-directory: eval
       - run: npm run test:unit
@@ -109,8 +109,8 @@ jobs:
         with:
           name: e2e-sandboxes-${{ matrix.os }}
           path: |
-            /tmp/pbse-*/h/manager.log
-            /tmp/pbse-*/h/events.jsonl
-            /tmp/pbse-*/h/config.json
-            /tmp/pbse-*/faux-trace.jsonl
+            /tmp/pi-famulus-eval-*/h/manager.log
+            /tmp/pi-famulus-eval-*/h/events.jsonl
+            /tmp/pi-famulus-eval-*/h/config.json
+            /tmp/pi-famulus-eval-*/faux-trace.jsonl
           if-no-files-found: ignore

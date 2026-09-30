@@ -10,7 +10,7 @@ import {
   type MailboxOptions,
 } from "./mailbox";
 import type { Comms, CommsHost } from "./types";
-import { formatPbsWake, type FormattedWake } from "../wake";
+import { formatFamulusWake, type FormattedWake } from "../wake";
 import type { Clock } from "../clock";
 
 /** Ring bucket used when the host does not know the child (defensive fallback). */
@@ -21,7 +21,7 @@ export function formatSupervisorUpdate(
   from: { childId: string; name: string },
   message: string,
 ): FormattedWake {
-  return formatPbsWake({
+  return formatFamulusWake({
     kind: "supervisor-update",
     from: from.childId,
     name: from.name,
@@ -34,7 +34,7 @@ export function formatSupervisorRequest(
   from: { childId: string; name: string },
   message: string,
 ): FormattedWake {
-  return formatPbsWake({
+  return formatFamulusWake({
     kind: "supervisor-request",
     from: from.childId,
     name: from.name,

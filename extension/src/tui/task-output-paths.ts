@@ -1,7 +1,7 @@
 import { statSync } from "node:fs";
 import { readFileTail } from "../file-tail";
 
-/** Sibling stderr file next to `<id>.output` (matches pbs-manager). */
+/** Sibling stderr file next to `<id>.output` (matches pi-famulus). */
 export function stderrPathFor(outputPath: string): string {
   if (!outputPath) return "";
   const dot = outputPath.lastIndexOf(".");

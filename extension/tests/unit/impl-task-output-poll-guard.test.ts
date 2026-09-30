@@ -39,7 +39,7 @@ describe("task_output poll guard", () => {
     const { read } = setup();
     const text = await read();
     expect(text).toMatch(/with no tool call/i);
-    expect(text).toMatch(/pbs-wake/);
+    expect(text).toMatch(/pi-famulus-wake/);
   });
 
   it("refuses a repeat read of a running task with no new output", async () => {

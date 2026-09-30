@@ -2,7 +2,7 @@
 //! binary now at its executable path, without disturbing any task.
 //!
 //! The daemon `exec()`s the new binary. The pid stays the same, so every
-//! task runner (`pbs-manager __run`) is still its child and `waitpid` still
+//! task runner (`pi-famulus __run`) is still its child and `waitpid` still
 //! works, and descriptors without close-on-exec survive:
 //!
 //! - the listening socket (never re-bound: a client connecting during the
@@ -48,7 +48,7 @@ use std::time::Duration;
 pub const FORMAT: u32 = 1;
 /// Hidden subcommand answering the preflight.
 pub const CHECK_ARG: &str = "__handover-check";
-const CHECK_PREFIX: &str = "pbs-manager-handover";
+const CHECK_PREFIX: &str = "pi-famulus-handover";
 
 /// How long the quiesce may take before the upgrade is abandoned.
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -304,7 +304,7 @@ pub async fn perform(state: &Shared, listener_fd: RawFd, lock_fd: RawFd, ready: 
     );
     // Test hook (debug builds): exec something that does not exist, to
     // exercise the path where exec fails after the quiesce.
-    let exec_target = match std::env::var("PBS_TEST_EXEC_PATH") {
+    let exec_target = match std::env::var("PI_FAMULUS_TEST_EXEC_PATH") {
         Ok(p) if cfg!(debug_assertions) => PathBuf::from(p),
         _ => exe.clone(),
     };
@@ -505,8 +505,8 @@ pub struct Restored {
 /// Read the handover file and take over the inherited descriptors. Any
 /// error means the daemon must exit (the lifeline then cleans up).
 pub fn restore(path: &Path) -> Result<Restored, String> {
-    if cfg!(debug_assertions) && std::env::var("PBS_TEST_FAIL_RESTORE").as_deref() == Ok("1") {
-        return Err("PBS_TEST_FAIL_RESTORE=1".into());
+    if cfg!(debug_assertions) && std::env::var("PI_FAMULUS_TEST_FAIL_RESTORE").as_deref() == Ok("1") {
+        return Err("PI_FAMULUS_TEST_FAIL_RESTORE=1".into());
     }
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let _ = std::fs::remove_file(path);

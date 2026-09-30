@@ -19,7 +19,7 @@ afterEach(async () => {
 });
 
 async function fakeResources() {
-  const root = await mkdtemp(join(tmpdir(), "pbs-child-resources-"));
+  const root = await mkdtemp(join(tmpdir(), "pi-famulus-child-resources-"));
   tempDirs.push(root);
   const cwd = join(root, "project");
   const agentDir = join(root, "fake-home", ".pi", "agent");

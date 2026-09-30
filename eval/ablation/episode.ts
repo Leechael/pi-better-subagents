@@ -7,7 +7,7 @@ import { createSandbox, hasRunningWork, waitManagerReady } from "../lib/sandbox.
 import { assistants, itemsFromEvents } from "../lib/transcript.ts";
 import type { Grade } from "./graders.ts";
 import { judge } from "./judge.ts";
-import { type Variant, variantPbsConfig } from "./manifest.ts";
+import { type Variant, variantFamulusConfig } from "./manifest.ts";
 import type { Scenario } from "./scenarios.ts";
 
 /** Settled + silent this long with no running work → the agent is done. */
@@ -60,7 +60,7 @@ export async function runEpisode(opts: {
   env?: Record<string, string>;
 }): Promise<EpisodeResult> {
   const { scenario, variant } = opts;
-  const sb = createSandbox({ pbsConfig: deepMerge(scenario.pbsConfig, variantPbsConfig(variant)), keep: opts.keep });
+  const sb = createSandbox({ famulusConfig: deepMerge(scenario.famulusConfig, variantFamulusConfig(variant)), keep: opts.keep });
   const secretDir = join(sb.root, "secret");
   mkdirSync(secretDir, { recursive: true });
   const logPath = join(sb.root, "ablation.jsonl");
@@ -68,7 +68,7 @@ export async function runEpisode(opts: {
   const setup = scenario.setup(sb.cwd, secretDir);
   const pi = new PiRpc({
     cwd: sb.cwd,
-    env: { ...sb.env, PBS_ABLATE: variant.id, PBS_ABLATION_LOG: logPath, ...(opts.env ?? {}) },
+    env: { ...sb.env, PI_FAMULUS_ABLATE: variant.id, PI_FAMULUS_ABLATION_LOG: logPath, ...(opts.env ?? {}) },
     model: opts.model,
     extensions: [...(opts.extensions ?? []), ABLATION_EXT],
   });

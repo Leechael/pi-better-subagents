@@ -576,26 +576,26 @@ fn cli_on_tty(home: &Home, args: &[&str], env: &[(&str, &str)]) -> Option<String
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Pager: on a terminal, listings go through `PBS_PAGER` / `PAGER` (default
+/// Pager: on a terminal, listings go through `PI_FAMULUS_PAGER` / `PAGER` (default
 /// `less -FRX`); never when stdout is not a terminal, with `--no-pager`, or
 /// when following.
 #[test]
 fn c10_pager_on_a_terminal_only() {
     let home = Home::new("c10");
     append_event(&home, "sess-c10", json!({"ts":now_ms(),"src":"manager","type":"task.start","id":"sh_0000c10a"}));
-    let pager = [("PBS_PAGER", "sed s/^/PAGED:/"), ("PAGER", "false")];
+    let pager = [("PI_FAMULUS_PAGER", "sed s/^/PAGED:/"), ("PAGER", "false")];
 
     let Some(paged) = cli_on_tty(&home, &["events"], &pager) else {
         eprintln!("skipping c10_pager_on_a_terminal_only: script(1) is not runnable here");
         return;
     };
     assert!(paged.contains("PAGED:") && paged.contains("sh_0000c10a"), "{paged:?}");
-    let via_pager = cli_on_tty(&home, &["events"], &[("PBS_PAGER", ""), ("PAGER", "sed s/^/PAGER:/")]).unwrap();
+    let via_pager = cli_on_tty(&home, &["events"], &[("PI_FAMULUS_PAGER", ""), ("PAGER", "sed s/^/PAGER:/")]).unwrap();
     assert!(via_pager.contains("PAGER:"), "PAGER is the fallback: {via_pager:?}");
 
     let plain = cli_on_tty(&home, &["--no-pager", "events"], &pager).unwrap();
     assert!(plain.contains("sh_0000c10a") && !plain.contains("PAGED:"), "{plain:?}");
-    let cat = cli_on_tty(&home, &["events"], &[("PBS_PAGER", "cat")]).unwrap();
+    let cat = cli_on_tty(&home, &["events"], &[("PI_FAMULUS_PAGER", "cat")]).unwrap();
     assert!(cat.contains("sh_0000c10a"), "{cat:?}");
     let piped = run_cli_env(&home.path, &["events"], S(5), &pager);
     assert!(piped.stdout.contains("sh_0000c10a") && !piped.stdout.contains("PAGED:"), "not a terminal: {}", piped.stdout);
@@ -777,7 +777,7 @@ fn c2_show_task_agent_and_run() {
     // not found: one line, closest match only
     let out = home.cli(&["show", "ch_0000c209"], S(5));
     assert!(!out.status.success());
-    assert_eq!(out.stderr.trim(), "pbs-manager: unknown id 'ch_0000c209' (did you mean 'ch_0000c201'?)");
+    assert_eq!(out.stderr.trim(), "pi-famulus: unknown id 'ch_0000c209' (did you mean 'ch_0000c201'?)");
     assert!(!out.stderr.contains(&t), "no id dump: {}", out.stderr);
 }
 
@@ -839,7 +839,7 @@ fn c3_agent_transcript_and_ch_ids_in_log_tail_output_wait_stop() {
     assert_eq!(out.stdout.trim(), "done status=completed");
     let out = home.cli(&["stop", "ch_0000c301"], S(5));
     assert_eq!(out.status.code(), Some(1));
-    assert_eq!(out.stderr.trim(), "pbs-manager: agents run inside pi; stop from /tasks or ask the agent");
+    assert_eq!(out.stderr.trim(), "pi-famulus: agents run inside pi; stop from /tasks or ask the agent");
 }
 
 #[test]
@@ -908,7 +908,7 @@ fn c6_status_counts_uptime_and_not_running() {
     let home = Home::new("c6");
     let out = home.cli(&["status"], S(5));
     assert_eq!(out.status.code(), Some(1));
-    assert_eq!(out.stderr.trim(), "pbs-manager: pbs-manager is not running");
+    assert_eq!(out.stderr.trim(), "pi-famulus: pi-famulus is not running");
     assert!(!home.sock().exists(), "status must not start the daemon");
 
     agent_fixture(&home, "sess-c6", json!({"child_id":"ch_0000c601","session_id":"sess-c6","name":"a","agent":"w","status":"completed"}));
@@ -930,7 +930,7 @@ fn c6_status_counts_uptime_and_not_running() {
     // outside a git checkout, where build.rs already fell back to
     // "unknown", and would drift from the built-from commit on any tree
     // whose HEAD moved since the daemon binary was built.
-    let version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PBS_GIT_SHA"));
+    let version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PI_FAMULUS_GIT_SHA"));
     assert!(s.contains(&format!("version:  {version} (protocol 3)")), "{s}");
     let bin = std::fs::canonicalize(BIN).unwrap();
     // Fresh /tmp targets can be reported as /tmp or /private/tmp on macOS.
@@ -943,6 +943,24 @@ fn c6_status_counts_uptime_and_not_running() {
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["protocol"], 3);
     assert_eq!(v["agent_counts"], json!({"running":0,"terminal":2}));
+}
+
+#[test]
+fn c6_cli_hello_identifies_the_new_product() {
+    let home = Home::new("c6-hello");
+    let _d = home.start_daemon();
+    cli_ok(&home, &["start", "--session", "sess-cli-brand", "--", "sleep 300"]);
+    let out = cli_ok(&home, &["status", "--json"]);
+    let status: Value = serde_json::from_str(&out.stdout).unwrap();
+    let session = status["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session_id"] == "sess-cli-brand")
+        .expect("CLI start registered its extension-style session");
+    let version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PI_FAMULUS_GIT_SHA"));
+    assert_eq!(session["extension_version"], format!("pi-famulus-cli/{version}"));
+    assert_eq!(session["protocol"], 3);
 }
 
 // ===========================================================================
@@ -995,7 +1013,7 @@ fn c7_output_max_bytes_sigpipe_and_log_timestamps() {
 #[test]
 fn c8_doctor_checks_and_exit_status() {
     // Nonexistent home: failure, and doctor does not create it.
-    let missing = std::env::temp_dir().join(format!("pbsx-{}-c8-missing", std::process::id()));
+    let missing = std::env::temp_dir().join(format!("pi-famulus-test-{}-c8-missing", std::process::id()));
     let _ = std::fs::remove_dir_all(&missing);
     let out = run_cli(&missing, &["doctor"], S(5));
     assert_eq!(out.status.code(), Some(1));
@@ -1008,12 +1026,24 @@ fn c8_doctor_checks_and_exit_status() {
     assert_eq!(out.status.code(), Some(0), "{}", out.stdout);
     assert!(out.stdout.contains("ok    sessions dir:"), "{}", out.stdout);
 
+    // The product-specific manager path environment overrides config.json.
+    std::fs::write(home.path.join("config.json"), br#"{"managerPath":"/nonexistent/from-config"}"#).unwrap();
+    let out = run_cli_env(
+        &home.path,
+        &["doctor"],
+        S(5),
+        &[("PI_FAMULUS_MANAGER_PATH", "/nonexistent/pi-famulus-env")],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.contains("/nonexistent/pi-famulus-env from PI_FAMULUS_MANAGER_PATH"), "{}", out.stdout);
+    assert!(!out.stdout.contains("/nonexistent/from-config"), "{}", out.stdout);
+
     // Broken config.json, missing managerPath, stale agent record, orphan pid.
     std::fs::write(home.path.join("config.json"), b"{ not json").unwrap();
     let out = run_cli(&home.path, &["doctor"], S(5));
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.contains("FAIL  config.json: does not parse"), "{}", out.stdout);
-    std::fs::write(home.path.join("config.json"), br#"{"managerPath":"/nonexistent/pbs-manager"}"#).unwrap();
+    std::fs::write(home.path.join("config.json"), br#"{"managerPath":"/nonexistent/pi-famulus"}"#).unwrap();
     agent_fixture(&home, "sess-c8", json!({"child_id":"ch_0000c801","session_id":"sess-c8","name":"x","agent":"w","status":"running"}));
     let mut orphan = std::process::Command::new("sleep").arg("300").spawn().unwrap();
     record_fixture(&home, "sess-c8", "sh_0000c801", now_ms(), json!({"status":"running","pid":orphan.id(),"exit_code":null,"ended_at":null,"end_reason":null}));
@@ -1022,7 +1052,7 @@ fn c8_doctor_checks_and_exit_status() {
     let _ = orphan.wait();
     assert_eq!(out.status.code(), Some(1));
     let s = &out.stdout;
-    assert!(s.contains("FAIL  manager path: /nonexistent/pbs-manager from config.json managerPath does not exist"), "{s}");
+    assert!(s.contains("FAIL  manager path: /nonexistent/pi-famulus from config.json managerPath does not exist"), "{s}");
     assert!(s.contains("FAIL  agent record: ch_0000c801 says running but session sess-c8 is gone"), "{s}");
     assert!(s.contains(&format!("FAIL  orphan pid: sh_0000c801 (pid {})", orphan.id())), "{s}");
     assert!(s.lines().any(|l| l == "3 problem(s) found"), "{s}");

@@ -186,7 +186,7 @@ pub async fn connect_existing(home: &Path, mode: &HelloMode) -> Result<Conn, Str
             session_id: Some(session_id.clone()),
             pi_pid: Some(std::process::id()),
             cwd: std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
-            extension_version: Some(format!("pbs-manager-cli/{}", crate::VERSION)),
+            extension_version: Some(format!("pi-famulus-cli/{}", crate::VERSION)),
             protocol: Some(PROTOCOL),
         },
     };
@@ -219,7 +219,7 @@ async fn wait_for_socket(home: &Path, timeout: Duration) -> bool {
     false
 }
 
-/// Spawn `pbs-manager daemon` detached (own session, output to manager.log)
+/// Spawn `pi-famulus daemon` detached (own session, output to manager.log)
 /// so it outlives this short-lived CLI process (§3.1 step 3).
 fn spawn_daemon(home: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
@@ -283,7 +283,7 @@ pub async fn connect(home: &Path, mode: &HelloMode) -> Result<Conn, String> {
             Err(e) => last_err = format!("spawn lock: {e}"),
         }
     }
-    Err(format!("cannot reach pbs-manager: {last_err}"))
+    Err(format!("cannot reach pi-famulus: {last_err}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +416,7 @@ pub async fn cmd_kill_session(home: &Path, session_id: &str) -> Result<(), Strin
 
 pub async fn cmd_shutdown(home: &Path) -> Result<(), String> {
     let Ok(mut conn) = connect_existing(home, &HelloMode::Cli).await else {
-        outln!("pbs-manager is not running");
+        outln!("pi-famulus is not running");
         return Ok(());
     };
     let _: UnitOk = conn.roundtrip(RequestKind::Shutdown).await?;
@@ -436,18 +436,18 @@ fn same_file_by_path(a: &Path, b: &Path) -> bool {
     canon(a) == canon(b)
 }
 
-/// `pbs-manager upgrade`: ask the running daemon to exec the binary now at
+/// `pi-famulus upgrade`: ask the running daemon to exec the binary now at
 /// its path, then report how it went (from the new image's status).
 pub async fn cmd_upgrade(home: &Path) -> Result<(), String> {
     let Ok(mut conn) = connect_existing(home, &HelloMode::Cli).await else {
-        outln!("pbs-manager is not running; the next client starts the installed binary");
+        outln!("pi-famulus is not running; the next client starts the installed binary");
         return Ok(());
     };
     let before: StatusOk = conn.roundtrip(RequestKind::Status).await?;
     if before.protocol < PROTOCOL_UPGRADE {
         return Err(format!(
             "the running manager (pid {}, {}, protocol {}) predates in-place upgrade, so it cannot upgrade itself. \
-             Restart it once: `pbs-manager shutdown` (stops its running tasks); the next client starts the installed binary",
+             Restart it once: `pi-famulus shutdown` (stops its running tasks); the next client starts the installed binary",
             before.pid, before.version, before.protocol
         ));
     }
@@ -803,7 +803,7 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
     outln!("socket: {}", lifecycle::socket_path(home).display());
     outln!("lock:   {}", lifecycle::daemon_lock_path(home).display());
     if !home.is_dir() {
-        r.fail("home", "does not exist (nothing has run with this --home / PBS_HOME)");
+        r.fail("home", "does not exist (nothing has run with this --home / PI_FAMULUS_HOME)");
         outln!("{} problem(s) found", r.failures);
         return 1;
     }
@@ -818,10 +818,10 @@ pub async fn cmd_doctor(home: &Path) -> i32 {
 
     // config.json (optional) and the manager path it or the env configures.
     let cfg_path = home.join("config.json");
-    let mut manager_path: Option<(String, &str)> = std::env::var("PBS_MANAGER_PATH")
+    let mut manager_path: Option<(String, &str)> = std::env::var("PI_FAMULUS_MANAGER_PATH")
         .ok()
         .filter(|s| !s.is_empty())
-        .map(|p| (p, "PBS_MANAGER_PATH"));
+        .map(|p| (p, "PI_FAMULUS_MANAGER_PATH"));
     match std::fs::read(&cfg_path) {
         Err(_) => r.ok("config.json", "absent (defaults)"),
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
@@ -978,7 +978,7 @@ mod resolve_tests {
 
     #[test]
     fn same_file_by_path_follows_symlinks() {
-        let dir = std::env::temp_dir().join(format!("pbs-same-file-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pi-famulus-same-file-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let real = dir.join("real");
         std::fs::write(&real, b"x").unwrap();

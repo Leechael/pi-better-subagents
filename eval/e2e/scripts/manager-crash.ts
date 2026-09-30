@@ -1,5 +1,5 @@
 /**
- * A backgrounded command is running when pbs-manager is killed with
+ * A backgrounded command is running when pi-famulus is killed with
  * SIGKILL. The runner takes the command down (lifeline); the extension
  * reconnects to a fresh manager, which lists the task as orphaned
  * (manager-crash), and the agent gets that as the command's exit wake

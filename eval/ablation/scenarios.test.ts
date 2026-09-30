@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import type { Item } from "../lib/transcript.ts";
 import type { Wake } from "../lib/wake-adapter.ts";
-import { firstWriteOf } from "./graders.ts";
+import { firstWriteOf, isPoll } from "./graders.ts";
 import { getScenario } from "./scenarios.ts";
 
 const dirs: string[] = [];
@@ -20,7 +20,7 @@ after(() => {
 });
 
 function episode(files: Record<string, string> = {}, secrets: Record<string, string> = {}) {
-  const root = mkdtempSync(join(tmpdir(), "pbse-grade-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-famulus-eval-grade-"));
   dirs.push(root);
   const cwd = join(root, "w");
   const secretDir = join(root, "secret");
@@ -134,6 +134,14 @@ describe("still-running-continue, batch 5", () => {
     ];
     const r = scenario.grade({ items, ...episode({ "quick.txt": "QUICK Q1\n" }, { q: "Q1", s: "S1" }) });
     assert.equal(r.pass, true, r.reason);
+  });
+});
+
+describe("polling CLI detection", () => {
+  it("recognises pi-famulus commands as polling", () => {
+    for (const command of ["pi-famulus ls --json", "/tmp/isolated/bin/pi-famulus --home /tmp/h status --json"]) {
+      assert.equal(isPoll({ id: "poll", name: "bash", args: { command } }), true, command);
+    }
   });
 });
 

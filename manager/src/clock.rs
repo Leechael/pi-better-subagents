@@ -4,7 +4,7 @@
 //!
 //! Normal builds: a thin wrapper over `tokio::time::sleep`.
 //!
-//! With the `test-clock` cargo feature and `PBS_TEST_CLOCK=manual` in the
+//! With the `test-clock` cargo feature and `PI_FAMULUS_TEST_CLOCK=manual` in the
 //! daemon's environment, these timers run on a manual clock instead: virtual
 //! time starts at 0 and only moves when a client sends the debug request
 //! `clock_advance {ms}` (see `daemon::handle_clock`). Everything else stays
@@ -34,11 +34,11 @@ pub struct Clock {
 
 impl Clock {
     /// The clock the daemon should use: manual only when built with
-    /// `test-clock` *and* started with `PBS_TEST_CLOCK=manual`.
+    /// `test-clock` *and* started with `PI_FAMULUS_TEST_CLOCK=manual`.
     pub fn from_env() -> Clock {
         #[cfg(feature = "test-clock")]
         {
-            if std::env::var("PBS_TEST_CLOCK").as_deref() == Ok("manual") {
+            if std::env::var("PI_FAMULUS_TEST_CLOCK").as_deref() == Ok("manual") {
                 return Clock {
                     manual: Some(std::sync::Arc::new(manual::Manual::default())),
                 };

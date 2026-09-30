@@ -36,7 +36,7 @@ describe("child custom tools", () => {
     });
     const { session } = await createAgentSession({
       ...options,
-      agentDir: "/tmp/pbs-child-tools-agent-dir",
+      agentDir: "/tmp/pi-famulus-child-tools-agent-dir",
       sessionManager: SessionManager.inMemory("/tmp"),
     } as never);
     try {

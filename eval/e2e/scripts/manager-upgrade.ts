@@ -1,6 +1,6 @@
 /**
  * A backgrounded command and a streaming monitor are running when the
- * manager is upgraded in place (`pbs-manager upgrade`, exec with the same
+ * manager is upgraded in place (`pi-famulus upgrade`, exec with the same
  * pid). Neither notices: the command's single exit wake carries its real
  * exit code, and every monitor line reaches the agent once, in order.
  */

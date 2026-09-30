@@ -4,7 +4,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SubagentRegistry } from "../../src/subagent/registry";
 import { InProcessRunner } from "../../src/subagent/runner";
 import { createSubagentTool } from "../../src/subagent/tool";
-import { PBS_WAKE_CUSTOM_TYPE } from "../../src/wake";
+import { FAMULUS_WAKE_CUSTOM_TYPE } from "../../src/wake";
 import { SessionFactory, tick } from "./subagent-fakes";
 
 async function flushMicrotasks(): Promise<void> {
@@ -168,7 +168,7 @@ describe("subagent tool — tasks", () => {
     await flushMicrotasks();
     expect(notify).toHaveBeenCalledTimes(1);
     const message = notify.mock.calls[0][0];
-    expect(message.customType).toBe(PBS_WAKE_CUSTOM_TYPE);
+    expect(message.customType).toBe(FAMULUS_WAKE_CUSTOM_TYPE);
     expect(message.content).toContain('kind="subagent-done"');
     expect(message.content).toContain(`run-id="${runId}"`);
     expect(message.content).toContain('status="completed"');

@@ -1,12 +1,12 @@
 /**
- * Custom message renderers for PBS notifications (Claude-style compact pills).
+ * Custom message renderers for Famulus notifications (Claude-style compact pills).
  *
  * Box is `(paddingX, paddingY, bgFn)` — the second argument is vertical padding,
  * not a child gap. `outputPad` is the horizontal pad (0 or 1), matching pi's
  * custom-message boxes which use `new Box(1, 1, bg)`.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { PBS_WAKE_CUSTOM_TYPE, PBS_WAKE_LEAD_IN, type PbsWake, type TaskWake } from "../wake";
+import { FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN, type FamulusWake, type TaskWake } from "../wake";
 import { fitLines, loadPiTui } from "./pi-tui-load";
 import { statusGlyph } from "./tool-component";
 
@@ -58,7 +58,7 @@ function taskExit(task: TaskWake): string {
   return task.signal ?? task.status;
 }
 
-function taskHead(details: Extract<PbsWake, { kind: "task" }>): string {
+function taskHead(details: Extract<FamulusWake, { kind: "task" }>): string {
   const taskInfo = details.tasks.length === 1
     ? `${formatDuration(details.tasks[0].durationMs)} · ${taskExit(details.tasks[0])}`
     : `${details.tasks.length} tasks · ${countStatuses(details.tasks.map((task) => task.status))}`;
@@ -67,7 +67,7 @@ function taskHead(details: Extract<PbsWake, { kind: "task" }>): string {
   return `${summary} · ${taskInfo}${still}`;
 }
 
-function collapsedText(details: PbsWake, theme: Theme): string {
+function collapsedText(details: FamulusWake, theme: Theme): string {
   switch (details.kind) {
     case "task": {
       const bad = details.tasks.some((task) => badExit(task.status, task.exitCode));
@@ -108,10 +108,10 @@ function collapsedText(details: PbsWake, theme: Theme): string {
   }
 }
 
-export function expandedWakeText(details: PbsWake | undefined, content: string): string {
+export function expandedWakeText(details: FamulusWake | undefined, content: string): string {
   if (!details) {
     return content
-      .replace(PBS_WAKE_LEAD_IN, "")
+      .replace(FAMULUS_WAKE_LEAD_IN, "")
       .replace(/<[^>]+>/g, " ")
       .replace(/&lt;/g, "<")
       .replace(/&gt;/g, ">")
@@ -143,8 +143,8 @@ export function expandedWakeText(details: PbsWake | undefined, content: string):
   }
 }
 
-function wakeDetails(message: { details?: unknown }): PbsWake | undefined {
-  const details = message.details as PbsWake | undefined;
+function wakeDetails(message: { details?: unknown }): FamulusWake | undefined {
+  const details = message.details as FamulusWake | undefined;
   if (!details || typeof details !== "object" || !("kind" in details)) return undefined;
   return details;
 }
@@ -171,8 +171,8 @@ function makeComponent(pad: number, theme: Theme, text: string): PillComponent {
   };
 }
 
-export function registerPbsMessageRenderers(pi: ExtensionAPI): void {
-  pi.registerMessageRenderer(PBS_WAKE_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
+export function registerFamulusMessageRenderers(pi: ExtensionAPI): void {
+  pi.registerMessageRenderer(FAMULUS_WAKE_CUSTOM_TYPE, (message, { expanded, outputPad }, theme) => {
     const details = wakeDetails(message);
     const content = typeof message.content === "string" ? message.content : "";
     const head = details ? collapsedText(details, theme) : theme.fg("muted", "wake");

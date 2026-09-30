@@ -23,7 +23,7 @@ function run(record: Partial<TaskRecord>, params: { command: string; timeout?: n
   const tool = createBashOverride({
     getClient: () => client,
     config: { ...DEFAULT_CONFIG, foregroundBudgetMs: 50 },
-    home: "/tmp/pbs-test",
+    home: "/tmp/pi-famulus-test",
     sessionId: () => "s",
     sessionEnv: () => ({}),
     trackTask: vi.fn(),
@@ -59,7 +59,7 @@ describe("bash on the local fallback, command killed", () => {
     const tool = createBashOverride({
       getClient: () => null,
       config: DEFAULT_CONFIG,
-      home: "/tmp/pbs-test",
+      home: "/tmp/pi-famulus-test",
       sessionId: () => "s",
       sessionEnv: () => ({}),
       trackTask: vi.fn(),

@@ -1,5 +1,5 @@
 /**
- * pi-better-subagents extension entry point (design doc §4).
+ * pi-famulus extension entry point (design doc §4).
  *
  * M1: bash override (auto-backgrounding) + task_* tools + manager client.
  * M2: NotifyCenter + monitor tool.
@@ -22,7 +22,7 @@ import { createComms, type CommsWithOrigin } from "./comms/comms";
 import { createRegistryCommsHost } from "./comms/registry-host";
 import { createAgentMessageTool, createContactSupervisorTool } from "./comms/tools";
 import { registerReplyCommand } from "./comms/reply-command";
-import { describeManagerSearch, getPbsHome, loadConfig, resolveManagerPath, resolveSubagentConfig } from "./config";
+import { describeManagerSearch, getFamulusHome, loadConfig, resolveManagerPath, resolveSubagentConfig } from "./config";
 import type { TaskExitInfo } from "./format";
 import { ManagerClient, type ManagerEvent, type TaskRecord } from "./manager-client";
 import { createMonitorTool, exitEventFromRecord, MonitorRegistry } from "./monitor";
@@ -43,7 +43,7 @@ import { SubagentRegistry } from "./subagent/registry";
 import { InProcessRunner } from "./subagent/runner";
 import { createSubagentTool } from "./subagent/tool";
 import { createTaskListTool, createTaskOutputTool, createTaskStopTool } from "./task-tools";
-import { registerPbsMessageRenderers } from "./tui/message-renderers";
+import { registerFamulusMessageRenderers } from "./tui/message-renderers";
 import { registerTasksCommand } from "./tui/tasks-command";
 import { stderrPathFor } from "./tui/task-output-paths";
 import { shellWakeTitle } from "./wake";
@@ -65,13 +65,13 @@ function toExitStatus(event: ManagerEvent): TaskExitInfo["status"] {
 }
 
 export default function (pi: ExtensionAPI): void {
-  const home = getPbsHome();
+  const home = getFamulusHome();
   const config = loadConfig(home);
   const managerPath = resolveManagerPath(config, home);
   const clock = realClock;
 
   // Claude-style transcript pills for notifications (TUI only; no-ops elsewhere).
-  registerPbsMessageRenderers(pi);
+  registerFamulusMessageRenderers(pi);
 
   let ctx: ExtensionContext | null = null;
   let client: ManagerClient | null = null;
@@ -83,7 +83,7 @@ export default function (pi: ExtensionAPI): void {
   /** task_id -> metadata, for notifications and the original manager task start time. */
   const taskMeta = new Map<string, { kind: string; command: string; cwd?: string; startedAt?: number }>();
   /**
-   * task_ids whose task_exited should wake the parent via <pbs-wake kind="task">.
+   * task_ids whose task_exited should wake the parent via <pi-famulus-wake kind="task">.
    * Parent bash only adds ids when it actually backgrounded the command.
    * Child-bash (sync wait) must not — otherwise every subagent shell completion
    * is mis-labeled as a parent "Background command" wake (§4.2 / §4.6).
@@ -499,7 +499,7 @@ export default function (pi: ExtensionAPI): void {
     const agentLoadErrors = agentLoader.reload().errors;
     if (agentLoadErrors.length > 0 && startCtx.hasUI) {
       startCtx.ui.notify(
-        `pi-better-subagents: skipped ${agentLoadErrors.length} invalid agent definition(s): ` +
+        `pi-famulus: skipped ${agentLoadErrors.length} invalid agent definition(s): ` +
           agentLoadErrors.map((e) => `${e.path} (${e.error})`).join("; "),
         "warning",
       );
@@ -563,7 +563,7 @@ export default function (pi: ExtensionAPI): void {
     });
     registry.setRunner(runner);
     subagentRegistry = registry;
-    // Persist child records so `pbs-manager ls` / task_list can see in-process agents.
+    // Persist child records so `pi-famulus ls` / task_list can see in-process agents.
     const sessionIdForAgents = () => startCtx.sessionManager.getSessionId();
     const previousAgentStatus = new Map<string, string>();
     registry.onTransition((run) => {
@@ -659,9 +659,9 @@ export default function (pi: ExtensionAPI): void {
           const reason = detail ? ` (${detail})` : "";
           const searched = managerPath ? `using ${managerPath}` : `looked in: ${describeManagerSearch(config, home)}`;
           startCtx.ui.notify(
-            `pbs-manager unavailable${reason}; ${searched}. ` +
+            `pi-famulus unavailable${reason}; ${searched}. ` +
               "Bash runs locally without auto-backgrounding, task_*/monitor are disabled, " +
-              "and subagents cannot run bash. Install it or set PBS_MANAGER_PATH (see README Install).",
+              "and subagents cannot run bash. Install it or set PI_FAMULUS_MANAGER_PATH (see README Install).",
             "warning",
           );
         }

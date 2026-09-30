@@ -68,7 +68,7 @@ fn child_setup(limit: i32) -> io::Result<()> {
     Ok(())
 }
 
-/// Fixed descriptor numbers a task runner (`pbs-manager __run`) starts with:
+/// Fixed descriptor numbers a task runner (`pi-famulus __run`) starts with:
 /// the read end of the daemon's lifeline and the write end of its own status
 /// pipe (see `crate::runner`).
 pub const RUNNER_LIFELINE_FD: i32 = 3;

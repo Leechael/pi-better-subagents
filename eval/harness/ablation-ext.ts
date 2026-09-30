@@ -3,8 +3,8 @@
  *
  *   pi -e extension -e eval/harness/ablation-ext.ts
  *
- * PBS_ABLATE=<variant id>          baseline | segment id | group id (see ablation/manifest.json)
- * PBS_ABLATION_LOG=<path>          JSONL audit of every removal (hook, segment, hits)
+ * PI_FAMULUS_ABLATE=<variant id>          baseline | segment id | group id (see ablation/manifest.json)
+ * PI_FAMULUS_ABLATION_LOG=<path>          JSONL audit of every removal (hook, segment, hits)
  *
  * Hooks used (pi 0.87):
  *  - before_agent_start: strips segments from the chained system prompt. Our
@@ -31,9 +31,9 @@ import {
 } from "../ablation/manifest.ts";
 
 export default function ablationHarness(pi: ExtensionAPI): void {
-  const variantId = process.env.PBS_ABLATE ?? "baseline";
-  const logPath = process.env.PBS_ABLATION_LOG;
-  const variant = resolveVariantList(loadManifest(process.env.PBS_ABLATION_MANIFEST), variantId);
+  const variantId = process.env.PI_FAMULUS_ABLATE ?? "baseline";
+  const logPath = process.env.PI_FAMULUS_ABLATION_LOG;
+  const variant = resolveVariantList(loadManifest(process.env.PI_FAMULUS_ABLATION_MANIFEST), variantId);
   const segs = compileTextSegments(variant.segments);
   const blockSleep = variant.segments.some((s) => s.id === "mech.sleep-block");
 

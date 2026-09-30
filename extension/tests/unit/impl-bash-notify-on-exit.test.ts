@@ -29,7 +29,7 @@ function makeDeps(client: ManagerClient): BashOverrideDeps {
   return {
     getClient: () => client,
     config: { ...DEFAULT_CONFIG, foregroundBudgetMs: 50 },
-    home: "/tmp/pbs-test",
+    home: "/tmp/pi-famulus-test",
     sessionId: () => "sess",
     sessionEnv: () => ({}),
     trackTask: vi.fn(),

@@ -1,5 +1,5 @@
 /**
- * resolveModelSpec pure-function tests (design doc §4.6 模型解析, appendix B).
+ * resolveModelSpec pure-function tests (design doc §4.6 model resolution, appendix B).
  */
 import { describe, expect, it } from "vitest";
 import {

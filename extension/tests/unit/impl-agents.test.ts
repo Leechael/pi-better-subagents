@@ -165,7 +165,7 @@ describe("loadAgentDefinitions", () => {
   let projectDir: string;
 
   beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), "pbs-agents-"));
+    root = mkdtempSync(join(tmpdir(), "pi-famulus-agents-"));
     userDir = join(root, "user");
     projectDir = join(root, "project");
     mkdirSync(userDir, { recursive: true });
@@ -253,7 +253,7 @@ describe("createAgentLoader (mtime cache)", () => {
   let projectDir: string;
 
   beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), "pbs-agents-cache-"));
+    root = mkdtempSync(join(tmpdir(), "pi-famulus-agents-cache-"));
     userDir = join(root, "user");
     projectDir = join(root, "project");
     mkdirSync(userDir, { recursive: true });
@@ -308,8 +308,8 @@ describe("createAgentLoader (mtime cache)", () => {
 
 describe("resolveAgent", () => {
   const defs = loadAgentDefinitions({
-    userDir: join(tmpdir(), "pbs-resolve-nope-user"),
-    projectDir: join(tmpdir(), "pbs-resolve-nope-project"),
+    userDir: join(tmpdir(), "pi-famulus-resolve-nope-user"),
+    projectDir: join(tmpdir(), "pi-famulus-resolve-nope-project"),
   }).definitions;
 
   it("returns the worker definition when name is undefined", () => {

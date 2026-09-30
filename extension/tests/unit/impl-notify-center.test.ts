@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ManualClock } from "../../src/clock";
 import { formatMonitorEvent } from "../../src/format";
 import { NotifyCenter } from "../../src/notify";
-import { PBS_WAKE_CUSTOM_TYPE, type PbsWake } from "../../src/wake";
+import type { FamulusWake } from "../../src/wake";
 
 describe("NotifyCenter monitor batching", () => {
   it("coalesces busy monitor output per monitor and flushes one wake when idle", () => {
@@ -24,7 +24,7 @@ describe("NotifyCenter monitor batching", () => {
     idle = true;
     center.flushMonitorEvents();
     expect(sent).toHaveLength(2);
-    const first = sent[0].message.details as PbsWake;
+    const first = sent[0].message.details as FamulusWake;
     expect(first).toMatchObject({
       kind: "monitor",
       id: "mon_1",
@@ -33,7 +33,9 @@ describe("NotifyCenter monitor batching", () => {
       droppedLines: 3,
     });
     expect(first.kind === "monitor" ? first.event : "").toBe("2 events · last: tick 2");
-    expect(sent[0].message.customType).toBe(PBS_WAKE_CUSTOM_TYPE);
+    expect(sent[0].message.customType).toBe("pi-famulus-wake");
+    expect(sent[0].message.content).toContain('<pi-famulus-wake kind="monitor"');
+    expect(sent[0].message.content).toContain("</pi-famulus-wake>");
     expect(sent[0].options).toEqual({ triggerTurn: true });
     expect(sent[1].message.details).toMatchObject({ kind: "monitor", id: "mon_2", event: "ready" });
     expect(events).toContainEqual({ type: "wake.emit", fields: { kind: "monitor", ids: ["mon_1"], batch: true } });

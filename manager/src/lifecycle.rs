@@ -13,12 +13,12 @@ use std::path::{Path, PathBuf};
 // Base directory & well-known paths (§3.1)
 // ---------------------------------------------------------------------------
 
-/// Priority: --home flag > PBS_HOME env > ~/.pi/agent/pbs.
+/// Priority: --home flag > PI_FAMULUS_HOME env > ~/.pi/agent/pi-famulus.
 pub fn resolve_home(flag: Option<&Path>) -> PathBuf {
     if let Some(p) = flag {
         return p.to_path_buf();
     }
-    if let Some(env) = std::env::var_os("PBS_HOME") {
+    if let Some(env) = std::env::var_os("PI_FAMULUS_HOME") {
         if !env.is_empty() {
             return PathBuf::from(env);
         }
@@ -26,7 +26,7 @@ pub fn resolve_home(flag: Option<&Path>) -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".pi").join("agent").join("pbs")
+    home.join(".pi").join("agent").join("pi-famulus")
 }
 
 pub fn socket_path(home: &Path) -> PathBuf {
@@ -331,7 +331,7 @@ mod tests {
 
     fn temp_home(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "pbs-lc-test-{tag}-{}-{}",
+            "pi-famulus-lc-test-{tag}-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -342,15 +342,15 @@ mod tests {
     #[test]
     fn home_resolution_priority() {
         // flag wins over everything (§3.1).
-        let flag = PathBuf::from("/tmp/pbs-flag");
+        let flag = PathBuf::from("/tmp/pi-famulus-flag");
         assert_eq!(resolve_home(Some(&flag)), flag);
         // env beats the default.
-        std::env::set_var("PBS_HOME", "/tmp/pbs-env");
-        assert_eq!(resolve_home(None), PathBuf::from("/tmp/pbs-env"));
-        std::env::remove_var("PBS_HOME");
-        // default: ~/.pi/agent/pbs
+        std::env::set_var("PI_FAMULUS_HOME", "/tmp/pi-famulus-env");
+        assert_eq!(resolve_home(None), PathBuf::from("/tmp/pi-famulus-env"));
+        std::env::remove_var("PI_FAMULUS_HOME");
+        // default: ~/.pi/agent/pi-famulus
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
-        assert_eq!(resolve_home(None), home.join(".pi/agent/pbs"));
+        assert_eq!(resolve_home(None), home.join(".pi/agent/pi-famulus"));
     }
 
     #[test]
