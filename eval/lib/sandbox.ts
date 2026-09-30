@@ -87,7 +87,15 @@ export function createSandbox(opts: SandboxOptions = {}): Sandbox {
     cleanup() {
       // The manager exits by itself 5s after its last client; do not wait.
       spawnSync(mgr, ["--home", pbsHome, "shutdown"], { stdio: "ignore", timeout: 5000 });
-      if (!opts.keep && !process.env.PBS_EVAL_KEEP) rmSync(root, { recursive: true, force: true });
+      // The manager may still be writing its logs (ENOTEMPTY); retry briefly,
+      // then leave the temp dir rather than crash a graded episode.
+      if (!opts.keep && !process.env.PBS_EVAL_KEEP) {
+        try {
+          rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+        } catch (err) {
+          console.error(`sandbox cleanup: left ${root}: ${(err as Error).message}`);
+        }
+      }
     },
   };
 }

@@ -45,7 +45,7 @@ pi 实例 C (session c) ──┘                        ├─ 进程引擎: sp
     ├─ task_list/output/stop
     ├─ subagent 工具 ──► ChildRunner 接缝 (v1: InProcessRunner)
     ├─ comms ──► 进程内 mailbox (contact_supervisor / agent_message)
-    └─ NotifyCenter ──► 唯一注入出口 (triggerTurn/steer)
+    └─ NotifyCenter ──► 唯一注入出口 (triggerTurn/steer/passive)
 ```
 
 **分层铁律**: manager 只管进程与输出管道,无任何 LLM/会话语义;所有语义(预算、限流、截断、注入、通讯)在扩展侧。
@@ -264,7 +264,7 @@ SIGTERM 进程组 → 2s → SIGKILL(发给进程组,leader 已退出也照发)�
 - 每行 < 4 KiB(含换行):超长的字符串字段被截断(以 `…` 结尾)并加 `"truncated":true`;`src`/`type`/`ts` 不截断。每行用一次 O_APPEND `write` 写入,manager 与扩展并发追加也不会交错
 - 公共字段:`ts`(ms)、`src`(`"manager"` | `"extension"`)、`type`、`id?`(task/child id),加类型字段
 - manager 写:`session.connect {pi_pid, cwd, extension_version, protocol}`、`session.disconnect {reason: closed|rebound}`、`task.start {kind, command(≤200 字符), origin, pid}`、`task.background {after_ms}`、`task.stop {reason}`、`task.exit {exit_code, signal, end_reason, duration_ms}`(含 orphaned 与关闭时强制结束的任务)、`daemon.start {pid, version, protocol, orphaned, loaded}` / `daemon.shutdown {pid, killed_tasks}`(也写 manager.log)
-- 扩展写:`wake.emit {kind, ids[], batch}`、`wake.deliver {kind, mode: trigger|steer}`、`wake.dedupe {id}`、`monitor.drop {id, lines}`、`monitor.stop {id, reason}`、`agent.start {child_id, run_id, name, agent, model}`、`agent.settle {child_id, status, error?, stalls?, duration_ms}`、`agent.stall {child_id, attempt}`(**每次停滞检测**都写,含自动续跑前;不代表失败——判断失败以 `agent.settle` 的 error=stalled 为准)、`agent.timeout {child_id}`、`decision.request/reply/timeout {child_id}`
+- 扩展写:`wake.emit {kind, ids[], batch}`、`wake.deliver {kind, mode: trigger|steer|passive}`(passive = `triggerTurn:false`,不起新 turn:monitor 在事件后 2s 内的干净退出、模型自己停掉的 monitor 的残留行与退出)、`wake.dedupe {id}`、`monitor.drop {id, lines}`、`monitor.stop {id, reason}`、`agent.start {child_id, run_id, name, agent, model}`、`agent.settle {child_id, status, error?, stalls?, duration_ms}`、`agent.stall {child_id, attempt}`(**每次停滞检测**都写,含自动续跑前;不代表失败——判断失败以 `agent.settle` 的 error=stalled 为准)、`agent.timeout {child_id}`、`decision.request/reply/timeout {child_id}`
 - 读者(CLI `events`/`show`/`sessions`)跳过无法解析、或缺 `ts`/`type` 的行
 - 保留:随 session 目录存放,v1 不轮转(deferred: rotation | impact: 超长 session 磁盘增长 | trigger: doctor 报告 sessions 目录 > 100MB)
 

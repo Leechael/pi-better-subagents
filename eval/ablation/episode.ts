@@ -74,6 +74,7 @@ export async function runEpisode(opts: {
   });
   const bg = [] as Array<{ kill(sig?: NodeJS.Signals): boolean }>;
   let error: string | undefined;
+  let endedAt: number | undefined;
   try {
     await pi.ready(60_000);
     await waitManagerReady(sb, 15_000);
@@ -102,13 +103,14 @@ export async function runEpisode(opts: {
   } catch (err) {
     error = (err as Error).message;
   } finally {
+    endedAt = pi.now();
     await pi.stop();
     for (const p of bg) p.kill("SIGKILL");
   }
   const items = itemsFromEvents(pi.events);
   const providerError = assistants(items).find((a) => a.stopReason === "error" || a.stopReason === "aborted");
   if (!error && providerError && assistants(items).length === 1) error = `provider: ${providerError.errorMessage ?? providerError.stopReason}`;
-  const grade = scenario.grade({ items, cwd: sb.cwd, secretDir });
+  const grade = scenario.grade({ items, cwd: sb.cwd, secretDir, endedAt });
   if (opts.judgeModel && scenario.judgeQuestion) {
     const excerpt = items
       .map((i) =>

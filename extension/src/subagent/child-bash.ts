@@ -30,6 +30,8 @@ import {
   bareSleepError,
   collectOutput,
   formatFinishedOutput,
+  killedStatus,
+  timedOutStatus,
   SHELL_MAX_BYTES,
   SHELL_MAX_LINES,
   withAbort,
@@ -156,7 +158,7 @@ export function createChildBashTool(
           const collected = await collectOutput(client, start.task_id).catch(() => null);
           const text = collected ? formatFinishedOutput(collected, outputPath).text : "";
           throw new Error(
-            appendStatus(text, `Command timed out after ${input.timeout} seconds and was killed`),
+            appendStatus(text, timedOutStatus(input.timeout!)),
           );
         }
       }
@@ -166,6 +168,11 @@ export function createChildBashTool(
       const exitCode = waitResult.exit_code ?? null;
       if (exitCode !== 0 && exitCode !== null) {
         throw new Error(appendStatus(text, `Command exited with code ${exitCode}`));
+      }
+      // No exit code: killed (timeout, stop, crash), unless the manager
+      // finished it as completed with its runner status unobservable.
+      if (exitCode === null && collected.status !== "completed") {
+        throw new Error(appendStatus(text, await killedStatus(client, start.task_id, input.timeout)));
       }
       const finalDetails = details
         ? { ...details, task_id: start.task_id }

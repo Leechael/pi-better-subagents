@@ -26,6 +26,25 @@ const SATURATION_WINDOW_MS = 30_000;
 const SATURATION_DROP_RATIO = 0.5;
 const SATURATION_MIN_BATCHES = 10;
 /**
+ * A clean exit this soon after an event was caused by it (`grep -m1`). Its
+ * notice is appended without starting a turn: as a wake it cost every such monitor a
+ * turn spent acknowledging "exited" (eval batch 1, 2026-09-29).
+ */
+const EXIT_AFTER_EVENT_MS = 2_000;
+
+/**
+ * Model-facing, after the start line. The transcript row shows the first line only.
+ * After Claude Code's monitor start result: say everything that will arrive,
+ * so there is nothing left to verify, and name the polls. With "do not check
+ * on it", models still called task_list once while "waiting" (eval
+ * 2026-09-30c: 5 of the 6 FAILs outside grok). Its "Keep working" was tried
+ * and dropped: gpt-6-luna started duplicate monitors (eval 2026-09-30d).
+ */
+export const MONITOR_STARTED_INSTRUCTION =
+  'You will get a <pbs-wake kind="monitor"> for each event, and a notice when it exits or times out. ' +
+  "Do not poll it (task_list, task_output, or reading what it watches) or sleep. " +
+  "If nothing else is left to do, reply to the user now with no tool call.";
+/**
  * Events for ids the registry does not know yet. The manager streams a monitor
  * from spawn, so output and even the exit can arrive before `start()` has the
  * task id (same socket read as the start response). Bounded: unrelated shell
@@ -65,6 +84,9 @@ interface MonitorEntry {
   cursor: number;
   recovering: boolean;
   queuedOutput: { chunk: string; cursor?: number }[];
+  lastEventAt?: number;
+  /** The model asked to stop it (task_stop): what is left is not news. */
+  stopRequested?: boolean;
 }
 
 export class MonitorRegistry {
@@ -205,6 +227,20 @@ export class MonitorRegistry {
   }
 
   /**
+   * task_stop is about to stop this monitor at the model's request. Returns
+   * an undo for a stop that fails: the monitor keeps running and must keep
+   * waking the model.
+   */
+  noteStopRequested(taskId: string): (() => void) | undefined {
+    const entry = this.entries.get(taskId);
+    if (!entry) return undefined;
+    entry.stopRequested = true;
+    return () => {
+      entry.stopRequested = false;
+    };
+  }
+
+  /**
    * Handle the manager's task_exited event. Returns true when it closed a
    * known monitor; an unknown id is kept briefly in case `start()` is about to
    * register it.
@@ -222,6 +258,14 @@ export class MonitorRegistry {
     this.deps.onExited?.(taskId, event);
     if (alreadyStopped) return true; // timeout/saturation notice already sent
     const exitCode = event.exit_code ?? null;
+    // A clean exit soon after an event is the command finishing on it
+    // (grep -m1), unless someone stopped it (TUI stop: end_reason "tui").
+    const causedByEvent =
+      exitCode === 0 &&
+      !event.signal &&
+      (event.end_reason ?? "exited") === "exited" &&
+      entry.lastEventAt !== undefined &&
+      this.clock.now() - entry.lastEventAt <= EXIT_AFTER_EVENT_MS;
     const duration =
       typeof event.duration_ms === "number" ? `${(event.duration_ms / 1000).toFixed(1)}s` : "unknown duration";
     this.deps.logEvent?.("monitor.stop", { id: entry.taskId, reason: event.end_reason ?? "exited" });
@@ -233,6 +277,7 @@ export class MonitorRegistry {
         "exited",
         { droppedLines: entry.droppedLinesPending },
       ),
+      { passive: causedByEvent || entry.stopRequested === true, quietEvents: entry.stopRequested === true },
     );
     this.deps.toast?.(
       `Monitor "${entry.description}" exited (code ${exitCode === null ? "?" : exitCode})`,
@@ -298,12 +343,18 @@ export class MonitorRegistry {
       const droppedLines = text.split("\n").length;
       this.deps.logEvent?.("monitor.drop", { id: entry.taskId, lines: droppedLines });
       entry.droppedLinesPending += droppedLines;
-      if (entry.saturation.isSaturated(now)) void this.autoStop(entry);
+      // Already stopping at the model's request: no rate-limit stop or wake.
+      if (entry.saturation.isSaturated(now) && !entry.stopRequested) void this.autoStop(entry);
       return;
     }
     const droppedLines = entry.droppedLinesPending;
     entry.droppedLinesPending = 0;
-    this.deps.getNotifyCenter()?.notifyMonitorEvent(entry.description, entry.taskId, text, droppedLines);
+    entry.lastEventAt = now;
+    // Lines still buffered when the model stopped it: recorded, coalesced
+    // with that monitor's other pending output, and never a wake.
+    this.deps.getNotifyCenter()?.notifyMonitorEvent(entry.description, entry.taskId, text, droppedLines, {
+      quiet: entry.stopRequested === true,
+    });
   }
 
   /** Timeout reached: stop the process and notify (§4.4). */
@@ -419,6 +470,9 @@ export function createMonitorTool(
       "Start a background monitor process whose stdout lines are injected back to you as " +
       "<pbs-wake kind=\"monitor\"> messages (batched over 200ms, rate-limited). " +
       "The command must be line-buffered: each event must be a single line. " +
+      "It must keep running and follow its source, e.g. `tail -n +1 -F file | grep --line-buffered PATTERN`; " +
+      "a command that reads once and exits (a plain grep or cat) only reports what is there now. " +
+      "Add `-m1` to grep to stop after the first match. " +
       "Silence is not success: write the command so failures also produce lines " +
       "(e.g. grep for both success and error patterns). " +
       "Events arrive as system wakes (not new user messages). Handle each <pbs-wake kind=\"monitor\"> before other work. Do not poll.",
@@ -436,7 +490,7 @@ export function createMonitorTool(
         content: [
           {
             type: "text",
-            text: `Monitor started · task ${taskId} · ${timeoutText}`,
+            text: `Monitor started · task ${taskId} · ${timeoutText}\n${MONITOR_STARTED_INSTRUCTION}`,
           },
         ],
         details: { task_id: taskId, timeout_ms: timeoutMs },
@@ -453,9 +507,10 @@ export function createMonitorTool(
         .filter((c): c is { type: "text"; text: string } => c.type === "text")
         .map((c) => c.text)
         .join("\n");
+      const firstLine = text.split("\n")[0];
       const failed = context.isError || /\b(failed|killed|orphaned|error)\b/i.test(text);
       const { color, glyph } = statusGlyph(failed ? "failed" : "completed", failed);
-      const line = `${theme.fg(color as "error", glyph)} ${text}${expanded ? "" : theme.fg("dim", "  · manage via /tasks")}`;
+      const line = `${theme.fg(color as "error", glyph)} ${firstLine}${expanded ? "" : theme.fg("dim", "  · manage via /tasks")}`;
       return toolComponent([line]) as never;
     },
   };

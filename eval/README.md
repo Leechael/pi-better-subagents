@@ -37,7 +37,11 @@ Faux scripts live in `e2e/scripts/`; the DSL is `e2e/faux-dsl.ts`. Scripts run i
 
 ### Models and auth
 
+Per-model results, and when they must be rerun: [BASELINES.md](BASELINES.md).
+
 `eval/models.json` lists model specs exactly as `pi --model` takes them (`provider/id[:thinking]`); the first entry is the smoke model. Override per run with `--models a,b`.
+
+Always spell out the thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Episodes isolate `PBS_HOME` but not pi's own config, so a spec without one runs at `defaultThinkingLevel` from `~/.pi/agent/settings.json`: results then depend on whose machine ran them. The spec, level included, is the model key in `results.jsonl`, so `x:low` and `x:high` are separate cells and can be compared in one report.
 
 The eval never reads keys or `auth.json`. Each episode is the user's own `pi --model <spec>`, which resolves credentials (including OAuth refresh) the normal way. Models are validated against what pi can authenticate (RPC `get_available_models`) before anything runs. See what is available:
 
@@ -45,20 +49,58 @@ The eval never reads keys or `auth.json`. Each episode is the user's own `pi --m
 pi -ne --list-models
 ```
 
-### Tiers
+### What a run is made of
+
+A run is a grid of **cells**, one per (model × variant × scenario), each repeated `k` times. By default (`--pairs affected`) a variant is paired only with the scenarios in its `affects`; `--pairs all` gives the full cross product. Every repeat is one **episode**: a fresh pi session given one scenario's task, graded PASS / FAIL / INVALID.
+
+| Flag | Chooses | Default |
+|---|---|---|
+| `--tier smoke\|full` | A preset for the three flags below | `smoke` |
+| `--models a,b` | Which models (`pi --model` specs) | smoke: first entry of `models.json`; full: all of it |
+| `--variants a,b` | Which prompt texts to remove, one at a time. `baseline` removes nothing and always runs | smoke: `baseline` only; full: baseline + every ablatable segment in `manifest.json` + the groups |
+| `--k N` | Repeats per cell | smoke: 3; full: 10 |
+| `--scenarios a,b` | Which behaviors to probe (see [Scenarios](#scenarios-ablationscenariosts)) | all 8 |
+
+So **smoke** answers "does this model behave with the full prompt?", and **full** answers "which pieces of the prompt does that depend on?". An explicit flag overrides the tier's preset: `--tier full --models x` runs every variant on model `x` only.
+
+Other flags: `--transcripts` (save each episode's event stream; see below), `--concurrency N` (episodes in parallel, default 3), `--pairs all` (run a variant on every scenario, not just the ones in its `affects`), `--max-episodes N`, `--results FILE`, `--keep` (keep sandboxes), `--judge <model>` (optional LLM judge for fuzzy criteria, recorded as `metrics.judge`, never overrides the programmatic grade).
+
+### A complete first run
+
+Run from `eval/`. Every command without `--yes` prints the plan and a cost bound and runs nothing: check it first.
 
 ```bash
-node ablation/run.ts --tier smoke            # prints the plan + cost estimate, runs nothing
-node ablation/run.ts --tier smoke --yes      # 1 model × baseline × 8 scenarios × k=3
-node ablation/run.ts --tier full --yes       # all models × (baseline + every ablatable segment + groups) × k=10
-node ablation/report.ts                      # tables + verdicts (reads results/results.jsonl)
+npm run test:e2e                                        # free: harness and manifest are sound
+pi -ne --list-models                                    # pick models pi can authenticate
+node ablation/run.ts --tier full --models <a>,<b> --transcripts          # plan + cost
+node ablation/run.ts --tier full --models <a>,<b> --transcripts --yes    # run it
+node ablation/report.ts                                 # tables + verdicts
 ```
 
-Useful flags: `--models`, `--scenarios bg-end-turn,no-fabrication`, `--variants baseline,wake.lead-in`, `--k N`, `--concurrency N` (default 3), `--pairs all` (default only pairs listed in a segment's `affects`), `--max-episodes N`, `--transcripts` (save event streams), `--judge <model>` (optional LLM judge for fuzzy criteria, recorded as `metrics.judge`, never overrides the programmatic grade), `--results FILE`.
+`--tier full` covers smoke: baselines run first, then the variants. For scale, all three models in `models.json` came to 252 cells / ≤2520 episodes, ~$169 at list price (2026-09-29, before early stopping).
+
+Use `--transcripts` on a first run. Without it you get the grade and metrics (`polls: 12`) but not what the model did; with it you can read every tool call behind a FAIL. It costs disk, not model calls.
+
+### Where results go
+
+Everything lands under `eval/results/` (gitignored):
+
+- `results/results.jsonl`: one line per episode (model, variant, scenario, pass, reason, metrics, usage). `report.ts` reads this.
+- `results/transcripts/<label>.jsonl`: the event stream per episode, with `--transcripts`. Each result line's `transcriptPath` points at its file.
+
+The runner resumes from `results.jsonl`: a cell with k scored episodes is skipped. That is also why two versions of the extension need separate files, or the second run skips everything:
+
+```bash
+# <rev>: the version to compare against (a branch or SHA not checked out in another worktree)
+git -C .. worktree add --detach .worktree/base <rev>
+PBS_EVAL_EXTENSION=../.worktree/base/extension \
+  node ablation/run.ts --tier full --models <a> --transcripts --results results/base/results.jsonl --yes
+node ablation/report.ts --results results/base/results.jsonl
+```
+
+### Cost and early stopping
 
 **Cost.** Without `--yes` the runner only prints the plan and a list-price upper bound per model (from pi's model catalog, assuming ~2.5k fresh + 6k cached input and ~450 output tokens per call). Early stopping usually cuts the full tier well below the bound; OAuth/subscription providers may bill nothing. The report shows the parent-session cost pi reported; child-session usage is not included.
-
-**Resumable.** Results append to `results/results.jsonl` (gitignored). Re-running the same command skips cells that already have k scored episodes.
 
 **Early stopping.** Baselines run first. A variant stops as soon as its 95% Wilson interval is entirely below or above `baseline − 20pp`. Variants of a (model, scenario) whose baseline is below 20% are skipped ("floor"): no drop of 20pp is possible there.
 

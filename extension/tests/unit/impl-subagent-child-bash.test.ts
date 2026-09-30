@@ -124,8 +124,32 @@ describe("child bash (no-background variant)", () => {
       const tool = createChildBashTool(makeDeps(client, clock));
       await expect(
         tool.execute("tc", { command: "slow", timeout: 5 }, undefined, undefined, ctx),
-      ).rejects.toThrow(/timed out after 5 seconds and was killed/);
+      ).rejects.toThrow(/timed out after 5 seconds/);
       expect(client.stop).toHaveBeenCalledWith("sh_test1234", "timeout");
     });
+  });
+});
+
+// Same gap as the parent bash (eval batch 4): the manager enforces the
+// timeout too, and a kill it wins reached the child as a success.
+describe("child bash, command killed", () => {
+  function killed(record: Record<string, unknown>) {
+    return fakeClient({
+      wait: vi.fn(async () => ({ done: true, exit_code: null })),
+      output: vi.fn(async () => ({ chunk: "working\n", next_cursor: 8, status: "killed", exit_code: null, total_size: 8 })),
+      list: vi.fn(async () => [{ task_id: "sh_test1234", status: "killed", exit_code: null, ...record }]),
+    });
+  }
+
+  it("reports the manager's timeout kill as a timeout", async () => {
+    const tool = createChildBashTool(makeDeps(killed({ end_reason: "timeout", signal: "SIGTERM" })));
+    await expect(tool.execute("tc", { command: "./slow.sh", timeout: 1 }, undefined, undefined, ctx)).rejects.toThrow(
+      /working[\s\S]*timed out after 1 seconds/,
+    );
+  });
+
+  it("reports any other kill as killed", async () => {
+    const tool = createChildBashTool(makeDeps(killed({ signal: "SIGKILL" })));
+    await expect(tool.execute("tc", { command: "./slow.sh" }, undefined, undefined, ctx)).rejects.toThrow(/killed \(SIGKILL\)/);
   });
 });

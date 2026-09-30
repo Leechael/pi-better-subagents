@@ -25,6 +25,8 @@ export interface TaskToolsDeps {
   clock?: Clock;
   /** Settle work the manager reports as ended (lost exit events). */
   syncWithManager?: () => Promise<unknown>;
+  /** task_stop on a monitor: its leftover lines and exit should not wake the model. */
+  noteStopRequested?: (taskId: string) => (() => void) | void;
 }
 
 function requireClient(deps: TaskToolsDeps): Promise<ManagerClient> {
@@ -83,6 +85,11 @@ function formatTaskLine(task: TaskRecord, now: number): string {
   );
 }
 
+const END_TURN_HINT =
+  'The task is still running. Reply to the user now with no tool call; a <pbs-wake> arrives when it finishes.';
+const LIST_END_TURN_HINT =
+  "Running work wakes you with a <pbs-wake> when it finishes. Reply to the user now with no tool call instead of checking again.";
+
 const taskListParameters = Type.Object({
   all: Type.Optional(
     Type.Boolean({ description: "Also include finished work (default: running only). Always limited to this session." }),
@@ -108,12 +115,14 @@ export function createTaskListTool(
       const now = (deps.clock ?? realClock).now();
       const lines: string[] = [];
       const seen = new Set<string>();
+      let running = false;
 
       const pushItem = (item: WorkItem) => {
         if (seen.has(item.id)) return;
         if (!params.all && item.status !== "running" && item.status !== "pending") return;
         seen.add(item.id);
         const age = formatAge(item.startedAt, item.endedAt, now);
+        running ||= item.status === "running" || item.status === "pending";
         lines.push(`${item.id} [${item.kind}] ${item.status} (${age}) "${item.title}"`);
       };
 
@@ -126,6 +135,7 @@ export function createTaskListTool(
         // Sync-waited shells are not in the index and must not be listed as workers.
         if (task.kind === "shell" && !index?.get(task.task_id)) continue;
         seen.add(task.task_id);
+        running ||= task.status === "running";
         lines.push(formatTaskLine(task, now));
       }
 
@@ -145,6 +155,7 @@ export function createTaskListTool(
         for (const rec of disk) {
           if (liveIds.has(rec.child_id) || seen.has(rec.child_id)) continue;
           if (!params.all && !isAgentStatusActive(rec.status)) continue;
+          running ||= isAgentStatusActive(rec.status);
           agentLines.push(
             `${rec.child_id} [agent] ${rec.status} (run=${rec.run_id}) "${formatAgentCommand(rec).replace(/^agent:/, "")}"` +
               (rec.error ? ` — error: ${rec.error}` : ""),
@@ -161,7 +172,7 @@ export function createTaskListTool(
       const header = `${lines.length + agentLines.length} background item(s):`;
       const body = [...lines, ...agentLines];
       return {
-        content: [{ type: "text", text: [header, ...body].join("\n") }],
+        content: [{ type: "text", text: [header, ...body, ...(running ? ["", LIST_END_TURN_HINT] : [])].join("\n") }],
         details: { tasks, agents: agentLines },
       };
     },
@@ -195,23 +206,37 @@ const DEFAULT_OUTPUT_BYTES = 65536;
 export function createTaskOutputTool(
   deps: TaskToolsDeps,
 ): ToolDefinition<typeof taskOutputParameters, TaskOutputDetails> {
+  // total_size at the last read of each running task. A repeat read that finds
+  // the same size is polling: the prompt forbids it, but models still loop.
+  const lastRunningSize = new Map<string, number>();
+  const guardPoll = (id: string, running: boolean, size: number) => {
+    if (running && lastRunningSize.get(id) === size) {
+      throw new Error(`No new output from ${id} since your last read. ${END_TURN_HINT}`);
+    }
+    if (running) lastRunningSize.set(id, size);
+    else lastRunningSize.delete(id);
+  };
   return {
     name: "task_output",
     label: "Task Output",
     description:
       "Read output of a background task. Without a cursor, returns the tail of the output " +
-      "plus the current file pointer; pass the returned next_cursor as cursor for incremental reads.",
+      "plus the current file pointer; pass the returned next_cursor as cursor for incremental reads. " +
+      "Not a way to wait: a running task wakes you when it finishes, so reply with no tool call instead of calling this again.",
     promptSnippet: "Read background task output",
     parameters: taskOutputParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const agentText = agentTextFor(deps, params.task_id);
       if (agentText !== undefined) {
-        const body = agentText || "(no output yet)";
+        const status = deps.getIndex?.()?.get(params.task_id)?.status ?? "unknown";
+        const running = status === "pending" || status === "running";
+        guardPoll(params.task_id, running, agentText.length);
+        const body = (agentText || "(no output yet)") + (running ? `\n\n${END_TURN_HINT}` : "");
         return {
           content: [{ type: "text", text: body }],
           details: {
             task_id: params.task_id,
-            status: deps.getIndex?.()?.get(params.task_id)?.status ?? "unknown",
+            status,
             exit_code: null,
             cursor: 0,
             next_cursor: 0,
@@ -233,6 +258,8 @@ export function createTaskOutputTool(
       }
 
       const res = await client.output(params.task_id, cursor, maxBytes);
+      const running = res.status === "running";
+      guardPoll(params.task_id, running, res.total_size);
       const details: TaskOutputDetails = {
         task_id: params.task_id,
         status: res.status,
@@ -245,7 +272,8 @@ export function createTaskOutputTool(
       const footer =
         `\n\n[task ${params.task_id} status=${res.status}` +
         ` exit_code=${res.exit_code === null ? "null" : res.exit_code}` +
-        ` cursor=${cursor} next_cursor=${res.next_cursor} total_size=${res.total_size}]`;
+        ` cursor=${cursor} next_cursor=${res.next_cursor} total_size=${res.total_size}]` +
+        (running ? `\n${END_TURN_HINT}` : "");
       return { content: [{ type: "text", text: body + footer }], details };
     },
   };
@@ -278,8 +306,12 @@ export function createTaskStopTool(
         };
       }
       const client = await requireClient(deps);
+      const undoNote = deps.noteStopRequested?.(params.task_id);
       try {
         await client.stop(params.task_id, "tool");
+      } catch (err) {
+        undoNote?.();
+        throw err;
       } finally {
         // Stopping a task that already ended emits no new exit event.
         await deps.syncWithManager?.();

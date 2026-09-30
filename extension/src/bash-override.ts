@@ -35,6 +35,9 @@ import {
   bareSleepError,
   collectOutput,
   formatFinishedOutput,
+  killedBy,
+  killedStatus,
+  timedOutStatus,
   SHELL_MAX_BYTES,
   SHELL_MAX_LINES,
   withAbort,
@@ -129,7 +132,7 @@ async function executeLocal(
   const timeoutMs = resolveTimeoutMs(params.timeout);
   const shell = process.env.SHELL && process.env.SHELL.length > 0 ? process.env.SHELL : "/bin/bash";
 
-  const output = await new Promise<{ text: string; exitCode: number | null; timedOut: boolean; aborted: boolean }>(
+  const output = await new Promise<{ text: string; exitCode: number | null; signal: string | null; timedOut: boolean; aborted: boolean }>(
     (resolve, reject) => {
       const child = spawn(shell, ["-c", params.command], {
         cwd: ctx.cwd,
@@ -141,12 +144,12 @@ async function executeLocal(
       let timedOut = false;
       let aborted = false;
       let timer: ClockTimer | null = null;
-      const finish = (exitCode: number | null) => {
+      const finish = (exitCode: number | null, killSignal: string | null) => {
         if (settled) return;
         settled = true;
         if (timer !== null) clock.clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
-        resolve({ text: Buffer.concat(chunks).toString("utf8"), exitCode, timedOut, aborted });
+        resolve({ text: Buffer.concat(chunks).toString("utf8"), exitCode, signal: killSignal, timedOut, aborted });
       };
       const kill = () => {
         try {
@@ -178,7 +181,7 @@ async function executeLocal(
           reject(new Error(`Failed to start shell: ${err.message}`));
         }
       });
-      child.on("close", (code) => finish(code));
+      child.on("close", (code, killSignal) => finish(code, killSignal));
     },
   );
 
@@ -211,11 +214,12 @@ async function executeLocal(
 
   if (output.aborted) throw new Error(appendStatus(text, "Command aborted"));
   if (output.timedOut && params.timeout !== undefined) {
-    throw new Error(appendStatus(text, `Command timed out after ${params.timeout} seconds`));
+    throw new Error(appendStatus(text, timedOutStatus(params.timeout)));
   }
   if (output.exitCode !== 0 && output.exitCode !== null) {
     throw new Error(appendStatus(text, `Command exited with code ${output.exitCode}`));
   }
+  if (output.exitCode === null) throw new Error(appendStatus(text, killedBy(output.signal)));
   return { content: [{ type: "text", text }], details };
 }
 
@@ -238,7 +242,7 @@ export function createBashOverride(
     promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
     promptGuidelines: [
       "You can inspect PI_* environment variables for current model and session details.",
-      "Long-running bash commands are moved to the background automatically; do not poll or sleep to wait for them. End your turn and resume from the task wake when it arrives.",
+      "Long-running bash commands are moved to the background automatically; do not poll or sleep to wait for them. End your turn (a reply with no tool call) and resume from the task wake when it arrives.",
     ],
     parameters: bashParameters,
     renderResult(result, { expanded }, theme, context) {
@@ -356,6 +360,11 @@ export function createBashOverride(
       const exitCode = waitResult.exit_code ?? null;
       if (exitCode !== 0 && exitCode !== null) {
         throw new Error(appendStatus(text, `Command exited with code ${exitCode}`));
+      }
+      // No exit code: killed (timeout, stop, crash), unless the manager
+      // finished it as completed with its runner status unobservable.
+      if (exitCode === null && collected.status !== "completed") {
+        throw new Error(appendStatus(text, await killedStatus(client, start.task_id, input.timeout)));
       }
       return { content: [{ type: "text", text }], details };
     },

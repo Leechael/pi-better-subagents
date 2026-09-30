@@ -66,12 +66,15 @@ export function assistantTextBetween(items: Item[], fromSeq: number, toSeq = Num
     .join("\n");
 }
 
-export function finalAssistantText(items: Item[]): string {
-  for (let i = items.length - 1; i >= 0; i--) {
-    const it = items[i];
-    if (it.kind === "assistant" && it.text.trim()) return it.text;
-  }
-  return "";
+/**
+ * Did any assistant text state this canary? Canaries are only knowable once
+ * revealed, so the whole transcript is fair game. Checking only the final
+ * text failed runs that answered, then acknowledged a later wake (a monitor's
+ * exit right after its event): batch 1, 2026-09-29.
+ */
+export function stated(items: Item[], canaries: string[]): boolean {
+  const text = assistantTextBetween(items, -1);
+  return canaries.some((c) => text.includes(c));
 }
 
 /**
@@ -89,7 +92,17 @@ export function firstWriteOf(items: Item[], file: string, afterSeq = -1): CallAt
   const base = file.replace(/^.*\//, "");
   return callsBetween(items, afterSeq).find((c) => {
     if (c.name === "write" || c.name === "edit") return String(c.args.path ?? "").endsWith(base);
-    if (c.name === "bash") return new RegExp(`>>?\\s*['"]?(\\./)?${base.replace(/\./g, "\\.")}`).test(cmd(c)) || new RegExp(`tee\\s+(-a\\s+)?['"]?(\\./)?${base.replace(/\./g, "\\.")}`).test(cmd(c));
+    if (c.name === "bash") {
+      const b = base.replace(/\./g, "\\.");
+      return (
+        new RegExp(`>>?\\s*['"]?(\\./)?${b}`).test(cmd(c)) ||
+        new RegExp(`tee\\s+(-a\\s+)?['"]?(\\./)?${b}`).test(cmd(c)) ||
+        // mv/cp onto it: a command of its own (at the start or after a
+        // separator, not quoted text), the file its last argument; a
+        // redirect may follow.
+        new RegExp(`(^|[;&|(]\\s*)(mv|cp)\\s+(-\\S+\\s+)*\\S+\\s+['"]?(\\./)?${b}['"]?(?=\\s*($|[;&|]|\\d?>))`, "m").test(cmd(c))
+      );
+    }
     return false;
   });
 }

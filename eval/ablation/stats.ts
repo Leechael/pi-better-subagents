@@ -50,6 +50,15 @@ export function stopDecision(
   return "continue";
 }
 
+/**
+ * A cell whose first attempts all came back INVALID or errored has a setup
+ * the scenario cannot meet (e.g. mech.autobg on a scenario that needs a
+ * backgrounded command). Stop it instead of spending the 2k attempt cap.
+ */
+export function setupBroken(c: { attempts: number; scored: number }, limit = 3): boolean {
+  return c.scored === 0 && c.attempts >= limit;
+}
+
 export type SegmentVerdict = "load-bearing" | "slop" | "untested";
 
 /** Point-estimate rule from the spec: drop >= 20pp on any (model, scenario) → load-bearing. */
