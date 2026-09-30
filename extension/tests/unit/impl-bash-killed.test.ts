@@ -11,12 +11,12 @@ import { createBashOverride } from "../../src/bash-override";
 import { DEFAULT_CONFIG } from "../../src/config";
 import type { ManagerClient, TaskRecord } from "../../src/manager-client";
 
-function run(record: Partial<TaskRecord>, params: { command: string; timeout?: number }) {
+function run(record: Partial<TaskRecord>, params: { command: string; timeout?: number }, outputStatus = "killed") {
   const client = {
     ensureAvailable: vi.fn(async () => true),
     start: vi.fn(async () => ({ task_id: "sh_1", pid: 1 })),
     wait: vi.fn(async () => ({ done: true, exit_code: null })),
-    output: vi.fn(async () => ({ chunk: "generating...\n", next_cursor: 14, status: "killed", exit_code: null, total_size: 14 })),
+    output: vi.fn(async () => ({ chunk: "generating...\n", next_cursor: 14, status: outputStatus, exit_code: null, total_size: 14 })),
     list: vi.fn(async () => [{ task_id: "sh_1", status: "killed", exit_code: null, ...record }]),
     stop: vi.fn(async () => {}),
   } as unknown as ManagerClient;
@@ -40,7 +40,34 @@ describe("bash on the manager path, command killed", () => {
     );
   });
 
+  // cubic review on #19: the manager records a command whose runner status
+  // was unobservable as completed with a null exit code. That is not a kill.
+  it("returns a completed task with no exit code as a success", async () => {
+    const res = await run({ status: "completed" }, { command: "./gen.sh" }, "completed");
+    expect((res.content[0] as { text: string }).text).toContain("generating...");
+  });
+
   it("reports any other kill as killed, with the signal", async () => {
     await expect(run({ signal: "SIGKILL" }, { command: "./gen.sh" })).rejects.toThrow(/killed \(SIGKILL\)/);
+  });
+});
+
+// cubic review on #19: the local fallback (manager unavailable) had the same
+// gap: a command killed by a signal came back as a success.
+describe("bash on the local fallback, command killed", () => {
+  it("reports a signal kill as killed", async () => {
+    const tool = createBashOverride({
+      getClient: () => null,
+      config: DEFAULT_CONFIG,
+      home: "/tmp/pbs-test",
+      sessionId: () => "s",
+      sessionEnv: () => ({}),
+      trackTask: vi.fn(),
+      markNotifyOnExit: vi.fn(),
+    });
+    const ctx = { cwd: "/tmp", sessionManager: { getSessionId: () => "s", getSessionFile: () => null } } as unknown as ExtensionContext;
+    await expect(tool.execute("tc", { command: "echo partial; kill -9 $$" }, undefined, undefined, ctx)).rejects.toThrow(
+      /partial[\s\S]*killed \(SIGKILL\)/,
+    );
   });
 });

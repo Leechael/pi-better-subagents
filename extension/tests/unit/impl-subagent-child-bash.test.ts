@@ -124,7 +124,7 @@ describe("child bash (no-background variant)", () => {
       const tool = createChildBashTool(makeDeps(client, clock));
       await expect(
         tool.execute("tc", { command: "slow", timeout: 5 }, undefined, undefined, ctx),
-      ).rejects.toThrow(/timed out after 5 seconds and was killed/);
+      ).rejects.toThrow(/timed out after 5 seconds/);
       expect(client.stop).toHaveBeenCalledWith("sh_test1234", "timeout");
     });
   });

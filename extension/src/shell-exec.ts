@@ -55,6 +55,8 @@ export interface CollectedOutput {
   text: string;
   totalSize: number;
   windowed: boolean;
+  /** The task's status as the manager reported it with the output. */
+  status: string;
 }
 
 export async function collectOutput(client: ManagerClient, taskId: string): Promise<CollectedOutput> {
@@ -69,7 +71,7 @@ export async function collectOutput(client: ManagerClient, taskId: string): Prom
     if (res.next_cursor <= cursor || res.next_cursor >= res.total_size) break;
     cursor = res.next_cursor;
   }
-  return { text, totalSize, windowed: start > 0 };
+  return { text, totalSize, windowed: start > 0, status: probe.status };
 }
 
 export function formatSize(bytes: number): string {
@@ -129,8 +131,15 @@ export function appendStatus(text: string, status: string): string {
  */
 export async function killedStatus(client: ManagerClient, taskId: string, timeoutSeconds: number | undefined): Promise<string> {
   const record = (await client.list(true).catch(() => [])).find((t) => t.task_id === taskId);
-  if (record?.end_reason === "timeout" && timeoutSeconds !== undefined) {
-    return `Command timed out after ${timeoutSeconds} seconds`;
-  }
-  return `Command was killed${record?.signal ? ` (${record.signal})` : ""}`;
+  if (record?.end_reason === "timeout" && timeoutSeconds !== undefined) return timedOutStatus(timeoutSeconds);
+  return killedBy(record?.signal);
+}
+
+/** The one wording of a timeout kill, on every bash path. */
+export function timedOutStatus(timeoutSeconds: number): string {
+  return `Command timed out after ${timeoutSeconds} seconds`;
+}
+
+export function killedBy(signal: string | null | undefined): string {
+  return `Command was killed${signal ? ` (${signal})` : ""}`;
 }
