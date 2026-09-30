@@ -2103,13 +2103,13 @@ async fn run_exit_watch(state: Shared, tid: String) {
             FirstSeen::Report(Some(r)) => {
                 let outcome = Outcome { code: r.code, signal: r.signal };
                 let leftover = if r.linger { Leftover::Guarded } else { Leftover::None };
-                wait_tee_drained(&state, &tid).await;
+                wait_tee_drained(&state, &tid, !r.linger).await;
                 finalize_exit(&state, &tid, outcome, leftover);
                 set_exit_phase(&state, &tid, registry::ExitPhase::AwaitRunnerExit);
             }
             FirstSeen::Report(None) => {
                 let s = runner.wait().await;
-                wait_tee_drained(&state, &tid).await;
+                wait_tee_drained(&state, &tid, false).await;
                 finalize_exit(&state, &tid, Outcome::of(s), Leftover::Probe);
                 set_exit_phase(&state, &tid, registry::ExitPhase::Done);
                 return;
@@ -2117,13 +2117,16 @@ async fn run_exit_watch(state: Shared, tid: String) {
             FirstSeen::RunnerExit(s) => {
                 // A report written just before the runner exited may still
                 // be in the pipe; the write end is closed now, so this ends.
-                wait_tee_drained(&state, &tid).await;
                 match read_status_line(&mut status_rx, &mut line).await {
                     Some(r) => {
                         let leftover = if r.linger { Leftover::Probe } else { Leftover::None };
+                        wait_tee_drained(&state, &tid, !r.linger).await;
                         finalize_exit(&state, &tid, Outcome { code: r.code, signal: r.signal }, leftover);
                     }
-                    None => finalize_exit(&state, &tid, Outcome::of(s), Leftover::Probe),
+                    None => {
+                        wait_tee_drained(&state, &tid, false).await;
+                        finalize_exit(&state, &tid, Outcome::of(s), Leftover::Probe)
+                    }
                 }
                 set_exit_phase(&state, &tid, registry::ExitPhase::Done);
                 return;
@@ -2155,13 +2158,22 @@ fn set_exit_phase(state: &Shared, tid: &str, phase: registry::ExitPhase) {
 /// The record's terminal `output_size` is snapshotted at finalize, so the
 /// tee pumps must drain the command's last output first. EOF arrives
 /// moments after the runner (and any leftover) closes its inherited write
-/// ends; a leftover that keeps the pipes open ends the wait early once
-/// output goes quiet. Capped: a stuck pump must not delay the exit event.
-/// A parked pump (in-place upgrade) has finished too, so it never waits.
-async fn wait_tee_drained(state: &Shared, tid: &str) {
+/// ends. A parked pump (in-place upgrade) has finished too, so it never waits.
+///
+/// `alone`: the runner reported an empty group, so nothing else holds the
+/// pipes and EOF will come; wait for it, however long the pumps take to get
+/// there (a pump behind a busy runtime or a full fanout channel went quiet
+/// for over 50 ms on CI and lost the last 48 KiB). Capped at 2 s in case a
+/// process that left the group (`setsid`) kept a write end.
+///
+/// Otherwise a leftover may keep the pipes open for good, so the wait also
+/// ends once output goes quiet (~50 ms), capped at 500 ms: a stuck pump must
+/// not delay the exit event.
+async fn wait_tee_drained(state: &Shared, tid: &str, alone: bool) {
+    let (rounds, quiet_rounds) = if alone { (400, u32::MAX) } else { (100, 10) };
     let mut last = u64::MAX;
     let mut quiet = 0u32;
-    for _ in 0..100 {
+    for _ in 0..rounds {
         let size = {
             let st = state.lock().unwrap();
             let Some(e) = st.registry.tasks.get(tid) else { return };
@@ -2173,8 +2185,8 @@ async fn wait_tee_drained(state: &Shared, tid: &str) {
             }
         };
         quiet = if size == last { quiet + 1 } else { 0 };
-        if quiet >= 10 {
-            return; // ~50 ms without new output
+        if quiet >= quiet_rounds {
+            return;
         }
         last = size;
         tokio::time::sleep(Duration::from_millis(5)).await;

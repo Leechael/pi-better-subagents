@@ -360,6 +360,19 @@ pub async fn parked(park: &mut tokio::sync::watch::Receiver<bool>) {
     let _ = park.wait_for(|p| *p).await;
 }
 
+/// Test hook `PBS_TEST_PUMP_STALL=<bytes>:<ms>`: a pump pauses once, after
+/// it has read at least `bytes`, as a pump held up by a busy runtime or a
+/// full fanout channel would. Placed near the end of a command's output, the
+/// pause outlasts the command: its exit is seen with output still unread.
+fn test_pump_stall() -> Option<(u64, std::time::Duration)> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let v = std::env::var("PBS_TEST_PUMP_STALL").ok()?;
+    let (bytes, ms) = v.split_once(':')?;
+    Some((bytes.parse().ok()?, std::time::Duration::from_millis(ms.parse().ok()?)))
+}
+
 async fn pump(
     mut reader: pipe::Receiver,
     out: Arc<Mutex<OutputState>>,
@@ -368,6 +381,8 @@ async fn pump(
     mut park: tokio::sync::watch::Receiver<bool>,
 ) -> Option<OwnedFd> {
     let mut buf = [0u8; READ_CHUNK];
+    let mut stall = test_pump_stall();
+    let mut read_total = 0u64;
     loop {
         let n = tokio::select! {
             biased;
@@ -381,6 +396,13 @@ async fn pump(
                 Err(_) => return None,
             },
         };
+        if let Some((after, d)) = stall {
+            read_total += n as u64;
+            if read_total >= after {
+                stall = None;
+                tokio::time::sleep(d).await;
+            }
+        }
         let chunk = buf[..n].to_vec();
         if let Some(f) = mirror.as_mut() {
             let _ = f.write_all(&chunk);
