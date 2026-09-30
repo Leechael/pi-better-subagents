@@ -356,11 +356,15 @@ fn u7_replacing_the_binary_upgrades_by_itself() {
     let deadline = Instant::now() + s(15);
     let after = loop {
         std::thread::sleep(Duration::from_millis(250));
-        let st = status(&home);
+        // A request that lands while the daemon quiesces or execs is closed
+        // ("manager closed the connection"; CI, 2026-09-30): the upgrade is
+        // in progress, not failed. Ask again.
+        let out = home.cli(&["status", "--json"], s(10));
+        let st: Value = serde_json::from_str(&out.stdout).unwrap_or(Value::Null);
         if st["generation"] == 1 {
             break st;
         }
-        assert!(Instant::now() < deadline, "no automatic upgrade: {st}");
+        assert!(Instant::now() < deadline, "no automatic upgrade: {} {}", out.stdout, out.stderr);
     };
     assert_eq!(after["pid"], before["pid"]);
     assert_eq!(after["last_upgrade"]["trigger"], "binary-changed");

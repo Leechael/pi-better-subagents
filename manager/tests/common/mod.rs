@@ -416,9 +416,30 @@ pub struct CliOut {
 pub fn replace_binary(dst: &Path, src: &Path) {
     let tmp = dst.with_extension("new");
     fs::copy(src, &tmp).expect("copy binary");
-    // The first run of a new binary file is slow on macOS (signature
-    // assessment): take it here, not inside a timed step of the test.
-    let _ = Command::new(&tmp).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status();
+    // Run it once before it takes its final name. The first run of a new
+    // binary file is slow on macOS (signature assessment): take it here, not
+    // inside a timed step of the test. And on Linux, a child another test
+    // thread forked while `fs::copy` had the file open for writing holds that
+    // descriptor until it execs; until then, exec of this file fails with
+    // ETXTBSY (CI, 2026-09-29: "spawn daemon: Text file busy"). Our own
+    // descriptor is closed, so no later fork can inherit it: once one exec
+    // succeeds, the file stays executable, for the test and for a daemon
+    // that execs it in an upgrade.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match Command::new(&tmp).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                panic!("{}: still ETXTBSY after 10 s of retries (a writer never exec'd?)", tmp.display())
+            }
+            r => {
+                r.unwrap_or_else(|e| panic!("run the copied binary {}: {e}", tmp.display()));
+                break;
+            }
+        }
+    }
     fs::rename(&tmp, dst).expect("rename binary");
 }
 
