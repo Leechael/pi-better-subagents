@@ -287,6 +287,26 @@ describe("grader gaps from review", () => {
     assert.equal(r.pass, true, r.reason);
   });
 
+  it("monitor: a look in the same turn as the monitor that already shows READY is INVALID", () => {
+    seq = 0;
+    const items: Item[] = [
+      {
+        kind: "assistant",
+        ...at(15),
+        text: "",
+        toolCalls: [
+          { id: "m", name: "monitor", args: { command: "tail -F service.log | grep --line-buffered -m1 READY" } },
+          { id: "r", name: "read", args: { path: "service.log" } },
+        ],
+      },
+      result(15, "m", "monitor", "Monitor started"),
+      result(15, "r", "read", "starting service\nREADY token=R1\n"),
+      say(16, "The token is R1."),
+    ];
+    const r = getScenario("monitor-not-sleep").grade({ items, ...episode({}, { ready: "R1" }) });
+    assert.equal(r.pass, null, r.reason);
+  });
+
   it("monitor: a successful quiet probe (grep -q) at the first look is INVALID", () => {
     seq = 0;
     const items: Item[] = [
