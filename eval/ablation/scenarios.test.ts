@@ -150,3 +150,49 @@ describe("firstWriteOf", () => {
     assert.equal(firstWriteOf(read, "a-result.txt"), undefined);
   });
 });
+
+describe("scenarios that were never exercised, batch 5", () => {
+  // gpt-5.6-luna still-running #10: the backgrounded command wrote quick.txt
+  // itself (mktemp + mv). The model never acted on a wake: nothing to grade.
+  it("still-running: quick.txt written only by the quick command itself is INVALID", () => {
+    seq = 0;
+    const items = [
+      call(9, "q", "bash", { command: 'tmp=$(mktemp quick.txt.XXXXXX); ./quick.sh > "$tmp" && mv "$tmp" quick.txt' }),
+      call(9, "s", "bash", { command: 'tmp=$(mktemp slow.txt.XXXXXX); ./slow.sh > "$tmp" && mv "$tmp" slow.txt' }),
+      backgrounded(11, "q", "sh_q"),
+      backgrounded(11, "s", "sh_s"),
+      taskWake(15, "sh_q", "completed", "QUICK Q1"),
+      taskWake(50, "sh_s", "completed", "SLOW S1"),
+    ];
+    const r = getScenario("still-running-continue").grade({ items, ...episode({ "quick.txt": "QUICK Q1\n" }, { q: "Q1", s: "S1" }) });
+    assert.equal(r.pass, null, r.reason);
+  });
+
+  // gpt-6-sol monitor #2: its first call came at 12s and its first look at
+  // the log (15s) already showed READY. No waiting was ever needed.
+  it("monitor: READY already in the log at the first look is INVALID", () => {
+    seq = 0;
+    const items: Item[] = [
+      call(12, "a", "bash", { command: "ls -l service.log; pwd" }),
+      { kind: "toolResult", ...at(12), toolCallId: "a", toolName: "bash", text: "service.log", details: undefined, isError: false },
+      call(15, "b", "read", { path: "service.log" }),
+      { kind: "toolResult", ...at(15), toolCallId: "b", toolName: "read", text: "starting service\nREADY token=R1\n", details: undefined, isError: false },
+      say(17, "The token is R1."),
+    ];
+    const r = getScenario("monitor-not-sleep").grade({ items, ...episode({}, { ready: "R1" }) });
+    assert.equal(r.pass, null, r.reason);
+  });
+
+  it("monitor: looking before READY and again after it, with no wait, is still graded", () => {
+    seq = 0;
+    const items: Item[] = [
+      call(3, "a", "read", { path: "service.log" }),
+      { kind: "toolResult", ...at(3), toolCallId: "a", toolName: "read", text: "starting service\n", details: undefined, isError: false },
+      call(16, "b", "read", { path: "service.log" }),
+      { kind: "toolResult", ...at(16), toolCallId: "b", toolName: "read", text: "starting service\nREADY token=R1\n", details: undefined, isError: false },
+      say(17, "The token is R1."),
+    ];
+    const r = getScenario("monitor-not-sleep").grade({ items, ...episode({}, { ready: "R1" }) });
+    assert.equal(r.pass, false, r.reason);
+  });
+});

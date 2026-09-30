@@ -190,7 +190,14 @@ const stillRunningContinue: Scenario = {
     // "Slow finished" is the wake of the slow.sh run that completed, not of
     // one the model stopped or timed out and then restarted.
     const slowWake = firstWake(items, (w) => w.kind === "task" && w.status === "completed" && slows.some((b) => w.taskIds.includes(b.taskId)));
-    const write = firstWriteOf(items, "quick.txt");
+    // The write under test is the model's own call after quick.sh's wake. If
+    // the only write is the quick command itself (`./quick.sh > t && mv t
+    // quick.txt`), the model never acted on a wake: nothing to grade.
+    const write = quickWake ? firstWriteOf(items, "quick.txt", quickWake.seq) : undefined;
+    const earliest = firstWriteOf(items, "quick.txt");
+    if (!write && earliest && cmd(earliest) === quick.text) {
+      return { pass: null, reason: "the quick command wrote quick.txt itself", metrics: {} };
+    }
     const q = secret(secretDir, "q");
     const quickOk = q.some((t) => (readFile(cwd, "quick.txt") ?? "").includes(t));
     const beforeSlow = !!write && (slowWake === undefined || write.seq < slowWake.seq);
@@ -282,6 +289,14 @@ const monitorNotSleep: Scenario = {
     const tokens = secret(secretDir, "ready");
     const follows = (c: (typeof calls)[number]) => /tail\s+(-n\s*\+?\d+\s+)?-[fF]\b|--follow|inotifywait|fswatch/.test(cmd(c));
     const armed = calls.find((c) => c.name === "monitor" || (c.name === "bash" && follows(c)));
+    // A slow first model call can land after READY: the first look at the
+    // log already shows it, and no waiting was ever needed (gpt-6-sol, batch 5).
+    const readsLog = (c: (typeof calls)[number]) =>
+      (c.name === "bash" && /service\.log/.test(cmd(c)) && !follows(c)) || (c.name === "read" && /service\.log/.test(String(c.args.path)));
+    // The first call that shows the log's content (`ls` does not).
+    const firstLook = calls.find((c) => readsLog(c) && !/^\s*ls\b/.test(cmd(c)));
+    const firstLookText = firstLook ? (toolResults(items).find((r) => r.toolCallId === firstLook.id)?.text ?? "") : "";
+    const readyAtFirstLook = !!firstLook && (!armed || firstLook.seq < armed.seq) && /READY/.test(firstLookText);
     const readyAt = firstWake(items, (w) => tokens.some((t) => w.body.includes(t)))?.seq ?? Number.POSITIVE_INFINITY;
     const whileArmed = armed ? calls.filter((c) => c.seq > armed.seq && c.seq < readyAt) : calls;
     const logReads = whileArmed.filter(
@@ -294,6 +309,8 @@ const monitorNotSleep: Scenario = {
     const via = usedMonitor ? "monitor" : eventDriven > 0 ? "event-driven-bash" : "none";
     const metrics = { waitVia: via, sleepLoops, polls, blockedSleeps: blocked, answered };
     if (sleepLoops > 0 || blocked > 0) return { pass: false, reason: `sleep/poll loop (${sleepLoops} sleep cmds, ${blocked} blocked)`, metrics };
+    // Checked after sleep loops: a loop's own read shows READY too.
+    if (readyAtFirstLook) return { pass: null, reason: "READY was already in the log at the first look", metrics };
     if (polls > 0) return { pass: false, reason: `polled ${polls}x`, metrics };
     if (via === "none") return { pass: false, reason: `no event-driven wait (log reads: ${logReads})`, metrics };
     return { pass: answered, reason: answered ? `${via} + correct token` : `${via} but no correct answer`, metrics };
