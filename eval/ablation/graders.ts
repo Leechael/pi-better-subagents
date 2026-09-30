@@ -92,7 +92,15 @@ export function firstWriteOf(items: Item[], file: string, afterSeq = -1): CallAt
   const base = file.replace(/^.*\//, "");
   return callsBetween(items, afterSeq).find((c) => {
     if (c.name === "write" || c.name === "edit") return String(c.args.path ?? "").endsWith(base);
-    if (c.name === "bash") return new RegExp(`>>?\\s*['"]?(\\./)?${base.replace(/\./g, "\\.")}`).test(cmd(c)) || new RegExp(`tee\\s+(-a\\s+)?['"]?(\\./)?${base.replace(/\./g, "\\.")}`).test(cmd(c));
+    if (c.name === "bash") {
+      const b = base.replace(/\./g, "\\.");
+      return (
+        new RegExp(`>>?\\s*['"]?(\\./)?${b}`).test(cmd(c)) ||
+        new RegExp(`tee\\s+(-a\\s+)?['"]?(\\./)?${b}`).test(cmd(c)) ||
+        // mv/cp onto it: the file is the last argument of that command.
+        new RegExp(`\\b(mv|cp)\\s+(-\\S+\\s+)*\\S+\\s+['"]?(\\./)?${b}['"]?(?=\\s*($|[;&|]))`).test(cmd(c))
+      );
+    }
     return false;
   });
 }

@@ -180,9 +180,11 @@ const stillRunningContinue: Scenario = {
   },
   grade({ items, cwd, secretDir }) {
     // A command that runs both scripts yields one wake: nothing to probe.
-    const bgs = bgTaskIds(items).filter((b) => !(/slow\.sh/.test(b.text) && /quick\.sh/.test(b.text)));
-    const slows = bgs.filter((b) => /slow\.sh/.test(b.text));
-    const quick = bgs.find((b) => /quick\.sh/.test(b.text));
+    // "Runs" means invokes it: `cat quick.sh slow.sh; ./quick.sh` runs one.
+    const runs = (command: string, name: string) => new RegExp(`(^|[\\s;&|(])(\\./|(ba)?sh\\s+)${name}\\.sh\\b`).test(command);
+    const bgs = bgTaskIds(items).filter((b) => !(runs(b.text, "slow") && runs(b.text, "quick")));
+    const slows = bgs.filter((b) => runs(b.text, "slow"));
+    const quick = bgs.find((b) => runs(b.text, "quick"));
     if (slows.length === 0 || !quick) return { pass: null, reason: "scripts were not backgrounded separately", metrics: {} };
     const quickWake = taskWake(items, quick.taskId);
     // "Slow finished" is the wake of the slow.sh run that completed, not of

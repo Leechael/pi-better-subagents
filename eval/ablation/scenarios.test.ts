@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import type { Item } from "../lib/transcript.ts";
 import type { Wake } from "../lib/wake-adapter.ts";
+import { firstWriteOf } from "./graders.ts";
 import { getScenario } from "./scenarios.ts";
 
 const dirs: string[] = [];
@@ -111,5 +112,41 @@ describe("still-running-continue", () => {
     ];
     const r = scenario.grade({ items, ...episode({ "quick.txt": "QUICK Q1\n" }, { q: "Q1", s: "S1" }) });
     assert.equal(r.pass, true, r.reason);
+  });
+});
+
+// Batch 5 (2026-09-30).
+describe("still-running-continue, batch 5", () => {
+  const scenario = getScenario("still-running-continue");
+
+  // k3-256k #0: `cat quick.sh slow.sh; ./quick.sh` names both scripts but runs
+  // one. The first "one command runs both" rule called that INVALID.
+  it("a command that only reads a script's source does not count as running it", () => {
+    seq = 0;
+    const items = [
+      call(8, "q", "bash", { command: "cat quick.sh slow.sh; ./quick.sh" }),
+      call(8, "s", "bash", { command: "./slow.sh" }),
+      backgrounded(10, "q", "sh_q"),
+      backgrounded(10, "s", "sh_s"),
+      taskWake(17, "sh_q", "completed", "QUICK Q1"),
+      call(23, "w", "bash", { command: "grep '^QUICK' out > quick.txt" }),
+      taskWake(49, "sh_s", "completed", "SLOW S1"),
+    ];
+    const r = scenario.grade({ items, ...episode({ "quick.txt": "QUICK Q1\n" }, { q: "Q1", s: "S1" }) });
+    assert.equal(r.pass, true, r.reason);
+  });
+});
+
+describe("firstWriteOf", () => {
+  // gpt-5.6-luna still-running #10 wrote quick.txt with mv; kimi-for-coding
+  // handover #5 wrote a-result.txt with cp. Only > and tee were recognised.
+  it("recognises mv and cp onto the file", () => {
+    seq = 0;
+    const mv = [call(9, "a", "bash", { command: 'tmp=$(mktemp quick.txt.XXXXXX); ./quick.sh > "$tmp" && mv "$tmp" quick.txt' })];
+    assert.ok(firstWriteOf(mv, "quick.txt"));
+    const cp = [call(23, "b", "bash", { command: "cp alpha.txt a-result.txt && od -c a-result.txt" })];
+    assert.ok(firstWriteOf(cp, "a-result.txt"));
+    const read = [call(1, "c", "bash", { command: "cp a-result.txt backup.txt" })];
+    assert.equal(firstWriteOf(read, "a-result.txt"), undefined);
   });
 });
