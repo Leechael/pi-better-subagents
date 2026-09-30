@@ -1831,7 +1831,7 @@ fn t15_output_printed_just_before_exit_is_all_recorded() {
 /// and the exit was finalized with its last output still in the pipe. Here
 /// the pump pauses 300 ms once it has read all but 16 KiB, after the command
 /// has written everything. Invariant: a command that left nothing behind is
-/// finalized only after its pipes reach EOF.
+/// finalized only after its pipes reach EOF (within the drain's 2 s cap).
 #[test]
 fn t15b_a_pump_that_falls_behind_still_has_all_output_recorded() {
     let home = Home::new("t15b");

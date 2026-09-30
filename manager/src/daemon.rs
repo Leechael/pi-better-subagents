@@ -2160,11 +2160,13 @@ fn set_exit_phase(state: &Shared, tid: &str, phase: registry::ExitPhase) {
 /// moments after the runner (and any leftover) closes its inherited write
 /// ends. A parked pump (in-place upgrade) has finished too, so it never waits.
 ///
-/// `alone`: the runner reported an empty group, so nothing else holds the
-/// pipes and EOF will come; wait for it, however long the pumps take to get
-/// there (a pump behind a busy runtime or a full fanout channel went quiet
-/// for over 50 ms on CI and lost the last 48 KiB). Capped at 2 s in case a
-/// process that left the group (`setsid`) kept a write end.
+/// `alone`: the runner reported an empty group, so EOF should come; wait for
+/// it rather than for a quiet spell (a pump behind a busy runtime or a full
+/// fanout channel went quiet for over 50 ms on CI and lost the last 48 KiB).
+/// Capped at 2 s: a process that left the group (`setsid`) can hold a write
+/// end forever, and then the snapshot misses whatever it writes after the
+/// cap. The output file still gets it; the startup scan and `inspect` read
+/// the size from the file.
 ///
 /// Otherwise a leftover may keep the pipes open for good, so the wait also
 /// ends once output goes quiet (~50 ms), capped at 500 ms: a stuck pump must
