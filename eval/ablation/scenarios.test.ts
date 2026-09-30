@@ -52,7 +52,7 @@ const backgrounded = (s: number, callId: string, taskId: string): Item => ({
 const taskWake = (s: number, taskId: string, status: string, body = ""): Item => ({
   kind: "wake",
   ...at(s),
-  wake: { kind: "task", taskIds: [taskId], status, body, stillRunning: [], tasks: [], children: [] } as unknown as Wake,
+  wake: { kind: "task", taskIds: [taskId], status, body, stillRunning: [], tasks: [{ id: taskId, status }], children: [] } as unknown as Wake,
 });
 
 describe("bg-end-turn with no wake", () => {
@@ -194,5 +194,110 @@ describe("scenarios that were never exercised, batch 5", () => {
     ];
     const r = getScenario("monitor-not-sleep").grade({ items, ...episode({}, { ready: "R1" }) });
     assert.equal(r.pass, false, r.reason);
+  });
+});
+
+// cubic review on #18 (2026-09-29/30).
+describe("grader gaps from review", () => {
+  const multiWake = (s: number, tasks: [string, string][]): Item => ({
+    kind: "wake",
+    ...at(s),
+    wake: {
+      kind: "task",
+      taskIds: tasks.map(([id]) => id),
+      status: tasks.map(([, st]) => st).join(","),
+      tasks: tasks.map(([id, status]) => ({ id, status })),
+      body: "",
+      stillRunning: [],
+      children: [],
+    } as unknown as Wake,
+  });
+  const result = (s: number, id: string, name: string, text: string, isError = false): Item => ({
+    kind: "toolResult",
+    ...at(s),
+    toolCallId: id,
+    toolName: name,
+    text,
+    details: undefined,
+    isError,
+  });
+
+  it("still-running: writing quick.txt only after slow.sh finished is a FAIL", () => {
+    seq = 0;
+    const items = [
+      call(5, "q", "bash", { command: "./quick.sh" }),
+      call(5, "s", "bash", { command: "./slow.sh" }),
+      backgrounded(6, "q", "sh_q"),
+      backgrounded(6, "s", "sh_s"),
+      taskWake(12, "sh_q", "completed", "QUICK Q1"),
+      say(13, "quick done; waiting for slow too"),
+      taskWake(47, "sh_s", "completed", "SLOW S1"),
+      call(48, "w", "write", { path: "quick.txt", content: "QUICK Q1\n" }),
+    ];
+    const r = getScenario("still-running-continue").grade({ items, ...episode({ "quick.txt": "QUICK Q1\n" }, { q: "Q1", s: "S1" }) });
+    assert.equal(r.pass, false, r.reason);
+    assert.match(r.reason, /waited for slow/);
+  });
+
+  it("still-running: slow.sh finishing in a wake shared with another task still counts", () => {
+    seq = 0;
+    const items = [
+      call(5, "q", "bash", { command: "./quick.sh" }),
+      call(5, "s", "bash", { command: "./slow.sh" }),
+      call(5, "o", "bash", { command: "./other.sh" }),
+      backgrounded(6, "q", "sh_q"),
+      backgrounded(6, "s", "sh_s"),
+      backgrounded(6, "o", "sh_o"),
+      taskWake(12, "sh_q", "completed", "QUICK Q1"),
+      say(13, "waiting"),
+      multiWake(47, [["sh_o", "completed"], ["sh_s", "completed"]]),
+      call(48, "w", "write", { path: "quick.txt", content: "QUICK Q1\n" }),
+    ];
+    const r = getScenario("still-running-continue").grade({ items, ...episode({ "quick.txt": "QUICK Q1\n" }, { q: "Q1", s: "S1" }) });
+    assert.equal(r.pass, false, r.reason);
+  });
+
+  it("firstWriteOf: cp with a redirect after the destination writes; a quoted cp does not", () => {
+    seq = 0;
+    assert.ok(firstWriteOf([call(1, "a", "bash", { command: "cp alpha.txt a-result.txt 2>/dev/null" })], "a-result.txt"));
+    assert.equal(firstWriteOf([call(1, "b", "bash", { command: 'echo "next: cp alpha.txt a-result.txt"' })], "a-result.txt"), undefined);
+  });
+
+  // cubic suggested counting it; batch 5 has one such episode (grok-4.6 #9):
+  // it read the log alongside arming, before any instruction, then waited.
+  it("monitor: a log read in the same turn as arming the monitor is not a poll", () => {
+    seq = 0;
+    const items: Item[] = [
+      {
+        kind: "assistant",
+        ...at(3),
+        text: "",
+        toolCalls: [
+          { id: "m", name: "monitor", args: { command: "tail -F service.log | grep --line-buffered -m1 READY" } },
+          { id: "r", name: "read", args: { path: "service.log" } },
+        ],
+      },
+      result(3, "m", "monitor", "Monitor started"),
+      result(3, "r", "read", "starting service\n"),
+      say(4, "waiting"),
+      { kind: "wake", ...at(15), wake: { kind: "monitor", taskIds: ["mon_1"], status: "event", body: "READY token=R1", tasks: [], stillRunning: [], children: [] } as unknown as Wake },
+      say(16, "The token is R1."),
+    ];
+    const r = getScenario("monitor-not-sleep").grade({ items, ...episode({}, { ready: "R1" }) });
+    assert.equal(r.pass, true, r.reason);
+  });
+
+  it("monitor: a successful quiet probe (grep -q) at the first look is INVALID", () => {
+    seq = 0;
+    const items: Item[] = [
+      call(15, "g", "bash", { command: "grep -q READY service.log && echo found" }),
+      result(15, "g", "bash", "found\n"),
+      call(16, "m", "monitor", { command: "tail -F service.log | grep --line-buffered -m1 READY" }),
+      result(16, "m", "monitor", "Monitor started"),
+      { kind: "wake", ...at(17), wake: { kind: "monitor", taskIds: ["mon_1"], status: "event", body: "READY token=R1", tasks: [], stillRunning: [], children: [] } as unknown as Wake },
+      say(18, "The token is R1."),
+    ];
+    const r = getScenario("monitor-not-sleep").grade({ items, ...episode({}, { ready: "R1" }) });
+    assert.equal(r.pass, null, r.reason);
   });
 });

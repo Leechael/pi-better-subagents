@@ -97,8 +97,10 @@ export function firstWriteOf(items: Item[], file: string, afterSeq = -1): CallAt
       return (
         new RegExp(`>>?\\s*['"]?(\\./)?${b}`).test(cmd(c)) ||
         new RegExp(`tee\\s+(-a\\s+)?['"]?(\\./)?${b}`).test(cmd(c)) ||
-        // mv/cp onto it: the file is the last argument of that command.
-        new RegExp(`\\b(mv|cp)\\s+(-\\S+\\s+)*\\S+\\s+['"]?(\\./)?${b}['"]?(?=\\s*($|[;&|]))`).test(cmd(c))
+        // mv/cp onto it: a command of its own (at the start or after a
+        // separator, not quoted text), the file its last argument; a
+        // redirect may follow.
+        new RegExp(`(^|[;&|(]\\s*)(mv|cp)\\s+(-\\S+\\s+)*\\S+\\s+['"]?(\\./)?${b}['"]?(?=\\s*($|[;&|]|\\d?>))`, "m").test(cmd(c))
       );
     }
     return false;

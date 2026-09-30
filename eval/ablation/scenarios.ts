@@ -189,7 +189,11 @@ const stillRunningContinue: Scenario = {
     const quickWake = taskWake(items, quick.taskId);
     // "Slow finished" is the wake of the slow.sh run that completed, not of
     // one the model stopped or timed out and then restarted.
-    const slowWake = firstWake(items, (w) => w.kind === "task" && w.status === "completed" && slows.some((b) => w.taskIds.includes(b.taskId)));
+    // Per task: a wake can batch several exits, and then `status` is joined.
+    const slowWake = firstWake(
+      items,
+      (w) => w.kind === "task" && w.tasks.some((t) => t.status === "completed" && slows.some((b) => b.taskId === t.id)),
+    );
     // The write under test is the model's own call after quick.sh's wake. If
     // the only write is the quick command itself (`./quick.sh > t && mv t
     // quick.txt`), the model never acted on a wake: nothing to grade.
@@ -295,8 +299,15 @@ const monitorNotSleep: Scenario = {
       (c.name === "bash" && /service\.log/.test(cmd(c)) && !follows(c)) || (c.name === "read" && /service\.log/.test(String(c.args.path)));
     // The first call that shows the log's content (`ls` does not).
     const firstLook = calls.find((c) => readsLog(c) && !/^\s*ls\b/.test(cmd(c)));
-    const firstLookText = firstLook ? (toolResults(items).find((r) => r.toolCallId === firstLook.id)?.text ?? "") : "";
-    const readyAtFirstLook = !!firstLook && (!armed || firstLook.seq < armed.seq) && /READY/.test(firstLookText);
+    const firstLookResult = firstLook ? toolResults(items).find((r) => r.toolCallId === firstLook.id) : undefined;
+    // A quiet probe (`grep -q READY service.log`) shows READY by succeeding.
+    const quietProbe = !!firstLook && /\bgrep\b[^|;&]*\s(-\w*q\w*|--quiet|--silent)\b[^|;&]*READY/.test(cmd(firstLook));
+    const sawReady = /READY/.test(firstLookResult?.text ?? "") || (quietProbe && !!firstLookResult && !firstLookResult.isError);
+    // Calls in the same turn as arming the wait (same seq) were issued before
+    // the model had anything to wait for: a look alongside the monitor is a
+    // first look, not a poll (grok-4.6 batch 5 #9 armed a monitor and read
+    // the log in one turn, then waited).
+    const readyAtFirstLook = !!firstLook && (!armed || firstLook.seq <= armed.seq) && sawReady;
     const readyAt = firstWake(items, (w) => tokens.some((t) => w.body.includes(t)))?.seq ?? Number.POSITIVE_INFINITY;
     const whileArmed = armed ? calls.filter((c) => c.seq > armed.seq && c.seq < readyAt) : calls;
     const logReads = whileArmed.filter(
