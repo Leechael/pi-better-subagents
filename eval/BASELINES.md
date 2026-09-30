@@ -29,25 +29,25 @@ Read the transcript of every FAIL and INVALID before writing the numbers down: g
 
 ## Summary
 
-Latest reviewed result per model and scenario. 2026-09-30c reran three scenarios (`monitor-not-sleep`, `wake-continue`, `no-fabrication`); the other five come from 2026-09-30a or b. Pass + fail is the 80 scored episodes (8 scenarios × 10); INVALID episodes are rerun, so they come on top. gpt-5.6-luna shows 79: review turned one FAIL into INVALID after the run had ended, so no replacement episode ran.
+Latest reviewed result per model and scenario: `monitor-not-sleep` from 2026-09-30d, `wake-continue` and `no-fabrication` from 2026-09-30c (grok-4.7: 2026-09-30d), the other five from 2026-09-30a or b. Pass + fail is the 80 scored episodes (8 scenarios × 10); INVALID episodes are rerun, so they come on top. gpt-5.6-luna shows 79: review turned one FAIL into INVALID after the run had ended, so no replacement episode ran.
 
 | Model spec | pi ran at | Runs | Pass | Fail | Invalid | Usable |
 |---|---|---|---|---|---|---|
-| `openai-codex/gpt-6.1-sol:medium` | medium | 2026-09-30b, c | 80 | 0 | 0 | yes |
-| `deepseek/deepseek-flash:medium` | **high** | 2026-09-30b, c | 80 | 0 | 1 | yes |
-| `openai-codex/gpt-6-sol:medium` | medium | 2026-09-30a, c | 80 | 0 | 0 | yes |
-| `openai-codex/gpt-6-luna:medium` | medium | 2026-09-30a, c | 78 | 2 | 0 | yes |
-| `openai-codex/gpt-5.6-sol:medium` | medium | 2026-09-30a, c | 80 | 0 | 0 | yes |
-| `openai-codex/gpt-5.6-luna:medium` | medium | 2026-09-30a, c | 79 | 0 | 11 | yes |
-| `openai-codex/gpt-5.6-terra:medium` | medium | 2026-09-30a, c | 79 | 1 | 1 | yes |
-| `xai/grok-4.7:medium` | medium | 2026-09-30a only | 80 | 0 | 0 | yes, not re-measured on `b3df40a` (see 2026-09-30c) |
-| `xai/grok-4.6:medium` | medium | 2026-09-30a, c | 80 | 0 | 0 | yes |
-| `xai/grok-4.5:medium` | medium | 2026-09-30a, c | 80 | 0 | 1 | yes |
-| `xai/grok-4.3:medium` | medium | 2026-09-30a, c | 61 | 19 | 2 | **no** |
-| `kimi-coding/kimi-for-coding:medium` | **high** | 2026-09-30a, c | 79 | 1 | 0 | yes |
-| `kimi-coding/k3-256k:medium` | **high** | 2026-09-30a, c | 77 | 3 | 2 | yes |
+| `openai-codex/gpt-6.1-sol:medium` | medium | 2026-09-30b, c, d | 80 | 0 | 0 | yes |
+| `deepseek/deepseek-flash:medium` | **high** | 2026-09-30b, c, d | 80 | 0 | 1 | yes |
+| `openai-codex/gpt-6-sol:medium` | medium | 2026-09-30a, c, d | 80 | 0 | 0 | yes |
+| `openai-codex/gpt-6-luna:medium` | medium | 2026-09-30a, c, d | 80 | 0 | 0 | yes |
+| `openai-codex/gpt-5.6-sol:medium` | medium | 2026-09-30a, c, d | 80 | 0 | 0 | yes |
+| `openai-codex/gpt-5.6-luna:medium` | medium | 2026-09-30a, c, d | 79 | 0 | 11 | yes |
+| `openai-codex/gpt-5.6-terra:medium` | medium | 2026-09-30a, c, d | 79 | 1 | 1 | yes |
+| `xai/grok-4.7:medium` | medium | 2026-09-30a, d | 80 | 0 | 0 | yes |
+| `xai/grok-4.6:medium` | medium | 2026-09-30a, c, d | 80 | 0 | 0 | yes |
+| `xai/grok-4.5:medium` | medium | 2026-09-30a, c, d | 80 | 0 | 1 | yes |
+| `xai/grok-4.3:medium` | medium | 2026-09-30a, c, d | 61 | 19 | 2 | **no** |
+| `kimi-coding/kimi-for-coding:medium` | **high** | 2026-09-30a, c, d | 79 | 1 | 0 | yes |
+| `kimi-coding/k3-256k:medium` | **high** | 2026-09-30a, c, d | 79 | 1 | 2 | yes |
 
-**grok-4.3 is not usable with this extension.** It failed 10 of 10 `bg-end-turn` (2026-09-30a) and 9 of 10 `monitor-not-sleep` (2026-09-30c): All 9 `monitor-not-sleep` failures are repeated checks on the armed monitor (`cat` of the log, `task_list`, `ps`) instead of ending its turn; for `bg-end-turn` see 2026-09-30a. The same held in every run since PRs #17–#20 were started: 9 or 10 failures in 10 on `monitor-not-sleep` (seven runs), and 5 to 10 on `bg-end-turn` (six). None of the fixes or wording changes moved it.
+**grok-4.3 is not usable with this extension.** It failed 10 of 10 `bg-end-turn` (2026-09-30a) and 9 of 10 `monitor-not-sleep` (2026-09-30d): All 9 `monitor-not-sleep` failures are repeated checks on the armed monitor (`cat` of the log, `task_list`, `ps`) instead of ending its turn, with the start result naming exactly those as polls; for `bg-end-turn` see 2026-09-30a. The same held in every run since PRs #17–#20 were started: 9 or 10 failures in 10 on `monitor-not-sleep` (eight runs, and 10 of 10 under a wording tried in 2026-09-30d), and 5 to 10 on `bg-end-turn` (six). None of the fixes or wording changes moved it.
 
 ## Known gaps in these numbers
 
@@ -57,6 +57,25 @@ Latest reviewed result per model and scenario. 2026-09-30c reran three scenarios
 - `deferred: a provider failure inside an episode is graded as the model's behavior | impact: an episode that ends while the model's response is still pending, or whose model call returned a provider error, is scored PASS/FAIL/INVALID on whatever happened before; the runner flags only some of them as errors. 2026-09-30c: 12 grok-4.7 FAILs were this (4 in the run, 8 in its rerun), corrected by hand; 11 other episodes in 2026-09-30a–c, none a FAIL | trigger: any FAIL whose transcript ends on a pending assistant message or has an assistant message with stopReason "error"`
 - `deferred: monitor-not-sleep's first look skips any command that starts with ls | impact: \`ls -la service.log; tail -n 5 service.log\` shows READY but is not the first look, so a model that found READY already written FAILs instead of being INVALID; 1 episode in 2026-09-30a–c (grok-4.7, corrected by hand) | trigger: a second such episode, or any change to that grader`
 - Result lines do not keep the episode's canary tokens, so a grader fix cannot re-grade an old run; it has to be reviewed by hand or rerun (2026-09-30a was).
+
+## 2026-09-30d: monitor start result, rewritten after Claude Code's
+
+- Change (`6994213`): the monitor's start result says what will arrive (a wake for each event, a notice when it exits or times out) and names the polls (`task_list`, `task_output`, reading what it watches, sleep). Before, it said "do not check on it". Only `monitor-not-sleep` was rerun: the text is in the result of a `monitor` call, and in 2026-09-30a/b the model called `monitor` in 129 `monitor-not-sleep` episodes and in 6 of all the others (handover 2, still-running 3, supervisor 1).
+- Why: in 2026-09-30c, 5 of the 6 FAILs outside grok were one `task_list` or `task_output` right after arming, and the reasoning just before it was "I'm waiting" / "Awaiting monitor wake": the check was how the model waited. Claude Code's monitor start result lists what will arrive and says "do not poll or sleep".
+- Extension tree `2bed786` for the ten-model run; the tip, `61dc635`, differs only in a code comment. The three-model A/B ran before the commit, with the same model-visible text. 170 episodes, $2.33 reported by pi. grok-4.7 could not be measured in 2026-09-30c, so its `wake-continue` and `no-fabrication` were run here too, on `2bed786` (20 episodes, $0.64): 10 of 10 each, no invalid.
+
+A/B on the three models that did the one check, `monitor-not-sleep`, k=10:
+
+| Model | 2026-09-30c (old text) | A: + "Keep working", + `head` note in the tool description | B: this commit |
+|---|---|---|---|
+| gpt-6-luna | 8 | 7 | 10 |
+| kimi-for-coding | 9 | 10 | 9 |
+| k3-256k | 7 | 10 | 9 |
+| grok-4.3 (control) | 1 | 0 | 1 (ten-model run) |
+
+A was dropped: gpt-6-luna started two to four monitors for the same line in 3 of 10 episodes (never before), and its first monitor was a one-shot `grep` in 5 of 10 (0 and 1 of 10 in the two runs before). Which of A's two changes caused which is not separated. Under B, gpt-6-luna started one `tail -F` monitor in all 10. The totals (24, 27, 28 of 30) are within the noise of k=10; B is kept because it removes the one-check failure in most transcripts without adding another.
+
+Ten other models on B: all 10 of 10 except grok-4.3 (1 of 10, 9 FAILs, all repeated checks: `cat service.log`, `task_list`, `ps aux`). Review changed none. The remaining FAILs of B outside grok-4.3: kimi-for-coding #9 and k3-256k #5, each one `task_list` after "Wait for the wake." in its reasoning.
 
 ## 2026-09-30c: three scenarios after the review fixes
 
@@ -72,7 +91,7 @@ Recorded by the grader, 12 models (grok-4.7 below): 345 pass, 15 fail, 0 invalid
 - gpt-6-luna `monitor-not-sleep` #1: one `task_list` after arming. #6: its first monitor (`grep READY service.log`, no follow) exited at once; it checked the log, then armed `tail -n 0 -F`, which skips the READY line already written, and never answered.
 - kimi-for-coding `monitor-not-sleep` #5: one `task_list` after arming.
 
-**grok-4.7 could not be measured.** xAI returned "model is currently at capacity" throughout, and its calls took 20–60 s. Recorded: 25 pass, 5 fail, 6 invalid, 3 errors. Review turned all 5 FAILs into INVALID: in 4 the episode ended while the model's response was still pending, and in 1 (`monitor-not-sleep` #1) its first look, `ls -la service.log; …; tail -n 5 service.log`, already showed READY (see Known gaps). A rerun into a separate file (`results/batch7b`) was worse: 18 pass, 8 fail, 18 invalid, 6 errors; all 8 FAILs ended on a pending response (7) or a capacity error (1). Every grok-4.7 FAIL in both files was a provider failure; the 43 episodes it completed all passed. The summary keeps its 2026-09-30a numbers; rerun it when xAI has capacity.
+**grok-4.7 could not be measured.** xAI returned "model is currently at capacity" throughout, and its calls took 20–60 s. Recorded: 25 pass, 5 fail, 6 invalid, 3 errors. Review turned all 5 FAILs into INVALID: in 4 the episode ended while the model's response was still pending, and in 1 (`monitor-not-sleep` #1) its first look, `ls -la service.log; …; tail -n 5 service.log`, already showed READY (see Known gaps). A rerun into a separate file (`results/batch7b`) was worse: 18 pass, 8 fail, 18 invalid, 6 errors; all 8 FAILs ended on a pending response (7) or a capacity error (1). Every grok-4.7 FAIL in both files was a provider failure; the 43 episodes it completed all passed. Measured again in 2026-09-30d, when xAI had capacity.
 
 ## 2026-09-30b: gpt-6.1-sol, deepseek-flash
 
