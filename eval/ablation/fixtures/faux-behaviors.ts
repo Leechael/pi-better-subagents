@@ -4,7 +4,7 @@
  * Runs inside pi via harness/faux-ext.ts.
  */
 import { call, type FauxScript, type FauxStep, lastInputText, say, textOf } from "../../e2e/faux-dsl.ts";
-import { TAIL_GREP_COMMAND } from "./tail-grep-command.ts";
+import { tailGrepBehavior } from "./tail-grep-behavior.ts";
 
 /** Echo the first line of the wake that matches `re`, else a neutral ack. */
 const echoFromWake = (re: RegExp): FauxStep => (ctx) => {
@@ -78,22 +78,13 @@ function supervisorBehavior(mode: "reply" | "send"): FauxScript {
   return { steps: [], fallback: decide };
 }
 
-/** A READY can arrive in the foreground result or overtake the waiting reply. */
-const readyReply = (otherwise: string): FauxStep => (ctx) => {
-  const m = /token=([A-Z0-9]+)/.exec(lastInputText(ctx));
-  return say(m ? `The token is ${m[1]}` : otherwise);
-};
-
 const behaviors: Record<string, FauxScript> = {
   "supervisor-reply/reply": supervisorBehavior("reply"),
   "supervisor-reply/send": supervisorBehavior("send"),
   "resume-finished/resume": resumeBehavior("resume"),
   "resume-finished/send-then-resume": resumeBehavior("send-then-resume"),
   "resume-finished/send-only": resumeBehavior("send-only"),
-  "monitor-not-sleep/tail-grep": {
-    steps: [call("bash", { command: TAIL_GREP_COMMAND }), readyReply("Waiting for READY in the background.")],
-    fallback: readyReply("ok"),
-  },
+  "monitor-not-sleep/tail-grep": tailGrepBehavior,
   "bg-end-turn/good": {
     steps: [call("bash", { command: "./build.sh" }), say("It is building in the background; I will report when notified.")],
     fallback: echoFromWake(/BUILD OK [A-Z0-9]+/),

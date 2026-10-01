@@ -1,11 +1,10 @@
 /** Regression replay of READY overtaking the tail-grep fixture's waiting reply. */
 import assert from "node:assert/strict";
 import { type CtxMessage, say, textOf } from "../../e2e/faux-dsl.ts";
-import tailGrep from "./faux-behaviors.ts";
+import { waitingReply } from "./tail-grep-behavior.ts";
 
 export default {
   steps: [async () => {
-    const waiting = tailGrep.steps[1];
     const token = "RACE1234";
     // Foreground completion, captured from the real timing repro at 3104ms.
     const result: CtxMessage = {
@@ -18,12 +17,11 @@ export default {
         `<pi-famulus-wake kind="task"><task id="sh_12345678" status="exited"><preview>READY token=${token}</preview></task></pi-famulus-wake>` }],
     };
     for (const incoming of [result, wake]) {
-      const answer = typeof waiting === "function"
-        ? await waiting({ call: 1, messages: [incoming] }) : waiting;
+      const answer = waitingReply({ call: 1, messages: [incoming] });
       assert.equal(textOf({ role: answer.role, content: answer.content }), `The token is ${token}`, `READY swallowed at waiting step (${incoming.role})`);
     }
     const pending: CtxMessage = { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "moved to background (task_id: sh_12345678)" }] };
-    const answer = typeof waiting === "function" ? await waiting({ call: 1, messages: [pending] }) : waiting;
+    const answer = waitingReply({ call: 1, messages: [pending] });
     assert.equal(textOf({ role: answer.role, content: answer.content }), "Waiting for READY in the background.");
     return say("READY replays passed");
   }],

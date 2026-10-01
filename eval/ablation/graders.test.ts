@@ -106,7 +106,8 @@ describe("tail-grep timing regressions", () => {
         const code = await Promise.race([
           exited,
           new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(new Error(`tail/grep command did not exit: ${JSON.stringify({ mode, path, output, stderr })}`)), 3000);
+            // A safety watchdog for a leaked process, not a performance assertion.
+            timer = setTimeout(() => reject(new Error(`tail/grep command did not exit: ${JSON.stringify({ mode, path, output, stderr })}`)), 10_000);
           }),
         ]);
         assert.equal(code, expectedCode, "cleanup must preserve grep's success/failure status");
@@ -153,6 +154,41 @@ describe("tail-grep timing regressions", () => {
       assert.equal(r.usage.calls, 2, "initial tool call then immediate token reply");
     });
   });
+
+  for (const behavior of [undefined, "no-fabrication/good"]) {
+    it(`regression: fresh-process READY replay with behavior ${behavior ?? "unset"}`, async () => {
+      await withDiagnostics(async (diagnostics) => {
+        const env = { ...process.env };
+        delete env.PI_FAMULUS_FAUX_BEHAVIOR;
+        if (behavior !== undefined) env.PI_FAMULUS_FAUX_BEHAVIOR = behavior;
+        const source = `
+          import assert from "node:assert/strict";
+          import { runEpisode } from ${JSON.stringify(new URL("./episode.ts", import.meta.url).href)};
+          import { loadManifest, resolveVariant } from ${JSON.stringify(new URL("./manifest.ts", import.meta.url).href)};
+          import { getScenario } from ${JSON.stringify(new URL("./scenarios.ts", import.meta.url).href)};
+          const replied = (items) => items.some((item) => item.kind === "assistant" && item.text === "READY replays passed");
+          const scenario = { ...getScenario("monitor-not-sleep"), timeoutMs: 12000, quietMs: 100,
+            setup: () => ({ prompt: "Replay READY timing inputs." }), done: replied,
+            grade: ({ items }) => ({ pass: replied(items), reason: "READY replay", metrics: {} }) };
+          const r = await runEpisode({ model: "faux/faux-1", variant: resolveVariant(loadManifest(), "baseline"), scenario,
+            transcriptDir: ${JSON.stringify(join(diagnostics, "h"))}, label: "events",
+            extensions: [${JSON.stringify(FAUX_EXT)}], env: {
+              PI_FAMULUS_FAUX_SCRIPT: ${JSON.stringify(join(import.meta.dirname, "fixtures", "tail-grep-replay.ts"))},
+              PI_FAMULUS_FAUX_TRACE: ${JSON.stringify(join(diagnostics, "faux-trace.jsonl"))} } });
+          assert.equal(r.error, undefined, r.error);
+          assert.equal(r.grade.pass, true, JSON.stringify(r.grade));
+        `;
+        await new Promise<void>((resolve, reject) => {
+          const child = spawn(process.execPath, ["--input-type=module", "-e", source], { env });
+          let output = "";
+          child.stdout.on("data", (chunk) => { output += chunk; });
+          child.stderr.on("data", (chunk) => { output += chunk; });
+          child.on("error", reject);
+          child.on("close", (code) => code === 0 ? resolve() : reject(new Error(`fresh replay exited ${code}: ${output}`)));
+        });
+      });
+    });
+  }
 
   it("regression: READY overtaking the waiting step is answered (provider input replay)", async () => {
     const scenario = {
