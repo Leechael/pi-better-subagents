@@ -17,6 +17,7 @@ import { runEpisode } from "./episode.ts";
 import { loadManifest, resolveVariant } from "./manifest.ts";
 import { getScenario, type Scenario } from "./scenarios.ts";
 import { TAIL_GREP_COMMAND } from "./fixtures/tail-grep-command.ts";
+import { startFreshNode } from "./fresh-node.ts";
 
 const FIXTURE = join(import.meta.dirname, "fixtures", "faux-behaviors.ts");
 const baseline = resolveVariant(loadManifest(), "baseline");
@@ -75,6 +76,54 @@ const CASES: Array<[string, string, boolean, RegExp]> = [
 ];
 
 describe("tail-grep timing regressions", () => {
+  it("regression: fresh Node watchdog terminates and reaps a hung process tree", async () => {
+    const timersBefore = process.getActiveResourcesInfo().filter((type) => type === "Timeout");
+    const source = `
+      import { spawn } from "node:child_process";
+      const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "inherit" });
+      let stopping = false;
+      descendant.on("close", () => { if (stopping) process.exit(0); });
+      process.on("SIGTERM", () => {
+        stopping = true;
+        if (descendant.exitCode !== null || descendant.signalCode !== null) process.exit(0);
+      });
+      descendant.on("spawn", () => console.log(JSON.stringify({ descendant: descendant.pid })));
+      setInterval(() => {}, 1000);
+    `;
+    const { child, completed } = startFreshNode(source, { timeoutMs: 2000 });
+    let descendantPid: number | undefined;
+    child.stdout.on("data", (chunk) => {
+      const match = /"descendant":(\d+)/.exec(String(chunk));
+      if (match) descendantPid = Number(match[1]);
+    });
+    let guard: NodeJS.Timeout | undefined;
+    try {
+      await assert.rejects(Promise.race([
+        completed,
+        new Promise<never>((_, reject) => {
+          guard = setTimeout(() => reject(new Error("helper watchdog never settled the hung subprocess")), 7000);
+        }),
+      ]), (error: Error) => {
+        assert.match(error.message, /fresh Node timed out/);
+        assert.match(error.message, new RegExp(`pid=${child.pid}`));
+        assert.match(error.message, /"descendant":\d+/);
+        return true;
+      });
+    } finally {
+      clearTimeout(guard);
+      // Also clean up when testing a broken helper that never fired its watchdog.
+      try { process.kill(-child.pid!, "SIGTERM"); } catch { /* group already exited */ }
+    }
+    assert.equal(child.exitCode, 0, "hung parent reaped its descendant before exiting");
+    assert.equal(child.stdout.closed, true);
+    assert.equal(child.stderr.closed, true);
+    assert.equal(child.stdin.closed, true);
+    assert.ok(descendantPid, "actual descendant must have started");
+    for (const pid of [child.pid!, descendantPid, -child.pid!]) {
+      assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, "process and its owned group must be gone");
+    }
+    assert.deepEqual(process.getActiveResourcesInfo().filter((type) => type === "Timeout"), timersBefore, "no watchdog or cleanup timer left pending");
+  });
   it("regression: system tail exits after READY even when the service writes nothing else", async () => {
     const systemPath = `/usr/bin:/bin:${process.env.PATH ?? ""}`;
     for (const { path, mode } of [systemPath, process.env.PATH ?? systemPath].flatMap((path) =>
@@ -178,14 +227,7 @@ describe("tail-grep timing regressions", () => {
           assert.equal(r.error, undefined, r.error);
           assert.equal(r.grade.pass, true, JSON.stringify(r.grade));
         `;
-        await new Promise<void>((resolve, reject) => {
-          const child = spawn(process.execPath, ["--input-type=module", "-e", source], { env });
-          let output = "";
-          child.stdout.on("data", (chunk) => { output += chunk; });
-          child.stderr.on("data", (chunk) => { output += chunk; });
-          child.on("error", reject);
-          child.on("close", (code) => code === 0 ? resolve() : reject(new Error(`fresh replay exited ${code}: ${output}`)));
-        });
+        await startFreshNode(source, { env }).completed;
       });
     });
   }
