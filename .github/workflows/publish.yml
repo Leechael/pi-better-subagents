@@ -1,8 +1,7 @@
 name: Publish npm packages
 
 on:
-  release:
-    types: [published]
+  # Select main as the workflow ref; the release tag is an explicit build input.
   workflow_dispatch:
     inputs:
       tag:
@@ -18,13 +17,16 @@ on:
 permissions:
   contents: read
 
-# Serialize all versions, including retries. Never interrupt a partial publication.
+# Serialize publication, retaining up to 100 pending runs (not just the latest).
+# GitHub cancels arrivals beyond that queue limit; retry them explicitly.
 concurrency:
   group: npm-release
+  queue: max
   cancel-in-progress: false
 
 jobs:
   validate:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.input.outputs.tag }}
@@ -41,8 +43,8 @@ jobs:
       - name: Validate event input before using it as a Git ref
         id: input
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
@@ -75,7 +77,9 @@ jobs:
   publish:
     needs: [validate, tests]
     runs-on: ubuntu-24.04
-    # Deliberately no GitHub environment: npm binds to publish.yml, empty environment.
+    # npm trust must require this environment. Its external deployment policy
+    # allows only the main branch, so editing a non-main workflow cannot bypass it.
+    environment: npm
     permissions:
       contents: read
       id-token: write

@@ -14,7 +14,7 @@ The main extension and four native manager packages form one versioned release. 
 
 Linux artifacts are statically linked with musl. macOS builds explicitly target macOS 13+. Node/pi's runtime requirements still apply. There is no Windows or other-architecture release.
 
-CI builds the four targets on native-architecture hosts, runs the ordinary and manual-clock Rust suites, and verifies actual root/native npm tarball installation on each host. Installed-package tests use an isolated HOME with no manager override and check both the CLI and the extension's real TypeScript resolver. CI also runs extension typecheck/full tests, real-manager integration, and the free faux-model eval/unit/grader suites. These do not replace the [required real-model baseline gate](../eval/BASELINES.md).
+CI builds the four targets on native-architecture hosts, runs the ordinary and manual-clock Rust suites, and verifies actual root/native npm tarball installation on each host. Installation smoke tests explicitly select the pi version pinned in the extension lockfile rather than an unbounded latest peer. Installed-package tests use an isolated HOME with no manager override and check both the CLI and the extension's real TypeScript resolver. CI also runs extension typecheck/full tests, real-manager integration, and the free faux-model eval/unit/grader suites. These do not replace the [required real-model baseline gate](../eval/BASELINES.md).
 
 ## Exact release metadata
 
@@ -46,7 +46,7 @@ https://github.com/Leechael/pi-better-subagents
 
 The repository has not been renamed externally. This URL is the actual GitHub/OIDC identity, not a leftover product namespace. If the GitHub repository is renamed, update the five URLs, the canonical release validator, this guide, and **all five npm trust bindings** together before publishing again.
 
-The publish job has **no GitHub environment**; leave the npm trusted-publisher Environment field blank. Bind each package separately:
+The publish job requires the **`npm` GitHub environment**. In repository Settings → Environments → npm, use **Selected branches and tags**, with exactly one **Branch** rule named `main` and no tag rules. This external policy blocks a non-main workflow from acquiring the trusted environment even if someone edits its in-file guards. Protect `main` against unreviewed changes as part of repository access policy. Bind each package separately; do not leave npm's Environment field blank:
 
 | npm setting | Value |
 |---|---|
@@ -54,7 +54,7 @@ The publish job has **no GitHub environment**; leave the npm trusted-publisher E
 | Owner / organization | `Leechael` |
 | Repository | `pi-better-subagents` |
 | Workflow filename | `publish.yml` (not the path or display name) |
-| Environment | Empty |
+| Environment | `npm` (required) |
 | Publish permission | Allow direct `npm publish` |
 
 ## Required one-time npm setup
@@ -63,7 +63,7 @@ Repository configuration does not create npm packages or their trusted-publisher
 
 1. Confirm the public license/ownership and all five npm names before the first public release.
 2. Merge the release code only after required review/testing, including the real-model baseline gate or an explicit maintainer waiver.
-3. Create the matching main-ancestor tag (for example `v0.1.0`). Run `publish.yml` via **workflow_dispatch**, selecting that tag and leaving **dry_run=true**. The resulting artifacts are `npm-root` and `npm-<os>-<arch>`.
+3. Verify the `npm` environment's main-only deployment policy. Create the matching main-ancestor tag (for example `v0.1.0`). Run `publish.yml` via **workflow_dispatch** from **main**, selecting that tag as the input and leaving **dry_run=true**. The resulting artifacts are `npm-root` and `npm-<os>-<arch>`.
 4. Download all five `.tgz` files from that exact run. Authenticate interactively with `npm login` in a maintainer-controlled terminal, then bootstrap the four native tarballs **first** and the root tarball **last**, with `npm publish <file.tgz> --access public`. Do not publish placeholders, source-only native packages, or different bytes under the same version. Local interactive bootstrap does not automatically produce GitHub OIDC provenance.
 5. Configure the table above under each package's npm Access / Trusted publishing settings. With current npm, the equivalent authenticated commands are:
 
@@ -73,7 +73,7 @@ for package in \
   pi-famulus-darwin-x64 pi-famulus-darwin-arm64 pi-famulus
 do
   npm trust github "$package" --file publish.yml \
-    --repository Leechael/pi-better-subagents --allow-publish --yes \
+    --repository Leechael/pi-better-subagents --environment npm --allow-publish --yes \
     --registry https://registry.npmjs.org
   npm trust list "$package" --registry https://registry.npmjs.org
 done
@@ -81,18 +81,25 @@ done
 
 Use npm's website if your npm version lacks `npm trust`. Refresh and verify the saved bindings; do not merely assume form submission proved authentication. After verifying OIDC on a subsequent version, restrict token publishing as appropriate for the maintainer's npm account policy.
 
-At implementation time local `npm whoami` returned 401 and the root package lookup returned 404. No public package was created or published, and no remote trust binding was changed. Those observations are setup status only: `whoami` returning 401 inside an OIDC-only job is expected and must not block publishing.
+The repository's `npm` GitHub environment was created and its single `main` branch-only deployment rule verified through GitHub's API. This is not npm-side authorization. At implementation time local `npm whoami` returned 401 and the root package lookup returned 404. No public package was created or published, and no npm trust binding was changed. Those observations are setup status only: `whoami` returning 401 inside an OIDC-only job is expected and must not block publishing.
 
 ## Subsequent tokenless releases
 
 `publish.yml` accepts stable tags only. A tag must resolve to the checked-out commit, match all five package/Cargo versions, and be an ancestor of `origin/main`. The workflow pins that SHA for full CI and publication, revalidates it, and downloads the five artifacts from that same workflow run.
 
-- **GitHub release published:** runs full validation/CI, then publishes via OIDC.
-- **Manual workflow:** `tag=vX.Y.Z`, `dry_run=true` builds/tests and invokes real `npm publish --dry-run`; set `dry_run=false` explicitly for publication.
+Publication is explicitly dispatched from **main**; publishing a GitHub release does not itself trigger npm publication. A tag-triggered workflow runs under a tag ref, not main, and is deliberately incompatible with the main-only environment gate.
+
+```sh
+gh workflow run publish.yml --ref main -f tag=vX.Y.Z -f dry_run=true
+# After reviewing the artifacts and trust bindings:
+gh workflow run publish.yml --ref main -f tag=vX.Y.Z -f dry_run=false
+```
+
+`dry_run=true` builds/tests and invokes real `npm publish --dry-run`; `dry_run=false` explicitly requests publication.
 
 A dry run proves package validity, **not** OIDC authentication or npm-side trust. For real publication, safe diagnostics assert OIDC request credentials are present without logging them. Successful OIDC/provenance must be verified from the publishing logs and npm metadata. Re-running an identical bootstrap version may skip every publish call; that is **not** an OIDC authentication test. Verify on a subsequent new version.
 
-Native packages publish before the root. The script preflights all five registry names/versions before its first mutation. Existing versions are skipped only if their SHA-512 tarball integrity equals the candidate; a mismatch or registry error stops publication. Releases are serialized and not auto-cancelled. npm versions cannot be overwritten. If a partial retry rebuilds different artifacts, fail closed and publish a new synchronized version rather than bypassing the integrity check.
+Native packages publish before the root. The script preflights all five registry names/versions before its first mutation. Existing versions are skipped only if their SHA-512 tarball integrity equals the candidate; a mismatch or registry error stops publication. Releases are serialized with GitHub's `queue: max`: one active run and up to 100 pending runs. Active publication is not auto-cancelled. GitHub cancels additional arrivals beyond that queue limit; operators must inspect and explicitly redispatch those requests. npm versions cannot be overwritten. If a partial retry rebuilds different artifacts, fail closed and publish a new synchronized version rather than bypassing the integrity check.
 
 Verify a completed release with `npm view <package>@X.Y.Z version dist.integrity`, the provenance link, and clean installs on the four supported platforms. Roll back by installing a previously complete root version; its exact optional dependencies select the corresponding native build.
 
@@ -101,3 +108,5 @@ Verify a completed release with `npm view <package>@X.Y.Z version dist.integrity
 - [npm Trusted Publishers: The Complete Guide](https://leechael.org/posts/2025/npm-trusted-publishers-the-complete-guide/)
 - [Official npm trusted publishing documentation](https://docs.npmjs.com/trusted-publishers/)
 - [Official npm trust commands](https://docs.npmjs.com/cli/v11/commands/npm-trust/)
+- [GitHub environment deployment restrictions](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)
+- [GitHub concurrency queues](https://github.blog/changelog/2026-05-07-github-actions-concurrency-groups-now-allow-larger-queues/)

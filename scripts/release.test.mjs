@@ -21,7 +21,7 @@ function fixture(t) {
   put('extension/bin/pi-famulus.js', '#!/usr/bin/env node\nconsole.log("pi-famulus");');
   put('extension/README.md', 'Test package');
   put('manager/Cargo.toml', `[package]\nname = "pi-famulus"\nversion = "${version}"\n`);
-  for (const p of PLATFORMS) put(`${p.directory}/package.json`, { name: p.name, version, main: './bin/pi-famulus', exports: { './package.json': './package.json', './bin/pi-famulus': './bin/pi-famulus' }, files: ['bin'], os: [p.os], cpu: [p.arch], repository: repo(p.directory) });
+  for (const p of PLATFORMS) put(`${p.directory}/package.json`, { name: p.name, version, main: './bin/pi-famulus', exports: { './package.json': './package.json', './bin/pi-famulus': './bin/pi-famulus' }, files: ['bin/pi-famulus'], os: [p.os], cpu: [p.arch], repository: repo(p.directory) });
   return { root, put };
 }
 function packAll(t) {
@@ -36,6 +36,50 @@ function packAll(t) {
   return f;
 }
 const response = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body });
+// actionlint validates YAML. This guard follows each shell scalar's parent
+// indentation rather than assuming a fixed column, scalar style, or final LF.
+function workflowRunBodies(text) {
+  const lines = text.split('\n');
+  const bodies = [];
+  for (let i = 0; i < lines.length; i++) {
+    const run = lines[i].match(/^( *)(- +)?run: *(.*)$/);
+    if (!run) continue;
+    const keyIndent = run[1].length + (run[2]?.length ?? 0);
+    bodies.push(run[3]);
+    while (i + 1 < lines.length) {
+      const next = lines[i + 1];
+      if (next.trim() && next.match(/^ */)[0].length <= keyIndent) break;
+      bodies.push(next);
+      i++;
+    }
+  }
+  return bodies.join('\n');
+}
+
+test('shell-expression guard covers blank lines, indentation and scalar styles', () => {
+  for (const scalar of ['|', '|-', '>', '>+']) {
+    for (const indent of [8, 10, 12]) {
+      const workflow = `jobs:\n  publish:\n    steps:\n${' '.repeat(indent - 4)}- run: ${scalar}\n${' '.repeat(indent)}echo safe\n\n${' '.repeat(indent)}echo \${{ inputs.tag }}`;
+      assert.match(workflowRunBodies(workflow), /\$\{\{/, `guard must cover ${scalar} at ${indent} spaces after a blank line`);
+    }
+  }
+  assert.match(workflowRunBodies('      - run: echo "${{ inputs.tag }}"'), /\$\{\{/);
+  assert.ok(!/\$\{\{/.test(workflowRunBodies('      - run: echo safe\n        env:\n          TAG: ${{ inputs.tag }}')));
+});
+
+test('explicit empty release tags are rejected by metadata and the actual CLI', t => {
+  const { root } = fixture(t);
+  assert.throws(() => validateMetadata(root, { tag: '' }), /release tag must/);
+  assert.throws(() => execFileSync(process.execPath, [new URL('./validate-release.mjs', import.meta.url).pathname, '--tag', ''], { cwd: root, stdio: 'pipe' }), /release tag must/);
+});
+
+test('native files whitelist cannot ship an entire bin directory', t => {
+  const { root, put } = fixture(t);
+  const path = 'npm/linux-x64/package.json';
+  const pkg = JSON.parse(readFileSync(join(root, path)));
+  put(path, { ...pkg, files: ['bin'] });
+  assert.throws(() => validateMetadata(root), /native files/);
+});
 
 test('release versions, literal repository and all four metadata contracts', t => {
   const { root, put } = fixture(t);
@@ -73,6 +117,8 @@ test('tag must be the checked-out commit and an ancestor of main (real git)', t 
   assert.throws(() => validateGitTag(root, 'v0.1.0'), /checked-out/);
   git('tag', 'v0.2.0');
   assert.throws(() => validateGitTag(root, 'v0.2.0'), /ancestor/);
+  git('update-ref', '-d', 'refs/remotes/origin/main');
+  assert.throws(() => validateGitTag(root, 'v0.2.0'), /origin\/main.*missing|fetch.*origin\/main/);
 });
 
 test('prepare fails for missing/nonexecutable/wrong-version binary; real npm tarball contains binary', t => {
@@ -116,8 +162,16 @@ test('dry run uses all real packed candidates, natives first/root last, and neve
 test('real release preflights all names before publish; bootstrap absence actionable', async t => {
   const { root } = packAll(t);
   const calls = [];
-  await assert.rejects(publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', dryRun: false, fetchImpl: async () => response(404, {}), run: (...args) => calls.push(args) }), /first publish.*trusted publisher/i);
-  assert.equal(calls.length, 0);
+  const lookups = [];
+  const missingName = PLATFORMS.at(-1).name;
+  const fetchImpl = async url => {
+    lookups.push(url);
+    return response(url.endsWith(`/${missingName}`) || url.endsWith('/0.1.0') ? 404 : 200, {});
+  };
+  await assert.rejects(publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', dryRun: false, fetchImpl, run: (...args) => calls.push(args) }), /first publish.*trusted publisher \(publish\.yml, environment npm\)/i);
+  assert.ok(lookups.includes(`https://registry.npmjs.org/${PLATFORMS[0].name}`), 'earlier package name exists');
+  assert.ok(lookups.includes(`https://registry.npmjs.org/${missingName}`), 'a later package name is missing');
+  assert.equal(calls.length, 0, 'no earlier package is published before the full preflight');
 });
 
 test('partial retry skips only byte-identical integrity; mismatch/network errors never publish', async t => {
@@ -171,6 +225,8 @@ test('workflow literal security, release graph and four host/target contracts', 
   assert.ok(native.includes('cargo test --locked\n'));
   assert.ok(native.includes('cargo test --locked --features test-clock'));
   assert.ok(native.includes('resolveManagerPath(DEFAULT_CONFIG'));
+  assert.ok(native.includes("packages['node_modules/@earendil-works/pi-coding-agent'].version"));
+  assert.ok(native.includes('"@earendil-works/pi-coding-agent@$pi_version"'));
   assert.ok(!native.includes('id-token:'));
   const ci = workflow('ci');
   assert.ok(!ci.includes('npm ci --omit=optional'), 'source installs must retain TypeScript/Rollup native optional bindings');
@@ -181,10 +237,13 @@ test('workflow literal security, release graph and four host/target contracts', 
   assert.ok(publish.includes('needs: [validate, tests]'));
   assert.ok(publish.includes('uses: ./.github/workflows/ci.yml'));
   assert.ok(publish.includes('cancel-in-progress: false'));
+  assert.ok(publish.includes('queue: max'));
+  assert.ok(publish.includes("if: github.ref == 'refs/heads/main'"));
+  assert.ok(!/^  release:/m.test(publish), 'tag-triggered workflows cannot use the main-only publishing environment');
   assert.ok(publish.includes('default: true'));
   assert.equal((publish.match(/id-token: write/g) ?? []).length, 1);
-  assert.ok(!/\n\s+environment:/.test(publish));
+  assert.equal((publish.match(/^    environment: npm$/gm) ?? []).length, 1);
   assert.ok(!/NPM_TOKEN|NODE_AUTH_TOKEN|npm whoami|npm login/.test(publish));
-  const runBodies = [...publish.matchAll(/^        run: (?:\|\n(?: {10}.*\n)*|.*)$/gm)].map(match => match[0]).join('');
+  const runBodies = workflowRunBodies(publish);
   assert.ok(!/\$\{\{[^}]+\}\}/.test(runBodies));
 });

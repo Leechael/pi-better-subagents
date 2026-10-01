@@ -36,7 +36,7 @@ export async function publishPackages(root, directory, { tag, dryRun = true, rep
   // Resolve all availability and integrity checks before the first mutating operation.
   for (const p of candidates) {
     if (!dryRun) {
-      assert.ok(await lookup(p.name), `${p.name} is not available on npm: first publish must be performed interactively, then configure its trusted publisher (publish.yml, no environment)`);
+      assert.ok(await lookup(p.name), `${p.name} is not available on npm: first publish must be performed interactively, then configure its trusted publisher (publish.yml, environment npm)`);
       const existing = await lookup(`${p.name}/${p.metadata.version}`);
       if (existing) {
         assert.equal(existing.dist?.integrity, p.integrity, `registry integrity differs for ${p.name}@${p.metadata.version}; refusing to skip or overwrite`);

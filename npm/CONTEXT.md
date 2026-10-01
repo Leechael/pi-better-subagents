@@ -16,7 +16,7 @@ _Avoid_: "release" when referring to only one platform's archive.
 **Published version**: Immutable registry bytes for a package name/version, identified by tarball integrity.
 _Avoid_: "replace" or "overwrite" for a version already published.
 
-**Trust binding**: npm's package-side authorization of the actual GitHub owner/repository, workflow filename, and optional environment.
+**Trust binding**: npm's package-side authorization of the actual GitHub owner/repository, workflow filename, and required `npm` environment. The environment's external deployment policy allows only the `main` branch.
 _Avoid_: treating workflow permissions or a dry run as proof that this remote binding exists.
 
 ## Customer invariants

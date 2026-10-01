@@ -21,7 +21,7 @@ export function validateMetadata(root, { tag, repository = REPOSITORY } = {}) {
   assert.equal(repository, REPOSITORY, 'repository must match the canonical GitHub repository');
   const read = directory => JSON.parse(readFileSync(join(root, directory, 'package.json'), 'utf8'));
   const pkg = read('extension');
-  const version = tag ? validateTag(tag) : pkg.version;
+  const version = tag === undefined ? pkg.version : validateTag(tag);
   validateTag(`v${version}`);
   const packages = [{ name: 'pi-famulus', directory: 'extension', metadata: pkg }, ...PLATFORMS.map(p => ({ ...p, metadata: read(p.directory) }))];
   for (const p of packages) {
@@ -37,7 +37,7 @@ export function validateMetadata(root, { tag, repository = REPOSITORY } = {}) {
       assert.deepEqual(m.exports, { './package.json': './package.json', './bin/pi-famulus': './bin/pi-famulus' }, `native exports: ${p.name}`);
       assert.deepEqual(m.os, [p.os], `native os: ${p.name}`);
       assert.deepEqual(m.cpu, [p.arch], `native cpu: ${p.name}`);
-      assert.ok(Array.isArray(m.files) && m.files.some(f => ['bin', 'bin/pi-famulus'].includes(f)) && m.files.every(f => ['bin', 'bin/pi-famulus', 'README.md'].includes(f)), `native files must whitelist binary and optional README: ${p.name}`);
+      assert.ok(Array.isArray(m.files) && m.files.includes('bin/pi-famulus') && m.files.every(f => ['bin/pi-famulus', 'README.md'].includes(f)), `native files must whitelist binary and optional README: ${p.name}`);
       for (const key of ['dependencies', 'optionalDependencies', 'peerDependencies', 'devDependencies']) assert.equal(Object.keys(m[key] ?? {}).length, 0, `native dependencies forbidden: ${p.name}`);
     }
   }
@@ -54,8 +54,13 @@ export function validateGitTag(root, tag) {
   const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   const tagged = git('rev-parse', '--verify', `refs/tags/${tag}^{commit}`);
   assert.equal(git('rev-parse', 'HEAD'), tagged, 'release tag must be the checked-out commit');
+  try { git('rev-parse', '--verify', 'refs/remotes/origin/main^{commit}'); }
+  catch (cause) { throw new Error('origin/main is missing or invalid; fetch origin/main before release validation', { cause }); }
   try { git('merge-base', '--is-ancestor', tagged, 'refs/remotes/origin/main'); }
-  catch { throw new Error('release tagged commit must be an ancestor of origin/main'); }
+  catch (error) {
+    if (error.status === 1) throw new Error('release tagged commit must be an ancestor of origin/main', { cause: error });
+    throw error;
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
@@ -64,7 +69,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     assert.ok(args.length === 0 || (args.length === 2 && args[0] === '--tag'), 'usage: validate-release.mjs [--tag vX.Y.Z]');
     const tag = args[1];
     validateMetadata(process.cwd(), { tag, repository: process.env.GITHUB_REPOSITORY ?? REPOSITORY });
-    if (tag) validateGitTag(process.cwd(), tag);
+    if (tag !== undefined) validateGitTag(process.cwd(), tag);
     console.log(`Validated all five packages${tag ? ` for ${tag}` : ''}`);
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }

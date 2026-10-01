@@ -115,7 +115,10 @@ jobs:
           cd "$sandbox/project"
           npm init -y
           version=$(node -p "JSON.parse(require('fs').readFileSync('$GITHUB_WORKSPACE/extension/package.json')).version")
+          # Use the same exact pi version as source tests, not the latest peer.
+          pi_version=$(node -p "JSON.parse(require('fs').readFileSync('$GITHUB_WORKSPACE/extension/package-lock.json')).packages['node_modules/@earendil-works/pi-coding-agent'].version")
           npm install --ignore-scripts --no-audit --no-fund \
+            "@earendil-works/pi-coding-agent@$pi_version" \
             "$RUNNER_TEMP/packages/pi-famulus-$version.tgz" \
             "$RUNNER_TEMP/packages/pi-famulus-$PLATFORM-$version.tgz"
           # No global manager or ~/.pi/agent/pi-famulus/bin: use the optional package.
