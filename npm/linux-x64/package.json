@@ -10,7 +10,7 @@
   "files": ["bin/pi-famulus", "README.md"],
   "repository": {
     "type": "git",
-    "url": "https://github.com/Leechael/pi-better-subagents",
+    "url": "https://github.com/Leechael/pi-famulus",
     "directory": "npm/linux-x64"
   },
   "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org" }

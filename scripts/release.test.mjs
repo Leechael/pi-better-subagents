@@ -1,14 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, statSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { PLATFORMS, validateMetadata, validateTag, validateGitTag } from './validate-release.mjs';
 import { prepareNative } from './prepare-native.mjs';
 import { publishPackages } from './publish-packages.mjs';
 
-const repository = 'Leechael/pi-better-subagents';
+const repository = 'Leechael/pi-famulus';
 const version = '0.1.0';
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'famulus-release-'));
@@ -98,7 +99,7 @@ test('shell-expression guard covers blank lines, indentation and scalar styles',
 test('explicit empty release tags are rejected by metadata and the actual CLI', t => {
   const { root } = fixture(t);
   assert.throws(() => validateMetadata(root, { tag: '' }), /release tag must/);
-  assert.throws(() => execFileSync(process.execPath, [new URL('./validate-release.mjs', import.meta.url).pathname, '--tag', ''], { cwd: root, stdio: 'pipe' }), /release tag must/);
+  assert.throws(() => execFileSync(process.execPath, [fileURLToPath(new URL('./validate-release.mjs', import.meta.url)), '--tag', ''], { cwd: root, stdio: 'pipe' }), /release tag must/);
 });
 
 test('native files whitelist cannot ship an entire bin directory', t => {
@@ -107,6 +108,32 @@ test('native files whitelist cannot ship an entire bin directory', t => {
   const pkg = JSON.parse(readFileSync(join(root, path)));
   put(path, { ...pkg, files: ['bin'] });
   assert.throws(() => validateMetadata(root), /native files/);
+});
+
+test('actual checkout and CLI accept the renamed GitHub repository and reject the old identity', () => {
+  const root = fileURLToPath(new URL('../', import.meta.url));
+  const cli = fileURLToPath(new URL('./validate-release.mjs', import.meta.url));
+  assert.equal(validateMetadata(root, { repository: 'Leechael/pi-famulus' }).length, 5);
+  const output = execFileSync(process.execPath, [cli], {
+    cwd: root, encoding: 'utf8', env: { ...process.env, GITHUB_REPOSITORY: 'Leechael/pi-famulus' }, stdio: 'pipe',
+  });
+  assert.match(output, /Validated all five packages/);
+  assert.throws(() => validateMetadata(root, { repository: 'Leechael/pi-better-subagents' }), /canonical GitHub repository/);
+  assert.throws(() => execFileSync(process.execPath, [cli], {
+    cwd: root, encoding: 'utf8', env: { ...process.env, GITHUB_REPOSITORY: 'Leechael/pi-better-subagents' }, stdio: 'pipe',
+  }), /canonical GitHub repository/);
+});
+
+test('release checkout paths with spaces and percent signs run the actual CLI regression', t => {
+  const { root } = fixture(t);
+  const spaced = mkdtempSync(join(tmpdir(), 'famulus checkout % '));
+  t.after(() => rmSync(spaced, { recursive: true, force: true }));
+  cpSync(root, spaced, { recursive: true });
+  cpSync(new URL('.', import.meta.url), join(spaced, 'scripts'), { recursive: true });
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  const output = execFileSync(process.execPath, ['--test', '--test-name-pattern=^actual checkout and CLI', join(spaced, 'scripts/release.test.mjs')], { env, encoding: 'utf8', stdio: 'pipe' });
+  assert.match(output, /actual checkout and CLI accept the renamed GitHub repository/);
 });
 
 test('release versions, literal repository and all four metadata contracts', t => {

@@ -41,10 +41,10 @@ The workflow is `.github/workflows/publish.yml`. It uses GitHub-hosted runners, 
 All five package manifests specify the exact public repository URL:
 
 ```text
-https://github.com/Leechael/pi-better-subagents
+https://github.com/Leechael/pi-famulus
 ```
 
-The repository has not been renamed externally. This URL is the actual GitHub/OIDC identity, not a leftover product namespace. If the GitHub repository is renamed, update the five URLs, the canonical release validator, this guide, and **all five npm trust bindings** together before publishing again.
+The GitHub repository has been renamed to `Leechael/pi-famulus`. Package metadata, the canonical release validator, and **all five npm trust bindings** must use this exact current identity. GitHub redirects from the previous repository name do not replace the matching OIDC identity.
 
 The publish job requires the **`npm` GitHub environment**. In repository Settings → Environments → npm, use **Selected branches and tags**, with exactly one **Branch** rule named `main` and no tag rules. This external policy blocks a non-main workflow from acquiring the trusted environment even if someone edits its in-file guards. Protect `main` against unreviewed changes as part of repository access policy. Bind each package separately; do not leave npm's Environment field blank:
 
@@ -52,7 +52,7 @@ The publish job requires the **`npm` GitHub environment**. In repository Setting
 |---|---|
 | Provider | GitHub Actions |
 | Owner / organization | `Leechael` |
-| Repository | `pi-better-subagents` |
+| Repository | `pi-famulus` |
 | Workflow filename | `publish.yml` (not the path or display name) |
 | Environment | `npm` (required) |
 | Publish permission | Allow direct `npm publish` |
@@ -73,7 +73,7 @@ for package in \
   pi-famulus-darwin-x64 pi-famulus-darwin-arm64 pi-famulus
 do
   npm trust github "$package" --file publish.yml \
-    --repository Leechael/pi-better-subagents --environment npm --allow-publish --yes \
+    --repository Leechael/pi-famulus --environment npm --allow-publish --yes \
     --registry https://registry.npmjs.org
   npm trust list "$package" --registry https://registry.npmjs.org
 done
