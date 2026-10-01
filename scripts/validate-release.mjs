@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
-export const REPOSITORY = 'Leechael/pi-better-subagents';
+export const REPOSITORY = 'Leechael/pi-famulus';
 export const PLATFORMS = [
   ['linux', 'x64', 'x86_64-unknown-linux-musl'],
   ['linux', 'arm64', 'aarch64-unknown-linux-musl'],

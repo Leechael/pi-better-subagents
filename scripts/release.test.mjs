@@ -8,7 +8,7 @@ import { PLATFORMS, validateMetadata, validateTag, validateGitTag } from './vali
 import { prepareNative } from './prepare-native.mjs';
 import { publishPackages } from './publish-packages.mjs';
 
-const repository = 'Leechael/pi-better-subagents';
+const repository = 'Leechael/pi-famulus';
 const version = '0.1.0';
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'famulus-release-'));
@@ -107,6 +107,16 @@ test('native files whitelist cannot ship an entire bin directory', t => {
   const pkg = JSON.parse(readFileSync(join(root, path)));
   put(path, { ...pkg, files: ['bin'] });
   assert.throws(() => validateMetadata(root), /native files/);
+});
+
+test('actual checkout and CLI accept the renamed GitHub repository and reject the old identity', () => {
+  const root = new URL('../', import.meta.url).pathname;
+  assert.equal(validateMetadata(root, { repository: 'Leechael/pi-famulus' }).length, 5);
+  const output = execFileSync(process.execPath, [new URL('./validate-release.mjs', import.meta.url).pathname], {
+    cwd: root, encoding: 'utf8', env: { ...process.env, GITHUB_REPOSITORY: 'Leechael/pi-famulus' }, stdio: 'pipe',
+  });
+  assert.match(output, /Validated all five packages/);
+  assert.throws(() => validateMetadata(root, { repository: 'Leechael/pi-better-subagents' }), /canonical GitHub repository/);
 });
 
 test('release versions, literal repository and all four metadata contracts', t => {

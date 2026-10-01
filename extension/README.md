@@ -33,4 +33,4 @@ Configuration and runtime state remain in `~/.pi/agent/pi-famulus`. Installing/u
 
 If optional dependencies were omitted, reinstall with them enabled. The CLI reports an actionable error; the extension can still discover an explicitly installed manager and otherwise enters degraded mode. An arbitrary different-version native npm package is never substituted.
 
-See the [project README](https://github.com/Leechael/pi-better-subagents#readme) for tools, settings, one-time migration, and source-build instructions; see the [CLI manual](https://github.com/Leechael/pi-better-subagents/blob/main/docs/cli.md) for operations.
+See the [project README](https://github.com/Leechael/pi-famulus#readme) for tools, settings, one-time migration, and source-build instructions; see the [CLI manual](https://github.com/Leechael/pi-famulus/blob/main/docs/cli.md) for operations.
