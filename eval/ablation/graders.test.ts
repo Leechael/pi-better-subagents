@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { FAUX_EXT } from "../lib/paths.ts";
@@ -16,6 +16,7 @@ import { itemsFromEvents, toolResults, wakes } from "../lib/transcript.ts";
 import { runEpisode } from "./episode.ts";
 import { loadManifest, resolveVariant } from "./manifest.ts";
 import { getScenario, type Scenario } from "./scenarios.ts";
+import { TAIL_GREP_COMMAND } from "./fixtures/tail-grep-command.ts";
 
 const FIXTURE = join(import.meta.dirname, "fixtures", "faux-behaviors.ts");
 const baseline = resolveVariant(loadManifest(), "baseline");
@@ -74,6 +75,54 @@ const CASES: Array<[string, string, boolean, RegExp]> = [
 ];
 
 describe("tail-grep timing regressions", () => {
+  it("regression: system tail exits after READY even when the service writes nothing else", async () => {
+    const systemPath = `/usr/bin:/bin:${process.env.PATH ?? ""}`;
+    for (const { path, mode } of [systemPath, process.env.PATH ?? systemPath].flatMap((path) =>
+      ["ready-now", "ready-later", "grep-failure"].map((mode) => ({ path, mode })))) {
+      const expectedCode = mode === "grep-failure" ? 7 : 0;
+      const cwd = mkdtempSync("/tmp/eval-tail-");
+      writeFileSync(join(cwd, "service.log"), mode === "ready-later" ? "starting service\n" : "starting service\nREADY token=RACE1234\n");
+      if (expectedCode !== 0) {
+        mkdirSync(join(cwd, "bin"));
+        writeFileSync(join(cwd, "bin", "grep"), "#!/bin/sh\necho fixture-grep-failure >&2\nexit 7\n", { mode: 0o700 });
+      }
+      // Hosted macOS uses BSD tail; a local Homebrew GNU tail masks this bug.
+      const child = spawn("/bin/sh", ["-c", TAIL_GREP_COMMAND], {
+        cwd, detached: true, env: {
+          ...process.env, TMPDIR: cwd,
+          PATH: `${expectedCode ? `${join(cwd, "bin")}:` : ""}${path}`,
+        },
+      });
+      let output = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => { output += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      const exited = new Promise<number | null>((resolve) => child.on("close", resolve));
+      let timer: NodeJS.Timeout | undefined;
+      const writer = mode === "ready-later" ? setTimeout(() => {
+        writeFileSync(join(cwd, "service.log"), "READY token=RACE1234\n", { flag: "a" });
+      }, 200) : undefined;
+      try {
+        const code = await Promise.race([
+          exited,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`tail/grep command did not exit: ${JSON.stringify({ mode, path, output, stderr })}`)), 3000);
+          }),
+        ]);
+        assert.equal(code, expectedCode, "cleanup must preserve grep's success/failure status");
+        assert.equal(output, expectedCode === 0 ? "READY token=RACE1234\n" : "");
+        assert.equal(stderr, expectedCode === 0 ? "" : "fixture-grep-failure\n");
+        assert.deepEqual(readdirSync(cwd).sort(), expectedCode === 0 ? ["service.log"] : ["bin", "service.log"], "command must leave no temporary files");
+      } finally {
+        clearTimeout(timer);
+        clearTimeout(writer);
+        // A leaked producer can hold stdio open even after its shell exited.
+        try { process.kill(-child.pid!, "SIGKILL"); } catch { /* group already exited */ }
+        await exited;
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    }
+  });
   it("regression: READY delivered before foreground return is answered without a wake", async () => {
     const original = getScenario("monitor-not-sleep");
     const scenario = {

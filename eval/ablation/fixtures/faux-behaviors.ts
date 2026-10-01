@@ -4,6 +4,7 @@
  * Runs inside pi via harness/faux-ext.ts.
  */
 import { call, type FauxScript, type FauxStep, lastInputText, say, textOf } from "../../e2e/faux-dsl.ts";
+import { TAIL_GREP_COMMAND } from "./tail-grep-command.ts";
 
 /** Echo the first line of the wake that matches `re`, else a neutral ack. */
 const echoFromWake = (re: RegExp): FauxStep => (ctx) => {
@@ -90,7 +91,7 @@ const behaviors: Record<string, FauxScript> = {
   "resume-finished/send-then-resume": resumeBehavior("send-then-resume"),
   "resume-finished/send-only": resumeBehavior("send-only"),
   "monitor-not-sleep/tail-grep": {
-    steps: [call("bash", { command: "tail -n +1 -F service.log | grep --line-buffered -m1 READY" }), readyReply("Waiting for READY in the background.")],
+    steps: [call("bash", { command: TAIL_GREP_COMMAND }), readyReply("Waiting for READY in the background.")],
     fallback: readyReply("ok"),
   },
   "bg-end-turn/good": {
