@@ -56,6 +56,21 @@ function workflowRunBodies(text) {
   return bodies.join('\n');
 }
 
+function assertPublishingAuthority(publish) {
+  assert.match(publish, /^concurrency:\n  group: npm-release\n  queue: max\n  cancel-in-progress: false\n/m, 'workflow-level release queue must retain pending runs');
+  const validate = publish.match(/^  validate:\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/m)?.[1] ?? '';
+  assert.match(validate, /^    if: github\.ref == 'refs\/heads\/main'$/m, 'validate job must require main');
+}
+
+test('publication guards cannot be satisfied by comments or other jobs', () => {
+  const publish = readFileSync(new URL('../.github/workflows/publish.yml', import.meta.url), 'utf8');
+  assertPublishingAuthority(publish);
+  assert.throws(() => assertPublishingAuthority(publish.replace('  queue: max', '  # queue: max')), /release queue/);
+  assert.throws(() => assertPublishingAuthority(publish.replace("    if: github.ref == 'refs/heads/main'", "    # if: github.ref == 'refs/heads/main'")), /validate job/);
+  const movedGuard = publish.replace("    if: github.ref == 'refs/heads/main'\n", '').replace('  publish:\n', "  publish:\n    if: github.ref == 'refs/heads/main'\n");
+  assert.throws(() => assertPublishingAuthority(movedGuard), /validate job/);
+});
+
 function assertExtensionSourceInstall(ci) {
   const job = ci.match(/^  extension:\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/m)?.[1] ?? '';
   assert.ok(job.includes('      - run: npm ci\n      - run: npx tsc --noEmit\n'), 'extension source job must install full dependencies before typecheck');
@@ -250,8 +265,7 @@ test('workflow literal security, release graph and four host/target contracts', 
   assert.ok(publish.includes('needs: [validate, tests]'));
   assert.ok(publish.includes('uses: ./.github/workflows/ci.yml'));
   assert.ok(publish.includes('cancel-in-progress: false'));
-  assert.ok(publish.includes('queue: max'));
-  assert.ok(publish.includes("if: github.ref == 'refs/heads/main'"));
+  assertPublishingAuthority(publish);
   assert.ok(!/^  release:/m.test(publish), 'tag-triggered workflows cannot use the main-only publishing environment');
   assert.ok(publish.includes('default: true'));
   assert.equal((publish.match(/id-token: write/g) ?? []).length, 1);
