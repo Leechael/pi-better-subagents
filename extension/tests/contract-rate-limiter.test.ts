@@ -9,7 +9,7 @@
  *   }
  *   export class RateLimiter {
  *     constructor(opts?: RateLimiterOptions);
- *     tryConsume(n?: number): boolean;  // default n=1; returns false if insufficient
+ *     tryConsume(n?: number): boolean;  // default n=1; false if insufficient
  *     dispose(): void;
  *   }
  *

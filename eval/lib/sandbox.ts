@@ -62,7 +62,7 @@ export function hasRunningWork(sb: Sandbox): boolean {
 
 export function createSandbox(opts: SandboxOptions = {}): Sandbox {
   // Short base path: unix socket paths are limited to ~104 bytes on macOS.
-  const root = mkdtempSync(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "pi-famulus-eval-"));
+  const root = mkdtempSync(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "eval-"));
   const cwd = join(root, "w");
   const famulusHome = join(root, "h");
   mkdirSync(cwd, { recursive: true });

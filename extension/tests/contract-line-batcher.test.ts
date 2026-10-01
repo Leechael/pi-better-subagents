@@ -7,18 +7,21 @@
  * `npx vitest run tests/contract-*.ts`. The required `contract-` prefix is
  * preserved.
  *
- * Contract under test (Appendix A, verbatim):
+ * Interface adapted from Appendix A (not a verbatim contract):
+ * dispose() below documents current implementation behavior: pending content
+ * is dropped, whereas Appendix A says "flush + clear timer". Batch tests check
+ * the hard cap, not Appendix A's separate plain-cut/no-marker requirement.
  *   export interface LineBatcherOptions {
  *     flushMs?: number;          // batching window, default 200
- *     maxLineChars?: number;     // per-line cap, default 500
- *     maxBatchChars?: number;    // per-batch cap, default 3000
+ *     maxLineChars?: number;     // per-line hard cap, default 500 (plain cut, no marker)
+ *     maxBatchChars?: number;    // per-batch hard cap, default 3000
  *     onFlush: (text: string) => void;
  *   }
  *   export class LineBatcher {
  *     constructor(opts: LineBatcherOptions);
- *     push(chunk: string): void;
- *     flush(): void;             // emit the current buffer immediately if nonempty
- *     dispose(): void;           // clear timers
+ *     push(chunk: string): void;   // feed raw output chunk (possibly no newline / multiple lines)
+ *     flush(): void;               // emit current buffer immediately (including a partial trailing line)
+ *     dispose(): void;             // actual behavior: clear timer and drop pending content
  *   }
  */
 import { describe, it, expect, beforeEach } from "vitest";
@@ -96,7 +99,8 @@ describe("LineBatcher (contract: design.md §4.4 + Appendix A)", () => {
     for (const line of lines) {
       expect(line.length).toBeLessThanOrEqual(500);
     }
-    // head of the line is preserved (truncation indicator unspecified)
+    // Appendix A specifies a plain cut with no marker; this assertion only
+    // checks that the head of the line is preserved.
     expect(batches[0]).toContain("x".repeat(100));
     b.dispose();
   });

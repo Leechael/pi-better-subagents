@@ -17,14 +17,14 @@ Every episode spawns the installed `pi` in RPC mode (`pi --mode rpc -ne -ns -np 
 - `tmux` for the TUI test
 - `npm install` in `eval/` is only needed for `npm run typecheck`
 
-Extension under test: `../extension` (override with `PI_FAMULUS_EVAL_EXTENSION`).
+Extension under test: `../extension` (override with `PI_FAMULUS_EVAL_EXTENSION` only for post-transition revisions compatible with this harness). For earlier revisions, use their matching harness and manager as described in [Where results go](#where-results-go).
 
 ## E2E (free)
 
 ```bash
 npm run test:e2e      # faux scenarios + ablation-harness self-test   (~15s)
 npm run test:tui      # PI_FAMULUS_E2E_TUI=1: tmux-driven interactive pi, asserts no line wider than the pane
-npm run test:unit     # wake adapter, Wilson/early-stopping stats, report verdicts
+npm run test:unit     # sandbox socket paths, wake adapter, Wilson/early-stopping stats, report verdicts
 npm run test:graders  # real-model graders run on scripted good/bad behaviors (~2 min)
 npm run typecheck
 ```
@@ -88,15 +88,42 @@ Everything lands under `eval/results/` (gitignored):
 - `results/results.jsonl`: one line per episode (model, variant, scenario, pass, reason, metrics, usage). `report.ts` reads this.
 - `results/transcripts/<label>.jsonl`: the event stream per episode, with `--transcripts`. Each result line's `transcriptPath` points at its file.
 
-The runner resumes from `results.jsonl`: a cell with k scored episodes is skipped. That is also why two versions of the extension need separate files, or the second run skips everything. The name transition changes model-visible prompt/wake text, so use an independent `--results` file when evaluating it; do not resume or mix episodes from a previous prompt version:
+The runner resumes from `results.jsonl`: a cell with k scored episodes is skipped. That is also why two versions of the extension need separate files, or the second run skips everything. The name transition changes model-visible prompt/wake text, so use independent `--results` files; do not resume or mix episodes from a previous prompt version.
+
+`PI_FAMULUS_EVAL_EXTENSION` swaps only the extension, not the manager, wake adapter, manifest, or ablation hooks. Use it only for post-transition revisions compatible with all of those. A pre-transition baseline must run with **its entire matching eval harness and manager**, not this harness with an older extension. No runtime compatibility aliases are provided.
+
+For a cross-transition comparison, start in the current checkout's `eval/` with no extension, manager, or home environment overrides set. Use a fresh results directory for each comparison, and the same explicit model/thinking-level spec for both revisions:
 
 ```bash
-# <rev>: the version to compare against (a branch or SHA not checked out in another worktree)
-git -C .. worktree add --detach .worktree/base <rev>
-PI_FAMULUS_EVAL_EXTENSION=../.worktree/base/extension \
-  node ablation/run.ts --tier full --models <a> --transcripts --results results/base/results.jsonl --yes
-node ablation/report.ts --results results/base/results.jsonl
+# <rev>: baseline branch or SHA; <a>: provider/model:thinking-level
+repo_root=$(git -C .. rev-parse --show-toplevel)
+baseline="$repo_root/.worktree/base"
+results_dir="$PWD/results/transition-comparison"  # absolute, shared only as an output destination
+git -C "$repo_root" worktree add --detach "$baseline" <rev>
+
+# Build and run entirely from the baseline revision, including its own harness.
+(
+  set -e
+  cd "$baseline"
+  npm ci --prefix extension
+  npm ci --prefix eval
+  cargo build --release --manifest-path manager/Cargo.toml --target-dir eval/.cache/target
+  cd eval
+  node ablation/run.ts --tier full --models <a> --transcripts --results "$results_dir/base/results.jsonl" --yes
+  node ablation/report.ts --results "$results_dir/base/results.jsonl"
+)
+
+# The subshell left us in the current checkout's eval/.
+(
+  set -e
+  npm ci --prefix ../extension
+  npm ci
+  node ablation/run.ts --tier full --models <a> --transcripts --results "$results_dir/current/results.jsonl" --yes
+  node ablation/report.ts --results "$results_dir/current/results.jsonl"
+)
 ```
+
+Each revision's harness builds/selects its own manager and isolates each episode's manager home. Both result files and their transcript directories remain independent, under the absolute output directory above. Check the baseline revision's README for supported flags and prerequisites; compare only model/scenario cells supported by both revisions. Omit `--yes` from each runner command to inspect its plan before paying for episodes.
 
 ### Cost and early stopping
 

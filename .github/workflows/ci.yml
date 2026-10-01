@@ -70,7 +70,7 @@ jobs:
     env:
       PI_FAMULUS_MANAGER_PATH: ${{ github.workspace }}/manager/target/release/pi-famulus
       PI_BIN: ${{ github.workspace }}/eval/node_modules/.bin/pi
-      # Keep every sandbox (/tmp/pi-famulus-eval-*) so a failure can be uploaded.
+      # Keep every sandbox (/tmp/eval-*) so a failure can be uploaded.
       PI_FAMULUS_EVAL_KEEP: "1"
     steps:
       - uses: actions/checkout@v4
@@ -109,8 +109,8 @@ jobs:
         with:
           name: e2e-sandboxes-${{ matrix.os }}
           path: |
-            /tmp/pi-famulus-eval-*/h/manager.log
-            /tmp/pi-famulus-eval-*/h/events.jsonl
-            /tmp/pi-famulus-eval-*/h/config.json
-            /tmp/pi-famulus-eval-*/faux-trace.jsonl
+            /tmp/eval-*/h/manager.log
+            /tmp/eval-*/h/events.jsonl
+            /tmp/eval-*/h/config.json
+            /tmp/eval-*/faux-trace.jsonl
           if-no-files-found: ignore

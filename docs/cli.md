@@ -85,7 +85,7 @@ Durations (`--since`): `500ms`, `30s`, `10m`, `2h`, `1d` (a bare number is secon
 
 | Starts the daemon when none runs | Never starts it |
 |---|---|
-| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (prints "pi-famulus is not running", exit 1), `sessions` and `show` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `doctor`, `shutdown` (prints "pi-famulus is not running", exit 0) |
+| `ls`, `output`, `wait`, `stop`, `kill-session`, `start` | `status` (stderr: `pi-famulus: pi-famulus is not running`, exit 1), `sessions` and `show` (read the disk instead), `agent`, `events`, `log`, `tail`, `completion`, `doctor`, `shutdown` (stdout: `pi-famulus is not running`, exit 0) |
 
 A daemon started this way exits again ~5s after its last client leaves (§3.2).
 
@@ -110,7 +110,7 @@ sessions: 2 (1 connected)
 tasks:    3 running, 8 finished (shells 2/5, agents 1/3)
 ```
 
-The version carries the commit the binary was built from, so two builds of 0.1.0 differ; `unknown` for a build outside a git checkout. `binary` is the daemon's file, the one an [`upgrade`](#upgrade) execs, which is not necessarily the CLI you ran. Counts include agents (running/finished shells and agents are also shown separately). `--json` prints the protocol `status` response plus `agent_counts`. With no daemon: `pi-famulus is not running` on stderr, exit 1.
+The version carries the commit the binary was built from, so two builds of 0.1.0 differ; `unknown` for a build outside a git checkout. `binary` is the daemon's file, the one an [`upgrade`](#upgrade) execs, which is not necessarily the CLI you ran. Counts include agents (running/finished shells and agents are also shown separately). `--json` prints the protocol `status` response plus `agent_counts`. With no daemon: `pi-famulus: pi-famulus is not running` on stderr, exit 1 (also with `--json`).
 
 ### `sessions`
 
@@ -298,7 +298,7 @@ upgraded in place: 0.1.0 -> 0.1.1 (pid 4321, generation 1, 3 running task(s) kep
 
 ### `shutdown`
 
-Asks the daemon to shut down gracefully: every running task and every leftover process group of a finished task gets SIGTERM, then SIGKILL after 2s; records end as `manager-shutdown`. Prints `manager shutting down`. The daemon also shuts itself down ~5s after its last client disconnects.
+Asks the daemon to shut down gracefully: every running task and every leftover process group of a finished task gets SIGTERM, then SIGKILL after 2s; records end as `manager-shutdown`. Prints `manager shutting down` on stdout; with no daemon, prints `pi-famulus is not running` on stdout and exits 0. The daemon also shuts itself down ~5s after its last client disconnects.
 
 The manager is the parent of every task and there is no crash recovery. Each task runs under a small runner (`pi-famulus __run`) that holds a lifeline to the daemon. If the daemon dies without shutting down (`kill -9`, a panic), every runner sees the lifeline break and takes its process group down: SIGTERM, then SIGKILL after 2s, background children included. The next daemon re-adopts nothing and signals nothing: only records still persisted as `running` are marked `orphaned` with `end_reason: manager-crash`; a command that already exited (even if its guardian runner is still cleaning up leftover children) has a terminal record that stays unchanged.
 

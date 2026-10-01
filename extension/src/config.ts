@@ -4,7 +4,7 @@
  * Config file: <famulus-home>/config.json
  * Base directory resolution: PI_FAMULUS_HOME env > ~/.pi/agent/pi-famulus
  */
-import { accessSync, constants, existsSync, readFileSync } from "node:fs";
+import { accessSync, constants, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 
@@ -200,48 +200,59 @@ export function loadConfig(home: string = getFamulusHome()): FamulusConfig {
   return config;
 }
 
+/** Return why a candidate is unusable, or null for an executable regular file. */
+function managerCandidateProblem(path: string): string | null {
+  try {
+    if (!statSync(path).isFile()) return "not a regular file";
+    accessSync(path, constants.X_OK);
+    return null;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return "missing";
+    if (code === "EACCES" || code === "EPERM") return "not executable";
+    return "inaccessible";
+  }
+}
+
 /**
- * Resolve the pi-famulus binary path.
- * Priority: config.managerPath > PI_FAMULUS_MANAGER_PATH env > <home>/bin/pi-famulus > PATH.
- * Returns null when no candidate exists.
- */
-/**
- * Human-readable account of where the manager binary was looked for, for the
- * degraded-startup warning. Mentions configured paths that do not exist, since
- * those are silently skipped by resolveManagerPath.
+ * Human-readable account of the manager search locations for the degraded-startup
+ * warning, including why explicit and home/bin candidates are ignored.
  */
 export function describeManagerSearch(
   config: FamulusConfig,
   home: string = getFamulusHome(),
   env: NodeJS.ProcessEnv = process.env,
 ): string {
+  const describeCandidate = (path: string): string => {
+    const problem = managerCandidateProblem(path);
+    return `${path}${problem ? ` (${problem}, ignored)` : ""}`;
+  };
   const tried: string[] = [];
-  if (config.managerPath) tried.push(`config managerPath ${config.managerPath}${existsSync(config.managerPath) ? "" : " (missing, ignored)"}`);
-  if (env.PI_FAMULUS_MANAGER_PATH) tried.push(`PI_FAMULUS_MANAGER_PATH ${env.PI_FAMULUS_MANAGER_PATH}${existsSync(env.PI_FAMULUS_MANAGER_PATH) ? "" : " (missing, ignored)"}`);
-  tried.push(join(home, "bin", "pi-famulus"));
+  if (config.managerPath) tried.push(`config managerPath ${describeCandidate(config.managerPath)}`);
+  if (env.PI_FAMULUS_MANAGER_PATH) tried.push(`PI_FAMULUS_MANAGER_PATH ${describeCandidate(env.PI_FAMULUS_MANAGER_PATH)}`);
+  tried.push(describeCandidate(join(home, "bin", "pi-famulus")));
   tried.push("pi-famulus on PATH");
   return tried.join("; ");
 }
 
+/**
+ * Resolve an executable regular pi-famulus binary, or null if none is usable.
+ * Priority: config.managerPath > PI_FAMULUS_MANAGER_PATH env > <home>/bin/pi-famulus > PATH.
+ */
 export function resolveManagerPath(
   config: FamulusConfig,
   home: string = getFamulusHome(),
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
-  if (config.managerPath && existsSync(config.managerPath)) return config.managerPath;
+  if (config.managerPath && managerCandidateProblem(config.managerPath) === null) return config.managerPath;
   const envPath = env.PI_FAMULUS_MANAGER_PATH;
-  if (envPath && existsSync(envPath)) return envPath;
+  if (envPath && managerCandidateProblem(envPath) === null) return envPath;
   const bundled = join(home, "bin", "pi-famulus");
-  if (existsSync(bundled)) return bundled;
+  if (managerCandidateProblem(bundled) === null) return bundled;
   for (const dir of (env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
     const candidate = join(dir, "pi-famulus");
-    try {
-      accessSync(candidate, constants.X_OK);
-      return candidate;
-    } catch {
-      // keep searching
-    }
+    if (managerCandidateProblem(candidate) === null) return candidate;
   }
   return null;
 }
