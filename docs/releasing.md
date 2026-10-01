@@ -25,7 +25,7 @@ Keep these at the same stable `X.Y.Z`:
 - `manager/Cargo.toml` version and the own-package Cargo lock record.
 - The extension lockfile's root metadata and first-party native-package version records.
 
-Third-party dependency records need not change for a version bump. For source development, the extension lockfile resolves native packages to their local metadata directories; CI uses `npm ci --omit=optional` and verifies built packages independently. The published root tarball does **not** contain this lockfile: consumers resolve the exact native versions from npm.
+Third-party dependency records need not change for a version bump. For source development, the extension lockfile resolves native packages to their local metadata directories; CI uses full `npm ci` and verifies built packages independently. Do not globally omit optional dependencies: TypeScript and Rollup also require their platform-specific optional bindings. The published root tarball does **not** contain this lockfile: consumers resolve the exact native versions from npm.
 
 ```sh
 node scripts/validate-release.mjs

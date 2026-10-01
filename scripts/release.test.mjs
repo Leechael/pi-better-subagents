@@ -173,7 +173,8 @@ test('workflow literal security, release graph and four host/target contracts', 
   assert.ok(native.includes('resolveManagerPath(DEFAULT_CONFIG'));
   assert.ok(!native.includes('id-token:'));
   const ci = workflow('ci');
-  assert.ok(ci.includes('npm ci --omit=optional'));
+  assert.ok(!ci.includes('npm ci --omit=optional'), 'source installs must retain TypeScript/Rollup native optional bindings');
+  assert.ok(ci.includes('- run: npm ci\n'));
   assert.ok(ci.includes('npm run test:graders'));
   assert.ok(ci.includes('/tmp/eval-*'));
   const publish = workflow('publish');

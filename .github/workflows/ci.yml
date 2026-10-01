@@ -40,8 +40,9 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: extension/package-lock.json
-      # Native packages need not exist in the registry for source tests.
-      - run: npm ci --omit=optional
+      # First-party natives use local lock links before registry bootstrap.
+      # Do not omit all optionals: TypeScript and Rollup need native bindings.
+      - run: npm ci
       - run: npx tsc --noEmit
       - run: npx vitest run
 
@@ -79,7 +80,7 @@ jobs:
       # Require the exact release artifact before running real integration;
       # a missing or misnamed binary must not pass as green.
       - run: test -x "$PI_FAMULUS_MANAGER_PATH"
-      - run: npm ci --omit=optional
+      - run: npm ci
         working-directory: extension
       - run: npm ci
         working-directory: eval
