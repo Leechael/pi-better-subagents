@@ -95,33 +95,54 @@ The runner resumes from `results.jsonl`: a cell with k scored episodes is skippe
 For a cross-transition comparison, start in the current checkout's `eval/` with no extension, manager, or home environment overrides set. Use a fresh results directory for each comparison, and the same explicit model/thinking-level spec for both revisions:
 
 ```bash
-# <rev>: baseline branch or SHA; <a>: provider/model:thinking-level
-repo_root=$(git -C .. rev-parse --show-toplevel)
-baseline="$repo_root/.worktree/base"
-results_dir="$PWD/results/transition-comparison"  # absolute, shared only as an output destination
-git -C "$repo_root" worktree add --detach "$baseline" <rev>
-
-# Build and run entirely from the baseline revision, including its own harness.
 (
-  set -e
+  set -euo pipefail
+  # Replace these values: baseline branch/SHA and provider/model:thinking-level.
+  revision="<rev>"
+  model="<a>"
+  current_eval="$PWD"
+  repo_root=$(git -C .. rev-parse --show-toplevel)
+  mkdir -p "$current_eval/results"
+  results_dir=$(mktemp -d "$current_eval/results/transition-comparison.XXXXXX")
+  printf 'Results: %s\n' "$results_dir"
+  worktree_dir=$(mktemp -d "${TMPDIR:-/tmp}/pi-famulus-baseline.XXXXXX")
+  baseline="$worktree_dir/base"
+  worktree_added=false
+  cleanup() {
+    status=$?
+    trap - EXIT
+    if "$worktree_added" && ! git -C "$repo_root" worktree remove "$baseline"; then
+      printf 'Worktree retained at %s; inspect it before removing manually (no --force).\n' "$baseline" >&2
+    else
+      rmdir "$worktree_dir" || printf 'Temporary directory retained: %s\n' "$worktree_dir" >&2
+    fi
+    exit "$status"
+  }
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  git -C "$repo_root" worktree add --detach "$baseline" "$revision"
+  worktree_added=true
+
+  # Build and run entirely from the baseline revision, including its own harness.
   cd "$baseline"
   npm ci --prefix extension
   npm ci --prefix eval
   cargo build --release --manifest-path manager/Cargo.toml --target-dir eval/.cache/target
   cd eval
-  node ablation/run.ts --tier full --models <a> --transcripts --results "$results_dir/base/results.jsonl" --yes
+  node ablation/run.ts --tier full --models "$model" --transcripts --results "$results_dir/base/results.jsonl" --yes
   node ablation/report.ts --results "$results_dir/base/results.jsonl"
-)
 
-# The subshell left us in the current checkout's eval/.
-(
-  set -e
+  # Candidate setup/run happens only if every baseline command succeeded.
+  cd "$current_eval"
   npm ci --prefix ../extension
   npm ci
-  node ablation/run.ts --tier full --models <a> --transcripts --results "$results_dir/current/results.jsonl" --yes
+  node ablation/run.ts --tier full --models "$model" --transcripts --results "$results_dir/current/results.jsonl" --yes
   node ablation/report.ts --results "$results_dir/current/results.jsonl"
 )
 ```
+
+The single fail-fast subshell stops before the candidate if baseline setup, evaluation, or reporting fails. Each invocation creates a disposable detached worktree (leaving existing worktrees untouched) and a unique results directory, so old episodes/reports cannot be reused accidentally. Cleanup never uses `--force`: if the worktree has untracked files or changes, it is retained with a warning for inspection and manual removal; results are always kept.
 
 Each revision's harness builds/selects its own manager and isolates each episode's manager home. Both result files and their transcript directories remain independent, under the absolute output directory above. Check the baseline revision's README for supported flags and prerequisites; compare only model/scenario cells supported by both revisions. Omit `--yes` from each runner command to inspect its plan before paying for episodes.
 
