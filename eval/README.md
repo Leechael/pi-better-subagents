@@ -142,7 +142,9 @@ For a cross-transition comparison, start in the current checkout's `eval/` with 
 )
 ```
 
-The single fail-fast subshell stops before the candidate if baseline setup, evaluation, or reporting fails. Each invocation creates a disposable detached worktree (leaving existing worktrees untouched) and a unique results directory, so old episodes/reports cannot be reused accidentally. Cleanup never uses `--force`: if the worktree has untracked files or changes, it is retained with a warning for inspection and manual removal; results are always kept.
+The single fail-fast subshell stops before the candidate if baseline setup, evaluation, or reporting fails. Each invocation creates a disposable detached worktree (leaving existing worktrees untouched) and a unique results directory, so old episodes/reports cannot be reused accidentally. Cleanup never uses `--force`: if the worktree has untracked files or changes, it is intentionally retained with a warning for inspection and manual removal; results are always kept.
+
+The pre-transition `origin/main` baseline ignores `extension/node_modules/` in the root `.gitignore`, and `eval/node_modules/`, `eval/.cache/`, and `eval/results/` in `eval/.gitignore`. Other revisions use their own ignore rules: inspect them before building. After preserving any changes and cleaning only verified generated files, run `git worktree remove /retained/path/from/warning` from the current repository. If the worktree directory was removed outside Git, inspect stale registrations with `git worktree prune --dry-run`, then prune them. Pruning does not remove an existing retained worktree or replace inspecting its files.
 
 Each revision's harness builds/selects its own manager and isolates each episode's manager home. Both result files and their transcript directories remain independent, under the absolute output directory above. Check the baseline revision's README for supported flags and prerequisites; compare only model/scenario cells supported by both revisions. Omit `--yes` from each runner command to inspect its plan before paying for episodes.
 
