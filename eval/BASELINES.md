@@ -58,6 +58,14 @@ Latest reviewed result per model and scenario: `monitor-not-sleep` from 2026-09-
 - `deferred: monitor-not-sleep's first look skips any command that starts with ls | impact: \`ls -la service.log; tail -n 5 service.log\` shows READY but is not the first look, so a model that found READY already written FAILs instead of being INVALID; 1 episode in 2026-09-30a–c (grok-4.7, corrected by hand) | trigger: a second such episode, or any change to that grader`
 - Result lines do not keep the episode's canary tokens, so a grader fix cannot re-grade an old run; it has to be reviewed by hand or rerun (2026-09-30a was).
 
+## Release-specific maintainer waiver: 0.1.0 name transition / 0.1.1 OIDC
+
+The maintainer approved reusing the historical 13-model baselines from 2026-09-30a–d for the pi-famulus name transition in the 0.1.0 interactive-auth bootstrap and the subsequent 0.1.1 GitHub Actions OIDC release. [PR #25, comment 5929597627](https://github.com/Leechael/pi-famulus/pull/25#issuecomment-5929597627) records the approval.
+
+This is a release-specific waiver of the renamed-prompt rerun gate, **not a renamed-prompt rerun**: no new real-model runs or scores were produced. The summary above retains the historical reviewed scores and limitations; it does not measure the renamed prompt (0.1.0 extension tree `a90bf5a`, main commit `8c758e7`). The 0.1.1 patch synchronizes release metadata and the extension version reported in its manager handshake for the subsequent OIDC publication. Wake delivery and model-visible tool/prompt wording are unchanged.
+
+Future meaningful model-visible changes and wake-delivery changes retain the rerun gate above; this waiver is not a standing exemption.
+
 ## 2026-09-30d: monitor start result, rewritten after Claude Code's
 
 - Change (`6994213`): the monitor's start result says what will arrive (a wake for each event, a notice when it exits or times out) and names the polls (`task_list`, `task_output`, reading what it watches, sleep). Before, it said "do not check on it". The text is in the result of a `monitor` call. In 2026-09-30a/b the model called `monitor` in 129 `monitor-not-sleep` episodes and in 6 others, in four cells: gpt-6-luna `handover-continue` (2), gpt-5.6-luna `still-running-continue` (2) and `supervisor-reply` (1), grok-4.3 `still-running-continue` (1). `monitor-not-sleep` was rerun on all 13 models and those four cells on their model.
