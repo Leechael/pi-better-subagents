@@ -1,9 +1,10 @@
 /**
  * Scripted "model behaviors" used to prove the real-model graders can go
- * both green and red (graders.test.ts). Selected by PBS_FAUX_BEHAVIOR.
+ * both green and red (graders.test.ts). Selected by PI_FAMULUS_FAUX_BEHAVIOR.
  * Runs inside pi via harness/faux-ext.ts.
  */
 import { call, type FauxScript, type FauxStep, lastInputText, say, textOf } from "../../e2e/faux-dsl.ts";
+import { tailGrepBehavior } from "./tail-grep-behavior.ts";
 
 /** Echo the first line of the wake that matches `re`, else a neutral ack. */
 const echoFromWake = (re: RegExp): FauxStep => (ctx) => {
@@ -83,13 +84,7 @@ const behaviors: Record<string, FauxScript> = {
   "resume-finished/resume": resumeBehavior("resume"),
   "resume-finished/send-then-resume": resumeBehavior("send-then-resume"),
   "resume-finished/send-only": resumeBehavior("send-only"),
-  "monitor-not-sleep/tail-grep": {
-    steps: [call("bash", { command: "tail -n +1 -F service.log | grep --line-buffered -m1 READY" }), say("Waiting for READY in the background.")],
-    fallback: (ctx) => {
-      const m = /token=([A-Z0-9]+)/.exec(lastInputText(ctx));
-      return say(m ? `The token is ${m[1]}` : "ok");
-    },
-  },
+  "monitor-not-sleep/tail-grep": tailGrepBehavior,
   "bg-end-turn/good": {
     steps: [call("bash", { command: "./build.sh" }), say("It is building in the background; I will report when notified.")],
     fallback: echoFromWake(/BUILD OK [A-Z0-9]+/),
@@ -171,7 +166,7 @@ const behaviors: Record<string, FauxScript> = {
   },
 };
 
-const key = process.env.PBS_FAUX_BEHAVIOR ?? "";
+const key = process.env.PI_FAMULUS_FAUX_BEHAVIOR ?? "";
 const script = behaviors[key];
-if (!script) throw new Error(`unknown PBS_FAUX_BEHAVIOR ${key}`);
+if (!script) throw new Error(`unknown PI_FAMULUS_FAUX_BEHAVIOR ${key}`);
 export default script;

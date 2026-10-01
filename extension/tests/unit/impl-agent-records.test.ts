@@ -17,7 +17,7 @@ describe("agent child records", () => {
   });
 
   it("round-trips a running agent record for ls / task_list", () => {
-    home = mkdtempSync(join(tmpdir(), "pbs-agent-rec-"));
+    home = mkdtempSync(join(tmpdir(), "pi-famulus-agent-rec-"));
     const rec: AgentChildRecord = {
       v: 1,
       kind: "agent",
@@ -46,7 +46,7 @@ describe("agent child records", () => {
   });
 
   it("round-trips provider errors on failed agent records", () => {
-    home = mkdtempSync(join(tmpdir(), "pbs-agent-rec-"));
+    home = mkdtempSync(join(tmpdir(), "pi-famulus-agent-rec-"));
     writeAgentChildRecord(home, {
       v: 1,
       kind: "agent",
@@ -67,7 +67,7 @@ describe("agent child records", () => {
   });
 
   it("hides terminal records unless includeTerminal is set", () => {
-    home = mkdtempSync(join(tmpdir(), "pbs-agent-rec-"));
+    home = mkdtempSync(join(tmpdir(), "pi-famulus-agent-rec-"));
     writeAgentChildRecord(home, {
       v: 1,
       kind: "agent",
@@ -85,7 +85,7 @@ describe("agent child records", () => {
   });
 
   it("treats a running record as not running when its session is disconnected", () => {
-    home = mkdtempSync(join(tmpdir(), "pbs-agent-rec-"));
+    home = mkdtempSync(join(tmpdir(), "pi-famulus-agent-rec-"));
     writeAgentChildRecord(home, {
       v: 1,
       kind: "agent",

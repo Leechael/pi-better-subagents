@@ -3,17 +3,17 @@
  *
  * Contract under test (Appendix A, verbatim):
  *   export interface RateLimiterOptions {
- *     capacity?: number;          // 默认 10
- *     refillIntervalMs?: number;  // 默认 2000
- *     refillAmount?: number;      // 默认 1
+ *     capacity?: number;          // default 10
+ *     refillIntervalMs?: number;  // default 2000
+ *     refillAmount?: number;      // default 1
  *   }
  *   export class RateLimiter {
  *     constructor(opts?: RateLimiterOptions);
- *     tryConsume(n?: number): boolean;  // 默认 n=1; 不足返回 false
+ *     tryConsume(n?: number): boolean;  // default n=1; false if insufficient
  *     dispose(): void;
  *   }
  *
- * §4.4: token bucket(容量 10,每 2s +1).
+ * §4.4: token bucket (capacity 10, refills by 1 every 2s).
  * ASSUMPTION: the bucket starts full (standard token-bucket semantics).
  */
 import { describe, it, expect, beforeEach } from "vitest";

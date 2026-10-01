@@ -7,18 +7,21 @@
  * `npx vitest run tests/contract-*.ts`. The required `contract-` prefix is
  * preserved.
  *
- * Contract under test (Appendix A, verbatim):
+ * Interface adapted from Appendix A (not a verbatim contract):
+ * dispose() below documents current implementation behavior: pending content
+ * is dropped, whereas Appendix A says "flush + clear timer". Batch tests check
+ * the hard cap, not Appendix A's separate plain-cut/no-marker requirement.
  *   export interface LineBatcherOptions {
- *     flushMs?: number;          // 合批窗口, 默认 200
- *     maxLineChars?: number;     // 单行 cap, 默认 500
- *     maxBatchChars?: number;    // 单批 cap, 默认 3000
+ *     flushMs?: number;          // batching window, default 200
+ *     maxLineChars?: number;     // per-line hard cap, default 500 (plain cut, no marker)
+ *     maxBatchChars?: number;    // per-batch hard cap, default 3000
  *     onFlush: (text: string) => void;
  *   }
  *   export class LineBatcher {
  *     constructor(opts: LineBatcherOptions);
- *     push(chunk: string): void;
- *     flush(): void;             // 立即发出当前缓冲(若有非空内容)
- *     dispose(): void;           // 清定时器
+ *     push(chunk: string): void;   // feed raw output chunk (possibly no newline / multiple lines)
+ *     flush(): void;               // emit current buffer immediately (including a partial trailing line)
+ *     dispose(): void;             // actual behavior: clear timer and drop pending content
  *   }
  */
 import { describe, it, expect, beforeEach } from "vitest";
@@ -41,7 +44,7 @@ describe("LineBatcher (contract: design.md §4.4 + Appendix A)", () => {
     const b = new LineBatcher({ onFlush, clock });
     b.push("hello ");
     b.push("world\n");
-    // 合批窗口: nothing is emitted synchronously
+    // Batching window: nothing is emitted synchronously
     expect(batches).toHaveLength(0);
     clock.advanceBy(200);
     expect(batches).toHaveLength(1);
@@ -96,7 +99,8 @@ describe("LineBatcher (contract: design.md §4.4 + Appendix A)", () => {
     for (const line of lines) {
       expect(line.length).toBeLessThanOrEqual(500);
     }
-    // head of the line is preserved (truncation indicator unspecified)
+    // Appendix A specifies a plain cut with no marker; this assertion only
+    // checks that the head of the line is preserved.
     expect(batches[0]).toContain("x".repeat(100));
     b.dispose();
   });
@@ -129,7 +133,7 @@ describe("LineBatcher (contract: design.md §4.4 + Appendix A)", () => {
     b.dispose();
   });
 
-  it("flush() on an empty buffer is a no-op (若有非空内容)", () => {
+  it("flush() on an empty buffer is a no-op", () => {
     const { batches, onFlush } = collect();
     const b = new LineBatcher({ onFlush, clock });
     b.flush();

@@ -4,14 +4,14 @@
  * Contract under test (Appendix A, verbatim):
  *   export interface TruncationInfo { truncated: boolean; totalLines: number; totalBytes: number }
  *   export function truncateTail(
- *     text: string, maxLines?: number (默认2000), maxBytes?: number (默认51200)
+ *     text: string, maxLines?: number (default 2000), maxBytes?: number (default 51200)
  *   ): { text: string } & TruncationInfo;
  *
  *   export interface TaskExitInfo {
  *     taskId: string; kind: string; command: string;
  *     status: "completed" | "failed" | "killed" | "orphaned";
  *     exitCode: number | null; durationMs: number;
- *     outputPath: string; preview: string;  // preview 由调用方先截断到 4000
+ *     outputPath: string; preview: string;  // preview is pre-truncated by the caller to 4000 characters
  *   }
  *   export function formatTaskNotification(events: TaskExitInfo[]): string;
  *   export function formatBackgroundNotice(taskId: string, command: string, outputPath: string): string;
@@ -113,15 +113,15 @@ describe("formatTaskNotification (contract: Appendix A + §4.5 XML template)", (
     status: "completed",
     exitCode: 0,
     durationMs: 12345,
-    outputPath: "/home/u/.pi/agent/pbs/sessions/s/tasks/sh_a1b2c3d4.output",
+    outputPath: "/home/u/.pi/agent/pi-famulus/sessions/s/tasks/sh_a1b2c3d4.output",
     preview: "last lines of output",
   };
 
   it("emits <task-notification> XML with every required field (§4.5 template)", () => {
     const xml = formatTaskNotification([base]).content;
     expect(xml).toContain("System wake");
-    expect(xml).toContain('<pbs-wake kind="task">');
-    expect(xml).toContain("</pbs-wake>");
+    expect(xml).toContain('<pi-famulus-wake kind="task">');
+    expect(xml).toContain("</pi-famulus-wake>");
     expect(xml).toContain('id="sh_a1b2c3d4"');
     expect(xml).toContain('kind="shell"');
     expect(xml).toContain('status="completed"');
@@ -130,14 +130,14 @@ describe("formatTaskNotification (contract: Appendix A + §4.5 XML template)", (
     expect(xml).toMatch(/exit code 0/);
     expect(xml).toContain('exit-code="0"');
     expect(xml).toContain(
-      "<output-file>/home/u/.pi/agent/pbs/sessions/s/tasks/sh_a1b2c3d4.output</output-file>",
+      "<output-file>/home/u/.pi/agent/pi-famulus/sessions/s/tasks/sh_a1b2c3d4.output</output-file>",
     );
     expect(xml).toContain("<preview>");
     expect(xml).toContain("last lines of output");
     expect(xml).toContain('duration-ms="12345"');
   });
 
-  it("merges multiple events into one message covering every task (§4.5 合批)", () => {
+  it("merges multiple events into one message covering every task (§4.5 batching)", () => {
     const failed: TaskExitInfo = {
       ...base,
       taskId: "sh_deadbeef",
@@ -147,7 +147,7 @@ describe("formatTaskNotification (contract: Appendix A + §4.5 XML template)", (
       exitCode: 2,
     };
     const xml = formatTaskNotification([base, failed]).content;
-    expect(xml.match(/<pbs-wake /g)).toHaveLength(1);
+    expect(xml.match(/<pi-famulus-wake /g)).toHaveLength(1);
     expect(xml).toContain("sh_a1b2c3d4");
     expect(xml).toContain("sh_deadbeef");
     expect(xml).toContain('status="completed"');
@@ -193,15 +193,15 @@ describe("formatBackgroundNotice (contract: Appendix A + §4.2 template)", () =>
     expect(msg).toContain("/tmp/x.output");
     expect(msg).toContain("npm run build");
     expect(msg).toMatch(/do not poll/i);
-    expect(msg).toContain('<pbs-wake kind="task">');
+    expect(msg).toContain('<pi-famulus-wake kind="task">');
   });
 });
 
 describe("formatMonitorEvent (contract: Appendix A + §4.4)", () => {
   it("wraps the batch in a <monitor-event> element carrying description and task id", () => {
     const msg = formatMonitorEvent("cargo test failures", "mon_abc123", "test foo failed\n").content;
-    expect(msg).toContain('<pbs-wake kind="monitor"');
-    expect(msg).toContain("</pbs-wake>");
+    expect(msg).toContain('<pi-famulus-wake kind="monitor"');
+    expect(msg).toContain("</pi-famulus-wake>");
     expect(msg).toContain("cargo test failures");
     expect(msg).toContain("mon_abc123");
     expect(msg).toContain("test foo failed");

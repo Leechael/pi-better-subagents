@@ -1,4 +1,4 @@
-//! `pbs-manager __run <command>`: the leader of every task's process group
+//! `pi-famulus __run <command>`: the leader of every task's process group
 //! (design doc §3.2 / §3.4).
 //!
 //! The daemon spawns this runner as a session leader instead of `sh -c`
@@ -62,7 +62,7 @@ pub fn main(command: &OsStr) -> i32 {
     let mut child = match sh.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("pbs-manager: cannot run /bin/sh: {e}");
+            eprintln!("pi-famulus: cannot run /bin/sh: {e}");
             report("exit 127", alone(me));
             return 127;
         }

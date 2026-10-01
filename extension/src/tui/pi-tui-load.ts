@@ -65,7 +65,7 @@ function warnFallbackOnce(): void {
   if (fallbackWarningLogged) return;
   fallbackWarningLogged = true;
   console.warn(
-    "pi-better-subagents: pi-tui is unavailable; using the reduced text fallback. " +
+    "pi-famulus: pi-tui is unavailable; using the reduced text fallback. " +
       "Load this extension through pi to enable interactive task views and full-width rendering.",
   );
 }

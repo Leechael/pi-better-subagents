@@ -1,5 +1,5 @@
 /**
- * Live child transcripts for the CLI (`pbs-manager agent ch_…`, `show ch_…`).
+ * Live child transcripts for the CLI (`pi-famulus agent ch_…`, `show ch_…`).
  *
  * Layout: <home>/sessions/<session_id>/agents/<child_id>.jsonl, one JSON object
  * per conversation turn: { ts, role, text, tool?, isError? }. Lines are only

@@ -181,7 +181,7 @@ async function openTasksUi(ctx: ExtensionContext, deps: TasksCommandDeps): Promi
   const currentItems = () => index?.list(clock.now()) ?? [];
   const loadAll = async (): Promise<WorkItem[]> => {
     const client = deps.getClient();
-    if (!client || !(await client.ensureAvailable())) throw new Error("pbs-manager is unavailable");
+    if (!client || !(await client.ensureAvailable())) throw new Error("pi-famulus is unavailable");
     return (await client.list(true)).map(itemFromTask);
   };
   if (!ctx.hasUI) {
@@ -196,7 +196,7 @@ async function openTasksUi(ctx: ExtensionContext, deps: TasksCommandDeps): Promi
   const manager = deps.getClient();
   if (currentItems().length === 0 && !(manager?.isAvailable() ?? false)) {
     ctx.ui.notify(
-      "No background tasks. pbs-manager is unavailable, so bash runs locally and nothing is backgrounded (see the startup warning).",
+      "No background tasks. pi-famulus is unavailable, so bash runs locally and nothing is backgrounded (see the startup warning).",
       "warning",
     );
     return;
@@ -411,7 +411,7 @@ async function stopItem(item: WorkItem, deps: TasksCommandDeps): Promise<void> {
     return;
   }
   const client = deps.getClient();
-  if (!client || !(await client.ensureAvailable())) throw new Error("pbs-manager is not available");
+  if (!client || !(await client.ensureAvailable())) throw new Error("pi-famulus is not available");
   await client.stop(item.id, "tui");
 }
 

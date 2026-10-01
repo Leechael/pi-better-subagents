@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Code-ablation runner for pbs-manager.
+# Code-ablation runner for pi-famulus.
 #
 # For every entry in manager/ablation.toml:
 #   1. copy manager/ (without build dirs) into a scratch directory,
@@ -30,7 +30,7 @@ set -euo pipefail
 
 MANAGER_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MANIFEST="$MANAGER_DIR/ablation.toml"
-WORK="${ABLATE_WORK:-$(mktemp -d "${TMPDIR:-/tmp}/pbs-ablate.XXXXXX")}"
+WORK="${ABLATE_WORK:-$(mktemp -d "${TMPDIR:-/tmp}/pi-famulus-ablate.XXXXXX")}"
 TEST_TIMEOUT="${ABLATE_TEST_TIMEOUT:-180}"
 FEATURES="${ABLATE_FEATURES-test-clock}"
 FEATURE_ARGS=(--features "$FEATURES")

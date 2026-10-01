@@ -118,7 +118,7 @@ pub struct OutputChunk {
 
 #[cfg(test)]
 pub struct SpawnedTask {
-    /// The task's runner (`pbs-manager __run`), leader of its process group.
+    /// The task's runner (`pi-famulus __run`), leader of its process group.
     pub child: Child,
     /// Read end of the runner's status pipe (see `crate::runner`).
     pub status: pipe::Receiver,
@@ -201,14 +201,14 @@ pub fn lifeline() -> io::Result<&'static Lifeline> {
 }
 
 /// Path of the binary that provides `__run`: this executable. Unit tests
-/// run inside the test harness, so they use the `pbs-manager` binary cargo
+/// run inside the test harness, so they use the `pi-famulus` binary cargo
 /// builds next to it.
 pub fn runner_exe() -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     if cfg!(test) {
-        // target/<profile>/deps/pbs_manager-<hash> -> target/<profile>/pbs-manager
+        // target/<profile>/deps/pi_famulus-<hash> -> target/<profile>/pi-famulus
         if let Some(profile_dir) = exe.parent().and_then(|d| d.parent()) {
-            return Ok(profile_dir.join("pbs-manager"));
+            return Ok(profile_dir.join("pi-famulus"));
         }
     }
     Ok(exe)
@@ -285,7 +285,7 @@ pub struct Tee {
 /// Start reading a task's stdout / stderr descriptors: both append to the
 /// merged `.output` file + ring (protocol / agent view stays merged), and
 /// stderr is mirrored into `stderr_mirror` for CLI inspection
-/// (`pbs-manager log -f --stderr <task_id>`). Either may be None when that
+/// (`pi-famulus log -f --stderr <task_id>`). Either may be None when that
 /// pipe already reached EOF.
 ///
 /// When `park` turns true, each pump stops between two reads, so every
@@ -360,7 +360,7 @@ pub async fn parked(park: &mut tokio::sync::watch::Receiver<bool>) {
     let _ = park.wait_for(|p| *p).await;
 }
 
-/// Test hook `PBS_TEST_PUMP_STALL=<bytes>:<ms>`: a pump pauses once, after
+/// Test hook `PI_FAMULUS_TEST_PUMP_STALL=<bytes>:<ms>`: a pump pauses once, after
 /// it has read at least `bytes`, as a pump held up by a busy runtime or a
 /// full fanout channel would. Placed near the end of a command's output, the
 /// pause outlasts the command: its exit is seen with output still unread.
@@ -368,7 +368,7 @@ fn test_pump_stall() -> Option<(u64, std::time::Duration)> {
     if !cfg!(debug_assertions) {
         return None;
     }
-    let v = std::env::var("PBS_TEST_PUMP_STALL").ok()?;
+    let v = std::env::var("PI_FAMULUS_TEST_PUMP_STALL").ok()?;
     let (bytes, ms) = v.split_once(':')?;
     Some((bytes.parse().ok()?, std::time::Duration::from_millis(ms.parse().ok()?)))
 }
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn read_file_range_offsets() {
         let dir = std::env::temp_dir().join(format!(
-            "pbs-task-test-{}-{}",
+            "pi-famulus-task-test-{}-{}",
             std::process::id(),
             crate::proto::now_ms()
         ));
@@ -632,7 +632,7 @@ mod tests {
 
     fn unique_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "pbs-task-test-{tag}-{}-{}",
+            "pi-famulus-task-test-{tag}-{}-{}",
             std::process::id(),
             crate::proto::now_ms()
         ));
@@ -833,7 +833,7 @@ mod tests {
     /// Optional RSS sanity: after multi-MB tee + drain, peak RSS should not
     /// grow by anything close to the full output size (ring + bounded channel
     /// dominate). Run with:
-    /// `cargo test -p pbs-manager rss_stays_bounded_after_large_output -- --ignored --nocapture`
+    /// `cargo test -p pi-famulus rss_stays_bounded_after_large_output -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "RSS sampling is coarse; run manually on Darwin/Linux"]
     async fn rss_stays_bounded_after_large_output() {

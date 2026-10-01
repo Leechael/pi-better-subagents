@@ -4,41 +4,25 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build and test
+        type: string
+        default: ''
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  manager:
-    name: manager (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: manager
-    env:
-      # A failed test copies its daemon's logs here (tests/common Home::drop).
-      PBS_TEST_ARTIFACTS: ${{ github.workspace }}/pbs-test-artifacts
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: manager
-      # Real time: the actual idle / kill graces (timing_canary included).
-      - run: cargo test
-      # Manual clock: the daemon's own timers are stepped by the tests.
-      - run: cargo test --features test-clock
-      - uses: actions/upload-artifact@v4
-        if: failure()
-        with:
-          name: manager-logs-${{ matrix.os }}
-          path: pbs-test-artifacts
-          if-no-files-found: ignore
+  native-packages:
+    uses: ./.github/workflows/native-packages.yml
+    with:
+      ref: ${{ inputs.ref || '' }}
 
   # No Windows job: the manager is unix-only, and the extension reaches it
   # over a unix socket path (manager/TESTING.md, Deferrals).
@@ -49,16 +33,20 @@ jobs:
         working-directory: extension
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || '' }}
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: extension/package-lock.json
+      # First-party natives use local lock links before registry bootstrap.
+      # Do not omit all optionals: TypeScript and Rollup need native bindings.
       - run: npm ci
       - run: npx tsc --noEmit
       - run: npx vitest run
 
-  # Real pi + real pbs-manager + the extension, driven by the faux model.
+  # Real pi + real pi-famulus + the extension, driven by the faux model.
   # No model credentials, no network: pi runs with --offline.
   e2e:
     name: e2e (${{ matrix.os }})
@@ -68,12 +56,14 @@ jobs:
         os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     env:
-      PBS_MANAGER_PATH: ${{ github.workspace }}/manager/target/release/pbs-manager
+      PI_FAMULUS_MANAGER_PATH: ${{ github.workspace }}/manager/target/release/pi-famulus
       PI_BIN: ${{ github.workspace }}/eval/node_modules/.bin/pi
-      # Keep every sandbox (/tmp/pbse-*) so a failure can be uploaded.
-      PBS_EVAL_KEEP: "1"
+      # Keep every sandbox (/tmp/eval-*) so a failure can be uploaded.
+      PI_FAMULUS_EVAL_KEEP: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || '' }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -87,9 +77,9 @@ jobs:
             eval/package-lock.json
       - run: cargo build --release
         working-directory: manager
-      # real-manager.test.ts skips itself when the binary is missing; a
-      # skipped integration suite must not pass as green.
-      - run: test -x "$PBS_MANAGER_PATH"
+      # Require the exact release artifact before running real integration;
+      # a missing or misnamed binary must not pass as green.
+      - run: test -x "$PI_FAMULUS_MANAGER_PATH"
       - run: npm ci
         working-directory: extension
       - run: npm ci
@@ -97,10 +87,12 @@ jobs:
       - run: npx vitest run tests/integration/real-manager.test.ts
         working-directory: extension
         env:
-          PBS_INTEG: "1"
+          PI_FAMULUS_INTEG: "1"
       - run: npm run typecheck
         working-directory: eval
       - run: npm run test:unit
+        working-directory: eval
+      - run: npm run test:graders
         working-directory: eval
       - run: npm run test:e2e
         working-directory: eval
@@ -109,8 +101,8 @@ jobs:
         with:
           name: e2e-sandboxes-${{ matrix.os }}
           path: |
-            /tmp/pbse-*/h/manager.log
-            /tmp/pbse-*/h/events.jsonl
-            /tmp/pbse-*/h/config.json
-            /tmp/pbse-*/faux-trace.jsonl
+            /tmp/eval-*/h/manager.log
+            /tmp/eval-*/h/events.jsonl
+            /tmp/eval-*/h/config.json
+            /tmp/eval-*/faux-trace.jsonl
           if-no-files-found: ignore

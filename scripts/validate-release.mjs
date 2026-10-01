@@ -1,0 +1,75 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { execFileSync } from 'node:child_process';
+
+export const REPOSITORY = 'Leechael/pi-better-subagents';
+export const PLATFORMS = [
+  ['linux', 'x64', 'x86_64-unknown-linux-musl'],
+  ['linux', 'arm64', 'aarch64-unknown-linux-musl'],
+  ['darwin', 'x64', 'x86_64-apple-darwin'],
+  ['darwin', 'arm64', 'aarch64-apple-darwin'],
+].map(([os, arch, target]) => ({ os, arch, target, id: `${os}-${arch}`, name: `pi-famulus-${os}-${arch}`, directory: `npm/${os}-${arch}` }));
+
+export function validateTag(tag) {
+  assert.match(tag ?? '', /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/, 'release tag must be vX.Y.Z (stable version, no shell syntax)');
+  return tag.slice(1);
+}
+
+export function validateMetadata(root, { tag, repository = REPOSITORY } = {}) {
+  assert.equal(repository, REPOSITORY, 'repository must match the canonical GitHub repository');
+  const read = directory => JSON.parse(readFileSync(join(root, directory, 'package.json'), 'utf8'));
+  const pkg = read('extension');
+  const version = tag === undefined ? pkg.version : validateTag(tag);
+  validateTag(`v${version}`);
+  const packages = [{ name: 'pi-famulus', directory: 'extension', metadata: pkg }, ...PLATFORMS.map(p => ({ ...p, metadata: read(p.directory) }))];
+  for (const p of packages) {
+    const m = p.metadata;
+    assert.equal(m.name, p.name, `package name: ${p.directory}`);
+    assert.equal(m.version, version, `version mismatch: ${p.name}`);
+    assert.equal(m.repository?.type, 'git', `repository type: ${p.name}`);
+    assert.equal(m.repository?.url, `https://github.com/${repository}`, `repository URL mismatch: ${p.name}`);
+    assert.equal(m.repository?.directory, p.directory, `repository directory: ${p.name}`);
+    for (const hook of ['preinstall', 'install', 'postinstall']) assert.ok(!m.scripts?.[hook], `install hook forbidden: ${p.name}`);
+    if (p.os) {
+      assert.equal(m.main, './bin/pi-famulus', `native main: ${p.name}`);
+      assert.deepEqual(m.exports, { './package.json': './package.json', './bin/pi-famulus': './bin/pi-famulus' }, `native exports: ${p.name}`);
+      assert.deepEqual(m.os, [p.os], `native os: ${p.name}`);
+      assert.deepEqual(m.cpu, [p.arch], `native cpu: ${p.name}`);
+      assert.ok(Array.isArray(m.files) && m.files.includes('bin/pi-famulus') && m.files.every(f => ['bin/pi-famulus', 'README.md'].includes(f)), `native files must whitelist binary and optional README: ${p.name}`);
+      for (const key of ['dependencies', 'optionalDependencies', 'peerDependencies', 'devDependencies']) assert.equal(Object.keys(m[key] ?? {}).length, 0, `native dependencies forbidden: ${p.name}`);
+    }
+  }
+  assert.deepEqual(pkg.files, ['src', 'bin', 'README.md'], 'root files contract');
+  assert.deepEqual(pkg.bin, { 'pi-famulus': './bin/pi-famulus.js' }, 'root CLI contract');
+  assert.deepEqual(pkg.optionalDependencies, Object.fromEntries(PLATFORMS.map(p => [p.name, version])), 'root optional native dependencies must match version exactly');
+  const cargo = readFileSync(join(root, 'manager/Cargo.toml'), 'utf8').match(/\[package\]([\s\S]*?)(?=\n\[|$)/)?.[1];
+  assert.equal(cargo?.match(/^version\s*=\s*"([^"]+)"/m)?.[1], version, 'Cargo version mismatch');
+  return packages;
+}
+
+export function validateGitTag(root, tag) {
+  validateTag(tag);
+  const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const tagged = git('rev-parse', '--verify', `refs/tags/${tag}^{commit}`);
+  assert.equal(git('rev-parse', 'HEAD'), tagged, 'release tag must be the checked-out commit');
+  try { git('rev-parse', '--verify', 'refs/remotes/origin/main^{commit}'); }
+  catch (cause) { throw new Error('origin/main is missing or invalid; fetch origin/main before release validation', { cause }); }
+  try { git('merge-base', '--is-ancestor', tagged, 'refs/remotes/origin/main'); }
+  catch (error) {
+    if (error.status === 1) throw new Error('release tagged commit must be an ancestor of origin/main', { cause: error });
+    throw error;
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  try {
+    const args = process.argv.slice(2);
+    assert.ok(args.length === 0 || (args.length === 2 && args[0] === '--tag'), 'usage: validate-release.mjs [--tag vX.Y.Z]');
+    const tag = args[1];
+    validateMetadata(process.cwd(), { tag, repository: process.env.GITHUB_REPOSITORY ?? REPOSITORY });
+    if (tag !== undefined) validateGitTag(process.cwd(), tag);
+    console.log(`Validated all five packages${tag ? ` for ${tag}` : ''}`);
+  } catch (error) { console.error(error.message); process.exitCode = 1; }
+}

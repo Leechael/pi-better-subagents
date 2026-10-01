@@ -1,5 +1,5 @@
 /**
- * On-disk agent child records so `pbs-manager ls` can see in-process subagents
+ * On-disk agent child records so `pi-famulus ls` can see in-process subagents
  * (design doc §4.3: task_list merges manager tasks with subagent runs).
  *
  * Layout: <home>/sessions/<session_id>/agents/<child_id>.json

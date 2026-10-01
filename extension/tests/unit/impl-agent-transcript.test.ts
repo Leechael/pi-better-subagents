@@ -9,7 +9,7 @@ import { TranscriptWriter, transcriptPath } from "../../src/subagent/transcript"
 
 const dirs: string[] = [];
 function tempHome(): string {
-  const dir = mkdtempSync(join(tmpdir(), "pbs-transcript-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-famulus-transcript-"));
   dirs.push(dir);
   return dir;
 }
@@ -68,8 +68,12 @@ describe("child transcript", () => {
 });
 
 // Contract check against the real CLI: what the extension writes is what
-// `pbs-manager show` / `agent` read. Skipped when the manager is not built.
-const managerBin = join(__dirname, "../../../manager/target/debug/pbs-manager");
+// `pi-famulus show` / `agent` read. Skipped when no binary is available.
+const managerBin = process.env.PI_FAMULUS_MANAGER_PATH ??
+  join(__dirname, "../../../manager/target/debug/pi-famulus");
+if (process.env.PI_FAMULUS_MANAGER_PATH && !existsSync(managerBin)) {
+  throw new Error(`Requested pi-famulus transcript binary does not exist: ${managerBin}`);
+}
 describe.skipIf(!existsSync(managerBin))("CLI reads extension-written agent files", () => {
   it("show and agent render the record and transcript", () => {
     const home = tempHome();
@@ -98,7 +102,7 @@ describe.skipIf(!existsSync(managerBin))("CLI reads extension-written agent file
       transcript,
     });
     const run = (args: string[]) =>
-      execFileSync(managerBin, ["--home", home, ...args], { encoding: "utf8", env: { ...process.env, PBS_HOME: home } });
+      execFileSync(managerBin, ["--home", home, ...args], { encoding: "utf8", env: { ...process.env, PI_FAMULUS_HOME: home } });
 
     const show = run(["show", "ch_cafe0001"]);
     expect(show).toContain("model-error");

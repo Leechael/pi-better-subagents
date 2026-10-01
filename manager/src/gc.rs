@@ -151,7 +151,7 @@ mod tests {
     }
 
     fn home(tag: &str) -> std::path::PathBuf {
-        let h = std::env::temp_dir().join(format!("pbs-gc-{tag}-{}", std::process::id()));
+        let h = std::env::temp_dir().join(format!("pi-famulus-gc-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&h);
         fs::create_dir_all(h.join("sessions")).unwrap();
         h

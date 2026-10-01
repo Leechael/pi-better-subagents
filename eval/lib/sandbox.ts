@@ -1,5 +1,5 @@
 /**
- * Per-episode sandbox: temp cwd + isolated PBS_HOME (own manager socket,
+ * Per-episode sandbox: temp cwd + isolated PI_FAMULUS_HOME (own manager socket,
  * config.json, task logs). pi's own agent dir is NOT isolated, so real-model
  * runs reuse the user's login (see ablation/README section in run.ts --help).
  */
@@ -10,8 +10,8 @@ import { dirname, join } from "node:path";
 import { managerPath } from "./paths.ts";
 
 export interface SandboxOptions {
-  /** Written to $PBS_HOME/config.json. */
-  pbsConfig?: Record<string, unknown>;
+  /** Written to $PI_FAMULUS_HOME/config.json. */
+  famulusConfig?: Record<string, unknown>;
   /** Files (relative to cwd) to create before the episode. */
   files?: Record<string, string>;
   keep?: boolean;
@@ -20,7 +20,7 @@ export interface SandboxOptions {
 export interface Sandbox {
   root: string;
   cwd: string;
-  pbsHome: string;
+  famulusHome: string;
   tracePath: string;
   env: Record<string, string>;
   cleanup(): void;
@@ -43,34 +43,34 @@ function hasConnectedSession(stdout: string): boolean {
 }
 
 export async function waitManagerReady(sb: Sandbox, timeoutMs = 10_000): Promise<void> {
-  const mgr = sb.env.PBS_MANAGER_PATH;
+  const mgr = sb.env.PI_FAMULUS_MANAGER_PATH;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const r = spawnSync(mgr, ["--home", sb.pbsHome, "sessions", "--json"], { encoding: "utf8", timeout: 3000 });
+    const r = spawnSync(mgr, ["--home", sb.famulusHome, "sessions", "--json"], { encoding: "utf8", timeout: 3000 });
     if (r.status === 0 && hasConnectedSession(r.stdout)) return;
-    if (Date.now() > deadline) throw new Error(`pbs-manager not ready: ${r.stdout}${r.stderr}`);
+    if (Date.now() > deadline) throw new Error(`pi-famulus not ready: ${r.stdout}${r.stderr}`);
     await new Promise((res) => setTimeout(res, 100));
   }
 }
 
-/** Any running shell/monitor task or in-process subagent in this PBS_HOME? */
+/** Any running shell/monitor task or in-process subagent in this PI_FAMULUS_HOME? */
 export function hasRunningWork(sb: Sandbox): boolean {
-  const r = spawnSync(sb.env.PBS_MANAGER_PATH, ["--home", sb.pbsHome, "ls"], { encoding: "utf8", timeout: 3000 });
+  const r = spawnSync(sb.env.PI_FAMULUS_MANAGER_PATH, ["--home", sb.famulusHome, "ls"], { encoding: "utf8", timeout: 3000 });
   if (r.status !== 0) return false; // manager gone: nothing can wake the agent any more
   return !/no running tasks/.test(r.stdout);
 }
 
 export function createSandbox(opts: SandboxOptions = {}): Sandbox {
   // Short base path: unix socket paths are limited to ~104 bytes on macOS.
-  const root = mkdtempSync(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "pbse-"));
+  const root = mkdtempSync(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "eval-"));
   const cwd = join(root, "w");
-  const pbsHome = join(root, "h");
+  const famulusHome = join(root, "h");
   mkdirSync(cwd, { recursive: true });
-  mkdirSync(pbsHome, { recursive: true });
+  mkdirSync(famulusHome, { recursive: true });
   const mgr = managerPath();
   writeFileSync(
-    join(pbsHome, "config.json"),
-    JSON.stringify({ managerPath: mgr, ...(opts.pbsConfig ?? {}) }, null, 2),
+    join(famulusHome, "config.json"),
+    JSON.stringify({ managerPath: mgr, ...(opts.famulusConfig ?? {}) }, null, 2),
   );
   for (const [rel, content] of Object.entries(opts.files ?? {})) {
     const p = join(cwd, rel);
@@ -81,15 +81,15 @@ export function createSandbox(opts: SandboxOptions = {}): Sandbox {
   return {
     root,
     cwd,
-    pbsHome,
+    famulusHome,
     tracePath,
-    env: { PBS_HOME: pbsHome, PBS_MANAGER_PATH: mgr },
+    env: { PI_FAMULUS_HOME: famulusHome, PI_FAMULUS_MANAGER_PATH: mgr },
     cleanup() {
       // The manager exits by itself 5s after its last client; do not wait.
-      spawnSync(mgr, ["--home", pbsHome, "shutdown"], { stdio: "ignore", timeout: 5000 });
+      spawnSync(mgr, ["--home", famulusHome, "shutdown"], { stdio: "ignore", timeout: 5000 });
       // The manager may still be writing its logs (ENOTEMPTY); retry briefly,
       // then leave the temp dir rather than crash a graded episode.
-      if (!opts.keep && !process.env.PBS_EVAL_KEEP) {
+      if (!opts.keep && !process.env.PI_FAMULUS_EVAL_KEEP) {
         try {
           rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
         } catch (err) {

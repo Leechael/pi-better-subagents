@@ -138,6 +138,6 @@ describe("FleetWidget", () => {
   });
 
   it("exports the widget key", () => {
-    expect(FLEET_WIDGET_KEY).toBe("pbs-fleet");
+    expect(FLEET_WIDGET_KEY).toBe("pi-famulus-fleet");
   });
 });

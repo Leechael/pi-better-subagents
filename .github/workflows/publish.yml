@@ -1,0 +1,127 @@
+name: Publish npm packages
+
+on:
+  # Select main as the workflow ref; the release tag is an explicit build input.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to test or publish (vX.Y.Z)
+        required: true
+        type: string
+      dry_run:
+        description: Validate tarballs without publishing (does not test OIDC)
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# Serialize publication, retaining up to 100 pending runs (not just the latest).
+# GitHub cancels arrivals beyond that queue limit; retry them explicitly.
+concurrency:
+  group: npm-release
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.input.outputs.tag }}
+      dry_run: ${{ steps.input.outputs.dry_run }}
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Validate event input before using it as a Git ref
+        id: input
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { appendFileSync } from 'node:fs';
+          import { validateTag } from './scripts/validate-release.mjs';
+          validateTag(process.env.RELEASE_TAG);
+          assert.ok(['true', 'false'].includes(process.env.DRY_RUN));
+          appendFileSync(process.env.GITHUB_OUTPUT, `tag=${process.env.RELEASE_TAG}\ndry_run=${process.env.DRY_RUN}\n`);
+          NODE
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.input.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require exact versions, repository and main ancestry
+        env:
+          RELEASE_TAG: ${{ steps.input.outputs.tag }}
+        run: node scripts/validate-release.mjs --tag "$RELEASE_TAG"
+      - id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # Same full PR/main pipeline: manager real+manual clocks on four hosts,
+  # extension tests, real pi e2e, tarball install smoke tests, all five packs.
+  tests:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.validate.outputs.sha }}
+
+  publish:
+    needs: [validate, tests]
+    runs-on: ubuntu-24.04
+    # npm trust must require this environment. Its external deployment policy
+    # allows only the main branch, so editing a non-main workflow cannot bypass it.
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      DRY_RUN: ${{ needs.validate.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Upgrade npm for trusted publishing
+        run: |
+          npm install --global npm@latest
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          const version = execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim();
+          const [major, minor, patch] = version.split('.').map(Number);
+          assert.ok(major > 11 || (major === 11 && (minor > 5 || (minor === 5 && patch >= 1))), 'npm >=11.5.1 is required');
+          console.log(`Node ${process.version}, npm ${version}`);
+          NODE
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: npm-*
+          path: ${{ runner.temp }}/packages
+          merge-multiple: true
+      - name: Revalidate tagged checkout before publication
+        run: node scripts/validate-release.mjs --tag "$RELEASE_TAG"
+      - name: Check OIDC availability (never log tokens)
+        if: needs.validate.outputs.dry_run == 'false'
+        run: |
+          test -n "$ACTIONS_ID_TOKEN_REQUEST_URL"
+          test -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN"
+          echo 'OIDC request credentials are available; npm authenticates during publish.'
+      - name: Validate artifacts and publish natives first, root last
+        run: |
+          mode=--dry-run
+          if [[ "$DRY_RUN" == false ]]; then mode=--publish; fi
+          node scripts/publish-packages.mjs "$RUNNER_TEMP/packages" "$RELEASE_TAG" "$mode"

@@ -1,7 +1,7 @@
 /**
  * bash tool override (design doc §4.2).
  *
- * Routes bash commands through pbs-manager:
+ * Routes bash commands through pi-famulus:
  * - foreground commands wait up to `foregroundBudgetMs` (default 20000,
  *   configurable) and are then moved to the background instead of blocking;
  * - bare sleep / idle-loop commands are rejected with guidance;
@@ -24,7 +24,7 @@ import type {
   ExtensionContext,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { taskOutputPath, type PbsConfig } from "./config";
+import { taskOutputPath, type FamulusConfig } from "./config";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 import { backgroundRowText, formatBackgroundNotice, truncateTail } from "./format";
 import { toolComponent } from "./tui/tool-component";
@@ -63,14 +63,14 @@ const bashParameters = Type.Object({
 type BashParams = { command: string; timeout?: number; run_in_background?: boolean };
 
 /** Details shape returned by this override; superset of BashToolDetails. */
-export interface PbsBashDetails extends BashToolDetails {
+export interface FamulusBashDetails extends BashToolDetails {
   backgrounded?: boolean;
   task_id?: string;
 }
 
 export interface BashOverrideDeps {
   getClient: () => ManagerClient | null;
-  config: PbsConfig;
+  config: FamulusConfig;
   home: string;
   sessionId: () => string;
   /** Extra environment injected into managed child processes (PI_* vars). */
@@ -78,7 +78,7 @@ export interface BashOverrideDeps {
   /** Register task metadata so exit notifications can describe the task. */
   trackTask: (taskId: string, meta: { kind: string; command: string; cwd?: string }) => void;
   /**
-   * Mark a task so its task_exited event becomes a parent <pbs-wake kind="task">.
+   * Mark a task so its task_exited event becomes a parent <pi-famulus-wake kind="task">.
    * Only backgrounded parent bash should call this — sync waits (foreground
    * budget hit, child-bash) must not wake the parent session.
    */
@@ -128,7 +128,7 @@ async function executeLocal(
   signal: AbortSignal | undefined,
   ctx: ExtensionContext,
   clock: Clock,
-): Promise<AgentToolResult<PbsBashDetails | undefined>> {
+): Promise<AgentToolResult<FamulusBashDetails | undefined>> {
   const timeoutMs = resolveTimeoutMs(params.timeout);
   const shell = process.env.SHELL && process.env.SHELL.length > 0 ? process.env.SHELL : "/bin/bash";
 
@@ -187,9 +187,9 @@ async function executeLocal(
 
   const t = truncateTail(output.text, MAX_LINES, MAX_BYTES);
   let text = t.text || "(no output)";
-  let details: PbsBashDetails | undefined;
+  let details: FamulusBashDetails | undefined;
   if (t.truncated) {
-    const fullOutputPath = join(tmpdir(), `pbs-bash-${randomUUID()}.log`);
+    const fullOutputPath = join(tmpdir(), `pi-famulus-bash-${randomUUID()}.log`);
     writeFileSync(fullOutputPath, output.text, "utf8");
     const outputLines = t.text.length === 0 ? 0 : t.text.split("\n").length;
     const startLine = t.totalLines - outputLines + 1;
@@ -229,7 +229,7 @@ async function executeLocal(
 
 export function createBashOverride(
   deps: BashOverrideDeps,
-): ToolDefinition<typeof bashParameters, PbsBashDetails | undefined> {
+): ToolDefinition<typeof bashParameters, FamulusBashDetails | undefined> {
   return {
     name: "bash",
     label: "Bash",
@@ -246,7 +246,7 @@ export function createBashOverride(
     ],
     parameters: bashParameters,
     renderResult(result, { expanded }, theme, context) {
-      const details = result.details as PbsBashDetails | undefined;
+      const details = result.details as FamulusBashDetails | undefined;
       if (details?.backgrounded && details.task_id) {
         const taskId = details.task_id;
         const index = deps.getIndex?.() ?? null;
@@ -336,7 +336,7 @@ export function createBashOverride(
             {
               type: "text",
               text:
-                `Lost contact with pbs-manager while waiting for task ${start.task_id}. ` +
+                `Lost contact with pi-famulus while waiting for task ${start.task_id}. ` +
                 `The command may still be running. Output: ${outputPath}. ` +
                 "Use task_list/task_output to check on it once the manager is back.",
             },

@@ -4,9 +4,9 @@
  * These functions are the shared contract between implementation and tests.
  * Signatures must match Appendix A exactly.
  */
-import { formatPbsWake, shellWakeTitle, type FormattedWake, type WakeItem } from "./wake";
+import { formatFamulusWake, shellWakeTitle, type FormattedWake, type WakeItem } from "./wake";
 
-export { PBS_WAKE_LEAD_IN } from "./wake";
+export { FAMULUS_WAKE_LEAD_IN } from "./wake";
 export type { FormattedWake, WakeItem } from "./wake";
 
 export interface TruncationInfo {
@@ -91,7 +91,7 @@ function statusPhrase(info: TaskExitInfo): string {
     case "killed":
       return "was killed";
     case "orphaned":
-      return "ended when pbs-manager crashed";
+      return "ended when pi-famulus crashed";
   }
 }
 
@@ -106,7 +106,7 @@ function taskSummary(info: TaskExitInfo): string {
 }
 
 /**
- * One <pbs-wake kind="task"> for a batch of exits (§4.5).
+ * One <pi-famulus-wake kind="task"> for a batch of exits (§4.5).
  * `leadIn` is the ablation seam: "" leaves a parseable envelope.
  */
 export function formatTaskNotification(
@@ -114,7 +114,7 @@ export function formatTaskNotification(
   stillRunning: WakeItem[] = [],
   leadIn?: string,
 ): FormattedWake {
-  return formatPbsWake(
+  return formatFamulusWake(
     {
       kind: "task",
       stillRunning,
@@ -144,7 +144,7 @@ export function formatBackgroundNotice(
   // Model-facing. The transcript row is drawn by the bash tool's renderResult.
   return [
     `Command "${displayCommand(command)}" moved to background (task_id: ${taskId}). Output: ${outputPath}.`,
-    'You will be notified when it completes, even if other commands are still running. Do not poll or sleep: reply to the user now with no tool call, and continue from the <pbs-wake kind="task"> when it arrives.',
+    'You will be notified when it completes, even if other commands are still running. Do not poll or sleep: reply to the user now with no tool call, and continue from the <pi-famulus-wake kind="task"> when it arrives.',
   ].join("\n");
 }
 
@@ -174,7 +174,7 @@ export function formatMonitorEvent(
   status?: string,
   extras: { eventCount?: number; droppedLines?: number } = {},
 ): FormattedWake {
-  return formatPbsWake({
+  return formatFamulusWake({
     kind: "monitor",
     id: taskId,
     description,
@@ -234,11 +234,11 @@ export interface SubagentHandoverInfo {
   stillRunning: WakeItem[];
 }
 
-/** Finished run: one <child> per child inside <pbs-wake kind="subagent-done">. */
+/** Finished run: one <child> per child inside <pi-famulus-wake kind="subagent-done">. */
 export function formatSubagentNotification(info: SubagentNotificationInfo): FormattedWake {
   const completed = info.children.filter((c) => c.status === "completed").length;
   const summary = `${completed}/${info.children.length} subagents completed in ${Math.round(info.durationMs)}ms`;
-  return formatPbsWake({
+  return formatFamulusWake({
     kind: "subagent-done",
     runId: info.runId,
     status: info.status,
@@ -261,7 +261,7 @@ export function formatSubagentNotification(info: SubagentNotificationInfo): Form
  */
 export function formatSubagentHandover(info: SubagentHandoverInfo): FormattedWake {
   const summary = `${info.name} ${info.status}; ${info.stillRunning.length} still running`;
-  return formatPbsWake({
+  return formatFamulusWake({
     kind: "subagent-handover",
     runId: info.runId,
     childId: info.childId,

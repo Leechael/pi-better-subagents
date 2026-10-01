@@ -1,35 +1,35 @@
 # Manual acceptance guide
 
-About 20 minutes. It walks every feature the way a user meets it, and says what you should see. Anything that doesn't match is a bug. Note the step number and run `pbs-manager doctor` and `pbs-manager events --since 10m` to attach to the report.
+About 20 minutes. It walks every feature the way a user meets it, and says what you should see. Anything that doesn't match is a bug. Note the step number and run `pi-famulus doctor` and `pi-famulus events --since 10m` to attach to the report.
 
 Automated suites (run first, all must be green):
 
 ```bash
 cd manager && cargo test && cargo test --features test-clock
 cd extension && npm ci && npx tsc --noEmit && npx vitest run
-PBS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts
+PI_FAMULUS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts
 cd eval && npm run test:e2e && npm run test:unit      # faux-model end-to-end, no model cost
 ```
 
 ## 0. Install into an isolated home
 
-Plain `pi` talks to whatever daemon already runs at `~/.pi/agent/pbs`, possibly an older binary with other sessions attached. Test against a separate home instead:
+Plain `pi` talks to whatever daemon already runs at `~/.pi/agent/pi-famulus`, possibly an older binary with other sessions attached. Test against a separate home instead:
 
 ```bash
 cd manager && cargo build --release
-mkdir -p ~/.pi/agent/pbs-test/bin
-install -m 755 target/release/pbs-manager ~/.pi/agent/pbs-test/bin/pbs-manager   # atomic replace (macOS code signing)
+mkdir -p ~/.pi/agent/pi-famulus-test/bin
+install -m 755 target/release/pi-famulus ~/.pi/agent/pi-famulus-test/bin/pi-famulus   # atomic replace (macOS code signing)
 
 # terminal A, from a scratch directory (worker subagents edit files)
-PBS_HOME=~/.pi/agent/pbs-test pi -ne -e /path/to/pi-better-subagents/extension
+PI_FAMULUS_HOME=~/.pi/agent/pi-famulus-test pi -ne -e /path/to/pi-famulus/extension
 
 # terminal B
-export PBS_HOME=~/.pi/agent/pbs-test
-alias pbs-manager=~/.pi/agent/pbs-test/bin/pbs-manager
-pbs-manager events -f
+export PI_FAMULUS_HOME=~/.pi/agent/pi-famulus-test
+alias pi-famulus=~/.pi/agent/pi-famulus-test/bin/pi-famulus
+pi-famulus events -f
 ```
 
-`-ne` keeps other extensions (e.g. an installed `pi-subagents`) out of the way. There must be no "pbs-manager unavailable" warning at startup, and `pbs-manager status` should report the version you just built.
+`-ne` keeps other extensions (e.g. an installed `pi-subagents`) out of the way. There must be no "pi-famulus unavailable" warning at startup, and `pi-famulus status` should report the version you just built.
 
 ## F1. Bash auto-background
 
@@ -58,10 +58,10 @@ pbs-manager events -f
 | 3.1 | "Use two subagents in parallel: one lists files, one sleeps 60 s via bash then reports" | After 45 s the tool row turns into `run run_… · running · /tasks` with one line per child. The fast child's result arrives as a handover wake while the other still runs; the agent continues right away |
 | 3.2 | Wait | A `subagent-done` pill with per-child counts; the fleet line drops the children |
 | 3.3 | `/tasks` → select a child → Enter | Conversation (no agent preamble), result, info tabs |
-| 3.4 | Use a model that fails (e.g. a provider without credits) for a subagent | Child is `✗ failed` with the provider error, in the pill, `/tasks`, and `pbs-manager show ch_…` (`reason model-error`) |
+| 3.4 | Use a model that fails (e.g. a provider without credits) for a subagent | Child is `✗ failed` with the provider error, in the pill, `/tasks`, and `pi-famulus show ch_…` (`reason model-error`) |
 | 3.5 | Ask for a subagent that must ask you a question (it uses `contact_supervisor`) | `? decision for <name>` pill; answer with `/reply <child> <text>`; the child continues |
 | 3.6 | Ask a subagent to start another subagent, or a monitor | It reports the tool is unavailable (depth cap 1; children have no `monitor` / `task_*`) |
-| 3.7 | Ask a subagent to run a 30 s command | It blocks and returns the output; nothing is backgrounded. The command shows under its run in `/tasks` and in `pbs-manager ls` |
+| 3.7 | Ask a subagent to run a 30 s command | It blocks and returns the output; nothing is backgrounded. The command shows under its run in `/tasks` and in `pi-famulus ls` |
 | 3.8 | Start background work in a second pi session (same home), then ask the first agent "what tasks, monitors and subagents are running?" (also "including finished ones") | Only the first session's own work is listed; nothing from the other session |
 
 ## F4. `/tasks`
@@ -88,27 +88,29 @@ pbs-manager events -f
 
 | # | Do | Expect |
 |---|---|---|
-| 6.1 | `pbs-manager status` · `pbs-manager doctor` | Version/protocol/uptime; doctor all OK, exit 0 |
-| 6.2 | `pbs-manager sessions` | Only connected pi sessions, with PID and CWD (never blank) |
-| 6.3 | `pbs-manager ls`, then `ls -a` | `ls`: running work only, newest first. `ls -a`: running first, then connected sessions' finished work, newest first. KIND (shell/monitor/agent), SESSION prefix, CWD, STATUS, TIME (an agent's last message), DUR, EXIT, REASON |
-| 6.4 | `pbs-manager show <id>` for a shell, a monitor, a `ch_…`, a `run_…` (fuzzy ids ok) | Everything about it; for an agent: model, error, reason, tool calls, result tail |
-| 6.5 | `pbs-manager agent ch_… -f` while a child runs | Live transcript; `--full` also shows the preamble |
-| 6.6 | `pbs-manager events -f` while running F1 | `task.start`, `task.background`, `task.exit`, `wake.emit`, `wake.deliver mode=…` |
-| 6.7 | `pbs-manager output <id> \| head` | No panic on the closed pipe |
-| 6.8 | `pbs-manager stop ch_…` | Explains agents run inside pi (stop from `/tasks`) |
+| 6.1 | `pi-famulus status` · `pi-famulus doctor` | Version/protocol/uptime; doctor all OK, exit 0 |
+| 6.2 | `pi-famulus sessions` | Only connected pi sessions, with PID and CWD (never blank) |
+| 6.3 | `pi-famulus ls`, then `ls -a` | `ls`: running work only, newest first. `ls -a`: running first, then connected sessions' finished work, newest first. KIND (shell/monitor/agent), SESSION prefix, CWD, STATUS, TIME (an agent's last message), DUR, EXIT, REASON |
+| 6.4 | `pi-famulus show <id>` for a shell, a monitor, a `ch_…`, a `run_…` (fuzzy ids ok) | Everything about it; for an agent: model, error, reason, tool calls, result tail |
+| 6.5 | `pi-famulus agent ch_… -f` while a child runs | Live transcript; `--full` also shows the preamble |
+| 6.6 | `pi-famulus events -f` while running F1 | `task.start`, `task.background`, `task.exit`, `wake.emit`, `wake.deliver mode=…` |
+| 6.7 | `pi-famulus output <id> \| head` | No panic on the closed pipe |
+| 6.8 | `pi-famulus stop ch_…` | Explains agents run inside pi (stop from `/tasks`) |
 
 ## F7. Manager lifecycle and degraded mode
 
+Upgrade checks 7.6–7.8 cover subsequent compatible same-name upgrades, not the one-time breaking name transition. For that transition, finish or stop work, close the previous installation's sessions, wait for its daemon to exit, reinstall, and migrate configuration only; see [README.md](../README.md#install). Do not move its runtime state/history tree, whose records contain absolute output/transcript paths.
+
 | # | Do | Expect |
 |---|---|---|
-| 7.1 | Start a background `sleep 300`, quit pi | Within ~7 s `pbs-manager status` says not running (exit 1) and the sleep is gone (`pgrep -f 'sleep 300'` empty) |
+| 7.1 | Start a background `sleep 300`, quit pi | Within ~7 s `pi-famulus status` says not running (exit 1) and the sleep is gone (`pgrep -f 'sleep 300'` empty) |
 | 7.2 | Two pi sessions at once, then quit one | Daemon stays; `sessions` and `ls` show only the remaining session at once; `show <id>` of the quit session's task still works |
-| 7.2b | Put `{"goneSessionRetention":"1m"}` in `~/.pi/agent/pbs-test/config.json`, restart the daemon (`pbs-manager shutdown` with no pi open), repeat 7.2 | About a minute after quitting, `sessions/<sid>/` of the quit session is deleted and `show <id>` says not found; `manager.log` has `gc: removed` |
+| 7.2b | Put `{"goneSessionRetention":"1m"}` in `~/.pi/agent/pi-famulus-test/config.json`, restart the daemon (`pi-famulus shutdown` with no pi open), repeat 7.2 | About a minute after quitting, `sessions/<sid>/` of the quit session is deleted and `show <id>` says not found; `manager.log` has `gc: removed` |
 | 7.3 | Start a background `sleep 300 & sleep 300` (a task with a grandchild), then `kill -9` the daemon | Within ~3s both sleeps are gone (`pgrep -f 'sleep 300'` empty). The extension reconnects to a fresh manager; the agent gets an exit wake with status `orphaned`; `ls -a` shows the task `orphaned`, REASON `manager-crash` |
 | 7.4 | Background a command that spawns `sleep 300 &` and exits; quit pi | The grandchild `sleep 300` is gone too |
-| 7.6 | While 7.3-style work runs (a background `for i in $(seq 1 600); do echo line-$i; sleep 0.5; done`, a monitor on `while true; do date; sleep 1; done`, and a `sleep 300 & sleep 300`), rebuild with any change and `install` the binary again, then `pbs-manager upgrade` | `upgraded in place: … (pid N, generation 1, … running task(s) kept)` with the SAME pid as before (`pbs-manager status`). No pi session shows an error or a warning; the background task later finishes with its real exit code and its output has every `line-$i` exactly once; the monitor keeps delivering; `pgrep -f 'sleep 300'` still shows both sleeps |
-| 7.7 | Just `install` a rebuilt binary again, no `upgrade` | Within ~5s `pbs-manager status` shows `upgrades: N (last: … binary-changed, …)` with N one higher; nothing interrupted |
-| 7.8 | `install` a broken file (e.g. `echo junk > x; install -m 755 x …/pbs-manager`), then `pbs-manager upgrade` | `upgrade not done, still running …`; everything keeps working. Restore the real binary afterwards |
+| 7.6 | While 7.3-style work runs (a background `for i in $(seq 1 600); do echo line-$i; sleep 0.5; done`, a monitor on `while true; do date; sleep 1; done`, and a `sleep 300 & sleep 300`), rebuild with any change and `install` the binary again, then `pi-famulus upgrade` | `upgraded in place: … (pid N, generation 1, … running task(s) kept)` with the SAME pid as before (`pi-famulus status`). No pi session shows an error or a warning; the background task later finishes with its real exit code and its output has every `line-$i` exactly once; the monitor keeps delivering; `pgrep -f 'sleep 300'` still shows both sleeps |
+| 7.7 | Just `install` a rebuilt binary again, no `upgrade` | Within ~5s `pi-famulus status` shows `upgrades: N (last: … binary-changed, …)` with N one higher; nothing interrupted |
+| 7.8 | `install` a broken file (e.g. `echo junk > x; install -m 755 x …/pi-famulus`), then `pi-famulus upgrade` | `upgrade not done, still running …`; everything keeps working. Restore the real binary afterwards |
 | 7.5 | Move the manager binary away, start pi | Warning lists the paths tried and says children lose bash; bash still runs locally; monitor/`task_*` report disabled (red); `/tasks` says the manager is unavailable |
 
 ## Prompt eval (optional, costs model credits)

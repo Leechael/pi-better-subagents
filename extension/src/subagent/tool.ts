@@ -7,7 +7,7 @@
  *   interpolation (unknown labels rejected before anything starts);
  * - sync wait bounded by subagentBudgetMs (default 45000, config subagent
  *   section); on expiry the run continues in the background and completion is
- *   delivered via a <pbs-wake kind="subagent-done"> through the NotifyCenter;
+ *   delivered via a <pi-famulus-wake kind="subagent-done"> through the NotifyCenter;
  * - management actions: list / get / status / interrupt / resume / steer.
  *
  * pi-free apart from type-only imports; the registry, runner and session
@@ -429,10 +429,10 @@ export function createSubagentTool(
           type: "text",
           text:
             `Started ${items.length} subagent(s) in run ${run.runId}. ${reason}\n` +
-            `While others are still running, each finished subagent arrives as <pbs-wake kind="subagent-handover"> ` +
+            `While others are still running, each finished subagent arrives as <pi-famulus-wake kind="subagent-handover"> ` +
             `with that child's prompt and result. Read it and continue: subagent({action:"resume", run_id, child_id, message}) for that child, ` +
             `or agent_message to steer the ones still running. Do not wait for the whole run. Do not poll. ` +
-            `<pbs-wake kind="subagent-done"> arrives when every subagent in the run has finished. ` +
+            `<pi-famulus-wake kind="subagent-done"> arrives when every subagent in the run has finished. ` +
             `Use subagent({action:"get", run_id:"${run.runId}"}) if you need the full record.`,
         },
       ],
@@ -610,8 +610,8 @@ export function createSubagentTool(
           type: "text",
           text:
             `Resumed subagent ${child.name} (${child.childId}) in run ${record.runId}. ` +
-            "You will be notified via <pbs-wake kind=\"subagent-handover\"> if others are still running, " +
-            "otherwise via <pbs-wake kind=\"subagent-done\"> when it completes. Do not poll.",
+            "You will be notified via <pi-famulus-wake kind=\"subagent-handover\"> if others are still running, " +
+            "otherwise via <pi-famulus-wake kind=\"subagent-done\"> when it completes. Do not poll.",
         },
       ],
       details: { run_id: record.runId, child_id: child.childId },
@@ -625,14 +625,14 @@ export function createSubagentTool(
       "Run subagents in parallel (tasks) or sequentially (chain with {previous}/{outputs.<label>} " +
       "interpolation). By default the call waits up to a foreground budget (default 45s); longer runs " +
       "continue in the background. Each child that finishes while others are still running wakes you with " +
-      "<pbs-wake kind=\"subagent-handover\"> (its prompt and result). The whole run wakes you with <pbs-wake kind=\"subagent-done\">. " +
+      "<pi-famulus-wake kind=\"subagent-handover\"> (its prompt and result). The whole run wakes you with <pi-famulus-wake kind=\"subagent-done\">. " +
       "Never poll or sleep to wait. Use action=list/get/status/interrupt/resume/steer to manage existing runs.",
     promptSnippet: "Fan out subagents in parallel or sequence them in a chain",
     promptGuidelines: [
-      'When a <pbs-wake kind="subagent-handover"> arrives, read <prompt> and <result> immediately and continue: subagent({action:"resume", run_id, child_id, message}) for that child, or agent_message to steer children that are still running. Do not wait for the rest of the run.',
+      'When a <pi-famulus-wake kind="subagent-handover"> arrives, read <prompt> and <result> immediately and continue: subagent({action:"resume", run_id, child_id, message}) for that child, or agent_message to steer children that are still running. Do not wait for the rest of the run.',
       "Subagent runs that exceed the foreground budget continue in the background; you are notified per finished child and again when the run completes — do not poll.",
       "A failed subagent does not fail the whole run; inspect per-subagent sections in the result.",
-      "<pbs-wake> is a system wake, not a user reply. kind=subagent-handover is one child; kind=subagent-done is the whole run.",
+      "<pi-famulus-wake> is a system wake, not a user reply. kind=subagent-handover is one child; kind=subagent-done is the whole run.",
     ],
     parameters: subagentParameters,
     renderResult(result, { expanded }, theme, context) {

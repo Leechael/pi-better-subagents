@@ -459,7 +459,7 @@ pub struct UpgradeInfo {
     /// Why it did not happen; the daemon kept running the old binary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// What started it: "cli" (`pbs-manager upgrade`) or "binary-changed".
+    /// What started it: "cli" (`pi-famulus upgrade`) or "binary-changed".
     #[serde(default)]
     pub trigger: String,
 }

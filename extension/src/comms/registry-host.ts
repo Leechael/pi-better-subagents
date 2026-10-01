@@ -6,7 +6,7 @@
  * concrete SubagentRegistry.handle() lookup.
  */
 import type { SubagentRegistry } from "../subagent/registry";
-import { PBS_WAKE_CUSTOM_TYPE } from "../wake";
+import { FAMULUS_WAKE_CUSTOM_TYPE } from "../wake";
 
 import type { CommsHost } from "./types";
 
@@ -64,7 +64,7 @@ export function createRegistryCommsHost(deps: RegistryHostDeps): CommsHost {
 
     notifySupervisor(wake) {
       deps.getNotifyCenter()?.notify({
-        customType: PBS_WAKE_CUSTOM_TYPE,
+        customType: FAMULUS_WAKE_CUSTOM_TYPE,
         content: wake.content,
         details: wake.details,
       });

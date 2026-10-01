@@ -70,7 +70,7 @@ function exitInfo(overrides: Partial<TaskExitInfo> = {}): TaskExitInfo {
     status: "completed",
     exitCode: 0,
     durationMs: 12345,
-    outputPath: "/home/u/.pi/agent/pbs/sessions/s/tasks/sh_a1b2c3d4.output",
+    outputPath: "/home/u/.pi/agent/pi-famulus/sessions/s/tasks/sh_a1b2c3d4.output",
     preview: "all tests passed",
     ...overrides,
   };
@@ -80,11 +80,11 @@ describe("formatTaskNotification", () => {
   it("matches the §4.5 XML layout for a single event", () => {
     const xml = formatTaskNotification([exitInfo()]).content;
     expect(xml).toContain("System wake");
-    expect(xml).toContain('<pbs-wake kind="task">');
+    expect(xml).toContain('<pi-famulus-wake kind="task">');
     expect(xml).toContain('<task id="sh_a1b2c3d4" kind="shell" status="completed" duration-ms="12345" exit-code="0">');
     expect(xml).toContain('<summary>Background command "npm test" completed (exit code 0)</summary>');
     expect(xml).toContain("<command>npm test</command>");
-    expect(xml).toContain("<output-file>/home/u/.pi/agent/pbs/sessions/s/tasks/sh_a1b2c3d4.output</output-file>");
+    expect(xml).toContain("<output-file>/home/u/.pi/agent/pi-famulus/sessions/s/tasks/sh_a1b2c3d4.output</output-file>");
     expect(xml).toContain("<preview>all tests passed</preview>");
   });
 
@@ -93,7 +93,7 @@ describe("formatTaskNotification", () => {
       exitInfo(),
       exitInfo({ taskId: "sh_deadbeef", status: "failed", exitCode: 1, command: "make" }),
     ]).content;
-    expect(xml.match(/<pbs-wake /g)).toHaveLength(1);
+    expect(xml.match(/<pi-famulus-wake /g)).toHaveLength(1);
     expect(xml.match(/<task /g)).toHaveLength(2);
     expect(xml).toContain('id="sh_deadbeef"');
     expect(xml).toContain('status="failed"');
@@ -156,12 +156,12 @@ describe("formatBackgroundNotice", () => {
 });
 
 describe("formatMonitorEvent", () => {
-  it("wraps the batch in a pbs-wake monitor envelope", () => {
+  it("wraps the batch in a pi-famulus-wake monitor envelope", () => {
     const text = formatMonitorEvent("watch tests", "mon_ab12", "line1\nline2").content;
-    expect(text).toContain('<pbs-wake kind="monitor" id="mon_ab12" description="watch tests">');
+    expect(text).toContain('<pi-famulus-wake kind="monitor" id="mon_ab12" description="watch tests">');
     expect(text).toContain("System wake");
     expect(text).toContain("<event>line1\nline2</event>");
-    expect(text).toContain("</pbs-wake>");
+    expect(text).toContain("</pi-famulus-wake>");
   });
 
   it("escapes attribute values", () => {

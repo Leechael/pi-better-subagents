@@ -1,5 +1,5 @@
 /**
- * Part 1: deterministic e2e — real `pi` (RPC mode) + real pbs-manager + our
+ * Part 1: deterministic e2e — real `pi` (RPC mode) + real pi-famulus + our
  * extension, with a scripted faux model. Tests the code, not the model.
  *
  *   node --test e2e/faux.test.ts
@@ -9,7 +9,7 @@ import { spawnSync } from "node:child_process";
 import { after, describe, it } from "node:test";
 import { type FauxEpisode, runFaux } from "./run-faux.ts";
 import { followedByAssistant, type Item, toolResults, wakes } from "../lib/transcript.ts";
-import { PBS_WAKE_LEAD_IN } from "../lib/wake-adapter.ts";
+import { FAMULUS_WAKE_LEAD_IN } from "../lib/wake-adapter.ts";
 
 const episodes: FauxEpisode[] = [];
 after(() => {
@@ -55,7 +55,7 @@ describe("faux e2e", { concurrency: true }, () => {
   it("(a) command over the foreground budget is backgrounded and notifies exactly once", async () => {
     const ep = await runFaux({
       script: "bg-once.ts",
-      pbsConfig: { foregroundBudgetMs: 300 },
+      famulusConfig: { foregroundBudgetMs: 300 },
       until: (items) => wakes(items).length >= 1 && followedByAssistant(items, wakes(items)[0].seq),
       quietMs: 2500, // long enough for a duplicate notification to show up
     });
@@ -70,10 +70,10 @@ describe("faux e2e", { concurrency: true }, () => {
     const ws = wakes(ep.items);
     assert.equal(ws.length, 1, `expected exactly one wake\n${explain(ep)}`);
     const [w] = ws;
-    assert.equal(w.wake.customType, "pbs-wake");
+    assert.equal(w.wake.customType, "pi-famulus-wake");
     assert.equal(w.wake.source, "details", "wake details missing from the event stream");
     assert.equal(w.wake.tasks[0].exitCode, 0);
-    assert.equal(w.wake.leadIn, PBS_WAKE_LEAD_IN);
+    assert.equal(w.wake.leadIn, FAMULUS_WAKE_LEAD_IN);
     assert.equal(w.wake.kind, "task");
     assert.deepEqual(w.wake.taskIds, [taskId]);
     assert.equal(w.wake.status, "completed");
@@ -91,7 +91,7 @@ describe("faux e2e", { concurrency: true }, () => {
   it("(b) command within the foreground budget returns inline and produces no notification", async () => {
     const ep = await runFaux({
       script: "fg-quiet.ts",
-      pbsConfig: { foregroundBudgetMs: 10_000 },
+      famulusConfig: { foregroundBudgetMs: 10_000 },
       quietMs: 2000,
     });
     episodes.push(ep);
@@ -118,7 +118,7 @@ describe("faux e2e", { concurrency: true }, () => {
     assert.match(taskId, /^mon_[0-9a-f]{8}$/);
 
     const ws = wakes(ep.items);
-    assert.ok(ws.every((w) => w.wake.customType === "pbs-wake" && w.wake.kind === "monitor"), explain(ep));
+    assert.ok(ws.every((w) => w.wake.customType === "pi-famulus-wake" && w.wake.kind === "monitor"), explain(ep));
     assert.ok(ws.every((w) => w.wake.taskIds[0] === taskId), explain(ep));
     const events = ws.filter((w) => w.wake.status === "event");
     const timeouts = ws.filter((w) => w.wake.status === "timeout");
@@ -145,17 +145,17 @@ describe("faux e2e", { concurrency: true }, () => {
     let runnerPid = 0;
     const ep = await runFaux({
       script: "manager-crash.ts",
-      pbsConfig: { foregroundBudgetMs: 300 },
+      famulusConfig: { foregroundBudgetMs: 300 },
       midway: {
         when: (items) => toolResults(items).some((r) => r.toolName === "bash" && r.details?.backgrounded === true),
         act: (sb) => {
           // A stalled or failing manager must hang the test at most 3s and
           // fail with a diagnostic, not a cryptic JSON parse error.
-          const mgr = sb.env.PBS_MANAGER_PATH;
+          const mgr = sb.env.PI_FAMULUS_MANAGER_PATH;
           const fail = (what: string, detail: string): never => {
             throw new Error(`midway ${what} failed: ${detail}`);
           };
-          const st = spawnSync(mgr, ["--home", sb.pbsHome, "status", "--json"], { encoding: "utf8", timeout: 3000 });
+          const st = spawnSync(mgr, ["--home", sb.famulusHome, "status", "--json"], { encoding: "utf8", timeout: 3000 });
           if (st.error) fail("status", String(st.error));
           if (st.status !== 0) fail("status", `exit ${st.status}: ${st.stderr.slice(0, 300)}`);
           if (!st.stdout.trim()) fail("status", "empty stdout");
@@ -172,7 +172,7 @@ describe("faux e2e", { concurrency: true }, () => {
 
           // The runner (process-group leader) must actually die for the
           // lifeline to count as working; capture it before the kill.
-          const ls = spawnSync(mgr, ["--home", sb.pbsHome, "ls", "--json"], { encoding: "utf8", timeout: 3000 });
+          const ls = spawnSync(mgr, ["--home", sb.famulusHome, "ls", "--json"], { encoding: "utf8", timeout: 3000 });
           if (ls.error) fail("ls", String(ls.error));
           if (ls.status !== 0) fail("ls", `exit ${ls.status}: ${ls.stderr.slice(0, 300)}`);
           if (!ls.stdout.trim()) fail("ls", "empty stdout");
@@ -223,15 +223,15 @@ describe("faux e2e", { concurrency: true }, () => {
     let before: { pid?: number } = {};
     const ep = await runFaux({
       script: "manager-upgrade.ts",
-      pbsConfig: { foregroundBudgetMs: 300 },
+      famulusConfig: { foregroundBudgetMs: 300 },
       midway: {
         when: (items) =>
           toolResults(items).some((r) => r.toolName === "bash" && r.details?.backgrounded === true) &&
           toolResults(items).some((r) => r.toolName === "monitor"),
         act: (sb) => {
-          const m = sb.env.PBS_MANAGER_PATH;
-          before = JSON.parse(spawnSync(m, ["--home", sb.pbsHome, "status", "--json"], { encoding: "utf8" }).stdout);
-          const r = spawnSync(m, ["--home", sb.pbsHome, "upgrade"], { encoding: "utf8", timeout: 40_000 });
+          const m = sb.env.PI_FAMULUS_MANAGER_PATH;
+          before = JSON.parse(spawnSync(m, ["--home", sb.famulusHome, "status", "--json"], { encoding: "utf8" }).stdout);
+          const r = spawnSync(m, ["--home", sb.famulusHome, "upgrade"], { encoding: "utf8", timeout: 40_000 });
           upgradeOut = `${r.status} ${r.stdout}${r.stderr}`;
         },
       },
@@ -244,7 +244,7 @@ describe("faux e2e", { concurrency: true }, () => {
     episodes.push(ep);
     assert.match(upgradeOut, /^0 upgraded in place/, `upgrade: ${upgradeOut}\n${explain(ep)}`);
     const after = JSON.parse(
-      spawnSync(ep.sandbox.env.PBS_MANAGER_PATH, ["--home", ep.sandbox.pbsHome, "status", "--json"], { encoding: "utf8" }).stdout,
+      spawnSync(ep.sandbox.env.PI_FAMULUS_MANAGER_PATH, ["--home", ep.sandbox.famulusHome, "status", "--json"], { encoding: "utf8" }).stdout,
     );
     assert.equal(after.pid, before.pid, "same manager pid");
     assert.equal(after.generation, 1);
@@ -344,11 +344,11 @@ describe("faux e2e", { concurrency: true }, () => {
     async () => {
       const ep = await runFaux({
         script: "bg-once.ts",
-        pbsConfig: { foregroundBudgetMs: 300 },
+        famulusConfig: { foregroundBudgetMs: 300 },
         until: (items) => wakes(items).length >= 1 && followedByAssistant(items, wakes(items)[0].seq),
       });
       episodes.push(ep);
-      const heading = "Background tasks and notifications (pi-better-subagents)";
+      const heading = "Background tasks and notifications (pi-famulus)";
       const sees = ep.calls.map((c) => JSON.stringify(c.messages).includes(heading));
       assert.equal(sees.length, 3, explain(ep));
       assert.ok(sees[0], "guidelines missing on the user-prompted turn");
@@ -362,7 +362,7 @@ describe("faux e2e", { concurrency: true }, () => {
     async () => {
       const ep = await runFaux({
         script: "exercise-surfaces.ts",
-        pbsConfig: { foregroundBudgetMs: 300 },
+        famulusConfig: { foregroundBudgetMs: 300 },
         until: (items) => wakes(items).some((w) => w.wake.kind === "subagent-done"),
         untilTimeoutMs: 15_000,
       });
@@ -382,7 +382,7 @@ describe("faux e2e", { concurrency: true }, () => {
     async () => {
       const ep = await runFaux({
         script: "bg-once.ts",
-        pbsConfig: { foregroundBudgetMs: 300 },
+        famulusConfig: { foregroundBudgetMs: 300 },
         warm: false,
         until: (items) => wakes(items).length >= 1,
         untilTimeoutMs: 6000,

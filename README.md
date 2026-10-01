@@ -1,11 +1,11 @@
-# pi-better-subagents
+# pi-famulus
 
-A pi extension for subagent orchestration, auto-backgrounding bash, monitoring tasks, and agent-to-agent communication. Process management lives in a standalone Rust daemon, `pbs-manager` (machine-wide singleton, session-isolated, exits with the last pi).
+A pi extension for subagent orchestration, auto-backgrounding bash, monitoring tasks, and agent-to-agent communication. Process management lives in a standalone Rust daemon, `pi-famulus` (machine-wide singleton, session-isolated, exits with the last pi).
 
 ## Architecture
 
 ```
-pi extension (extension/, TypeScript)        pbs-manager (manager/, Rust)
+pi extension (extension/, TypeScript)        pi-famulus (manager/, Rust)
 ├─ bash override: foreground budget →        ├─ spawn/wait/stop/output engine
 │  auto-background                           ├─ session_id namespacing
 ├─ subagent: parallel tasks / serial chain   ├─ output duality (ring + full log)
@@ -19,31 +19,49 @@ Design doc (wire protocol, state machines, interface contracts): [docs/design.md
 
 ## Install
 
+After the first public npm release:
+
 ```bash
-# 1. Build and install the manager (the extension auto-discovers it
-#    at ~/.pi/agent/pbs/bin/)
+pi install npm:pi-famulus
+```
+
+npm installs the matching exact-version native manager automatically: Linux/macOS × x64/arm64. No Rust compiler, postinstall download, or separate manager install is required. Linux builds are static musl binaries; macOS builds target macOS 13+ (Node/pi runtime requirements also apply). Windows and other architectures are unsupported. Keep optional dependencies enabled. The npm package also exposes `pi-famulus` on its npm bin path (`npx pi-famulus --help`).
+
+Discovery order: executable config `managerPath` → executable `PI_FAMULUS_MANAGER_PATH` → exact-version native npm package → executable home/bin → executable PATH. Installation does not move runtime state or copy into the shared home. Package installation/usage details: [extension/README.md](extension/README.md). CI, five-package publishing, and the one-time npm Trusted Publisher setup: [docs/releasing.md](docs/releasing.md).
+
+### Source build / local trial
+
+Before the first npm release, or to use a separately built manager:
+
+```bash
+# 1. Build and install the manager at ~/.pi/agent/pi-famulus/bin/
 cd manager && cargo build --release
-mkdir -p ~/.pi/agent/pbs/bin
+mkdir -p ~/.pi/agent/pi-famulus/bin
 # Atomic replace (new inode). In-place `cp` onto an existing binary breaks
 # macOS code-signing and the next run dies with SIGKILL / "killed".
-install -m 755 target/release/pbs-manager ~/.pi/agent/pbs/bin/pbs-manager
-#    Upgrading later: the same `install` line is enough. A running daemon
-#    upgrades itself in place within seconds (same pid, running work kept);
-#    `pbs-manager upgrade` does it now and reports the result.
+install -m 755 target/release/pi-famulus ~/.pi/agent/pi-famulus/bin/pi-famulus
+#    Subsequent same-name upgrades: the same `install` line is enough.
+#    A running daemon upgrades itself in place within seconds (same pid,
+#    running work kept); `pi-famulus upgrade` does it now and reports the result.
 
-# 2. Load the extension
-pi -e /path/to/pi-better-subagents/extension   # local trial (recommended first)
-# For keeps: publish to npm/git, then `pi install <source>`
+# 2. Load the extension with this manager (local trial recommended first)
+PI_FAMULUS_MANAGER_PATH="$HOME/.pi/agent/pi-famulus/bin/pi-famulus" \
+  pi -e /path/to/pi-famulus/extension
+# For keeps: `pi install <source>`
 ```
+
+An installed native npm manager takes precedence over home/bin and PATH. To test a separately built manager, explicitly set `PI_FAMULUS_MANAGER_PATH` as above or set `managerPath` in `~/.pi/agent/pi-famulus/config.json` to its absolute executable path. An executable `managerPath` takes precedence over the environment override; update or clear it when using the latter.
+
+**One-time name transition:** this rename is a breaking installation change, not a hot upgrade of a previous installation. Wait for work to finish or stop it, close the sessions using that installation, and wait for its daemon to exit. Reinstall via npm (once published) or the source-build paths above, migrate **configuration only** to `~/.pi/agent/pi-famulus/config.json` (update explicit paths and environment overrides), then reopen sessions. Do not move the runtime state/history tree: records contain absolute output and transcript paths that a directory move does not rewrite. Keep previous history separately if needed. Subsequent compatible upgrades under the same name and home support the in-place upgrades described above; when changing installation method/binary location, restart the sessions rather than assuming an in-place upgrade across different paths.
 
 **Conflict**: the legacy `pi-subagents` package also registers a `subagent` tool. Either `pi remove pi-subagents`, or test with `pi -ne -e ./extension` (note `-ne` suppresses your other extensions too).
 
-**Degraded startup:** if `pbs-manager` is missing or cannot start, the extension warns in the TUI. Bash runs locally (so auto-backgrounding and manager-backed output/history are unavailable); `task_*` and `monitor` report that they are disabled. In-process subagents remain usable. Fix the manager installation or point to a binary with `PBS_MANAGER_PATH` / `managerPath` in config.json. If the extension is loaded outside pi and pi's bundled `pi-tui` cannot be resolved, a one-time console warning explains that interactive `/tasks` views use reduced text fallback; load the extension through pi for the full interactive UI.
+**Degraded startup:** if `pi-famulus` is missing or cannot start, the extension warns in the TUI. Bash runs locally (so auto-backgrounding and manager-backed output/history are unavailable); `task_*` and `monitor` report that they are disabled. In-process subagents remain usable. Fix the manager installation or point to a binary with `PI_FAMULUS_MANAGER_PATH` / `managerPath` in config.json. If the extension is loaded outside pi and pi's bundled `pi-tui` cannot be resolved, a one-time console warning explains that interactive `/tasks` views use reduced text fallback; load the extension through pi for the full interactive UI.
 
 ## Tools
 
 ### bash (overrides the built-in)
-Adds a `run_in_background` parameter. Foreground commands that exceed `foregroundBudgetMs` (default 20s) move to the background automatically; completion arrives as a `<pbs-wake kind="task">`. Bare `sleep` commands are rejected (use monitor or the background flag instead).
+Adds a `run_in_background` parameter. Foreground commands that exceed `foregroundBudgetMs` (default 20s) move to the background automatically; completion arrives as a `<pi-famulus-wake kind="task">`. Bare `sleep` commands are rejected (use monitor or the background flag instead).
 
 ### subagent
 ```
@@ -51,7 +69,7 @@ subagent({ tasks: [{agent?, prompt, name?}], ... })   // parallel, ≤10, concur
 subagent({ chain: [{agent?, prompt, label?}], ... })  // serial, {previous}/{outputs.<label>} interpolation
 subagent({ action: "list|get|status|interrupt|resume|steer|models", run_id?, child_id?, message? })
 ```
-- Synchronous wait up to 45s (`subagent.budgetMs`); on expiry the run continues in the background with a `run_id`, and completion arrives via `<pbs-wake kind="subagent-done">`. **Never poll.**
+- Synchronous wait up to 45s (`subagent.budgetMs`); on expiry the run continues in the background with a `run_id`, and completion arrives via `<pi-famulus-wake kind="subagent-done">`. **Never poll.**
 - `model` accepts fuzzy specs (`"haiku"`, `"openai/gpt-5.2"`, `"luna:high"`); the candidate set respects pi's whitelist (`enabledModels` / `--models`). Use `action:"models"` to list selectable values before choosing.
 - Subagents run in-process via `createAgentSession`, capped at depth 1 (no nesting), with a no-background bash variant. The stall watchdog is 5 minutes of inactivity, paused while a tool is executing or a `need_decision` is pending. The hard child timeout is 30 minutes. A decision request waits 10 minutes.
 
@@ -85,7 +103,7 @@ thinking: high
 You are a reviewer… (body = system prompt segment)
 ```
 
-## Configuration `~/.pi/agent/pbs/config.json`
+## Configuration `~/.pi/agent/pi-famulus/config.json`
 
 ```json
 {
@@ -115,15 +133,15 @@ Operations manual (every subcommand, fuzzy ids, output formats): **[docs/cli.md]
 
 | Question | Command |
 |---|---|
-| Is the daemon healthy? | `pbs-manager doctor` (non-zero exit on any failure), `pbs-manager status` |
-| What is each pi session doing, and where? | `pbs-manager sessions` (connected sessions: PID, CWD, running/tasks/agents) |
-| What is running / just finished? | `pbs-manager ls [-a] [--session P] [--cwd DIR] [--since 10m] [--json]` (what is running, newest first; `-a` adds connected sessions' finished work; KIND, CWD, STATUS, DUR, EXIT, REASON). A session that exits drops its finished rows from `ls` at once, and drops out of `sessions` too once nothing of it is still running; either way its running work stays listed until it ends, and its records stay reachable by id for `goneSessionRetention` (default 24h) |
-| Why did this end? What did it print? | `pbs-manager show <id>` (shell, monitor, `ch_…` agent or `run_…`) |
-| What did this subagent do? | `pbs-manager agent <ch_id> [-f] [--full]` (live transcript) |
-| Why didn't a notification arrive? | `pbs-manager events [-f] [--id X]` (task lifecycle + wake emit/deliver/dedupe/drop) |
-| Follow output | `pbs-manager tail <id>`, `pbs-manager log -f <id> [--stderr]` |
+| Is the daemon healthy? | `pi-famulus doctor` (non-zero exit on any failure), `pi-famulus status` |
+| What is each pi session doing, and where? | `pi-famulus sessions` (connected sessions: PID, CWD, running/tasks/agents) |
+| What is running / just finished? | `pi-famulus ls [-a] [--session P] [--cwd DIR] [--since 10m] [--json]` (what is running, newest first; `-a` adds connected sessions' finished work; KIND, CWD, STATUS, DUR, EXIT, REASON). A session that exits drops its finished rows from `ls` at once, and drops out of `sessions` too once nothing of it is still running; either way its running work stays listed until it ends, and its records stay reachable by id for `goneSessionRetention` (default 24h) |
+| Why did this end? What did it print? | `pi-famulus show <id>` (shell, monitor, `ch_…` agent or `run_…`) |
+| What did this subagent do? | `pi-famulus agent <ch_id> [-f] [--full]` (live transcript) |
+| Why didn't a notification arrive? | `pi-famulus events [-f] [--id X]` (task lifecycle + wake emit/deliver/dedupe/drop) |
+| Follow output | `pi-famulus tail <id>`, `pi-famulus log -f <id> [--stderr]` |
 
-Ids are fuzzy (unique prefix/suffix/near-miss). State directory: `~/.pi/agent/pbs/` (`PBS_HOME` / `--home`).
+Ids are fuzzy (unique prefix/suffix/near-miss). State directory: `~/.pi/agent/pi-famulus/` (`PI_FAMULUS_HOME` / `--home`).
 
 ## TUI (interactive mode)
 
@@ -144,7 +162,7 @@ Print mode (`pi -p`) skips widgets; notifications still inject as before.
 cd manager && cargo test                        # Rust: unit + adversarial + protocol + observability
 cd manager && cargo test --features test-clock  # same suites on a manual clock (fast)
 cd extension && npx tsc --noEmit && npx vitest run
-PBS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts  # TS ↔ real daemon
+PI_FAMULUS_INTEG=1 npx vitest run tests/integration/real-manager.test.ts  # TS ↔ real daemon
 ```
 
 Manual acceptance checklist: [docs/testing-guide.md](docs/testing-guide.md).

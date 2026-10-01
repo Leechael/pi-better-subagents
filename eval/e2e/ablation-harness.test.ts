@@ -74,7 +74,7 @@ after(() => {
 const exercise = (env: Record<string, string>) =>
   runFaux({
     script: "exercise-surfaces.ts",
-    pbsConfig: { foregroundBudgetMs: 300 },
+    famulusConfig: { foregroundBudgetMs: 300 },
     extensions: [ABLATION_EXT],
     env,
     until: allWakesSeen,
@@ -84,7 +84,7 @@ const exercise = (env: Record<string, string>) =>
 
 describe("ablation harness", { concurrency: true }, () => {
   it("baseline: every reachable manifest segment reaches the model verbatim", async () => {
-    const ep = await exercise({ PBS_ABLATE: "baseline" });
+    const ep = await exercise({ PI_FAMULUS_ABLATE: "baseline" });
     episodes.push(ep);
     assert.ok(allWakesSeen(ep.items), `not every surface was exercised: ${wakes(ep.items).map((w) => w.wake.kind)}`);
     const seen = stringsSeen(ep);
@@ -98,16 +98,16 @@ describe("ablation harness", { concurrency: true }, () => {
     const childMissing = compileTextSegments(childOnly).filter((s) => !childSeen.some((str) => new RegExp(s.re.source).test(str)));
     assert.deepEqual(childMissing.map((s) => s.id), [], "child-only segments drifted (checked in child calls)");
     // Children are isolated: the parent-only guidelines section must not leak into them.
-    assert.ok(!childSeen.some((str) => str.includes("Background tasks and notifications (pi-better-subagents)")), "parent guidelines leaked into a child");
+    assert.ok(!childSeen.some((str) => str.includes("Background tasks and notifications (pi-famulus)")), "parent guidelines leaked into a child");
     const sleep = bareSleepResult(ep);
     assert.ok(sleep?.isError && /Refusing/.test(sleep.text), `bare sleep was not rejected in baseline: ${sleep?.text}`);
   });
 
   it("everything ablated: nothing left, every removal audited, wakes still delivered", async () => {
-    const dir = mkdtempSync("/tmp/pbse-audit-");
+    const dir = mkdtempSync("/tmp/pi-famulus-eval-audit-");
     tempDirs.push(dir);
     const logPath = join(dir, "ablation.jsonl");
-    const ep = await exercise({ PBS_ABLATE: ablateAll, PBS_ABLATION_LOG: logPath });
+    const ep = await exercise({ PI_FAMULUS_ABLATE: ablateAll, PI_FAMULUS_ABLATION_LOG: logPath });
     episodes.push(ep);
     assert.ok(allWakesSeen(ep.items), `wakes lost under ablation: ${wakes(ep.items).map((w) => w.wake.kind)}`);
 
@@ -116,7 +116,7 @@ describe("ablation harness", { concurrency: true }, () => {
     assert.deepEqual(leaked.map((s) => s.id), [], "segments still visible to the model after ablation");
     // Data envelopes survive; only instructions go.
     for (const kind of WAKE_KINDS) {
-      assert.ok(seen.some((s) => s.includes(`<pbs-wake kind="${kind}"`)), `<pbs-wake kind="${kind}"> removed by ablation`);
+      assert.ok(seen.some((s) => s.includes(`<pi-famulus-wake kind="${kind}"`)), `<pi-famulus-wake kind="${kind}"> removed by ablation`);
     }
     assert.ok(seen.some((s) => s.includes("<still-running>")), "<still-running> removed by ablation");
 
@@ -131,7 +131,7 @@ describe("ablation harness", { concurrency: true }, () => {
   });
 
   it("supervisor-request wake (and its <reply-with>) reaches the model", async () => {
-    const ep = await exercise({ PBS_ABLATE: "baseline" });
+    const ep = await exercise({ PI_FAMULUS_ABLATE: "baseline" });
     episodes.push(ep);
     const req = wakes(ep.items).find((w) => w.wake.kind === "supervisor-request");
     assert.ok(req, "no supervisor-request wake: child could not call contact_supervisor");
@@ -141,7 +141,7 @@ describe("ablation harness", { concurrency: true }, () => {
   });
 
   it("mech.sleep-block: the bare sleep runs instead of being rejected", async () => {
-    const ep = await exercise({ PBS_ABLATE: "mech.sleep-block" });
+    const ep = await exercise({ PI_FAMULUS_ABLATE: "mech.sleep-block" });
     episodes.push(ep);
     const sleep = bareSleepResult(ep);
     assert.ok(sleep && !sleep.isError, `bare sleep still rejected: ${sleep?.text}`);

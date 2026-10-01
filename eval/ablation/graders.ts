@@ -33,7 +33,7 @@ export function isPoll(c: ToolCall): boolean {
   if (c.name === "agent_message" && c.args.action === "list") return true;
   if (c.name === "bash") {
     const s = cmd(c);
-    return /\bsleep\b|\bwait\b|\.output\b|pbs-manager|\bps\b|pgrep|\/tasks\//.test(s);
+    return /\bsleep\b|\bwait\b|\.output\b|pi-famulus|\bps\b|pgrep|\/tasks\//.test(s);
   }
   return false;
 }

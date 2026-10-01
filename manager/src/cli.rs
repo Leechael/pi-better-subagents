@@ -1,26 +1,26 @@
-//! The `pbs-manager` command-line contract, declared with usage-rs.
+//! The `pi-famulus` command-line contract, declared with usage-rs.
 
 use std::path::PathBuf;
 
 use crate::VERSION;
 
-/// Process management daemon for pi-better-subagents.
+/// Process management daemon for pi-famulus.
 // usage-rs emits a literal spec version; runtime `VERSION` also carries the git SHA.
 #[derive(usage::Cli)]
 #[usage(
-    bin = "pbs-manager",
+    bin = "pi-famulus",
     version = VERSION,
     version_spec = "0.1.0",
-    about = "Process management daemon for pi-better-subagents",
+    about = "Process management daemon for pi-famulus",
     unknown_flags = "error",
     args_override_self = false,
     completion
 )]
 pub(crate) struct Cli {
-    /// Base directory (`--home` > `PBS_HOME` > `~/.pi/agent/pbs`).
+    /// Base directory (`--home` > `PI_FAMULUS_HOME` > `~/.pi/agent/pi-famulus`).
     #[usage(long, global, display_order = 1)]
     pub(crate) home: Option<PathBuf>,
-    /// Never page output (else `PBS_PAGER` / `PAGER` / `less -FRX` on a TTY).
+    /// Never page output (else `PI_FAMULUS_PAGER` / `PAGER` / `less -FRX` on a TTY).
     #[usage(long, global, display_order = 2)]
     pub(crate) no_pager: bool,
     #[usage(subcommand)]
@@ -47,7 +47,7 @@ impl Sub {
 pub(crate) enum Sub {
     /// Version, protocol, uptime, sessions, task and agent counts.
     ///
-    /// Never starts the daemon ("pbs-manager is not running", exit 1).
+    /// Never starts the daemon ("pi-famulus is not running", exit 1).
     #[usage(display_order = 10, help_heading = "Inspection")]
     Status {
         /// Machine-readable JSON on stdout.
@@ -259,10 +259,10 @@ mod tests {
 
     #[test]
     fn global_options_and_visible_alias_parse_with_usage() {
-        let argv = ["--home", "/tmp/pbs", "ls", "-a", "--json"].map(OsStr::new);
+        let argv = ["--home", "/tmp/pi-famulus", "ls", "-a", "--json"].map(OsStr::new);
         let cli = Cli::parse_from(&argv).expect("valid list invocation");
 
-        assert_eq!(cli.home.as_deref(), Some(Path::new("/tmp/pbs")));
+        assert_eq!(cli.home.as_deref(), Some(Path::new("/tmp/pi-famulus")));
         assert!(matches!(
             cli.cmd,
             Sub::List {

@@ -1,4 +1,4 @@
-//! Embed the commit this binary is built from as `PBS_GIT_SHA`, so that
+//! Embed the commit this binary is built from as `PI_FAMULUS_GIT_SHA`, so that
 //! `status` and upgrade logs can tell two builds of the same version apart.
 //! Outside a git checkout it is "unknown".
 
@@ -21,7 +21,7 @@ fn main() {
     if sha != "unknown" && git(&["diff-index", "--quiet", "HEAD", "--"]).is_none() {
         sha.push_str("-dirty");
     }
-    println!("cargo:rustc-env=PBS_GIT_SHA={sha}");
+    println!("cargo:rustc-env=PI_FAMULUS_GIT_SHA={sha}");
     // Rebuild when HEAD moves: HEAD itself (branch switch) and the ref it
     // names (a commit). Worktrees keep HEAD in their own git dir and refs in
     // the common one.

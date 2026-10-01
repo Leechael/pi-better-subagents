@@ -75,13 +75,13 @@ describe("registry-host adapter over a real registry", () => {
   it("notifySupervisor reaches the NotifyCenter sink with the comms customType", () => {
     const { host, notifications } = makeStack();
     host.notifySupervisor({
-      content: "<pbs-wake kind=\"supervisor-update\">hi</pbs-wake>",
+      content: "<pi-famulus-wake kind=\"supervisor-update\">hi</pi-famulus-wake>",
       details: { kind: "supervisor-update", from: "ch_a", name: "alpha", message: "hi" },
     });
     expect(notifications).toEqual([
       {
-        customType: "pbs-wake",
-        content: "<pbs-wake kind=\"supervisor-update\">hi</pbs-wake>",
+        customType: "pi-famulus-wake",
+        content: "<pi-famulus-wake kind=\"supervisor-update\">hi</pi-famulus-wake>",
         details: { kind: "supervisor-update", from: "ch_a", name: "alpha", message: "hi" },
       },
     ]);
@@ -197,7 +197,7 @@ describe("subagent tool with the real agents loader", () => {
   });
 
   it("resolves a project-level agent definition into the child request", async () => {
-    dir = mkdtempSync(join(tmpdir(), "pbs-agents-"));
+    dir = mkdtempSync(join(tmpdir(), "pi-famulus-agents-"));
     const projectAgents = join(dir, ".pi", "agents");
     mkdirSync(projectAgents, { recursive: true });
     writeFileSync(
@@ -238,7 +238,7 @@ describe("subagent tool with the real agents loader", () => {
   });
 
   it("unknown agent errors and lists available names (incl. builtins)", async () => {
-    dir = mkdtempSync(join(tmpdir(), "pbs-agents-"));
+    dir = mkdtempSync(join(tmpdir(), "pi-famulus-agents-"));
     const loader = createAgentLoader({
       userDir: join(dir, "nope-user"),
       projectDir: join(dir, "nope-project"),

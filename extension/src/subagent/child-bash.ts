@@ -51,7 +51,7 @@ const childBashParameters = Type.Object({
 
 type ChildBashParams = { command: string; timeout?: number };
 
-export interface PbsChildBashDetails extends BashToolDetails {
+export interface FamulusChildBashDetails extends BashToolDetails {
   task_id?: string;
 }
 
@@ -94,7 +94,7 @@ function fullEnv(deps: ChildBashDeps): Record<string, string> {
 
 export function createChildBashTool(
   deps: ChildBashDeps,
-): ToolDefinition<typeof childBashParameters, PbsChildBashDetails | undefined> {
+): ToolDefinition<typeof childBashParameters, FamulusChildBashDetails | undefined> {
   return {
     name: "bash",
     label: "Bash",
@@ -113,7 +113,7 @@ export function createChildBashTool(
 
       const client = deps.getClient();
       if (!client || !(await client.ensureAvailable())) {
-        throw new Error("pbs-manager is not available; bash is disabled inside this subagent");
+        throw new Error("pi-famulus is not available; bash is disabled inside this subagent");
       }
 
       const timeoutMs = resolveTimeoutMs(input.timeout);
@@ -148,7 +148,7 @@ export function createChildBashTool(
             throw new Error("Command aborted (task stopped)");
           }
           throw new Error(
-            `Lost contact with pbs-manager while waiting for task ${start.task_id}: ` +
+            `Lost contact with pi-famulus while waiting for task ${start.task_id}: ` +
               `${(err as Error).message}. Output so far: ${outputPath}.`,
           );
         }
@@ -176,7 +176,7 @@ export function createChildBashTool(
       }
       const finalDetails = details
         ? { ...details, task_id: start.task_id }
-        : ({ task_id: start.task_id } as PbsChildBashDetails);
+        : ({ task_id: start.task_id } as FamulusChildBashDetails);
       return { content: [{ type: "text", text }], details: finalDetails };
     },
   };

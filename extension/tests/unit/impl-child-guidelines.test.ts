@@ -33,7 +33,7 @@ describe("child system prompt", () => {
     });
     const { session } = await createAgentSession({
       ...options,
-      agentDir: "/tmp/pbs-child-guidelines-agent-dir",
+      agentDir: "/tmp/pi-famulus-child-guidelines-agent-dir",
       sessionManager: SessionManager.inMemory("/tmp"),
     } as never);
     try {

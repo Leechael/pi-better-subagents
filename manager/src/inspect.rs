@@ -251,8 +251,8 @@ fn warn_if_older_daemon(snap: &Snapshot) {
     if let Some(d) = &snap.daemon {
         if d.protocol < crate::proto::PROTOCOL {
             eprintln!(
-                "note: the running pbs-manager is older (protocol {}, this CLI {}); some columns stay empty until it restarts. \
-                 Run `pbs-manager shutdown` once no pi session needs it.",
+                "note: the running pi-famulus is older (protocol {}, this CLI {}); some columns stay empty until it restarts. \
+                 Run `pi-famulus shutdown` once no pi session needs it.",
                 d.protocol,
                 crate::proto::PROTOCOL
             );
@@ -1172,7 +1172,7 @@ pub async fn cmd_sessions(home: &Path, json_out: bool) -> Result<(), String> {
     }
     if rows.is_empty() {
         match &snap.daemon {
-            None => outln!("no connected sessions (pbs-manager is not running)"),
+            None => outln!("no connected sessions (pi-famulus is not running)"),
             Some(_) => outln!("no connected sessions"),
         }
         return Ok(());
@@ -1223,7 +1223,7 @@ pub async fn cmd_sessions(home: &Path, json_out: bool) -> Result<(), String> {
 pub async fn cmd_status(home: &Path, json_out: bool) -> Result<(), String> {
     let mut conn = client::connect_existing(home, &HelloMode::Cli)
         .await
-        .map_err(|_| "pbs-manager is not running".to_string())?;
+        .map_err(|_| "pi-famulus is not running".to_string())?;
     let st: StatusOk = conn.roundtrip(RequestKind::Status).await?;
     let connected: HashSet<String> = st.sessions.iter().filter(|s| s.connected).map(|s| s.session_id.clone()).collect();
     let agents = load_agent_records(home, &connected);

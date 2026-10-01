@@ -1,4 +1,4 @@
-# pbs-manager testing
+# pi-famulus testing
 
 How the manager is tested, what the tests are known to guard, and where the
 gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
@@ -19,7 +19,7 @@ gaps are. Contract sources: `docs/design.md` §3 and `docs/cli.md`.
 
 Daemon-facing black-box tests (`protocol`, `lifecycle_adversarial`,
 `mutation_gaps`, `observability`, `upgrade`, `timing_canary`) start the
-compiled binary with an isolated `--home` (`$TMPDIR/pbsx-<pid>-<test>`,
+compiled binary with an isolated `--home` (`$TMPDIR/pi-famulus-test-<pid>-<test>`,
 kept short for the ~104-byte socket path limit) and speak the u32-BE +
 JSON protocol directly. They depend only on `serde_json` and `libc`,
 which are already regular dependencies, so there are **no new
@@ -77,7 +77,7 @@ runner's own timers (the 2s lifeline grace and the guardian poll — 100ms
 for the first second, then 1s backoff) run in the runner process on real
 time via `std::thread::sleep` and are never advanced by the manual clock.
 In a normal build clock.rs is `tokio::time::sleep`. With the `test-clock`
-cargo feature **and** `PBS_TEST_CLOCK=manual` in the daemon's environment,
+cargo feature **and** `PI_FAMULUS_TEST_CLOCK=manual` in the daemon's environment,
 the daemon's timers run on a manual clock instead:
 
 - Virtual time starts at 0 and moves only on `clock_advance {ms}`.
@@ -92,7 +92,7 @@ the daemon's timers run on a manual clock instead:
   also what lets a test step the 2s grace that holds a shutdown open.
 - A manual-clock daemon never idles out by itself, so one left by a killed
   test binary (Ctrl-C, a timeout; `Drop` does not run) would hold its tasks
-  forever. `tests/common` sets `PBS_TEST_OWNER` to the test's pid on every
+  forever. `tests/common` sets `PI_FAMULUS_TEST_OWNER` to the test's pid on every
   daemon it starts. Under the feature the daemon polls that pid on real time
   and exits (a crash, so the lifelines take every task down) once it is
   gone (D4d).
@@ -133,7 +133,7 @@ Why not an existing tool:
 
 The feature is off by default and adds no dependency. Release builds do not
 contain the debug requests (`#[cfg(feature = "test-clock")]` on the protocol
-variants). `PBS_TEST_CLOCK` alone does nothing without the feature.
+variants). `PI_FAMULUS_TEST_CLOCK` alone does nothing without the feature.
 
 ## Lifecycle state-transition table
 
@@ -256,7 +256,7 @@ added while fixing and were also run against the pre-fix code: all red.
 | `t14` (descriptor leak into tasks) | Tasks inherited every daemon fd that lacked close-on-exec. On macOS, std sets FD_CLOEXEC only after `accept()` returns, so a task forked in that window got a copy of a client connection. That client then saw no EOF when the daemon closed it (session rebind, shutdown) until the task exited. The same happened to anything the daemon itself inherited without the flag. Found while root-causing `d11`. | The `pre_exec` hook that runs `setsid` now marks every fd ≥ 3 close-on-exec: `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` on Linux ≥ 5.11, otherwise an `fcntl` loop up to a bound computed before fork: the highest fd open in `/dev/fd` plus 64 slack, never above the soft RLIMIT_NOFILE. The limit alone is often 10^6, and even capped at 65536 it cost every spawn ~65k syscalls. That load made two existing `task.rs` unit-test races show up (next row). Nothing in the hook allocates. The fds are marked rather than closed, because std reports exec failures over a close-on-exec pipe that must stay open until exec. Applies to tasks and to the daemon the CLI spawns. | `t14` (the daemon holds an inherited fd 20 and two client connections; the task lists its own fds): red before (`"fd 20\nend\n"`), green after. `s6` (40 session rebinds while 120 tasks spawn; each old connection must see EOF within 2s) guards the behaviour; its pre-fix red is only statistical (a microsecond window), so it passed before the fix too. |
 | `task.rs` unit-test races (macOS) | Found while verifying the fd fix in a clean copy, 1 run in 300. `spawn_captures_merged_output_and_exit` called `getpgid` on a task that had usually already exited; on macOS a finished process is already gone for `getpgid`. `signal_group_kills_whole_tree` required `Ok` from signalling a dead group, but while the reparented grandchild is still an unreaped zombie, macOS answers EPERM, not ESRCH. Callers ignore that result either way. | The task reports its own process group (`ps -o pgid= -p $$`); the dead-group call accepts EPERM. The test-only `sys::getpgid` is removed. | full unit harness 300× in a loop: 0 failures |
 | `d1` flake (process-count snapshot) | `d1` counted daemon processes once, right after the 12 clients returned, and required exactly one. It failed twice (under mutation load in part A, and once in a clean-copy test-clock run), and the diagnostics were lost both times. A client that loses the race can spawn a redundant daemon, which exits "already running" without binding; a snapshot can catch it before it exits. The count was also standing in for the invariant: the old test never checked that the clients were served by that daemon. | Nothing in the product: the lifetime lock already guarantees one serving daemon. `d1` now asserts the invariant itself. (a) Each client opens its own session with `start --session`, and all 12 must appear in the survivor's `status` (sessions live only in the memory of the daemon that served them). (b) `manager.lock` is held while the socket's daemon runs, and free the moment it exits. (c) The process count converges to 1 within 2s. Failures print `ps -ww` lines and manager.log. | `d1` 100 rounds × 3 parallel copies in each mode: plain 300/300, test-clock 300/300. Proof it can fail: the `daemon-lifetime-lock` ablation turns it red at (b) (`nobody holds manager.lock`); expecting one session no client opened turns (a) red. |
-| `u1` `u5` `u11` on the macOS CI runner (test timing) | The upgrade tests streamed output with `sleep 0.01`/`0.02` per line and expected the loop to finish in ~3 s. On the GitHub macOS runner a sub-100 ms `sleep` takes ~95–115 ms (100 × `sleep 0.02`: 9.5–11.7 s; 100 × `/usr/bin/true`: 0.15 s; the same under pbs-manager: no slower), so a 300-line stream needed ~30 s and the tests' 10 s request timeout fired. It first looked like tasks stalling after an upgrade; a pump trace showed reads continuing at the same rate before and after the upgrade (u1 126 vs 148 B/s). Not product behaviour. | Loops sleep 0.1 s every N lines (same total ~3–5 s, output still straddles the upgrade); `Conn::request` waits `budget_ms` + 5 s for a request that carries one. | A `sleep` shim in PATH that rounds anything under 0.1 s up to 0.1 s: the old tests fail exactly u1, u5, u11 (u9 passes); the new ones pass. |
+| `u1` `u5` `u11` on the macOS CI runner (test timing) | The upgrade tests streamed output with `sleep 0.01`/`0.02` per line and expected the loop to finish in ~3 s. On the GitHub macOS runner a sub-100 ms `sleep` takes ~95–115 ms (100 × `sleep 0.02`: 9.5–11.7 s; 100 × `/usr/bin/true`: 0.15 s; the same under pi-famulus: no slower), so a 300-line stream needed ~30 s and the tests' 10 s request timeout fired. It first looked like tasks stalling after an upgrade; a pump trace showed reads continuing at the same rate before and after the upgrade (u1 126 vs 148 B/s). Not product behaviour. | Loops sleep 0.1 s every N lines (same total ~3–5 s, output still straddles the upgrade); `Conn::request` waits `budget_ms` + 5 s for a request that carries one. | A `sleep` shim in PATH that rounds anything under 0.1 s up to 0.1 s: the old tests fail exactly u1, u5, u11 (u9 passes); the new ones pass. |
 | `t13` hang (stale leftover-group flag, manual clock) | Seen once in a test-clock stress run: the daemon never exited after `shutdown`. `finalize_exit` marks a finished task `group_lingering` when `kill(-pgid, 0)` still succeeds. On macOS, just after the leader is reaped, that probe can answer EPERM for about a millisecond even though the group is already empty (diagnostic: EPERM at exit, `ps` shows no member, gone 1 ms later). Only the 500 ms `group-poll` clears the flag. Under the manual clock that poll never runs unless a test steps it, so shutdown saw a "leftover" group, sent SIGTERM to it, and waited forever on `shutdown-grace` (`clock_status`: `group-poll` 500, `shutdown-grace` 2000 at t=0). Plain mode lost only 2s. Any group that empties between two polls leaves the same stale flag. | Shutdown re-probes leftover groups before it signals them (`TaskEntry::refresh_lingering`), and a group that still looks alive gets a second probe 20 ms later. An emptied group gets no SIGTERM and no grace. The probe runs again before the SIGKILL pass, so a pgid that emptied during the grace is not signalled. A live leftover still gets TERM, grace and KILL (`t6c`, `g11`). | `t13b` (the leader leaves `sleep 0.3` behind; once it exits, shutdown with no clock step): red before (test-clock: `shutdown waited on an emptied group`; plain: `killed 1 leftover process group(s)`), green after. `t13` under load (6 copies + 3 full-suite loaders): 2 hangs in 360 runs before, 0 in 180 after; 200 × 3 copies with 3 loaders: 600/600. |
 | `t5b` | `signal` was an integer on the wire and on disk; §3.3 and the extension type say `"SIGTERM"`/`"SIGKILL"`. | `signal` is a name (`proto::signal_name`) in `task_exited`, `TaskRecord` and the CLI `EXIT` column (widened to 7). Legacy numeric records still load (converted). The extension only tests truthiness / displays it; verified with `tsc`, its unit tests, and its real-binary integration tests. | `t5b`, `t2`, unit `signal_names_on_wire_and_legacy_numbers_load` |
 
@@ -277,7 +277,7 @@ fixtures in the contract's format, because the extension side may land later.
 | every line < 4 KiB, oversized fields truncated (`truncated:true`), ids never cut | `e2`, unit `events::*` |
 | concurrent appends (8 extension-style writers × 300 lines of 1–3.5 KiB, plus the manager) never interleave or lose lines | `e3` |
 | `events`: malformed lines skipped with a stderr count; `--id` matches `id`/`ids[]`/`child_id`; `--session`, `--since`, `--json`, `-f` (incl. new sessions); cross-session time order; never starts the daemon | `e4` |
-| pager: on a terminal (script(1) pty) listings go through `PBS_PAGER`, else `PAGER`; not with `--no-pager`, `cat`, or piped stdout; a bare `less` runs as `less -FRX` | `c10`, unit `pager::*` |
+| pager: on a terminal (script(1) pty) listings go through `PI_FAMULUS_PAGER`, else `PAGER`; not with `--no-pager`, `cat`, or piped stdout; a bare `less` runs as `less -FRX` | `c10`, unit `pager::*` |
 | `ls`: columns, running-only default, `-a` (connected sessions' finished work), running first then newest first, an agent's TIME = its last transcript message, agents included, SESSION shortest unique prefix ≥ 8, CJK display-width truncation, `--json`, `--session`/`--cwd`/`--since`, bad duration rejected | `c1`, `c1b`, unit `fmt::*`, `inspect::*` |
 | `show` for sh_/ch_/run_ (header, origin, backgrounded, wake emitted→delivered, last 10 lines; agent error/tool calls/shells/prompt/result tail 20), fuzzy + `--json`, one-line not-found with closest match | `c2` |
 | `agent` (preamble hidden, `--full`), `log`/`tail -f` on ch_ ids, `output`/`wait` on ch_, `stop` on an agent refused with the contract message | `c3` |
@@ -507,7 +507,7 @@ No removal turned a test red.
 ## Deferrals
 
 - deferred: HELLO_TIMEOUT (10s) close of a silent connection is not asserted, only that it does not keep the daemon alive | impact: a silent peer holds one fd for 10s; not customer-visible | trigger: if connection limits are added
-- deferred: Windows. The manager is unix-only (process groups, `setsid`, signals, unix pipes; no Windows `cfg` anywhere), and the extension is not Windows-ready either: tried on `windows-latest` (ci-platforms), 18 of 378 extension unit tests failed. 15 because `pbsPaths()` gives `<home>/manager.sock`, a unix socket path Node cannot listen on or connect to on Windows (`listen EACCES`; it needs `\\.\pipe\...`, design §3.1); 2 because tests assume `/` separators; 1 because the 1 GiB sparse-file tail test times out on NTFS | impact: no Windows support at all, neither manager nor extension | trigger: first Windows build: a named-pipe path in `pbsPaths()`, a Windows manager, then add `windows-latest` to the CI matrix
+- deferred: Windows. The manager is unix-only (process groups, `setsid`, signals, unix pipes; no Windows `cfg` anywhere), and the extension is not Windows-ready either: tried on `windows-latest` (ci-platforms), 18 of 378 extension unit tests failed. 15 because `famulusPaths()` gives `<home>/manager.sock`, a unix socket path Node cannot listen on or connect to on Windows (`listen EACCES`; it needs `\\.\pipe\...`, design §3.1); 2 because tests assume `/` separators; 1 because the 1 GiB sparse-file tail test times out on NTFS | impact: no Windows support at all, neither manager nor extension | trigger: first Windows build: a named-pipe path in `famulusPaths()`, a Windows manager, then add `windows-latest` to the CI matrix
 - deferred: the extension's own connect path (TypeScript) is not changed to wait out a shutting-down manager the way the Rust client now does; the exact protocol to implement is design §3.1 step 6 | impact: an extension connecting in the ≤ 2s shutdown window gets `manager is shutting down` at once instead of a successor | trigger: extension side of this branch's merge (handed to the extension engineer)
 - resolved (ci-github-actions): `task_exited.output_size` and the terminal record now cover every byte. The exit watch waits for the pumps to drain before finalizing (restored after the rebase lost it, `t15`), and the output fanout no longer moves a finished record's `output_size` back to its own lagging cursor.
 - deferred: the extension's `list` (own session only) is not paged | impact: a single pi session with more than ~4 MiB of task records (thousands of tasks, or very long commands) gets `E_INTERNAL` from `task_list` and its reconnect reconcile | trigger: a session that long-lived, or `task_list` failing with the frame-limit error
@@ -516,12 +516,12 @@ No removal turned a test red.
 
 ## Lifeline and runner (manager-lifeline)
 
-Principle: pbs-manager is the parent of every task. When it ends by any
+Principle: pi-famulus is the parent of every task. When it ends by any
 means, every task's process group goes with it (a descendant that escapes
 to a new session with `setsid` is outside the guarantee). There is no crash
 recovery.
 
-Every task runs under `pbs-manager __run` (`src/runner.rs`), the leader of
+Every task runs under `pi-famulus __run` (`src/runner.rs`), the leader of
 its process group. The runner:
 - spawns `sh -c` as a child in the same group (it does not exec; it
   stays alive as group leader);
@@ -612,7 +612,9 @@ exec sleep …`) and require it gone too; the entry is 3/3 red again.
 
 ## In-place upgrade (manager-exec-handover)
 
-Principle: an upgrade is invisible to running work. `pbs-manager upgrade`
+These tests cover compatible upgrades under the same binary name and home. The initial name transition instead requires finishing or stopping work, closing the previous installation's sessions, waiting for its daemon to exit, and reinstalling. Migrate configuration only, not the runtime state/history tree: records contain absolute output/transcript paths. See [the installation notes](../README.md#install).
+
+Principle: an upgrade is invisible to running work. `pi-famulus upgrade`
 (or replacing the binary file) makes the daemon `exec()` the new binary:
 same pid, so every runner is still its child; the listener, the daemon
 lock, both lifeline ends and every task's stdout / stderr / status pipe are
@@ -631,7 +633,7 @@ it):
 | D22 | quiescing | exec fails | serving (old image) | descriptors back to close-on-exec, tasks resume with no byte lost, clients reconnect | `u5` |
 | D23 | restoring | the new image cannot restore | exited | the lifeline closes: every task and grandchild cleaned up (= a crash, no recovery) | `u6` |
 | D24 | serving, just restored | no client for longer than the 5 s idle grace | serving | the idle rule is held for the 30 s handover grace, then applies again | `u12` |
-| D26 | serving, protocol < 3 (a manager from before in-place upgrade) | `upgrade` (CLI) | serving, unchanged | the CLI sends no `upgrade`; it names the pid, version and protocol and says to restart once (`pbs-manager shutdown`) | `u13` |
+| D26 | serving, protocol < 3 (a manager from before in-place upgrade) | `upgrade` (CLI) | serving, unchanged | the CLI sends no `upgrade`; it names the pid, version and protocol and says to restart once (`pi-famulus shutdown`) | `u13` |
 | D27 | serving | `upgrade` from a binary other than the daemon's (e.g. target/release against the installed copy) | as D19 | before asking, the CLI notes on stderr that the daemon execs the file at its own path and names this CLI's path and build; nothing to note from the daemon's own file | `u14` |
 | S7 | connected | the manager upgrades | reconnects to the same pid | in-flight requests unanswered (resent by the client); `start` resent with its `key` returns the task it already started; protocol 1 / no-protocol hellos accepted | `u1`, `u2`, `u3` |
 | T17 | running / stop grace pending / timeout armed | upgrade | unchanged | later exits report the real code and signal; the timeout fires from the original start; a pending kill grace is re-armed with the time it had left | `u1`, `u8` |
@@ -677,4 +679,4 @@ as declared (`scripts/ablate.sh`, exit 0).
 Deferrals:
 - deferred: the upgrade replays missed output only to a session that reconnects; a session that never comes back loses nothing but also receives nothing (its pi is gone) | impact: none | trigger: multi-client sessions
 - deferred: the `upgrade-written-cursor` ablation is undetectable in isolation (loss needs a client that stops reading with a full queue past the 2 s flush); only the parallel suite / stress catch it | impact: a regression would show as rare missing monitor lines | trigger: a flaky `u11`, or a hook that can stall a connection's reader
-- deferred: preflight runs the new binary once (up to 20 s on a first run under macOS signature assessment) while everything is still served; an upgrade right after `install` can take that long | impact: `pbs-manager upgrade` waits; nothing is interrupted | trigger: user reports of slow upgrades
+- deferred: preflight runs the new binary once (up to 20 s on a first run under macOS signature assessment) while everything is still served; an upgrade right after `install` can take that long | impact: `pi-famulus upgrade` waits; nothing is interrupted | trigger: user reports of slow upgrades

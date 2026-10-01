@@ -1,13 +1,13 @@
 /**
- * Optional TUI screenshot mode (PBS_E2E_TUI=1): a real interactive pi inside
+ * Optional TUI screenshot mode (PI_FAMULUS_E2E_TUI=1): a real interactive pi inside
  * tmux, driven by the faux model. After the scenario settles we capture the
  * pane and assert that no rendered line is wider than the pane.
  *
  * `capture-pane -J` joins lines the terminal soft-wrapped, so a joined line
  * longer than the pane width is exactly a line pi-tui rendered too wide.
  *
- *   PBS_E2E_TUI=1 node --test e2e/tui.test.ts
- *   PBS_E2E_TUI_KEEP=1 ...   # print captures
+ *   PI_FAMULUS_E2E_TUI=1 node --test e2e/tui.test.ts
+ *   PI_FAMULUS_E2E_TUI_KEEP=1 ...   # print captures
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -18,7 +18,7 @@ import { piArgs } from "../lib/rpc.ts";
 import { createSandbox, type Sandbox, waitManagerReady } from "../lib/sandbox.ts";
 import { SCRIPTS } from "./run-faux.ts";
 
-const ENABLED = process.env.PBS_E2E_TUI === "1";
+const ENABLED = process.env.PI_FAMULUS_E2E_TUI === "1";
 const WIDTH = 100;
 const HEIGHT = 40;
 
@@ -79,18 +79,18 @@ const CASES = [
   { mode: "fullscreen", longDesc: true },
 ] as const;
 
-describe("TUI screenshot", { skip: ENABLED ? false : "set PBS_E2E_TUI=1 to run" }, () => {
+describe("TUI screenshot", { skip: ENABLED ? false : "set PI_FAMULUS_E2E_TUI=1 to run" }, () => {
   for (const c of CASES) {
     const mode = c.mode;
     const title = `${mode}${c.longDesc ? " + over-wide monitor description" : ""}: every captured line fits the ${WIDTH}-column pane`;
     it(title, async () => {
-      const sb = createSandbox({ pbsConfig: { foregroundBudgetMs: 300 } });
+      const sb = createSandbox({ famulusConfig: { foregroundBudgetMs: 300 } });
       sandboxes.push(sb);
       const env = {
         ...sb.env,
-        PBS_FAUX_SCRIPT: join(SCRIPTS, "tui-smoke.ts"),
-        PBS_FAUX_TRACE: sb.tracePath,
-        PBS_TUI_LONG_DESC: c.longDesc ? "1" : "0",
+        PI_FAMULUS_FAUX_SCRIPT: join(SCRIPTS, "tui-smoke.ts"),
+        PI_FAMULUS_FAUX_TRACE: sb.tracePath,
+        PI_FAMULUS_TUI_LONG_DESC: c.longDesc ? "1" : "0",
       };
       const argv = piArgs({ model: "faux/faux-1", extensions: [FAUX_EXT], extraArgs: ["--tui-mode", mode] }, "tui");
       const cmd = [
@@ -102,7 +102,7 @@ describe("TUI screenshot", { skip: ENABLED ? false : "set PBS_E2E_TUI=1 to run" 
         shellQuote(PI_BIN),
         ...argv.map(shellQuote),
       ].join(" ");
-      const session = `pbse-tui-${process.pid}-${mode}-${c.longDesc ? "long" : "std"}`;
+      const session = `pi-famulus-eval-tui-${process.pid}-${mode}-${c.longDesc ? "long" : "std"}`;
       sessions.push(session);
       tmux("new-session", "-d", "-s", session, "-x", String(WIDTH), "-y", String(HEIGHT), cmd);
       tmux("set-option", "-t", session, "remain-on-exit", "on");
@@ -116,7 +116,7 @@ describe("TUI screenshot", { skip: ENABLED ? false : "set PBS_E2E_TUI=1 to run" 
       const text = await waitForPane(session, (t) => (t.match(/TUI-WOKE/g) ?? []).length >= 3, 25_000);
       const final = tmux("capture-pane", "-p", "-J", "-t", session);
       const dead = tmux("display-message", "-p", "-t", session, "#{pane_dead}").trim();
-      if (process.env.PBS_E2E_TUI_KEEP) console.log(`---- ${mode} scrollback ----\n${text}\n---- visible ----\n${final}`);
+      if (process.env.PI_FAMULUS_E2E_TUI_KEEP) console.log(`---- ${mode} scrollback ----\n${text}\n---- visible ----\n${final}`);
 
       assert.equal(dead, "0", `pi exited:\n${final}`);
       assert.match(text, /TUI-WOKE/, `scenario did not complete:\n${final}`);

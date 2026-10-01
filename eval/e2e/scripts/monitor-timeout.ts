@@ -1,5 +1,5 @@
 /**
- * (c) A monitor emits three lines (each becomes a <pbs-wake kind="monitor">) and
+ * (c) A monitor emits three lines (each becomes a <pi-famulus-wake kind="monitor">) and
  * then goes silent until its timeout fires the re-arm notice.
  */
 import { call, type FauxScript, lastInputText, say } from "../faux-dsl.ts";

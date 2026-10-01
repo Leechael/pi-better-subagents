@@ -5,7 +5,7 @@ import type { ManagerClient } from "../../src/manager-client";
 import { MonitorRegistry } from "../../src/monitor";
 import { NotifyCenter } from "../../src/notify";
 import { createTaskStopTool } from "../../src/task-tools";
-import type { PbsWake } from "../../src/wake";
+import type { FamulusWake } from "../../src/wake";
 
 describe("MonitorRegistry saturation", () => {
   it("stops on sustained drops even when accepted batches interrupt them", async () => {
@@ -46,8 +46,8 @@ describe("MonitorRegistry saturation", () => {
 
     expect(stopped).toEqual(["mon_1"]);
     expect(registry.has("mon_1")).toBe(false);
-    const stopWake = sent.map((item) => item.details as PbsWake | undefined).find(
-      (details): details is Extract<PbsWake, { kind: "monitor" }> =>
+    const stopWake = sent.map((item) => item.details as FamulusWake | undefined).find(
+      (details): details is Extract<FamulusWake, { kind: "monitor" }> =>
         details?.kind === "monitor" && details.status === "stopped",
     );
     expect(stopWake?.droppedLines).toBeGreaterThan(0);
@@ -144,7 +144,7 @@ describe("MonitorRegistry early exit (manual testing, 2026-09-24)", () => {
       clock,
       onExited: (id) => exited.push(id),
     });
-    const wakes = () => sent.map((m) => m.details as PbsWake | undefined).filter((d) => d?.kind === "monitor");
+    const wakes = () => sent.map((m) => m.details as FamulusWake | undefined).filter((d) => d?.kind === "monitor");
     return { clock, registry, center, exited, wakes };
   }
 

@@ -25,7 +25,7 @@ function makeDeps(client: ManagerClient | null, clock?: ManualClock): ChildBashD
   return {
     client,
     getClient: () => client,
-    home: "/tmp/pbs-test",
+    home: "/tmp/pi-famulus-test",
     sessionId: () => "parent-session",
     sessionEnv: () => ({ PI_SESSION_ID: "parent-session" }),
     trackTask: vi.fn(),
@@ -96,7 +96,7 @@ describe("child bash (no-background variant)", () => {
     const tool = createChildBashTool(makeDeps(null));
     await expect(
       tool.execute("tc", { command: "echo hi" }, undefined, undefined, ctx),
-    ).rejects.toThrow(/pbs-manager is not available/);
+    ).rejects.toThrow(/pi-famulus is not available/);
   });
 
   it("stops the task and reports an abort when the signal fires", async () => {

@@ -52,7 +52,7 @@ pub enum ExitPhase {
 
 pub struct TaskEntry {
     pub record: TaskRecord,
-    /// The task's runner (`pbs-manager __run`), taken by the exit watch at
+    /// The task's runner (`pi-famulus __run`), taken by the exit watch at
     /// spawn time; None for records loaded from disk.
     pub child: Option<RunnerProc>,
     /// Read end of the runner's status pipe, taken with `child`.
@@ -345,7 +345,7 @@ mod tests {
 
     fn temp_home(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "pbs-reg-test-{tag}-{}-{}",
+            "pi-famulus-reg-test-{tag}-{}-{}",
             std::process::id(),
             crate::proto::now_ms()
         ));

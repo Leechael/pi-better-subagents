@@ -1,4 +1,4 @@
-//! Black-box integration tests for `pbs-manager`.
+//! Black-box integration tests for `pi-famulus`.
 //!
 //! Contract source: docs/design.md §3 (protocol messages, lifecycle, state
 //! machine, CLI). Written against the *contract*, not the implementation:
@@ -7,8 +7,8 @@
 //! no dev-dependencies, no serde; JSON is asserted via substring matching
 //! (whitespace-tolerant where it matters via `compact()`).
 //!
-//! Isolation: every test uses its own PBS_HOME under temp_dir()
-//! (pbs-test-<pid>-<testname>) and kills its daemon on drop.
+//! Isolation: every test uses its own PI_FAMULUS_HOME under temp_dir()
+//! (pi-famulus-test-<pid>-<testname>) and kills its daemon on drop.
 
 use std::env;
 use std::fs;
@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_pbs-manager");
+const BIN: &str = env!("CARGO_BIN_EXE_pi-famulus");
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(6);
@@ -32,7 +32,7 @@ fn sock_path(home: &Path) -> PathBuf {
 }
 
 fn test_home(name: &str) -> PathBuf {
-    let dir = env::temp_dir().join(format!("pbs-test-{}-{}", std::process::id(), name));
+    let dir = env::temp_dir().join(format!("pi-famulus-test-{}-{}", std::process::id(), name));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create test home");
     dir
@@ -41,12 +41,12 @@ fn test_home(name: &str) -> PathBuf {
 fn spawn_daemon(home: &Path) -> Child {
     Command::new(BIN)
         .arg("daemon")
-        .env("PBS_HOME", home)
+        .env("PI_FAMULUS_HOME", home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn pbs-manager daemon")
+        .expect("spawn pi-famulus daemon")
 }
 
 fn wait_for_socket(home: &Path, timeout: Duration) {
@@ -84,7 +84,7 @@ fn connect(home: &Path, timeout: Duration) -> Conn {
     }
 }
 
-/// RAII guard: kill the daemon and wipe PBS_HOME when the test ends.
+/// RAII guard: kill the daemon and wipe PI_FAMULUS_HOME when the test ends.
 /// (If the test already killed/reaped the child, the extra kill is a no-op.)
 struct Daemon {
     child: Child,
@@ -348,7 +348,7 @@ fn pid_running(pid: u64) -> bool {
 fn run_cli(home: &Path, args: &[&str], timeout: Duration) -> (ExitStatus, String) {
     let mut child = Command::new(BIN)
         .args(args)
-        .env("PBS_HOME", home)
+        .env("PI_FAMULUS_HOME", home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -748,7 +748,7 @@ fn t11_cli_smoke() {
 
 /// §3.1 step 5 + §3.2 lifeline: SIGKILL the daemon (stale socket/pid files
 /// remain). Its task dies with it: the runner sees the lifeline break. A
-/// restart with the same PBS_HOME cleans the stale files, takes over, and
+/// restart with the same PI_FAMULUS_HOME cleans the stale files, takes over, and
 /// lists the task as orphaned (end_reason manager-crash) without
 /// re-adopting anything.
 #[test]

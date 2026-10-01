@@ -1,14 +1,14 @@
 /**
  * Unified wake envelope (design doc §4.5).
  *
- * One customType, one lead-in, one <pbs-wake> element. details.kind is the
+ * One customType, one lead-in, one <pi-famulus-wake> element. details.kind is the
  * discriminator the renderer and the eval adapter both read.
  */
 
-export const PBS_WAKE_CUSTOM_TYPE = "pbs-wake";
+export const FAMULUS_WAKE_CUSTOM_TYPE = "pi-famulus-wake";
 
-export const PBS_WAKE_LEAD_IN =
-  "System wake — not a new user message. Handle this <pbs-wake> before other work.";
+export const FAMULUS_WAKE_LEAD_IN =
+  "System wake — not a new user message. Handle this <pi-famulus-wake> before other work.";
 
 export interface WakeItem {
   id: string;
@@ -38,7 +38,7 @@ export interface SubagentDoneChild {
   error?: string;
 }
 
-export type PbsWake =
+export type FamulusWake =
   | { kind: "task"; stillRunning: WakeItem[]; tasks: TaskWake[] }
   | {
       kind: "monitor";
@@ -73,9 +73,9 @@ export type PbsWake =
   | { kind: "supervisor-update"; from: string; name: string; message: string };
 
 export interface FormattedWake {
-  customType: typeof PBS_WAKE_CUSTOM_TYPE;
+  customType: typeof FAMULUS_WAKE_CUSTOM_TYPE;
   content: string;
-  details: PbsWake;
+  details: FamulusWake;
 }
 
 export function escapeXml(text: string): string {
@@ -93,13 +93,13 @@ export function shellWakeTitle(command: string): string {
   return `${one.slice(0, 79)}…`;
 }
 
-export function formatPbsWake(details: PbsWake, leadIn: string = PBS_WAKE_LEAD_IN): FormattedWake {
+export function formatFamulusWake(details: FamulusWake, leadIn: string = FAMULUS_WAKE_LEAD_IN): FormattedWake {
   const xml = renderWake(details);
   const content = leadIn ? `${leadIn}\n\n${xml}` : xml;
-  return { customType: PBS_WAKE_CUSTOM_TYPE, content, details };
+  return { customType: FAMULUS_WAKE_CUSTOM_TYPE, content, details };
 }
 
-function renderWake(details: PbsWake): string {
+function renderWake(details: FamulusWake): string {
   switch (details.kind) {
     case "task":
       return renderTask(details);
@@ -122,8 +122,8 @@ function stillRunningXml(items: WakeItem[]): string {
   return ["  <still-running>", ...lines, "  </still-running>"].join("\n");
 }
 
-function renderTask(details: Extract<PbsWake, { kind: "task" }>): string {
-  const parts = ['<pbs-wake kind="task">'];
+function renderTask(details: Extract<FamulusWake, { kind: "task" }>): string {
+  const parts = ['<pi-famulus-wake kind="task">'];
   const still = stillRunningXml(details.stillRunning);
   if (still) parts.push(still);
   for (const task of details.tasks) {
@@ -142,11 +142,11 @@ function renderTask(details: Extract<PbsWake, { kind: "task" }>): string {
     parts.push(`    <preview>${escapeXml(task.preview)}</preview>`);
     parts.push("  </task>");
   }
-  parts.push("</pbs-wake>");
+  parts.push("</pi-famulus-wake>");
   return parts.join("\n");
 }
 
-function renderMonitor(details: Extract<PbsWake, { kind: "monitor" }>): string {
+function renderMonitor(details: Extract<FamulusWake, { kind: "monitor" }>): string {
   const attrs = [
     'kind="monitor"',
     `id="${escapeXmlAttr(details.id)}"`,
@@ -157,10 +157,10 @@ function renderMonitor(details: Extract<PbsWake, { kind: "monitor" }>): string {
   if (details.droppedLines !== undefined && details.droppedLines > 0) {
     attrs.push(`dropped-lines="${details.droppedLines}"`);
   }
-  return [`<pbs-wake ${attrs.join(" ")}>`, `  <event>${escapeXml(details.event)}</event>`, "</pbs-wake>"].join("\n");
+  return [`<pi-famulus-wake ${attrs.join(" ")}>`, `  <event>${escapeXml(details.event)}</event>`, "</pi-famulus-wake>"].join("\n");
 }
 
-function renderHandover(details: Extract<PbsWake, { kind: "subagent-handover" }>): string {
+function renderHandover(details: Extract<FamulusWake, { kind: "subagent-handover" }>): string {
   const attrs = [
     'kind="subagent-handover"',
     `run-id="${escapeXmlAttr(details.runId)}"`,
@@ -168,25 +168,25 @@ function renderHandover(details: Extract<PbsWake, { kind: "subagent-handover" }>
     `name="${escapeXmlAttr(details.name)}"`,
     `status="${escapeXmlAttr(details.status)}"`,
   ];
-  const parts = [`<pbs-wake ${attrs.join(" ")}>`];
+  const parts = [`<pi-famulus-wake ${attrs.join(" ")}>`];
   const still = stillRunningXml(details.stillRunning);
   if (still) parts.push(still);
   parts.push(`  <summary>${escapeXml(details.summary)}</summary>`);
   parts.push(`  <prompt>${escapeXml(details.prompt)}</prompt>`);
   if (details.error) parts.push(`  <error>${escapeXml(details.error)}</error>`);
   parts.push(`  <result>${escapeXml(details.result)}</result>`);
-  parts.push("</pbs-wake>");
+  parts.push("</pi-famulus-wake>");
   return parts.join("\n");
 }
 
-function renderDone(details: Extract<PbsWake, { kind: "subagent-done" }>): string {
+function renderDone(details: Extract<FamulusWake, { kind: "subagent-done" }>): string {
   const attrs = [
     'kind="subagent-done"',
     `run-id="${escapeXmlAttr(details.runId)}"`,
     `status="${escapeXmlAttr(details.status)}"`,
     `duration-ms="${Math.round(details.durationMs)}"`,
   ];
-  const parts = [`<pbs-wake ${attrs.join(" ")}>`, `  <summary>${escapeXml(details.summary)}</summary>`];
+  const parts = [`<pi-famulus-wake ${attrs.join(" ")}>`, `  <summary>${escapeXml(details.summary)}</summary>`];
   for (const child of details.children) {
     parts.push(
       `  <child id="${escapeXmlAttr(child.childId)}" name="${escapeXmlAttr(child.name)}" status="${escapeXmlAttr(child.status)}">`,
@@ -196,24 +196,24 @@ function renderDone(details: Extract<PbsWake, { kind: "subagent-done" }>): strin
     parts.push(`    <result>${escapeXml(child.result)}</result>`);
     parts.push("  </child>");
   }
-  parts.push("</pbs-wake>");
+  parts.push("</pi-famulus-wake>");
   return parts.join("\n");
 }
 
-function renderRequest(details: Extract<PbsWake, { kind: "supervisor-request" }>): string {
+function renderRequest(details: Extract<FamulusWake, { kind: "supervisor-request" }>): string {
   const recipe = `agent_message { action: "reply", to: "${details.from}", message: "<your decision>" }`;
   return [
-    `<pbs-wake kind="supervisor-request" from="${escapeXmlAttr(details.from)}" name="${escapeXmlAttr(details.name)}">`,
+    `<pi-famulus-wake kind="supervisor-request" from="${escapeXmlAttr(details.from)}" name="${escapeXmlAttr(details.name)}">`,
     `  <message>${escapeXml(details.message)}</message>`,
     `  <reply-with>${escapeXml(recipe)}</reply-with>`,
-    "</pbs-wake>",
+    "</pi-famulus-wake>",
   ].join("\n");
 }
 
-function renderUpdate(details: Extract<PbsWake, { kind: "supervisor-update" }>): string {
+function renderUpdate(details: Extract<FamulusWake, { kind: "supervisor-update" }>): string {
   return [
-    `<pbs-wake kind="supervisor-update" from="${escapeXmlAttr(details.from)}" name="${escapeXmlAttr(details.name)}">`,
+    `<pi-famulus-wake kind="supervisor-update" from="${escapeXmlAttr(details.from)}" name="${escapeXmlAttr(details.name)}">`,
     `  <message>${escapeXml(details.message)}</message>`,
-    "</pbs-wake>",
+    "</pi-famulus-wake>",
   ].join("\n");
 }

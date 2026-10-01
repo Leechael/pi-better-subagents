@@ -1,5 +1,5 @@
 /**
- * Fuzzy model spec resolution (design doc §4.6 "模型解析", appendix B).
+ * Fuzzy model spec resolution (design doc §4.6 "model resolution", appendix B).
  *
  * Pure and pi-free: candidates are plain {provider, id, name} records so the
  * resolver is testable without a ModelRegistry. The caller decides the

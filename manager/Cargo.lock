@@ -136,7 +136,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pbs-manager"
+name = "pi-famulus"
 version = "0.1.0"
 dependencies = [
  "fd-lock",

@@ -87,8 +87,8 @@ describe("tasks view", () => {
   });
 
   it("uses the manager task output path for a live monitor before exit", () => {
-    expect(resolveTaskOutputPath(item("mon_1", "running"), "/home/pbs", "sess-a"))
-      .toBe("/home/pbs/sessions/sess-a/tasks/mon_1.output");
+    expect(resolveTaskOutputPath(item("mon_1", "running"), "/home/pi-famulus", "sess-a"))
+      .toBe("/home/pi-famulus/sessions/sess-a/tasks/mon_1.output");
   });
 
   it("puts task identity, outcome, duration, cwd, command, and info in the detail panes", () => {
@@ -189,7 +189,7 @@ describe("task detail tabs follow the live item", () => {
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     const { taskDetailTabs } = await import("../../src/tui/tasks-command");
-    const dir = mkdtempSync(join(tmpdir(), "pbs-tabs-"));
+    const dir = mkdtempSync(join(tmpdir(), "pi-famulus-tabs-"));
     const out = join(dir, "mon_1.output");
     writeFileSync(out, "");
     writeFileSync(join(dir, "mon_1.stderr"), "");

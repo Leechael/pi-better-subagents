@@ -1,5 +1,5 @@
 /**
- * Integration test for ManagerClient against an in-process fake pbs-manager
+ * Integration test for ManagerClient against an in-process fake pi-famulus
  * speaking the real §3.3 wire protocol (u32 BE length + JSON frames).
  */
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -170,7 +170,7 @@ describe("ManagerClient (integration, fake manager)", () => {
   let client: ManagerClient;
 
   beforeEach(async () => {
-    home = mkdtempSync(join(tmpdir(), "pbs-test-"));
+    home = mkdtempSync(join(tmpdir(), "pi-famulus-test-"));
     fake = await startFakeManager(home);
     client = new ManagerClient({ home, sessionId: "sess-1", managerPath: null });
   });
@@ -372,7 +372,7 @@ describe("ManagerClient (integration, fake manager)", () => {
     const lone = new ManagerClient({ home, sessionId: "sess-lock", managerPath: null });
     expect(await lone.connect()).toBe(false);
     // Reclaimed the empty lock and attempted spawn; no binary → explicit error.
-    // (Pre-fix: empty lock looked held → "timed out waiting for pbs-manager socket".)
+    // (Pre-fix: empty lock looked held → "timed out waiting for pi-famulus socket".)
     expect(lone.lastError()).toMatch(/binary not found/i);
     await lone.close();
   });
@@ -383,7 +383,7 @@ describe("tryAcquireSpawnLockFile", () => {
   let lockPath: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "pbs-lock-"));
+    dir = mkdtempSync(join(tmpdir(), "pi-famulus-lock-"));
     lockPath = join(dir, "manager.spawn.lock");
   });
 

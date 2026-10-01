@@ -12,7 +12,7 @@ import { realClock, type Clock, type ClockTimer } from "../clock";
 import { formatAge, type WorkIndex, type WorkItem } from "../work-index";
 import { truncateToWidth } from "../tui/pi-tui-load";
 
-export const FLEET_WIDGET_KEY = "pbs-fleet";
+export const FLEET_WIDGET_KEY = "pi-famulus-fleet";
 
 function isActive(item: WorkItem): boolean {
   return item.status === "pending" || item.status === "running";

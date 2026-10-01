@@ -10,11 +10,11 @@
  *   end, while a wake steered in at the same moment waits for the next turn's
  *   start: a monitor's exit landed before its own event (eval batches 2–4).
  * - task exit notifications are coalesced over a 200ms window into one
- *   <pbs-wake kind="task"> payload, and the same task/event pair is only
+ *   <pi-famulus-wake kind="task"> payload, and the same task/event pair is only
  *   ever delivered once.
  */
 import { formatMonitorEvent, formatTaskNotification, type TaskExitInfo } from "./format";
-import { PBS_WAKE_CUSTOM_TYPE, type WakeItem } from "./wake";
+import { FAMULUS_WAKE_CUSTOM_TYPE, type WakeItem } from "./wake";
 import { realClock, type Clock, type ClockTimer } from "./clock";
 
 
@@ -196,7 +196,7 @@ export class NotifyCenter {
     this.pendingExits = [];
     const wake = formatTaskNotification(events, this.deps.listStillRunning?.() ?? []);
     this.deliver({
-      customType: PBS_WAKE_CUSTOM_TYPE,
+      customType: FAMULUS_WAKE_CUSTOM_TYPE,
       content: wake.content,
       details: wake.details,
     });

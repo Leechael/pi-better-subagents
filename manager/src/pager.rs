@@ -1,5 +1,5 @@
 //! Page long CLI output, like git: when stdout is a terminal, listings go
-//! through `PBS_PAGER`, else `PAGER`, else `less`. A bare `less` runs as
+//! through `PI_FAMULUS_PAGER`, else `PAGER`, else `less`. A bare `less` runs as
 //! `less -FRX` (on top of any LESS the person set, e.g. `-R`), so output that
 //! fits one screen prints as if no pager ran; a pager configured with its own
 //! arguments runs as given. An empty value is treated as unset and falls
@@ -14,12 +14,12 @@ pub struct Pager {
 
 /// The pager command line, or None for no pager; `env` reads a variable.
 ///
-/// An empty `PBS_PAGER` is treated like an unset one and falls through to
-/// `PAGER`, so `PBS_PAGER=` lets `PAGER` take over rather than disabling
+/// An empty `PI_FAMULUS_PAGER` is treated like an unset one and falls through to
+/// `PAGER`, so `PI_FAMULUS_PAGER=` lets `PAGER` take over rather than disabling
 /// paging outright; `cat` (from either variable) is the explicit way to
 /// disable it.
 fn command(env: impl Fn(&str) -> Option<String>) -> Option<String> {
-    let chosen = env("PBS_PAGER")
+    let chosen = env("PI_FAMULUS_PAGER")
         .filter(|v| !v.is_empty())
         .or_else(|| env("PAGER").filter(|v| !v.is_empty()))
         .unwrap_or_else(|| "less".into());
@@ -112,9 +112,9 @@ mod tests {
 
     #[test]
     fn a_bare_less_quits_on_one_screen_a_configured_pager_runs_as_given() {
-        let with = |pbs: Option<&str>, pager: Option<&str>| {
+        let with = |famulus: Option<&str>, pager: Option<&str>| {
             command(|k| match k {
-                "PBS_PAGER" => pbs.map(String::from),
+                "PI_FAMULUS_PAGER" => famulus.map(String::from),
                 "PAGER" => pager.map(String::from),
                 _ => None,
             })
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn program_exists_checks_the_pager_will_actually_run() {
         assert!(program_exists("sh -c whatever"));
-        assert!(!program_exists("pbs-pager-does-not-exist-anywhere -R"));
+        assert!(!program_exists("pi-famulus-pager-does-not-exist-anywhere -R"));
         assert!(!program_exists(""));
     }
 

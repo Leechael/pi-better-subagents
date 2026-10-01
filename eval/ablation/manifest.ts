@@ -8,7 +8,7 @@ import { join } from "node:path";
 import * as guidelines from "../../extension/src/behavior-guidelines.ts";
 import * as wake from "../../extension/src/wake.ts";
 
-/** Extension exports a segment may take its text from (`textFrom: "wake.PBS_WAKE_LEAD_IN"`). */
+/** Extension exports a segment may take its text from (`textFrom: "wake.FAMULUS_WAKE_LEAD_IN"`). */
 const TEXT_SOURCES: Record<string, Record<string, unknown>> = { wake, guidelines };
 
 function resolveTextFrom(ref: string): string {
@@ -26,7 +26,7 @@ export interface Segment {
   /** Read the text from an extension export instead of copying it. */
   textFrom?: string;
   pattern?: string;
-  pbsConfig?: Record<string, unknown>;
+  famulusConfig?: Record<string, unknown>;
   /** "child": only child sessions see it. */
   scope?: "parent" | "child";
   /** false: no external hook can remove it (see notAblatableExternally). Never scheduled as a variant. */
@@ -97,9 +97,9 @@ export function variantAffects(v: Variant, scenarioId: string): boolean {
   return v.segments.some((s) => s.affects.includes("*") || s.affects.includes(scenarioId));
 }
 
-/** Merge config-kind mechanisms into the sandbox pbs config. */
-export function variantPbsConfig(v: Variant): Record<string, unknown> {
-  return Object.assign({}, ...v.segments.filter((s) => s.kind === "config").map((s) => s.pbsConfig ?? {}));
+/** Merge config-kind mechanisms into the sandbox famulus config. */
+export function variantFamulusConfig(v: Variant): Record<string, unknown> {
+  return Object.assign({}, ...v.segments.filter((s) => s.kind === "config").map((s) => s.famulusConfig ?? {}));
 }
 
 // ---------------------------------------------------------------------------

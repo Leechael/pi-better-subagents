@@ -1,17 +1,17 @@
 /**
  * The ONLY module that knows the wire format of injected wake messages.
  *
- * Contract: docs/design.md §4.5 "pbs-wake 合同". One customType (`pbs-wake`),
- * content = PBS_WAKE_LEAD_IN + blank line + one <pbs-wake kind="…"> element,
+ * Contract: docs/design.md §4.5 "pi-famulus-wake contract". One customType (`pi-famulus-wake`),
+ * content = FAMULUS_WAKE_LEAD_IN + blank line + one <pi-famulus-wake kind="…"> element,
  * and a camelCase `details` object discriminated by `kind`.
  *
  * `details` is authoritative when the event stream carries it (pi puts it on
  * the custom message); the XML is parsed only as a fallback (e.g. contexts
  * that keep content but drop details). Graders consume the normalized `Wake`.
  */
-import { PBS_WAKE_CUSTOM_TYPE, PBS_WAKE_LEAD_IN } from "../../extension/src/wake.ts";
+import { FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN } from "../../extension/src/wake.ts";
 
-export { PBS_WAKE_CUSTOM_TYPE, PBS_WAKE_LEAD_IN };
+export { FAMULUS_WAKE_CUSTOM_TYPE, FAMULUS_WAKE_LEAD_IN };
 
 export type WakeKind =
   | "task"
@@ -55,7 +55,7 @@ export interface Wake {
   customType: string;
   /** Full injected text. */
   raw: string;
-  /** Text before the <pbs-wake> element (the shared lead-in, or "" if ablated). */
+  /** Text before the <pi-famulus-wake> element (the shared lead-in, or "" if ablated). */
   leadIn: string;
   /** Where the fields came from. */
   source: "details" | "xml";
@@ -76,7 +76,7 @@ export interface Wake {
 }
 
 export function isWakeCustomType(customType: string | undefined): boolean {
-  return customType === PBS_WAKE_CUSTOM_TYPE;
+  return customType === FAMULUS_WAKE_CUSTOM_TYPE;
 }
 
 const SIGNALS: Record<number, string> = { 1: "SIGHUP", 2: "SIGINT", 9: "SIGKILL", 15: "SIGTERM" };
@@ -179,8 +179,8 @@ function fromDetails(customType: string, raw: string, leadIn: string, d: Details
 
 function fromXml(customType: string, raw: string, leadIn: string): Wake {
   const w = blank(customType, raw, leadIn, "xml");
-  // The lead-in mentions a bare "<pbs-wake>"; the envelope always carries kind="…".
-  const root = /<pbs-wake(\s+kind="[^"]*"(?:\s+[\w-]+="[^"]*")*)\s*>([\s\S]*)<\/pbs-wake>/.exec(raw);
+  // The lead-in mentions a bare "<pi-famulus-wake>"; the envelope always carries kind="…".
+  const root = /<pi-famulus-wake(\s+kind="[^"]*"(?:\s+[\w-]+="[^"]*")*)\s*>([\s\S]*)<\/pi-famulus-wake>/.exec(raw);
   if (!root) return w;
   const a = parseAttrs(root[1]);
   const inner = root[2];
@@ -226,7 +226,7 @@ function fromXml(customType: string, raw: string, leadIn: string): Wake {
 
 /** Normalize one injected wake. Pass `details` whenever the source has it. */
 export function parseWake(customType: string, content: string, details?: unknown): Wake {
-  const at = content.search(/<pbs-wake\s+kind="/);
+  const at = content.search(/<pi-famulus-wake\s+kind="/);
   const leadIn = (at >= 0 ? content.slice(0, at) : content).trim();
   const d = details as Details | undefined;
   if (d && typeof d === "object" && typeof d.kind === "string") return fromDetails(customType, content, leadIn, d);

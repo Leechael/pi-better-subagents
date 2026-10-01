@@ -33,7 +33,7 @@ function record(sessionId: string, childId: string, status: "running" | "complet
 // manages what this session created.
 describe("task_list scope", () => {
   async function list(all: boolean): Promise<string> {
-    const home = mkdtempSync(join(tmpdir(), "pbs-scope-"));
+    const home = mkdtempSync(join(tmpdir(), "pi-famulus-scope-"));
     dirs.push(home);
     writeAgentChildRecord(home, record("sess-mine", "ch_mine_done", "completed"));
     writeAgentChildRecord(home, record("sess-mine", "ch_mine_live", "running"));

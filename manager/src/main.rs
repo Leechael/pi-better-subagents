@@ -1,4 +1,4 @@
-//! pbs-manager — process management daemon for pi-better-subagents.
+//! pi-famulus — process management daemon for pi-famulus.
 //! Single binary: `daemon` runs the manager; every other subcommand is a
 //! socket client (design doc §3.5).
 
@@ -25,7 +25,7 @@ use cli::{Cli, Sub};
 
 /// Package version plus the commit it was built from ("0.1.0+066598ae00"):
 /// every build of 0.1.0 would otherwise look the same in `status`.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PBS_GIT_SHA"));
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("PI_FAMULUS_GIT_SHA"));
 
 fn main() {
     // `__run` is every task's process-group leader (`runner`): plain
@@ -181,7 +181,7 @@ async fn run_client(f: impl std::future::Future<Output = Result<(), String>>) ->
     match f.await {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("pbs-manager: {e}");
+            eprintln!("pi-famulus: {e}");
             1
         }
     }

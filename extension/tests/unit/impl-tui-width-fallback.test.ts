@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMonitorTool, MonitorRegistry } from "../../src/monitor";
-import { PBS_WAKE_CUSTOM_TYPE } from "../../src/wake";
-import { registerPbsMessageRenderers } from "../../src/tui/message-renderers";
+import { FAMULUS_WAKE_CUSTOM_TYPE } from "../../src/wake";
+import { registerFamulusMessageRenderers } from "../../src/tui/message-renderers";
 import { setPiTuiForTests, visibleWidth } from "../../src/tui/pi-tui-load";
 
 const theme = {
@@ -42,15 +42,15 @@ describe("tool rows stay within width without pi-tui", () => {
   it("truncates a notification pill when pi-tui cannot be resolved", () => {
     setPiTuiForTests(null);
     const map = new Map<string, Function>();
-    registerPbsMessageRenderers({
+    registerFamulusMessageRenderers({
       registerMessageRenderer(type: string, fn: unknown) {
         map.set(type, fn as never);
       },
     } as never);
     const summary = `Background command "${"宽".repeat(30)}${"x".repeat(80)}" failed`;
-    const component = map.get(PBS_WAKE_CUSTOM_TYPE)!(
+    const component = map.get(FAMULUS_WAKE_CUSTOM_TYPE)!(
       {
-        content: `<pbs-wake kind="task"><summary>${summary}</summary></pbs-wake>`,
+        content: `<pi-famulus-wake kind="task"><summary>${summary}</summary></pi-famulus-wake>`,
         details: {
           kind: "task",
           stillRunning: [],

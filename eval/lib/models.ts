@@ -39,9 +39,9 @@ export function parseModelSpec(spec: string): ModelSpec {
 
 /** Authenticated models as pi sees them with the eval's flags (-ne etc.). */
 export async function availableModels(): Promise<ModelInfo[]> {
-  const cwd = mkdtempSync(join(tmpdir(), "pbse-models-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-famulus-eval-models-"));
   // Any authenticated model works for starting RPC; model selection is not used.
-  const pi = new PiRpc({ cwd, env: {}, model: process.env.PBS_EVAL_PROBE_MODEL ?? "", extraArgs: [] });
+  const pi = new PiRpc({ cwd, env: {}, model: process.env.PI_FAMULUS_EVAL_PROBE_MODEL ?? "", extraArgs: [] });
   try {
     const res = await Promise.race([
       pi.send({ type: "get_available_models" }),

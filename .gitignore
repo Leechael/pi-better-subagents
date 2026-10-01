@@ -6,6 +6,10 @@ extension/node_modules/
 extension/dist/
 *.tsbuildinfo
 
+# Generated npm release artifacts (metadata is tracked; native executables are not)
+npm/*/bin/pi-famulus
+/dist/
+
 # OS / editor
 .DS_Store
 *.swp

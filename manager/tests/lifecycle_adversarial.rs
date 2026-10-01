@@ -1,4 +1,4 @@
-//! Adversarial black-box lifecycle tests for pbs-manager.
+//! Adversarial black-box lifecycle tests for pi-famulus.
 //!
 //! Each test targets one cell of the state-transition table in
 //! manager/TESTING.md (ids like `C3`, `T5`, `D7` refer to rows there) and
@@ -17,7 +17,7 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 /// Re-exec entry point for `HelperClient` (a killable stand-in for pi). It is
-/// a no-op unless PBSX_HELPER_HOME is set.
+/// a no-op unless PI_FAMULUS_TEST_HELPER_HOME is set.
 #[test]
 #[ignore = "helper entry point, re-executed by crash tests; not a test"]
 fn helper_hold_extension_conn() {
@@ -118,8 +118,8 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
                     .arg("--home")
                     .arg(&home.path)
                     .args(["start", "--session", sid, "--", "true"])
-                    .env("PBS_TEST_CLOCK", clock)
-                    .env("PBS_TEST_OWNER", test_owner())
+                    .env("PI_FAMULUS_TEST_CLOCK", clock)
+                    .env("PI_FAMULUS_TEST_OWNER", test_owner())
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -202,7 +202,7 @@ fn d1_concurrent_clients_spawn_exactly_one_daemon() {
         );
         assert!(
             poll_true(S(10), || daemon_pids_for(&home.path).is_empty()),
-            "round {round}: a pbs-manager daemon outlived shutdown\n{}",
+            "round {round}: a pi-famulus daemon outlived shutdown\n{}",
             d1_diagnostics(&home)
         );
     }
@@ -443,7 +443,7 @@ fn d4d_manual_clock_daemon_exits_when_its_test_owner_is_gone() {
     let home = Home::new("d4d");
     let mut owner = KillOnDrop(Some(std::process::Command::new("/bin/sleep").arg("300").spawn().unwrap()));
     let owner_pid = owner.0.as_ref().unwrap().id().to_string();
-    let mut d1 = home.start_daemon_from(std::path::Path::new(BIN), &[("PBS_TEST_OWNER", &owner_pid)]);
+    let mut d1 = home.start_daemon_from(std::path::Path::new(BIN), &[("PI_FAMULUS_TEST_OWNER", &owner_pid)]);
     let mut c = home.connect();
     c.hello_ext("sess-crash");
     let f = start_crash_fixture(&mut c);
@@ -519,12 +519,12 @@ fn d25_slow_startup_scan_still_serves_the_spawning_client() {
         &home.path,
         &["start", "true"],
         S(20),
-        &[("PBS_TEST_SLOW_SCAN_MS", "3000"), ("PBS_TEST_CLOCK", "")],
+        &[("PI_FAMULUS_TEST_SLOW_SCAN_MS", "3000"), ("PI_FAMULUS_TEST_CLOCK", "")],
     );
     let elapsed = started.elapsed();
     assert!(out.status.success(), "stdout: {}\nstderr: {}", out.stdout, out.stderr);
     assert!(out.stdout.contains("task_id="), "{}", out.stdout);
-    // PBS_TEST_SLOW_SCAN_MS is honored only under cfg!(debug_assertions), so
+    // PI_FAMULUS_TEST_SLOW_SCAN_MS is honored only under cfg!(debug_assertions), so
     // a release-built daemon would skip the pause and pass this test even if
     // the bind-before-scan ordering it guards had regressed. Requiring the
     // client to have waited near the full 3s proves the hook actually ran,
@@ -716,7 +716,7 @@ fn d8b_cli_during_shutdown_reaches_a_successor() {
     std::thread::sleep(MS(200));
     let path = home.path.clone();
     let clock = if home.manual { "manual" } else { "" };
-    let ls = std::thread::spawn(move || run_cli_env(&path, &["ls"], S(20), &[("PBS_TEST_CLOCK", clock)]));
+    let ls = std::thread::spawn(move || run_cli_env(&path, &["ls"], S(20), &[("PI_FAMULUS_TEST_CLOCK", clock)]));
     // Let `ls` meet the shutting-down manager before the grace ends.
     std::thread::sleep(MS(500));
     home.advance("shutdown-grace", 2000);
@@ -797,7 +797,7 @@ fn d11b_client_recovers_from_corrupt_pidfile() {
     assert!(out.status.success(), "{}", out.stderr);
 }
 
-/// D12: manager.pid names a pid that is alive but is NOT a pbs-manager (pid
+/// D12: manager.pid names a pid that is alive but is NOT a pi-famulus (pid
 /// reuse after a crash/reboot). The manager must still come up.
 #[test]
 fn d12_reused_pid_in_pidfile_does_not_block_startup() {
@@ -877,7 +877,7 @@ fn t5b_signal_field_is_signal_name() {
     );
 }
 
-/// R1: tasks run under `pbs-manager __run`, and the record still carries
+/// R1: tasks run under `pi-famulus __run`, and the record still carries
 /// the command's own status: its exit code, the signal it died of, and for
 /// a stop the SIGTERM that ended it (not anything about the runner).
 #[test]
@@ -1837,7 +1837,7 @@ fn t15b_a_pump_that_falls_behind_still_has_all_output_recorded() {
     let home = Home::new("t15b");
     const OUT: u64 = 256 << 10;
     let stall = format!("{}:300", OUT - (16 << 10));
-    let _d = home.start_daemon_from(std::path::Path::new(BIN), &[("PBS_TEST_PUMP_STALL", &stall)]);
+    let _d = home.start_daemon_from(std::path::Path::new(BIN), &[("PI_FAMULUS_TEST_PUMP_STALL", &stall)]);
     let mut c = home.connect();
     c.hello_ext("sess-a");
     let started = Instant::now();

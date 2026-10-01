@@ -1,6 +1,6 @@
 /**
  * Real-model probe scenarios. Each is tiny (a few model calls), runs in a
- * temp cwd with its own PBS_HOME, and probes ONE behavior. Canary values are
+ * temp cwd with its own PI_FAMULUS_HOME, and probes ONE behavior. Canary values are
  * generated at run time by the fixture scripts (written to a secret dir
  * outside the cwd), so the model can only learn them from the wake.
  */
@@ -39,8 +39,8 @@ export interface ScenarioSetup {
 export interface Scenario {
   id: string;
   behavior: string;
-  /** Merged into $PBS_HOME/config.json (variant config wins). */
-  pbsConfig: Record<string, unknown>;
+  /** Merged into $PI_FAMULUS_HOME/config.json (variant config wins). */
+  famulusConfig: Record<string, unknown>;
   /** Hard wall-clock cap per episode. */
   timeoutMs: number;
   /** Stop waiting early once this holds (then a short quiet window). */
@@ -100,7 +100,7 @@ const BUILD_SECONDS = 15;
 const bgEndTurn: Scenario = {
   id: "bg-end-turn",
   behavior: "ends its turn after a command is backgrounded instead of polling for it",
-  pbsConfig: FAST_BG,
+  famulusConfig: FAST_BG,
   timeoutMs: 75_000,
   quietMs: 3000,
   estCalls: 4,
@@ -139,7 +139,7 @@ const wakeContinue: Scenario = {
   id: "wake-continue",
   behavior: "handles a task wake and continues the work instead of only acknowledging",
   judgeQuestion: ACK_ONLY_QUESTION,
-  pbsConfig: FAST_BG,
+  famulusConfig: FAST_BG,
   timeoutMs: 75_000,
   quietMs: 4000,
   estCalls: 5,
@@ -164,7 +164,7 @@ const wakeContinue: Scenario = {
 const stillRunningContinue: Scenario = {
   id: "still-running-continue",
   behavior: "continues from one task's wake while another background task is still running",
-  pbsConfig: FAST_BG,
+  famulusConfig: FAST_BG,
   timeoutMs: 90_000,
   quietMs: 4000,
   estCalls: 6,
@@ -224,7 +224,7 @@ const handoverContinue: Scenario = {
   id: "handover-continue",
   behavior: "continues from a per-child subagent-handover wake while the other child still runs",
   judgeQuestion: ACK_ONLY_QUESTION,
-  pbsConfig: FAST_BG,
+  famulusConfig: FAST_BG,
   timeoutMs: 120_000,
   quietMs: 4000,
   estCalls: 8,
@@ -264,7 +264,7 @@ const handoverContinue: Scenario = {
 const monitorNotSleep: Scenario = {
   id: "monitor-not-sleep",
   behavior: "waits for a condition event-driven (monitor, or a backgrounded tail -f | grep -m1), not with a sleep/poll loop",
-  pbsConfig: FAST_BG,
+  famulusConfig: FAST_BG,
   timeoutMs: 75_000,
   quietMs: 3000,
   estCalls: 4,
@@ -331,7 +331,7 @@ const monitorNotSleep: Scenario = {
 const noFabrication: Scenario = {
   id: "no-fabrication",
   behavior: "never states a background result before its notification arrives",
-  pbsConfig: FAST_BG,
+  famulusConfig: FAST_BG,
   timeoutMs: 75_000,
   quietMs: 3000,
   estCalls: 4,
@@ -360,7 +360,7 @@ const noFabrication: Scenario = {
 const supervisorReply: Scenario = {
   id: "supervisor-reply",
   behavior: "answers a supervisor-request wake with agent_message action reply",
-  pbsConfig: FAST_BG,
+  famulusConfig: FAST_BG,
   timeoutMs: 120_000,
   quietMs: 4000,
   estCalls: 7,
@@ -399,7 +399,7 @@ const supervisorReply: Scenario = {
 const resumeFinished: Scenario = {
   id: "resume-finished",
   behavior: "resumes a finished subagent via subagent({action:\"resume\"}) (an agent_message attempt first is recorded, not failed)",
-  pbsConfig: FAST_BG,
+  famulusConfig: FAST_BG,
   timeoutMs: 120_000,
   quietMs: 5000,
   estCalls: 7,

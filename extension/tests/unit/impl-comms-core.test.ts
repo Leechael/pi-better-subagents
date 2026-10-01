@@ -111,10 +111,10 @@ describe("contactSupervisor", () => {
     // parent was notified with a supervisor-request that explains how to reply
     expect(host.notifications).toHaveLength(1);
     const note = host.notifications[0];
-    expect(note).toContain('<pbs-wake kind="supervisor-request" from="ch_a" name="explorer">');
+    expect(note).toContain('<pi-famulus-wake kind="supervisor-request" from="ch_a" name="explorer">');
     expect(note).toContain("<message>Which file should I modify?</message>");
     expect(note).toContain('action: "reply"');
-    expect(note).toContain("</pbs-wake>");
+    expect(note).toContain("</pi-famulus-wake>");
 
     await tick();
     expect(settled).toBe(false); // blocked
@@ -171,7 +171,7 @@ describe("contactSupervisor", () => {
     const r = await comms.contactSupervisor("ch_a", "progress_update", "50% done");
     expect(r).toBe("ok");
     expect(host.notifications).toHaveLength(1);
-    expect(host.notifications[0]).toContain('<pbs-wake kind="supervisor-update" from="ch_a" name="explorer">');
+    expect(host.notifications[0]).toContain('<pi-famulus-wake kind="supervisor-update" from="ch_a" name="explorer">');
     expect(host.notifications[0]).toContain("50% done");
     expect(comms.pendingRequests()).toEqual([]);
   });

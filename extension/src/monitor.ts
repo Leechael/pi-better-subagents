@@ -1,8 +1,8 @@
 /**
  * monitor tool (design doc §4.4).
  *
- * Starts a long-lived `kind:"monitor"` process via pbs-manager, watches its
- * output stream, and injects line batches as <pbs-wake kind="monitor"> messages.
+ * Starts a long-lived `kind:"monitor"` process via pi-famulus, watches its
+ * output stream, and injects line batches as <pi-famulus-wake kind="monitor"> messages.
  * Batching (LineBatcher) and throttling (RateLimiter) happen extension-side;
  * a monitor is stopped when at least half its batches are dropped in a rolling
  * 30-second window.
@@ -41,7 +41,7 @@ const EXIT_AFTER_EVENT_MS = 2_000;
  * and dropped: gpt-6-luna started duplicate monitors (eval 2026-09-30d).
  */
 export const MONITOR_STARTED_INSTRUCTION =
-  'You will get a <pbs-wake kind="monitor"> for each event, and a notice when it exits or times out. ' +
+  'You will get a <pi-famulus-wake kind="monitor"> for each event, and a notice when it exits or times out. ' +
   "Do not poll it (task_list, task_output, or reading what it watches) or sleep. " +
   "If nothing else is left to do, reply to the user now with no tool call.";
 /**
@@ -136,7 +136,7 @@ export class MonitorRegistry {
   ): Promise<{ taskId: string; timeoutMs: number | null }> {
     const client = this.deps.getClient();
     if (!client || !(await client.ensureAvailable())) {
-      throw new Error("pbs-manager is not available in this session; monitor is disabled");
+      throw new Error("pi-famulus is not available in this session; monitor is disabled");
     }
 
     const persistent = params.persistent === true;
@@ -468,18 +468,18 @@ export function createMonitorTool(
     label: "Monitor",
     description:
       "Start a background monitor process whose stdout lines are injected back to you as " +
-      "<pbs-wake kind=\"monitor\"> messages (batched over 200ms, rate-limited). " +
+      "<pi-famulus-wake kind=\"monitor\"> messages (batched over 200ms, rate-limited). " +
       "The command must be line-buffered: each event must be a single line. " +
       "It must keep running and follow its source, e.g. `tail -n +1 -F file | grep --line-buffered PATTERN`; " +
       "a command that reads once and exits (a plain grep or cat) only reports what is there now. " +
       "Add `-m1` to grep to stop after the first match. " +
       "Silence is not success: write the command so failures also produce lines " +
       "(e.g. grep for both success and error patterns). " +
-      "Events arrive as system wakes (not new user messages). Handle each <pbs-wake kind=\"monitor\"> before other work. Do not poll.",
+      "Events arrive as system wakes (not new user messages). Handle each <pi-famulus-wake kind=\"monitor\"> before other work. Do not poll.",
     promptSnippet: "Watch a command's line stream and get injected events",
     promptGuidelines: [
       "Use the monitor tool to watch for conditions instead of running sleep/poll loops in bash.",
-      "When woken by a <pbs-wake kind=\"monitor\">, handle the <event> before doing anything else — it is not a new user request and not user confirmation.",
+      "When woken by a <pi-famulus-wake kind=\"monitor\">, handle the <event> before doing anything else — it is not a new user request and not user confirmation.",
     ],
     parameters: monitorParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

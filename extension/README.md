@@ -1,0 +1,36 @@
+# pi-famulus
+
+Subagent orchestration, auto-backgrounding bash, monitoring, and agent-to-agent communication for pi.
+
+After the first public release:
+
+```sh
+pi install npm:pi-famulus
+```
+
+npm installs the matching native manager automatically through an exact-version optional dependency. No Rust compiler, postinstall download, or separate manager installation is needed. Keep optional dependencies enabled.
+
+Supported native packages:
+
+| System | CPU | Package |
+|---|---|---|
+| Linux | x64 | `pi-famulus-linux-x64` |
+| Linux | arm64 | `pi-famulus-linux-arm64` |
+| macOS | Intel x64 | `pi-famulus-darwin-x64` |
+| macOS | Apple Silicon arm64 | `pi-famulus-darwin-arm64` |
+
+Linux binaries are statically linked with musl. macOS binaries target macOS 13 or newer; your Node/pi runtime's requirements also apply. Windows and other CPU architectures are not supported.
+
+The npm package also exposes the `pi-famulus` CLI (`npx pi-famulus --help`). The extension's binary search order is:
+
+1. Executable `managerPath` from configuration.
+2. Executable `PI_FAMULUS_MANAGER_PATH` override.
+3. The matching-version installed native npm package.
+4. Executable `~/.pi/agent/pi-famulus/bin/pi-famulus` (or the equivalent beneath `PI_FAMULUS_HOME`).
+5. Executable `pi-famulus` on `PATH`.
+
+Configuration and runtime state remain in `~/.pi/agent/pi-famulus`. Installing/updating the npm package does not move that state or copy a binary into the shared home. The npm CLI uses the package's native executable; use the extension configuration above when intentionally running a separately built manager.
+
+If optional dependencies were omitted, reinstall with them enabled. The CLI reports an actionable error; the extension can still discover an explicitly installed manager and otherwise enters degraded mode. An arbitrary different-version native npm package is never substituted.
+
+See the [project README](https://github.com/Leechael/pi-better-subagents#readme) for tools, settings, one-time migration, and source-build instructions; see the [CLI manual](https://github.com/Leechael/pi-better-subagents/blob/main/docs/cli.md) for operations.
