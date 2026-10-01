@@ -56,10 +56,52 @@ describe("installed native manager", () => {
     expect(resolveNativeManagerPath({ platform: "darwin", arch: "arm64", resolve })).toBeNull();
   });
 
+  it("rejects an empty executable rather than shadowing a working manual binary", () => {
+    const { binary, resolve } = installed();
+    writeFileSync(binary, "");
+    expect(resolveNativeManagerPath({ platform: "darwin", arch: "arm64", resolve })).toBeNull();
+  });
+
   it.each(["{", "null"])("ignores malformed native package metadata %s", (text) => {
     const { resolve } = installed();
     writeFileSync(join(root, "node_modules", "pi-famulus-darwin-arm64", "package.json"), text);
     expect(resolveNativeManagerPath({ platform: "darwin", arch: "arm64", resolve })).toBeNull();
+  });
+
+  it("ignores a corrupted package with an invalid executable export target", () => {
+    const { resolve } = installed();
+    writeFileSync(join(root, "node_modules", "pi-famulus-darwin-arm64", "package.json"), JSON.stringify({
+      name: "pi-famulus-darwin-arm64", version: pkg.version,
+      exports: { "./package.json": "./package.json", "./bin/pi-famulus": "../outside-package" },
+    }));
+    expect(resolveNativeManagerPath({ platform: "darwin", arch: "arm64", resolve })).toBeNull();
+  });
+
+  it.each([
+    "EISDIR", "ELOOP", "ENAMETOOLONG", "EIO", "EMFILE", "EBUSY",
+    "ERR_INVALID_PACKAGE_TARGET", "ERR_MODULE_NOT_FOUND",
+    "ERR_PACKAGE_IMPORT_NOT_DEFINED", "ERR_UNSUPPORTED_DIR_IMPORT",
+    "ERR_INVALID_MODULE_SPECIFIER", "ERR_UNSUPPORTED_RESOLVE_REQUEST",
+  ].flatMap((code) => ["package.json", "bin/pi-famulus"].map((target) => [code, target])))(
+    "permits fallback for %s resolving %s", (code, target) => {
+      const { resolve: installedResolve } = installed();
+      const resolve = (specifier: string) => {
+        if (specifier === `pi-famulus-darwin-arm64/${target}`) throw Object.assign(new Error(code), { code });
+        return installedResolve(specifier);
+      };
+      expect(resolveNativeManagerPath({ platform: "darwin", arch: "arm64", resolve })).toBeNull();
+    },
+  );
+
+  it.each([
+    new TypeError("resolver programming error"),
+    new ReferenceError("resolver programming error"),
+    Object.assign(new Error("invalid resolver argument"), { code: "ERR_INVALID_ARG_TYPE" }),
+    Object.assign(new Error("unknown failure"), { code: "EAPPLICATION" }),
+    new Error("unexpected resolver failure"),
+  ])("preserves unexpected resolver errors: %s", (error) => {
+    const resolve = () => { throw error; };
+    expect(() => resolveNativeManagerPath({ platform: "darwin", arch: "arm64", resolve })).toThrow(error);
   });
 
   it("never pairs the extension with a different native package version", () => {

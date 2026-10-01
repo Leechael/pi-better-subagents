@@ -34,8 +34,7 @@ Discovery order: executable config `managerPath` → executable `PI_FAMULUS_MANA
 Before the first npm release, or to use a separately built manager:
 
 ```bash
-# 1. Build and install the manager (the extension auto-discovers it
-#    at ~/.pi/agent/pi-famulus/bin/)
+# 1. Build and install the manager at ~/.pi/agent/pi-famulus/bin/
 cd manager && cargo build --release
 mkdir -p ~/.pi/agent/pi-famulus/bin
 # Atomic replace (new inode). In-place `cp` onto an existing binary breaks
@@ -45,10 +44,13 @@ install -m 755 target/release/pi-famulus ~/.pi/agent/pi-famulus/bin/pi-famulus
 #    A running daemon upgrades itself in place within seconds (same pid,
 #    running work kept); `pi-famulus upgrade` does it now and reports the result.
 
-# 2. Load the extension
-pi -e /path/to/pi-famulus/extension   # local trial (recommended first)
+# 2. Load the extension with this manager (local trial recommended first)
+PI_FAMULUS_MANAGER_PATH="$HOME/.pi/agent/pi-famulus/bin/pi-famulus" \
+  pi -e /path/to/pi-famulus/extension
 # For keeps: `pi install <source>`
 ```
+
+An installed native npm manager takes precedence over home/bin and PATH. To test a separately built manager, explicitly set `PI_FAMULUS_MANAGER_PATH` as above or set `managerPath` in `~/.pi/agent/pi-famulus/config.json` to its absolute executable path. An executable `managerPath` takes precedence over the environment override; update or clear it when using the latter.
 
 **One-time name transition:** this rename is a breaking installation change, not a hot upgrade of a previous installation. Wait for work to finish or stop it, close the sessions using that installation, and wait for its daemon to exit. Reinstall via npm (once published) or the source-build paths above, migrate **configuration only** to `~/.pi/agent/pi-famulus/config.json` (update explicit paths and environment overrides), then reopen sessions. Do not move the runtime state/history tree: records contain absolute output and transcript paths that a directory move does not rewrite. Keep previous history separately if needed. Subsequent compatible upgrades under the same name and home support the in-place upgrades described above; when changing installation method/binary location, restart the sessions rather than assuming an in-place upgrade across different paths.
 
