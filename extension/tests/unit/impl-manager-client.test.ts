@@ -194,12 +194,13 @@ describe("ManagerClient (integration, fake manager)", () => {
     expect(await client.connect()).toBe(true);
     expect(client.isAvailable()).toBe(true);
     const hello = fake.received.find((m) => m.type === "hello");
+    const packageVersion = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")).version;
     expect(hello).toMatchObject({
       v: 1,
       client_kind: "extension",
       session_id: "sess-1",
       pi_pid: process.pid,
-      extension_version: "0.1.0",
+      extension_version: packageVersion,
       protocol: 3,
     });
   });

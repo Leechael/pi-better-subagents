@@ -62,7 +62,7 @@ Latest reviewed result per model and scenario: `monitor-not-sleep` from 2026-09-
 
 The maintainer approved reusing the historical 13-model baselines from 2026-09-30a–d for the pi-famulus name transition in the 0.1.0 interactive-auth bootstrap and the subsequent 0.1.1 GitHub Actions OIDC release. [PR #25, comment 5929597627](https://github.com/Leechael/pi-famulus/pull/25#issuecomment-5929597627) records the approval.
 
-This is a release-specific waiver of the renamed-prompt rerun gate, **not a renamed-prompt rerun**: no new real-model runs or scores were produced. The summary above retains the historical reviewed scores and limitations; it does not measure the renamed prompt (0.1.0 extension tree `a90bf5a`, main commit `8c758e7`). The 0.1.1 patch synchronizes release metadata for the subsequent OIDC publication without changing runtime or model-visible behavior.
+This is a release-specific waiver of the renamed-prompt rerun gate, **not a renamed-prompt rerun**: no new real-model runs or scores were produced. The summary above retains the historical reviewed scores and limitations; it does not measure the renamed prompt (0.1.0 extension tree `a90bf5a`, main commit `8c758e7`). The 0.1.1 patch synchronizes release metadata and the extension version reported in its manager handshake for the subsequent OIDC publication. Wake delivery and model-visible tool/prompt wording are unchanged.
 
 Future meaningful model-visible changes and wake-delivery changes retain the rerun gate above; this waiver is not a standing exemption.
 
