@@ -11,25 +11,25 @@ import { publishPackages } from './publish-packages.mjs';
 
 const repository = 'Leechael/pi-famulus';
 const version = '0.1.0';
-function fixture(t) {
+function fixture(t, fixtureVersion = version) {
   const root = mkdtempSync(join(tmpdir(), 'famulus-release-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const put = (path, value) => { mkdirSync(join(root, path, '..'), { recursive: true }); writeFileSync(join(root, path), typeof value === 'string' ? value : JSON.stringify(value)); };
   const repo = directory => ({ type: 'git', url: `https://github.com/${repository}`, directory });
-  put('extension/package.json', { name: 'pi-famulus', version, type: 'module', repository: repo('extension'), files: ['src', 'bin', 'README.md'], bin: { 'pi-famulus': './bin/pi-famulus.js' }, optionalDependencies: Object.fromEntries(PLATFORMS.map(p => [p.name, version])) });
+  put('extension/package.json', { name: 'pi-famulus', version: fixtureVersion, type: 'module', repository: repo('extension'), files: ['src', 'bin', 'README.md'], bin: { 'pi-famulus': './bin/pi-famulus.js' }, optionalDependencies: Object.fromEntries(PLATFORMS.map(p => [p.name, fixtureVersion])) });
   put('extension/src/config.ts', 'export const config = true;');
   put('extension/src/native-manager.js', 'export const native = true;');
   put('extension/bin/pi-famulus.js', '#!/usr/bin/env node\nconsole.log("pi-famulus");');
   put('extension/README.md', 'Test package');
-  put('manager/Cargo.toml', `[package]\nname = "pi-famulus"\nversion = "${version}"\n`);
-  for (const p of PLATFORMS) put(`${p.directory}/package.json`, { name: p.name, version, main: './bin/pi-famulus', exports: { './package.json': './package.json', './bin/pi-famulus': './bin/pi-famulus' }, files: ['bin/pi-famulus'], os: [p.os], cpu: [p.arch], repository: repo(p.directory) });
+  put('manager/Cargo.toml', `[package]\nname = "pi-famulus"\nversion = "${fixtureVersion}"\n`);
+  for (const p of PLATFORMS) put(`${p.directory}/package.json`, { name: p.name, version: fixtureVersion, main: './bin/pi-famulus', exports: { './package.json': './package.json', './bin/pi-famulus': './bin/pi-famulus' }, files: ['bin/pi-famulus'], os: [p.os], cpu: [p.arch], repository: repo(p.directory) });
   return { root, put };
 }
-function packAll(t) {
-  const f = fixture(t);
+function packAll(t, fixtureVersion = version) {
+  const f = fixture(t, fixtureVersion);
   for (const p of PLATFORMS) {
     const binary = join(f.root, 'manager', 'target', p.target, 'release', 'pi-famulus');
-    f.put(binary.slice(f.root.length + 1), `#!/bin/sh\necho pi-famulus ${version}+fixture\n`);
+    f.put(binary.slice(f.root.length + 1), `#!/bin/sh\necho pi-famulus ${fixtureVersion}+fixture\n`);
     chmodSync(binary, 0o755);
     prepareNative(f.root, p.id, join(f.root, 'dist'));
   }
@@ -288,10 +288,16 @@ test('tampered metadata and omitted native binary in real tarballs fail closed',
 });
 
 test('real npm publish dry-run validates all five packed artifacts without publication', async t => {
-  const { root } = packAll(t);
-  await publishPackages(root, join(root, 'dist'), { tag: 'v0.1.0', dryRun: true, fetchImpl: () => assert.fail('registry lookup'), run: (command, args, options) => {
+  // npm rejects dry-run republication of versions that already exist on the
+  // registry, so the real-registry smoke test must pack a version below the
+  // first real release that can never be published.
+  const { root } = packAll(t, '0.0.1');
+  await publishPackages(root, join(root, 'dist'), { tag: 'v0.0.1', dryRun: true, fetchImpl: () => assert.fail('registry lookup'), run: (command, args, options) => {
     assert.ok(args.includes('--dry-run'));
-    execFileSync(command, args, { ...options, stdio: 'pipe' });
+    // 0.0.1 is below the latest published version, so an explicit throwaway
+    // dist-tag avoids npm's implicit-latest restriction; production releases
+    // never use this version or tag.
+    execFileSync(command, [...args, '--tag', 'famulus-smoke'], { ...options, stdio: 'pipe' });
   } });
 });
 
