@@ -1,0 +1,103 @@
+# npm releases
+
+The main extension and four native manager packages form one versioned release. The packaging design is recorded in [the ADR](decisions/npm-native-packages.md).
+
+## Supported outputs
+
+| Package | Rust target | GitHub-hosted builder |
+|---|---|---|
+| `pi-famulus-linux-x64` | `x86_64-unknown-linux-musl` | `ubuntu-24.04` |
+| `pi-famulus-linux-arm64` | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` |
+| `pi-famulus-darwin-x64` | `x86_64-apple-darwin` | `macos-15-intel` |
+| `pi-famulus-darwin-arm64` | `aarch64-apple-darwin` | `macos-15` |
+| `pi-famulus` | TypeScript extension + JS CLI/resolver | `ubuntu-24.04` |
+
+Linux artifacts are statically linked with musl. macOS builds explicitly target macOS 13+. Node/pi's runtime requirements still apply. There is no Windows or other-architecture release.
+
+CI builds the four targets on native-architecture hosts, runs the ordinary and manual-clock Rust suites, and verifies actual root/native npm tarball installation on each host. Installed-package tests use an isolated HOME with no manager override and check both the CLI and the extension's real TypeScript resolver. CI also runs extension typecheck/full tests, real-manager integration, and the free faux-model eval/unit/grader suites. These do not replace the [required real-model baseline gate](../eval/BASELINES.md).
+
+## Exact release metadata
+
+Keep these at the same stable `X.Y.Z`:
+
+- `extension/package.json` version and its four exact optional dependency versions.
+- All four `npm/*/package.json` versions.
+- `manager/Cargo.toml` version and the own-package Cargo lock record.
+- The extension lockfile's root metadata and first-party native-package version records.
+
+Third-party dependency records need not change for a version bump. For source development, the extension lockfile resolves native packages to their local metadata directories; CI uses `npm ci --omit=optional` and verifies built packages independently. The published root tarball does **not** contain this lockfile: consumers resolve the exact native versions from npm.
+
+```sh
+node scripts/validate-release.mjs
+node --test scripts/*.test.mjs
+```
+
+`validate-release.mjs` checks versions, native names/targets, exports/files, no install hooks, and repository identity. `prepare-native.mjs <os-arch> <artifact-directory>` requires the compiled release under `manager/target/<target>/release/pi-famulus`, verifies its version, atomically installs it into the ignored native package bin directory, and packs a real tarball. Generated binaries and `dist/` are not committed.
+
+## Trusted Publishers: repository configuration
+
+The workflow is `.github/workflows/publish.yml`. It uses GitHub-hosted runners, Node 24, an explicit npm upgrade/check for npm >=11.5.1, and **publish-job-only** `id-token: write` plus `contents: read`. It does not use npm token secrets, login, or `npm whoami` as an OIDC check. Tokens and `.npmrc` contents must never be printed.
+
+All five package manifests specify the exact public repository URL:
+
+```text
+https://github.com/Leechael/pi-better-subagents
+```
+
+The repository has not been renamed externally. This URL is the actual GitHub/OIDC identity, not a leftover product namespace. If the GitHub repository is renamed, update the five URLs, the canonical release validator, this guide, and **all five npm trust bindings** together before publishing again.
+
+The publish job has **no GitHub environment**; leave the npm trusted-publisher Environment field blank. Bind each package separately:
+
+| npm setting | Value |
+|---|---|
+| Provider | GitHub Actions |
+| Owner / organization | `Leechael` |
+| Repository | `pi-better-subagents` |
+| Workflow filename | `publish.yml` (not the path or display name) |
+| Environment | Empty |
+| Publish permission | Allow direct `npm publish` |
+
+## Required one-time npm setup
+
+Repository configuration does not create npm packages or their trusted-publisher bindings. All five packages must first exist in npm and be controlled by the intended maintainer. This repository cannot assert that those remote settings are configured just because the workflow passes a dry run.
+
+1. Confirm the public license/ownership and all five npm names before the first public release.
+2. Merge the release code only after required review/testing, including the real-model baseline gate or an explicit maintainer waiver.
+3. Create the matching main-ancestor tag (for example `v0.1.0`). Run `publish.yml` via **workflow_dispatch**, selecting that tag and leaving **dry_run=true**. The resulting artifacts are `npm-root` and `npm-<os>-<arch>`.
+4. Download all five `.tgz` files from that exact run. Authenticate interactively with `npm login` in a maintainer-controlled terminal, then bootstrap the four native tarballs **first** and the root tarball **last**, with `npm publish <file.tgz> --access public`. Do not publish placeholders, source-only native packages, or different bytes under the same version. Local interactive bootstrap does not automatically produce GitHub OIDC provenance.
+5. Configure the table above under each package's npm Access / Trusted publishing settings. With current npm, the equivalent authenticated commands are:
+
+```sh
+for package in \
+  pi-famulus-linux-x64 pi-famulus-linux-arm64 \
+  pi-famulus-darwin-x64 pi-famulus-darwin-arm64 pi-famulus
+do
+  npm trust github "$package" --file publish.yml \
+    --repository Leechael/pi-better-subagents --allow-publish --yes \
+    --registry https://registry.npmjs.org
+  npm trust list "$package" --registry https://registry.npmjs.org
+done
+```
+
+Use npm's website if your npm version lacks `npm trust`. Refresh and verify the saved bindings; do not merely assume form submission proved authentication. After verifying OIDC on a subsequent version, restrict token publishing as appropriate for the maintainer's npm account policy.
+
+At implementation time local `npm whoami` returned 401 and the root package lookup returned 404. No public package was created or published, and no remote trust binding was changed. Those observations are setup status only: `whoami` returning 401 inside an OIDC-only job is expected and must not block publishing.
+
+## Subsequent tokenless releases
+
+`publish.yml` accepts stable tags only. A tag must resolve to the checked-out commit, match all five package/Cargo versions, and be an ancestor of `origin/main`. The workflow pins that SHA for full CI and publication, revalidates it, and downloads the five artifacts from that same workflow run.
+
+- **GitHub release published:** runs full validation/CI, then publishes via OIDC.
+- **Manual workflow:** `tag=vX.Y.Z`, `dry_run=true` builds/tests and invokes real `npm publish --dry-run`; set `dry_run=false` explicitly for publication.
+
+A dry run proves package validity, **not** OIDC authentication or npm-side trust. For real publication, safe diagnostics assert OIDC request credentials are present without logging them. Successful OIDC/provenance must be verified from the publishing logs and npm metadata. Re-running an identical bootstrap version may skip every publish call; that is **not** an OIDC authentication test. Verify on a subsequent new version.
+
+Native packages publish before the root. The script preflights all five registry names/versions before its first mutation. Existing versions are skipped only if their SHA-512 tarball integrity equals the candidate; a mismatch or registry error stops publication. Releases are serialized and not auto-cancelled. npm versions cannot be overwritten. If a partial retry rebuilds different artifacts, fail closed and publish a new synchronized version rather than bypassing the integrity check.
+
+Verify a completed release with `npm view <package>@X.Y.Z version dist.integrity`, the provenance link, and clean installs on the four supported platforms. Roll back by installing a previously complete root version; its exact optional dependencies select the corresponding native build.
+
+## References
+
+- [npm Trusted Publishers: The Complete Guide](https://leechael.org/posts/2025/npm-trusted-publishers-the-complete-guide/)
+- [Official npm trusted publishing documentation](https://docs.npmjs.com/trusted-publishers/)
+- [Official npm trust commands](https://docs.npmjs.com/cli/v11/commands/npm-trust/)

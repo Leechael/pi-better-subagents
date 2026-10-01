@@ -7,6 +7,7 @@
 import { accessSync, constants, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
+import { nativePackageName, resolveNativeManagerPath } from "./native-manager.js";
 
 export interface FamulusConfig {
   /** Foreground budget for bash before auto-backgrounding (ms). */
@@ -230,6 +231,11 @@ export function describeManagerSearch(
   const tried: string[] = [];
   if (config.managerPath) tried.push(`config managerPath ${describeCandidate(config.managerPath)}`);
   if (env.PI_FAMULUS_MANAGER_PATH) tried.push(`PI_FAMULUS_MANAGER_PATH ${describeCandidate(env.PI_FAMULUS_MANAGER_PATH)}`);
+  const nativeName = nativePackageName(process.platform, process.arch);
+  const native = resolveNativeManagerPath();
+  tried.push(nativeName
+    ? `npm ${nativeName}${native ? ` ${native}` : " (missing or unusable, ignored)"}`
+    : `npm native manager (unsupported ${process.platform}/${process.arch})`);
   tried.push(describeCandidate(join(home, "bin", "pi-famulus")));
   tried.push("pi-famulus on PATH");
   return tried.join("; ");
@@ -237,7 +243,7 @@ export function describeManagerSearch(
 
 /**
  * Resolve an executable regular pi-famulus binary, or null if none is usable.
- * Priority: config.managerPath > PI_FAMULUS_MANAGER_PATH env > <home>/bin/pi-famulus > PATH.
+ * Priority: config.managerPath > PI_FAMULUS_MANAGER_PATH env > npm native package > <home>/bin/pi-famulus > PATH.
  */
 export function resolveManagerPath(
   config: FamulusConfig,
@@ -247,6 +253,8 @@ export function resolveManagerPath(
   if (config.managerPath && managerCandidateProblem(config.managerPath) === null) return config.managerPath;
   const envPath = env.PI_FAMULUS_MANAGER_PATH;
   if (envPath && managerCandidateProblem(envPath) === null) return envPath;
+  const native = resolveNativeManagerPath();
+  if (native) return native;
   const bundled = join(home, "bin", "pi-famulus");
   if (managerCandidateProblem(bundled) === null) return bundled;
   for (const dir of (env.PATH ?? "").split(delimiter)) {

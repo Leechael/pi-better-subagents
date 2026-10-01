@@ -8,6 +8,10 @@ From the CLI alone you can answer: what is each session doing and where (cwd), w
 
 ## Install
 
+After the first npm release, install `pi-famulus` with optional dependencies enabled (`pi install npm:pi-famulus`). The main package automatically selects the matching Linux/macOS x64/arm64 native package and exposes the CLI on its npm bin path; `npx pi-famulus --help` is a quick check. No compiler or separate binary download is needed. See [the npm package guide](../extension/README.md).
+
+### Source build / separate manager
+
 ```bash
 cd manager && cargo build --release
 mkdir -p ~/.pi/agent/pi-famulus/bin
@@ -24,7 +28,7 @@ If you already hit `killed` after a reinstall, fix with another atomic replace (
 
 **Subsequent same-name upgrades while pi sessions run work:** just `install` the new binary. A running daemon notices within a few seconds and upgrades itself in place (see [`upgrade`](#upgrade)); `pi-famulus upgrade` does it now and reports the result. Nothing running is interrupted and no pi session needs a restart; reload or reopen pi sessions only when you also want the new extension code. This applies to compatible builds under the same name and home, not the one-time transition above.
 
-The extension discovers the same path, or an override via `PI_FAMULUS_MANAGER_PATH` / `managerPath` in config.
+The extension prioritizes executable config `managerPath`, executable `PI_FAMULUS_MANAGER_PATH`, the exact-version native npm package, this home/bin path, then executable PATH. The npm CLI always runs its own native package. Restart sessions when changing installation method/binary location; the daemon's in-place monitor follows its current path, not a different package's executable.
 
 ## Global options
 

@@ -1,0 +1,172 @@
+name: Native npm packages
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build and test (empty uses the caller's ref)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  root-package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node scripts/validate-release.mjs
+      - run: node --test scripts/*.test.mjs
+      - name: Pack root extension
+        run: |
+          mkdir -p "$RUNNER_TEMP/packages"
+          npm pack --pack-destination "$RUNNER_TEMP/packages"
+        working-directory: extension
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-root
+          path: ${{ runner.temp }}/packages/*.tgz
+          if-no-files-found: error
+
+  native:
+    name: native (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - platform: darwin-x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - platform: darwin-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    env:
+      PI_FAMULUS_TEST_ARTIFACTS: ${{ github.workspace }}/pi-famulus-test-artifacts
+      PLATFORM: ${{ matrix.platform }}
+      TARGET: ${{ matrix.target }}
+      # Avoid making the macOS runner's version the implicit runtime minimum.
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: manager
+          key: ${{ matrix.target }}
+      # musl-gcc links on the runner's own architecture; no cross linker needed.
+      - name: Install native musl linker
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV"
+          echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV"
+      # Keep real-time timing canaries AND manually stepped daemon clock coverage.
+      - run: cargo test --locked
+        working-directory: manager
+      - run: cargo test --locked --features test-clock
+        working-directory: manager
+      - name: Build release binary
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            export RUSTFLAGS='-C target-feature=+crt-static'
+          fi
+          cargo build --locked --release --target "$TARGET"
+        working-directory: manager
+      - name: Require a static Linux executable
+        if: runner.os == 'Linux'
+        run: |
+          binary="manager/target/$TARGET/release/pi-famulus"
+          file "$binary"
+          if readelf -d "$binary" | grep -q '(NEEDED)'; then
+            echo 'Release binary must not depend on a dynamic library' >&2
+            exit 1
+          fi
+      - name: Prepare and pack actual native and root tarballs
+        run: |
+          node scripts/prepare-native.mjs "$PLATFORM" "$RUNNER_TEMP/packages"
+          npm pack ./extension --pack-destination "$RUNNER_TEMP/packages"
+      - name: Install tarballs and verify automatic CLI and extension resolution
+        run: |
+          sandbox=$(mktemp -d "$RUNNER_TEMP/npm-smoke.XXXXXX")
+          export HOME="$sandbox/home"
+          mkdir -p "$HOME" "$sandbox/project"
+          unset PI_FAMULUS_MANAGER_PATH PI_FAMULUS_HOME
+          cd "$sandbox/project"
+          npm init -y
+          version=$(node -p "JSON.parse(require('fs').readFileSync('$GITHUB_WORKSPACE/extension/package.json')).version")
+          npm install --ignore-scripts --no-audit --no-fund \
+            "$RUNNER_TEMP/packages/pi-famulus-$version.tgz" \
+            "$RUNNER_TEMP/packages/pi-famulus-$PLATFORM-$version.tgz"
+          # No global manager or ~/.pi/agent/pi-famulus/bin: use the optional package.
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { createRequire } from 'node:module';
+          import { resolve } from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+          const root = resolve('node_modules/pi-famulus');
+          const { nativePackageName, resolveNativeManagerPath } = await import(pathToFileURL(`${root}/src/native-manager.js`));
+          const name = nativePackageName(process.platform, process.arch);
+          const expected = resolve(`node_modules/${name}/bin/pi-famulus`);
+          assert.equal(resolveNativeManagerPath(), expected);
+          // jiti is pi's actual TypeScript loader: Node cannot strip TS in node_modules.
+          const piRequire = createRequire(import.meta.resolve('@earendil-works/pi-coding-agent'));
+          const { createJiti } = piRequire('jiti');
+          const jiti = createJiti(import.meta.url);
+          const { DEFAULT_CONFIG, resolveManagerPath } = await jiti.import(`${root}/src/config.ts`);
+          const home = `${process.env.HOME}/.pi/agent/pi-famulus`;
+          assert.equal(resolveManagerPath(DEFAULT_CONFIG, home, {}), expected);
+          assert.equal(existsSync(`${home}/bin/pi-famulus`), false);
+          assert.equal(resolveManagerPath({ ...DEFAULT_CONFIG, managerPath: process.execPath }, home, {}), process.execPath);
+          assert.equal(resolveManagerPath(DEFAULT_CONFIG, home, { PI_FAMULUS_MANAGER_PATH: process.execPath }), process.execPath);
+          mkdirSync(`${home}/bin`, { recursive: true });
+          writeFileSync(`${home}/bin/pi-famulus`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+          assert.equal(resolveManagerPath(DEFAULT_CONFIG, home, {}), expected, 'package wins over old home installation');
+          try {
+            chmodSync(expected, 0o644);
+            assert.equal(resolveManagerPath(DEFAULT_CONFIG, home, {}), `${home}/bin/pi-famulus`, 'unusable native permits manual fallback');
+          } finally { chmodSync(expected, 0o755); }
+          NODE
+          ./node_modules/.bin/pi-famulus --help
+          ./node_modules/.bin/pi-famulus --version | grep -F "pi-famulus $version"
+          # Exercise the actual packaged daemon/runner (including musl), not just --help.
+          manager_home=$(mktemp -d /tmp/native-XXXXXX)
+          trap './node_modules/.bin/pi-famulus --home "$manager_home" shutdown || true' EXIT
+          line=$(./node_modules/.bin/pi-famulus --home "$manager_home" start 'printf native-package-roundtrip')
+          id=${line#task_id=}; id=${id%% *}
+          ./node_modules/.bin/pi-famulus --home "$manager_home" wait "$id" --budget-ms 10000
+          ./node_modules/.bin/pi-famulus --home "$manager_home" output "$id" | grep -F native-package-roundtrip
+          ./node_modules/.bin/pi-famulus --home "$manager_home" status --json
+          ./node_modules/.bin/pi-famulus --home "$manager_home" shutdown
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-${{ matrix.platform }}
+          path: ${{ runner.temp }}/packages/pi-famulus-${{ matrix.platform }}-*.tgz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: manager-logs-${{ matrix.platform }}
+          path: pi-famulus-test-artifacts
+          if-no-files-found: ignore
