@@ -77,6 +77,12 @@ function supervisorBehavior(mode: "reply" | "send"): FauxScript {
   return { steps: [], fallback: decide };
 }
 
+/** A READY can arrive in the foreground result or overtake the waiting reply. */
+const readyReply = (otherwise: string): FauxStep => (ctx) => {
+  const m = /token=([A-Z0-9]+)/.exec(lastInputText(ctx));
+  return say(m ? `The token is ${m[1]}` : otherwise);
+};
+
 const behaviors: Record<string, FauxScript> = {
   "supervisor-reply/reply": supervisorBehavior("reply"),
   "supervisor-reply/send": supervisorBehavior("send"),
@@ -84,11 +90,8 @@ const behaviors: Record<string, FauxScript> = {
   "resume-finished/send-then-resume": resumeBehavior("send-then-resume"),
   "resume-finished/send-only": resumeBehavior("send-only"),
   "monitor-not-sleep/tail-grep": {
-    steps: [call("bash", { command: "tail -n +1 -F service.log | grep --line-buffered -m1 READY" }), say("Waiting for READY in the background.")],
-    fallback: (ctx) => {
-      const m = /token=([A-Z0-9]+)/.exec(lastInputText(ctx));
-      return say(m ? `The token is ${m[1]}` : "ok");
-    },
+    steps: [call("bash", { command: "tail -n +1 -F service.log | grep --line-buffered -m1 READY" }), readyReply("Waiting for READY in the background.")],
+    fallback: readyReply("ok"),
   },
   "bg-end-turn/good": {
     steps: [call("bash", { command: "./build.sh" }), say("It is building in the background; I will report when notified.")],
