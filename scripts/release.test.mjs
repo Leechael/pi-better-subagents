@@ -56,6 +56,19 @@ function workflowRunBodies(text) {
   return bodies.join('\n');
 }
 
+function assertExtensionSourceInstall(ci) {
+  const job = ci.match(/^  extension:\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/m)?.[1] ?? '';
+  assert.ok(job.includes('      - run: npm ci\n      - run: npx tsc --noEmit\n'), 'extension source job must install full dependencies before typecheck');
+}
+
+test('extension source install guard cannot be satisfied by other jobs', () => {
+  const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  assertExtensionSourceInstall(ci);
+  const missingSourceInstall = ci.replace('      - run: npm ci\n      - run: npx tsc --noEmit\n', '      - run: npx tsc --noEmit\n');
+  assert.ok(missingSourceInstall.includes('- run: npm ci\n'), 'other jobs still install dependencies');
+  assert.throws(() => assertExtensionSourceInstall(missingSourceInstall), /extension source job/);
+});
+
 test('shell-expression guard covers blank lines, indentation and scalar styles', () => {
   for (const scalar of ['|', '|-', '>', '>+']) {
     for (const indent of [8, 10, 12]) {
@@ -230,7 +243,7 @@ test('workflow literal security, release graph and four host/target contracts', 
   assert.ok(!native.includes('id-token:'));
   const ci = workflow('ci');
   assert.ok(!ci.includes('npm ci --omit=optional'), 'source installs must retain TypeScript/Rollup native optional bindings');
-  assert.ok(ci.includes('- run: npm ci\n'));
+  assertExtensionSourceInstall(ci);
   assert.ok(ci.includes('npm run test:graders'));
   assert.ok(ci.includes('/tmp/eval-*'));
   const publish = workflow('publish');
