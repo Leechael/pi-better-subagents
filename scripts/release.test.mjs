@@ -136,6 +136,29 @@ test('release checkout paths with spaces and percent signs run the actual CLI re
   assert.match(output, /actual checkout and CLI accept the renamed GitHub repository/);
 });
 
+test('all five packed packages include the approved MIT license', t => {
+  const source = fileURLToPath(new URL('../', import.meta.url));
+  const license = readFileSync(join(source, 'LICENSE'), 'utf8');
+  assert.match(license, /^MIT License\n/);
+  const { root, put } = fixture(t);
+  const destination = join(root, 'licensed-packs');
+  mkdirSync(destination);
+  for (const p of validateMetadata(source)) {
+    const packageLicense = readFileSync(join(source, p.directory, 'LICENSE'), 'utf8');
+    assert.equal(packageLicense, license, `same license: ${p.name}`);
+    assert.equal(p.metadata.license, 'MIT');
+    put(`${p.directory}/package.json`, p.metadata);
+    put(`${p.directory}/LICENSE`, packageLicense);
+    if (p.os) {
+      put(`${p.directory}/bin/pi-famulus`, '#!/bin/sh\necho license-pack-fixture\n');
+      chmodSync(join(root, p.directory, 'bin/pi-famulus'), 0o755);
+    }
+    const [pack] = JSON.parse(execFileSync('npm', ['pack', '--json', '--pack-destination', destination], { cwd: join(root, p.directory), encoding: 'utf8', stdio: 'pipe' }));
+    const packedLicense = execFileSync('tar', ['-xOzf', join(destination, pack.filename), 'package/LICENSE'], { encoding: 'utf8', stdio: 'pipe' });
+    assert.equal(packedLicense, license, `license included despite files whitelist: ${p.name}`);
+  }
+});
+
 test('release versions, literal repository and all four metadata contracts', t => {
   const { root, put } = fixture(t);
   assert.equal(validateMetadata(root, { tag: 'v0.1.0', repository }).length, 5);
