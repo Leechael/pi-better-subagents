@@ -13,6 +13,7 @@ mod fmt;
 mod gc;
 mod handover;
 mod inspect;
+mod ipc;
 mod lifecycle;
 mod pager;
 mod proto;
