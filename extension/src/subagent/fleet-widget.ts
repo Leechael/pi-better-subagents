@@ -109,6 +109,11 @@ export class FleetWidget {
         (tui, theme) => {
           this.tui = tui;
           this.widgetRegistered = true;
+          // The ticker refuses to schedule while no component is mounted
+          // (refresh may have run before the host invoked the factory).
+          if (!this.ageTimer && this.deps.index.list(this.clock.now()).some((item) => item.kind === "agent" && isActive(item))) {
+            this.scheduleNextAgeTick();
+          }
           return {
             render: (width) => this.renderLine(width, theme),
             invalidate: () => {},
@@ -137,22 +142,34 @@ export class FleetWidget {
   }
 
   /**
-   * Tick once per displayed second. formatAge rounds to the nearest second,
-   * so the visible value flips on half-second boundaries; align the first
-   * tick there (not at an arbitrary phase) and then tick every second so the
-   * age advances exactly once per second instead of drifting or skipping.
+   * Tick exactly when a displayed age changes. formatAge rounds
+   * (now - startedAt) to the nearest second, so each live item's visible
+   * value flips on half-second boundaries relative to its own startedAt —
+   * a global phase would be early/late for items started off the second.
+   * Schedule the earliest pending flip and re-evaluate after every tick.
    */
   private startAgeTicker(): void {
     this.clearAgeTimer();
-    const phase = this.clock.now() % 1000;
-    const firstDelay = phase < 500 ? 500 - phase : 1500 - phase;
+    this.scheduleNextAgeTick();
+  }
+
+  private scheduleNextAgeTick(): void {
+    const now = this.clock.now();
+    const items = this.deps.index.list(now).filter((item) => item.kind === "agent" && isActive(item));
+    if (items.length === 0 || !this.tui) return;
+    let next = Infinity;
+    for (const item of items) {
+      const offset = (((now - item.startedAt) % 1000) + 1000) % 1000;
+      next = Math.min(next, now + (offset < 500 ? 500 - offset : 1500 - offset));
+    }
     this.ageTimerIsTimeout = true;
     this.ageTimer = this.clock.setTimeout(() => {
+      this.ageTimer = null;
       this.ageTimerIsTimeout = false;
       this.tui?.requestRender();
-      this.ageTimer = this.clock.setInterval(() => this.tui?.requestRender(), 1000);
-      this.clock.unref?.(this.ageTimer);
-    }, firstDelay);
+      // Phases and the active set may have changed; schedule the next flip.
+      this.scheduleNextAgeTick();
+    }, next - now);
     this.clock.unref?.(this.ageTimer);
   }
 

@@ -106,27 +106,43 @@ describe("FleetWidget", () => {
     widget.dispose();
   });
 
-  it("ticks the age exactly once per displayed second, aligned to the half-second boundary", () => {
+  it("ticks exactly when a displayed age flips, per-item relative to startedAt", () => {
     const ui = fakeUi();
     // Start mid-second so the ticker must realign instead of inheriting phase.
     const clock = new ManualClock(1_300);
     const index = new WorkIndex({ clock });
+    // startedAt 0: offset 1_300 → next flip at 1_500 ("1s" → "2s").
     index.upsert({ id: "ch_1", kind: "agent", status: "running", title: "alpha (worker)", name: "alpha", startedAt: 0, countsAsWorker: false });
+    // startedAt 400: offset 900 → next flip at 1_900 ("1s" → "2s"), a different phase.
+    index.upsert({ id: "ch_2", kind: "agent", status: "running", title: "beta (worker)", name: "beta", startedAt: 400, countsAsWorker: false });
     const widget = new FleetWidget({ index, getUi: () => ui, clock });
     widget.start();
-    // 1_300ms → displays "1s". formatAge rounds at half-second boundaries.
-    expect(lastFactory(ui)?.(80).join("\n")).toContain("alpha 1s");
-    // Advance to the next boundary (1_500ms): value flips to 2s.
-    clock.advanceBy(200);
+    // No render requested before the first boundary.
+    expect(ui.renders).toBe(0);
+    clock.advanceBy(199);
+    expect(ui.renders).toBe(0);
+    // alpha flips at 1_500 — exactly one render.
+    clock.advanceBy(1);
+    expect(ui.renders).toBe(1);
     expect(lastFactory(ui)?.(80).join("\n")).toContain("alpha 2s");
-    // Each following second flips exactly once — no skipped or duplicated ticks.
-    const seen: string[] = [];
-    for (let i = 0; i < 3; i++) {
-      clock.advanceBy(1000);
-      const match = lastFactory(ui)?.(80).join("\n").match(/alpha (\d+s)/);
-      seen.push(match?.[1] ?? "?");
-    }
-    expect(seen).toEqual(["3s", "4s", "5s"]);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("beta 1s");
+    // beta flips at 1_900 — its own phase, not the global one.
+    clock.advanceBy(399);
+    expect(ui.renders).toBe(1);
+    clock.advanceBy(1);
+    expect(ui.renders).toBe(2);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("beta 2s");
+    // Both items keep flipping on their own cadence: alpha at 2_500 and 3_500,
+    // beta at 2_900 and 3_900 — exactly one render per flip, none skipped.
+    clock.advanceBy(600);
+    expect(ui.renders).toBe(3);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("alpha 3s");
+    clock.advanceBy(400);
+    expect(ui.renders).toBe(4);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("beta 3s");
+    clock.advanceBy(600);
+    expect(ui.renders).toBe(5);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("alpha 4s");
     widget.dispose();
   });
 

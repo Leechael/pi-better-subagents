@@ -16,7 +16,6 @@ import { readTaskFileTailCached, stderrPathFor } from "./task-output-paths";
 import { fitLines, loadPiTui, truncateToWidth } from "./pi-tui-load";
 import { statusGlyph } from "./tool-component";
 
-const AGE_TICK_MS = 1000;
 
 function isLive(item: WorkItem): boolean {
   return item.status === "pending" || item.status === "running";
@@ -261,17 +260,37 @@ async function showTaskList(
       let loadingAll = false;
       let confirmId: string | undefined;
       let hint = "";
-      const unsub = subscribe(() => tui.requestRender());
-      // formatAge rounds to the nearest second, so ages flip on half-second
-      // boundaries; align the first tick there and then tick every second.
-      const tickAge = () => tui.requestRender();
-      const agePhase = clock.now() % 1000;
-      let ageTimer: unknown = clock.setTimeout(() => {
-        ageTimer = clock.setInterval(tickAge, AGE_TICK_MS);
+      // formatAge rounds (now - startedAt) to the nearest second, so each
+      // live row's visible age flips on half-second boundaries relative to
+      // its own startedAt. Schedule the earliest pending flip and
+      // re-evaluate after every tick and every index change.
+      let ageTimer: unknown = null;
+      const clearAgeTimer = () => {
+        if (ageTimer === null) return;
+        clock.clearTimeout(ageTimer);
+        ageTimer = null;
+      };
+      const scheduleAgeTick = () => {
+        clearAgeTimer();
+        const now = clock.now();
+        let next = Infinity;
+        for (const item of visibleItems()) {
+          if (!isLive(item)) continue;
+          const offset = (((now - item.startedAt) % 1000) + 1000) % 1000;
+          next = Math.min(next, now + (offset < 500 ? 500 - offset : 1500 - offset));
+        }
+        if (!Number.isFinite(next)) return;
+        ageTimer = clock.setTimeout(() => {
+          ageTimer = null;
+          tui.requestRender();
+          scheduleAgeTick();
+        }, next - now);
         clock.unref?.(ageTimer);
-        tickAge();
-      }, agePhase < 500 ? 500 - agePhase : 1500 - agePhase);
-      clock.unref?.(ageTimer);
+      };
+      const unsub = subscribe(() => {
+        tui.requestRender();
+        scheduleAgeTick();
+      });
       const border = new DynamicBorder((text) => theme.fg("border", text));
       const pageSize = () => Math.max(1, (tui.terminal?.rows ?? 24) - 8);
       const matches = (data: string, id: "tui.select.up" | "tui.select.down" | "tui.select.confirm" | "tui.select.cancel") => {
@@ -281,6 +300,7 @@ async function showTaskList(
         scope === "all" ? mergeItems(getItems(), allItems) : getItems(),
         filter,
       );
+      scheduleAgeTick();
       const choose = (id: string | undefined) => {
         selectedId = id;
         hint = "";
@@ -403,9 +423,7 @@ async function showTaskList(
           }
         },
         dispose() {
-          // The first handle is a timeout that swaps itself for an interval.
-          clock.clearTimeout(ageTimer);
-          clock.clearInterval(ageTimer);
+          clearAgeTimer();
           unsub();
         },
       };
