@@ -48,10 +48,11 @@ describe("bash override structured output (pi ≥0.99 contract)", () => {
 
   it("keeps the full 1 MiB tail when output is just over the structured cap", async () => {
     const tool = makeTool();
-    // 1,048,646 bytes + newline: 2 bytes over the 1 MiB structured cap.
+    // 1,048,577 bytes: exactly 1 byte over the 1 MiB structured cap.
+    // head -c adds no trailing newline.
     const res = await tool.execute(
       "tc3",
-      { command: "head -c 1048646 /dev/zero | tr '\\0' 'x'" },
+      { command: "head -c 1048577 /dev/zero | tr '\\0' 'x'" },
       undefined,
       undefined,
       ctx(),

@@ -81,16 +81,21 @@ const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
 
 /** Full-output slice for structuredContent, keeping the tail like the built-in. */
 function structuredOutput(fullText: string): { output: string; truncated: boolean } {
-  const bytes = Buffer.from(fullText, "utf8");
-  if (bytes.length <= STRUCTURED_OUTPUT_MAX_BYTES) {
+  if (Buffer.byteLength(fullText, "utf8") <= STRUCTURED_OUTPUT_MAX_BYTES) {
     return { output: fullText, truncated: false };
   }
-  // Cut on a byte boundary and keep the whole cap: decoding replaces any
-  // sequence split by the cut with U+FFFD instead of dropping half the text.
-  return {
-    output: bytes.subarray(bytes.length - STRUCTURED_OUTPUT_MAX_BYTES).toString("utf8"),
-    truncated: true,
-  };
+  // Keep the largest tail that fits the cap without materializing the whole
+  // output as a second buffer: search a UTF-16 index near the end (each code
+  // unit encodes to at least one byte, so the tail starts within `cap` units
+  // of the end) and only encode that slice.
+  let lo = Math.max(0, fullText.length - STRUCTURED_OUTPUT_MAX_BYTES);
+  let hi = fullText.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (Buffer.byteLength(fullText.slice(mid), "utf8") <= STRUCTURED_OUTPUT_MAX_BYTES) hi = mid;
+    else lo = mid + 1;
+  }
+  return { output: fullText.slice(lo), truncated: true };
 }
 
 function wallSeconds(startedAtMs: number, endedAtMs: number): number {
