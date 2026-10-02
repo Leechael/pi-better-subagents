@@ -51,7 +51,7 @@ describe.skipIf(!RUN)("real pi-famulus integration", () => {
     const ok = await client.connect();
     expect(ok).toBe(true);
     expect(client.isAvailable()).toBe(true);
-    expect(existsSync(paths.socket)).toBe(true);
+    if (process.platform !== "win32") expect(existsSync(paths.socket)).toBe(true);
     expect(existsSync(paths.pidFile)).toBe(true);
   }, 15000);
 
