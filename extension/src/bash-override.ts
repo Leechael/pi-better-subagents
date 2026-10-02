@@ -17,7 +17,7 @@ import { randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import type {
   AgentToolResult,
   BashToolDetails,
@@ -61,6 +61,39 @@ const bashParameters = Type.Object({
 });
 
 type BashParams = { command: string; timeout?: number; run_in_background?: boolean };
+
+/**
+ * Mirrors the built-in bash outputSchema (pi ≥0.99) so codemode scripts calling
+ * `bash()` resolve to the same structured shape the built-in tool returns.
+ * pi does not export `bashOutputSchema`, so keep this in sync with BashToolOutput.
+ */
+const bashOutputSchema = Type.Object({
+  output: Type.String(),
+  truncated: Type.Boolean(),
+  full_output_path: Type.Optional(Type.String()),
+  exit_code: Type.Number(),
+  wall_time_seconds: Type.Number(),
+});
+type BashToolOutput = Static<typeof bashOutputSchema>;
+
+/** Same cap as the built-in structured output (1 MiB). */
+const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
+
+/** Full-output slice for structuredContent, keeping the tail like the built-in. */
+function structuredOutput(fullText: string): { output: string; truncated: boolean } {
+  if (Buffer.byteLength(fullText, "utf8") <= STRUCTURED_OUTPUT_MAX_BYTES) {
+    return { output: fullText, truncated: false };
+  }
+  let tail = fullText;
+  while (Buffer.byteLength(tail, "utf8") > STRUCTURED_OUTPUT_MAX_BYTES) {
+    tail = tail.slice(Math.ceil(tail.length / 2));
+  }
+  return { output: tail, truncated: true };
+}
+
+function wallSeconds(startedAtMs: number, endedAtMs: number): number {
+  return Math.round((endedAtMs - startedAtMs) / 100) / 10;
+}
 
 /** Details shape returned by this override; superset of BashToolDetails. */
 export interface FamulusBashDetails extends BashToolDetails {
@@ -130,6 +163,7 @@ async function executeLocal(
   clock: Clock,
 ): Promise<AgentToolResult<FamulusBashDetails | undefined>> {
   const timeoutMs = resolveTimeoutMs(params.timeout);
+  const startedAtMs = clock.now();
   const shell = process.env.SHELL && process.env.SHELL.length > 0 ? process.env.SHELL : "/bin/bash";
 
   const output = await new Promise<{ text: string; exitCode: number | null; signal: string | null; timedOut: boolean; aborted: boolean }>(
@@ -216,11 +250,26 @@ async function executeLocal(
   if (output.timedOut && params.timeout !== undefined) {
     throw new Error(appendStatus(text, timedOutStatus(params.timeout)));
   }
-  if (output.exitCode !== 0 && output.exitCode !== null) {
-    throw new Error(appendStatus(text, `Command exited with code ${output.exitCode}`));
-  }
   if (output.exitCode === null) throw new Error(appendStatus(text, killedBy(output.signal)));
-  return { content: [{ type: "text", text }], details };
+  const { output: structuredText, truncated: structuredTruncated } = structuredOutput(output.text);
+  const structuredContent: BashToolOutput = {
+    output: structuredText,
+    truncated: structuredTruncated,
+    ...(details?.fullOutputPath ? { full_output_path: details.fullOutputPath } : {}),
+    exit_code: output.exitCode,
+    wall_time_seconds: wallSeconds(startedAtMs, clock.now()),
+  };
+  if (output.exitCode !== 0) {
+    // Mirror the built-in bash tool: non-zero exits resolve to an isError
+    // result carrying structuredContent instead of rejecting.
+    return {
+      content: [{ type: "text", text: appendStatus(text, `Command exited with code ${output.exitCode}`) }],
+      details,
+      structuredContent,
+      isError: true,
+    };
+  }
+  return { content: [{ type: "text", text }], details, structuredContent };
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +294,7 @@ export function createBashOverride(
       "Long-running bash commands are moved to the background automatically; do not poll or sleep to wait for them. End your turn (a reply with no tool call) and resume from the task wake when it arrives.",
     ],
     parameters: bashParameters,
+    outputSchema: bashOutputSchema,
     renderResult(result, { expanded }, theme, context) {
       const details = result.details as FamulusBashDetails | undefined;
       if (details?.backgrounded && details.task_id) {
@@ -291,6 +341,7 @@ export function createBashOverride(
       }
 
       const timeoutMs = resolveTimeoutMs(input.timeout);
+      const startedAtMs = (deps.clock ?? realClock).now();
       let start;
       try {
         start = await client.start({
@@ -358,15 +409,31 @@ export function createBashOverride(
       const collected = await collectOutput(client, start.task_id);
       const { text, details } = formatFinishedOutput(collected, outputPath);
       const exitCode = waitResult.exit_code ?? null;
-      if (exitCode !== 0 && exitCode !== null) {
-        throw new Error(appendStatus(text, `Command exited with code ${exitCode}`));
-      }
       // No exit code: killed (timeout, stop, crash), unless the manager
       // finished it as completed with its runner status unobservable.
       if (exitCode === null && collected.status !== "completed") {
         throw new Error(appendStatus(text, await killedStatus(client, start.task_id, input.timeout)));
       }
-      return { content: [{ type: "text", text }], details };
+      const { output: structuredText, truncated: structuredTruncated } = structuredOutput(collected.text);
+      const structuredContent: BashToolOutput = {
+        output: structuredText,
+        truncated: structuredTruncated || collected.windowed,
+        full_output_path: outputPath,
+        // Status completed but the runner's exit code was unobservable.
+        exit_code: exitCode ?? -1,
+        wall_time_seconds: wallSeconds(startedAtMs, (deps.clock ?? realClock).now()),
+      };
+      if (exitCode !== null && exitCode !== 0) {
+        // Mirror the built-in bash tool: non-zero exits resolve to an isError
+        // result carrying structuredContent instead of rejecting.
+        return {
+          content: [{ type: "text", text: appendStatus(text, `Command exited with code ${exitCode}`) }],
+          details,
+          structuredContent,
+          isError: true,
+        };
+      }
+      return { content: [{ type: "text", text }], details, structuredContent };
     },
   };
 }

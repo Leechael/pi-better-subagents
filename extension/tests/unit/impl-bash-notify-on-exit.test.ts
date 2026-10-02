@@ -3,7 +3,7 @@
  * Child-bash sync waits must not call markNotifyOnExit (covered by its deps shape).
  */
 import { describe, expect, it, vi } from "vitest";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { createBashOverride, type BashOverrideDeps } from "../../src/bash-override";
 import { DEFAULT_CONFIG } from "../../src/config";
 import type { ManagerClient } from "../../src/manager-client";
@@ -40,7 +40,7 @@ function makeDeps(client: ManagerClient): BashOverrideDeps {
 const ctx = {
   cwd: "/tmp",
   sessionManager: { getSessionId: () => "sess", getSessionFile: () => null },
-} as unknown as ExtensionContext;
+} as unknown as ExtensionToolContext;
 
 describe("parent bash markNotifyOnExit", () => {
   it("does not mark notify when the command finishes within the foreground budget", async () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { createComms } from "../../src/comms/comms";
 import {
   createAgentMessageTool,
@@ -78,7 +78,7 @@ class FakeHost implements CommsHost {
   }
 }
 
-const CTX = {} as ExtensionContext;
+const CTX = {} as ExtensionToolContext;
 const tick = async () => {
   await Promise.resolve();
   await Promise.resolve();

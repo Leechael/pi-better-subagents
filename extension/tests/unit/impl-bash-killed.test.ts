@@ -6,7 +6,7 @@
  * (exit_code null) as exit 0.
  */
 import { describe, expect, it, vi } from "vitest";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { createBashOverride } from "../../src/bash-override";
 import { DEFAULT_CONFIG } from "../../src/config";
 import type { ManagerClient, TaskRecord } from "../../src/manager-client";
@@ -29,7 +29,7 @@ function run(record: Partial<TaskRecord>, params: { command: string; timeout?: n
     trackTask: vi.fn(),
     markNotifyOnExit: vi.fn(),
   });
-  const ctx = { cwd: "/tmp", sessionManager: { getSessionId: () => "s", getSessionFile: () => null } } as unknown as ExtensionContext;
+  const ctx = { cwd: "/tmp", sessionManager: { getSessionId: () => "s", getSessionFile: () => null } } as unknown as ExtensionToolContext;
   return tool.execute("tc", params, undefined, undefined, ctx);
 }
 
@@ -65,7 +65,7 @@ describe("bash on the local fallback, command killed", () => {
       trackTask: vi.fn(),
       markNotifyOnExit: vi.fn(),
     });
-    const ctx = { cwd: "/tmp", sessionManager: { getSessionId: () => "s", getSessionFile: () => null } } as unknown as ExtensionContext;
+    const ctx = { cwd: "/tmp", sessionManager: { getSessionId: () => "s", getSessionFile: () => null } } as unknown as ExtensionToolContext;
     await expect(tool.execute("tc", { command: "echo partial; kill -9 $$" }, undefined, undefined, ctx)).rejects.toThrow(
       /partial[\s\S]*killed \(SIGKILL\)/,
     );
