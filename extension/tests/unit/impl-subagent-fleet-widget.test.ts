@@ -106,6 +106,30 @@ describe("FleetWidget", () => {
     widget.dispose();
   });
 
+  it("ticks the age exactly once per displayed second, aligned to the half-second boundary", () => {
+    const ui = fakeUi();
+    // Start mid-second so the ticker must realign instead of inheriting phase.
+    const clock = new ManualClock(1_300);
+    const index = new WorkIndex({ clock });
+    index.upsert({ id: "ch_1", kind: "agent", status: "running", title: "alpha (worker)", name: "alpha", startedAt: 0, countsAsWorker: false });
+    const widget = new FleetWidget({ index, getUi: () => ui, clock });
+    widget.start();
+    // 1_300ms → displays "1s". formatAge rounds at half-second boundaries.
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("alpha 1s");
+    // Advance to the next boundary (1_500ms): value flips to 2s.
+    clock.advanceBy(200);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("alpha 2s");
+    // Each following second flips exactly once — no skipped or duplicated ticks.
+    const seen: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      clock.advanceBy(1000);
+      const match = lastFactory(ui)?.(80).join("\n").match(/alpha (\d+s)/);
+      seen.push(match?.[1] ?? "?");
+    }
+    expect(seen).toEqual(["3s", "4s", "5s"]);
+    widget.dispose();
+  });
+
   it("counts only live work: finished or failed items drop out, and the line clears", () => {
     const ui = fakeUi();
     const clock = new ManualClock(1_000);

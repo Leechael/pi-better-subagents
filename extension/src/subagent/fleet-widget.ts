@@ -72,6 +72,7 @@ export class FleetWidget {
   private tui: FleetTui | null = null;
   private unsubscribe: (() => void) | null = null;
   private ageTimer: ClockTimer | null = null;
+  private ageTimerIsTimeout = false;
   private readonly clock: Clock;
 
   constructor(deps: FleetStatusDeps) {
@@ -94,8 +95,7 @@ export class FleetWidget {
     const activeAgents = items.filter((item) => item.kind === "agent" && isActive(item));
     const total = counts.workers + counts.subagents + counts.monitors;
     if (activeAgents.length > 0 && !this.ageTimer) {
-      this.ageTimer = this.clock.setInterval(() => this.tui?.requestRender(), 5000);
-      this.clock.unref?.(this.ageTimer);
+      this.startAgeTicker();
     } else if (activeAgents.length === 0) {
       this.clearAgeTimer();
     }
@@ -136,10 +136,32 @@ export class FleetWidget {
     if (ui) this.clearWidget(ui);
   }
 
+  /**
+   * Tick once per displayed second. formatAge rounds to the nearest second,
+   * so the visible value flips on half-second boundaries; align the first
+   * tick there (not at an arbitrary phase) and then tick every second so the
+   * age advances exactly once per second instead of drifting or skipping.
+   */
+  private startAgeTicker(): void {
+    this.clearAgeTimer();
+    const phase = this.clock.now() % 1000;
+    const firstDelay = phase < 500 ? 500 - phase : 1500 - phase;
+    this.ageTimerIsTimeout = true;
+    this.ageTimer = this.clock.setTimeout(() => {
+      this.ageTimerIsTimeout = false;
+      this.tui?.requestRender();
+      this.ageTimer = this.clock.setInterval(() => this.tui?.requestRender(), 1000);
+      this.clock.unref?.(this.ageTimer);
+    }, firstDelay);
+    this.clock.unref?.(this.ageTimer);
+  }
+
   private clearAgeTimer(): void {
     if (!this.ageTimer) return;
-    this.clock.clearInterval(this.ageTimer);
+    if (this.ageTimerIsTimeout) this.clock.clearTimeout(this.ageTimer);
+    else this.clock.clearInterval(this.ageTimer);
     this.ageTimer = null;
+    this.ageTimerIsTimeout = false;
   }
 
   private clearWidget(ui: FleetUi): void {

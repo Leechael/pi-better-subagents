@@ -262,7 +262,15 @@ async function showTaskList(
       let confirmId: string | undefined;
       let hint = "";
       const unsub = subscribe(() => tui.requestRender());
-      const ageTimer = clock.setInterval(() => tui.requestRender(), AGE_TICK_MS);
+      // formatAge rounds to the nearest second, so ages flip on half-second
+      // boundaries; align the first tick there and then tick every second.
+      const tickAge = () => tui.requestRender();
+      const agePhase = clock.now() % 1000;
+      let ageTimer: unknown = clock.setTimeout(() => {
+        ageTimer = clock.setInterval(tickAge, AGE_TICK_MS);
+        clock.unref?.(ageTimer);
+        tickAge();
+      }, agePhase < 500 ? 500 - agePhase : 1500 - agePhase);
       clock.unref?.(ageTimer);
       const border = new DynamicBorder((text) => theme.fg("border", text));
       const pageSize = () => Math.max(1, (tui.terminal?.rows ?? 24) - 8);
@@ -394,7 +402,12 @@ async function showTaskList(
             tui.requestRender();
           }
         },
-        dispose() { clock.clearInterval(ageTimer); unsub(); },
+        dispose() {
+          // The first handle is a timeout that swaps itself for an interval.
+          clock.clearTimeout(ageTimer);
+          clock.clearInterval(ageTimer);
+          unsub();
+        },
       };
     },
     // Bottom sheet over the editor, where the user typed /tasks; the list is
