@@ -1,37 +1,6 @@
-//! In-place upgrade (design doc §3.2): replace the running daemon with the
-//! binary now at its executable path, without disturbing any task.
-//!
-//! The daemon `exec()`s the new binary. The pid stays the same, so every
-//! task runner (`pi-famulus __run`) is still its child and `waitpid` still
-//! works, and descriptors without close-on-exec survive:
-//!
-//! - the listening socket (never re-bound: a client connecting during the
-//!   upgrade waits in the backlog instead of failing);
-//! - the daemon lock (`manager.lock`), so no other daemon can claim it;
-//! - both ends of the lifeline. Every runner holds the read end; if the
-//!   write end closed, every task would be torn down (§3.2);
-//! - each task's stdout / stderr / status pipe read ends.
-//!
-//! Everything else goes into `<home>/handover.json`. Sequence:
-//!
-//! 1. Preflight: run `<new binary> __handover-check`. It must answer with
-//!    this handover format. A missing, truncated or incompatible binary
-//!    stops the upgrade here, with nothing touched.
-//! 2. Quiesce: park every task's pumps and exit watch (their state lands in
-//!    the task entries; a pump stops only between two reads), let the
-//!    output fanout push what it holds, then close every client connection
-//!    and let the writers flush. Requests still in flight get no answer:
-//!    clients resend them after reconnecting.
-//! 3. Write `handover.json`, clear close-on-exec on the inherited
-//!    descriptors, and exec.
-//! 4. If exec fails, nothing is lost: the descriptors go back to
-//!    close-on-exec, the tasks resume, and the failure is recorded
-//!    (`status.last_upgrade`).
-//!
-//! The new image (`daemon --handover <file>`) restores from the file. If it
-//! cannot, it exits: the lifeline then closes and every task is cleaned up,
-//! which is the same thing a crash does (§3.2, no crash recovery).
+//! Unix in-place upgrade via `exec` (design doc §3.2).
 
+use super::{exe_path, file_path, Ready, CHECK_ARG, CHECK_PREFIX, FORMAT};
 use crate::daemon::{self, Shared};
 use crate::proto::*;
 use crate::registry::{ExitPhase, TaskEntry};
@@ -43,36 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Version of `handover.json` and the fd contract. The new binary must
-/// speak it (`__handover-check`).
-pub const FORMAT: u32 = 1;
-/// Hidden subcommand answering the preflight.
-pub const CHECK_ARG: &str = "__handover-check";
-const CHECK_PREFIX: &str = "pi-famulus-handover";
-
 /// How long the quiesce may take before the upgrade is abandoned.
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long connection writers get to flush before exec.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// This daemon's executable path. Linux reports a replaced binary as
-/// "<path> (deleted)"; the upgrade wants the file now at `<path>`.
-pub fn exe_path() -> std::io::Result<PathBuf> {
-    let p = std::env::current_exe()?;
-    let s = p.to_string_lossy();
-    Ok(match s.strip_suffix(" (deleted)") {
-        Some(orig) => PathBuf::from(orig),
-        None => p,
-    })
-}
-
-pub fn check_line() -> String {
-    format!("{CHECK_PREFIX} {FORMAT} {}", crate::VERSION)
-}
-
-pub fn file_path(home: &Path) -> PathBuf {
-    home.join("handover.json")
-}
 
 #[derive(Serialize, Deserialize)]
 pub struct Snapshot {
@@ -213,13 +156,6 @@ pub fn request(state: &Shared, trigger: &str) -> bool {
         }
     });
     true
-}
-
-/// A preflighted upgrade, waiting for the accept loop.
-pub struct Ready {
-    pub exe: PathBuf,
-    pub to_version: String,
-    pub trigger: String,
 }
 
 /// Perform a preflighted upgrade. Returns only when it did not happen (the
@@ -497,7 +433,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 pub struct Restored {
     pub snap: Snapshot,
-    pub listener: tokio::net::UnixListener,
+    pub listener: crate::ipc::Listener,
     pub lock: crate::lifecycle::DaemonLockGuard,
     pub entries: Vec<TaskEntry>,
 }
@@ -530,7 +466,8 @@ pub fn restore(path: &Path) -> Result<Restored, String> {
     let listener = {
         let std_l = std::os::unix::net::UnixListener::from(own(snap.listener_fd)?);
         std_l.set_nonblocking(true).map_err(|e| format!("listener: {e}"))?;
-        tokio::net::UnixListener::from_std(std_l).map_err(|e| format!("listener: {e}"))?
+        let l = tokio::net::UnixListener::from_std(std_l).map_err(|e| format!("listener: {e}"))?;
+        crate::ipc::Listener::from_unix(l)
     };
     let mut entries = Vec::new();
     for t in &snap.tasks {
