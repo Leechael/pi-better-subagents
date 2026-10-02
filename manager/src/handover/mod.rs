@@ -19,13 +19,21 @@ pub(crate) const CHECK_PREFIX: &str = "pi-famulus-handover";
 
 /// This daemon's executable path. Linux reports a replaced binary as
 /// "<path> (deleted)"; the upgrade wants the file now at `<path>`.
+/// Only strip that kernel marker (not a legitimate path that ends the same).
 pub fn exe_path() -> std::io::Result<PathBuf> {
     let p = std::env::current_exe()?;
-    let s = p.to_string_lossy();
-    Ok(match s.strip_suffix(" (deleted)") {
-        Some(orig) => PathBuf::from(orig),
-        None => p,
-    })
+    #[cfg(target_os = "linux")]
+    {
+        let s = p.to_string_lossy();
+        // procfs appends " (deleted)" when the inode is gone; require the
+        // path still to have looked like an absolute executable path before.
+        if let Some(orig) = s.strip_suffix(" (deleted)") {
+            if orig.starts_with('/') && !orig.is_empty() {
+                return Ok(PathBuf::from(orig));
+            }
+        }
+    }
+    Ok(p)
 }
 
 pub fn check_line() -> String {
