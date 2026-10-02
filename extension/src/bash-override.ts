@@ -81,14 +81,16 @@ const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
 
 /** Full-output slice for structuredContent, keeping the tail like the built-in. */
 function structuredOutput(fullText: string): { output: string; truncated: boolean } {
-  if (Buffer.byteLength(fullText, "utf8") <= STRUCTURED_OUTPUT_MAX_BYTES) {
+  const bytes = Buffer.from(fullText, "utf8");
+  if (bytes.length <= STRUCTURED_OUTPUT_MAX_BYTES) {
     return { output: fullText, truncated: false };
   }
-  let tail = fullText;
-  while (Buffer.byteLength(tail, "utf8") > STRUCTURED_OUTPUT_MAX_BYTES) {
-    tail = tail.slice(Math.ceil(tail.length / 2));
-  }
-  return { output: tail, truncated: true };
+  // Cut on a byte boundary and keep the whole cap: decoding replaces any
+  // sequence split by the cut with U+FFFD instead of dropping half the text.
+  return {
+    output: bytes.subarray(bytes.length - STRUCTURED_OUTPUT_MAX_BYTES).toString("utf8"),
+    truncated: true,
+  };
 }
 
 function wallSeconds(startedAtMs: number, endedAtMs: number): number {
@@ -414,16 +416,22 @@ export function createBashOverride(
       if (exitCode === null && collected.status !== "completed") {
         throw new Error(appendStatus(text, await killedStatus(client, start.task_id, input.timeout)));
       }
+      if (exitCode === null) {
+        // Completed but the exit code was unobservable: no honest
+        // structured shape (exit_code is required, and a sentinel like -1
+        // would misclassify success as failure), so omit structuredContent
+        // and let codemode scripts fall back to the text content.
+        return { content: [{ type: "text", text }], details };
+      }
       const { output: structuredText, truncated: structuredTruncated } = structuredOutput(collected.text);
       const structuredContent: BashToolOutput = {
         output: structuredText,
         truncated: structuredTruncated || collected.windowed,
         full_output_path: outputPath,
-        // Status completed but the runner's exit code was unobservable.
-        exit_code: exitCode ?? -1,
+        exit_code: exitCode,
         wall_time_seconds: wallSeconds(startedAtMs, (deps.clock ?? realClock).now()),
       };
-      if (exitCode !== null && exitCode !== 0) {
+      if (exitCode !== 0) {
         // Mirror the built-in bash tool: non-zero exits resolve to an isError
         // result carrying structuredContent instead of rejecting.
         return {

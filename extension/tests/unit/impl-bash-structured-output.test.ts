@@ -46,6 +46,23 @@ describe("bash override structured output (pi ≥0.99 contract)", () => {
     expect((res.structuredContent as { output: string }).output).toContain("ok-done");
   });
 
+  it("keeps the full 1 MiB tail when output is just over the structured cap", async () => {
+    const tool = makeTool();
+    // 1,048,646 bytes + newline: 2 bytes over the 1 MiB structured cap.
+    const res = await tool.execute(
+      "tc3",
+      { command: "head -c 1048646 /dev/zero | tr '\\0' 'x'" },
+      undefined,
+      undefined,
+      ctx(),
+    );
+    expect(res.isError).toBeUndefined();
+    const structured = res.structuredContent as { output: string; truncated: boolean };
+    expect(structured.truncated).toBe(true);
+    expect(Buffer.byteLength(structured.output, "utf8")).toBe(1024 * 1024);
+    expect(structured.output.endsWith("x")).toBe(true);
+  });
+
   it("declares the outputSchema matching the built-in bash shape", () => {
     const tool = makeTool();
     const schema = tool.outputSchema as { properties: Record<string, unknown> };

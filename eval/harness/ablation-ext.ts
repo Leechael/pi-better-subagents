@@ -6,7 +6,8 @@
  * PI_FAMULUS_ABLATE=<variant id>          baseline | segment id | group id (see ablation/manifest.json)
  * PI_FAMULUS_ABLATION_LOG=<path>          JSONL audit of every removal (hook, segment, hits)
  *
- * Hooks used (pi 0.87):
+ * Hooks used (pi 1.0.0 — verified unchanged from 0.87; eval typechecks
+ * against the 1.0.0 SDK):
  *  - before_agent_start: strips segments from the chained system prompt. Our
  *    extension returns a forced systemPrompt there, and pi projects a forced
  *    prompt onto the request after context hooks, so this is the only place

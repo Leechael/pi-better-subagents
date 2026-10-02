@@ -12,7 +12,7 @@ Every episode spawns the installed `pi` in RPC mode (`pi --mode rpc -ne -ns -np 
 ## Prerequisites
 
 - Node ≥ 22.18 (runs `.ts` directly; no build step)
-- `pi` on `PATH` (tested with 0.87) — override with `PI_BIN`
+- `pi` on `PATH` (tested with 1.0.0) — override with `PI_BIN`
 - `cargo`: `pi-famulus` is built from `../manager` into `eval/.cache/target` on first use (never inside `manager/`); override with `PI_FAMULUS_MANAGER_PATH`
 - `tmux` for the TUI test
 - `npm install` in `eval/` is only needed for `npm run typecheck`
