@@ -559,7 +559,8 @@ export class ManagerClient {
   private async waitForSocket(socketPath: string, timeoutMs: number): Promise<void> {
     const deadline = this.now() + timeoutMs;
     for (;;) {
-      if (existsSync(socketPath)) {
+      // A named pipe is not a file: existsSync does not see it, connecting does.
+      if (process.platform === "win32" || existsSync(socketPath)) {
         const ok = await new Promise<boolean>((resolve) => {
           const probe = net.connect(socketPath);
           probe.once("connect", () => {
