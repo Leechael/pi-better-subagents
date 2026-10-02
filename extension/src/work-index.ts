@@ -180,3 +180,19 @@ export function formatAge(startedAt: number, endedAt: number | undefined, now: n
   if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
   return `${Math.floor(ms / 3_600_000)}h${Math.floor((ms % 3_600_000) / 60_000)}m`;
 }
+
+/**
+ * Next time the age displayed by {@link formatAge} for an item started at
+ * `startedAt` changes, given at most one render per second.
+ *
+ * Below 1s formatAge shows raw milliseconds, so a sub-second item's first
+ * scheduled update is the transition to "1s" at the 1s mark. At 1s and above
+ * the value rounds to the nearest second and flips on half-second boundaries
+ * relative to `startedAt`.
+ */
+export function nextAgeBoundary(now: number, startedAt: number): number {
+  const age = now - startedAt;
+  if (age < 1000) return now + (1000 - age);
+  const offset = age % 1000;
+  return now + (offset < 500 ? 500 - offset : 1500 - offset);
+}

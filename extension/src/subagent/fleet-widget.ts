@@ -9,7 +9,7 @@
  * Driven by WorkIndex changes. Does not poll the manager.
  */
 import { realClock, type Clock, type ClockTimer } from "../clock";
-import { formatAge, type WorkIndex, type WorkItem } from "../work-index";
+import { formatAge, nextAgeBoundary, type WorkIndex, type WorkItem } from "../work-index";
 import { truncateToWidth } from "../tui/pi-tui-load";
 
 export const FLEET_WIDGET_KEY = "pi-famulus-fleet";
@@ -94,9 +94,11 @@ export class FleetWidget {
     const counts = this.deps.index.counts();
     const activeAgents = items.filter((item) => item.kind === "agent" && isActive(item));
     const total = counts.workers + counts.subagents + counts.monitors;
-    if (activeAgents.length > 0 && !this.ageTimer) {
+    // Always reschedule: an item added while a timeout is pending may have
+    // an earlier boundary, and a removed item must not tick for stale state.
+    if (activeAgents.length > 0) {
       this.startAgeTicker();
-    } else if (activeAgents.length === 0) {
+    } else {
       this.clearAgeTimer();
     }
     if (total === 0) {
@@ -159,8 +161,7 @@ export class FleetWidget {
     if (items.length === 0 || !this.tui) return;
     let next = Infinity;
     for (const item of items) {
-      const offset = (((now - item.startedAt) % 1000) + 1000) % 1000;
-      next = Math.min(next, now + (offset < 500 ? 500 - offset : 1500 - offset));
+      next = Math.min(next, nextAgeBoundary(now, item.startedAt));
     }
     this.ageTimerIsTimeout = true;
     this.ageTimer = this.clock.setTimeout(() => {

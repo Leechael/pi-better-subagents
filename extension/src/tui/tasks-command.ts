@@ -10,7 +10,7 @@ import type { ManagerClient, TaskRecord } from "../manager-client";
 import { taskOutputPath } from "../config";
 import { formatConversation } from "../subagent/conversation";
 import type { SubagentRegistry } from "../subagent/registry";
-import { formatAge, type WorkIndex, type WorkItem } from "../work-index";
+import { formatAge, nextAgeBoundary, type WorkIndex, type WorkItem } from "../work-index";
 import { notifyPlainFallback, showScrollDetail } from "./scroll-detail-view";
 import { readTaskFileTailCached, stderrPathFor } from "./task-output-paths";
 import { fitLines, loadPiTui, truncateToWidth } from "./pi-tui-load";
@@ -276,8 +276,7 @@ async function showTaskList(
         let next = Infinity;
         for (const item of visibleItems()) {
           if (!isLive(item)) continue;
-          const offset = (((now - item.startedAt) % 1000) + 1000) % 1000;
-          next = Math.min(next, now + (offset < 500 ? 500 - offset : 1500 - offset));
+          next = Math.min(next, nextAgeBoundary(now, item.startedAt));
         }
         if (!Number.isFinite(next)) return;
         ageTimer = clock.setTimeout(() => {
