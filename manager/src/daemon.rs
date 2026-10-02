@@ -1667,6 +1667,8 @@ pub fn spawn_group_watcher(state: &Shared, task_id: &str, pgid: u32) {
             if let Some(e) = state2.lock().unwrap().registry.tasks.get_mut(&tid) {
                 e.group_lingering = false;
             }
+            #[cfg(windows)]
+            crate::sys::drop_job(pgid);
             break;
         }
     });
@@ -2212,6 +2214,8 @@ async fn run_exit_watch(state: Shared, tid: String) {
     if let Some(e) = state.lock().unwrap().registry.tasks.get_mut(&tid) {
         e.group_lingering = false;
         e.exit_phase = registry::ExitPhase::Done;
+        #[cfg(windows)]
+        crate::sys::drop_job(e.record.pid);
     }
 }
 
