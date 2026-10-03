@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ManualClock } from "../../src/clock";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import type { ManagerClient } from "../../src/manager-client";
 import { createChildBashTool, type ChildBashDeps } from "../../src/subagent/child-bash";
 
@@ -35,7 +35,7 @@ function makeDeps(client: ManagerClient | null, clock?: ManualClock): ChildBashD
   };
 }
 
-const ctx = { cwd: "/tmp" } as ExtensionContext;
+const ctx = { cwd: "/tmp" } as ExtensionToolContext;
 
 describe("child bash (no-background variant)", () => {
   it("rejects bare sleep commands", async () => {

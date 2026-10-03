@@ -4,7 +4,7 @@
   "type": "module",
   "description": "E2E (faux model) and prompt-ablation (real model) evaluation for pi-famulus",
   "engines": {
-    "node": ">=22.18"
+    "node": ">=22.19"
   },
   "scripts": {
     "test:e2e": "node --test --test-concurrency=4 e2e/faux.test.ts e2e/ablation-harness.test.ts",
@@ -17,7 +17,7 @@
     "typecheck": "tsc --noEmit -p ."
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.87.0",
+    "@earendil-works/pi-coding-agent": "1.0.0",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"
   }

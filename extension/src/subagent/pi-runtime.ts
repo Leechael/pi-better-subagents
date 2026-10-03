@@ -161,9 +161,11 @@ function wrapSession(
   return {
     ...(extras.warning !== undefined ? { warning: extras.warning } : {}),
     ...(extras.resolvedModel !== undefined ? { resolvedModel: extras.resolvedModel } : {}),
-    prompt: (text) => session.prompt(text),
-    steer: (text) => session.steer(text),
-    followUp: (text) => session.followUp(text),
+    // pi ≥0.99 returns QueuedInputDisposition ("handled" | "queued") from
+    // input methods; the adapter contract stays Promise<void>.
+    prompt: async (text) => { await session.prompt(text); },
+    steer: async (text) => { await session.steer(text); },
+    followUp: async (text) => { await session.followUp(text); },
     abort: () => session.abort(),
     waitForIdle: () => session.waitForIdle(),
     getLastAssistantText: () => session.getLastAssistantText(),

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ManualClock } from "../../src/clock";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { SubagentRegistry } from "../../src/subagent/registry";
 import { InProcessRunner } from "../../src/subagent/runner";
 import { createSubagentTool } from "../../src/subagent/tool";
@@ -31,7 +31,7 @@ function makeStack(opts: { budgetMs?: number; autoComplete?: string | null } = {
     defaultConcurrency: 4,
     clock,
   });
-  const ctx = { cwd: "/tmp" } as ExtensionContext;
+  const ctx = { cwd: "/tmp" } as ExtensionToolContext;
   const exec = (params: Record<string, unknown>, signal?: AbortSignal) =>
     tool.execute("tc", params as never, signal, undefined, ctx);
   return { registry, factory, notify, exec, clock };
