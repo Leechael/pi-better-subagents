@@ -10,13 +10,12 @@ import type { ManagerClient, TaskRecord } from "../manager-client";
 import { taskOutputPath } from "../config";
 import { formatConversation } from "../subagent/conversation";
 import type { SubagentRegistry } from "../subagent/registry";
-import { formatAge, type WorkIndex, type WorkItem } from "../work-index";
+import { formatAge, nextAgeBoundary, type WorkIndex, type WorkItem } from "../work-index";
 import { notifyPlainFallback, showScrollDetail } from "./scroll-detail-view";
 import { readTaskFileTailCached, stderrPathFor } from "./task-output-paths";
 import { fitLines, loadPiTui, truncateToWidth } from "./pi-tui-load";
 import { statusGlyph } from "./tool-component";
 
-const AGE_TICK_MS = 1000;
 
 function isLive(item: WorkItem): boolean {
   return item.status === "pending" || item.status === "running";
@@ -261,9 +260,36 @@ async function showTaskList(
       let loadingAll = false;
       let confirmId: string | undefined;
       let hint = "";
-      const unsub = subscribe(() => tui.requestRender());
-      const ageTimer = clock.setInterval(() => tui.requestRender(), AGE_TICK_MS);
-      clock.unref?.(ageTimer);
+      // formatAge rounds (now - startedAt) to the nearest second, so each
+      // live row's visible age flips on half-second boundaries relative to
+      // its own startedAt. Schedule the earliest pending flip and
+      // re-evaluate after every tick and every index change.
+      let ageTimer: unknown = null;
+      const clearAgeTimer = () => {
+        if (ageTimer === null) return;
+        clock.clearTimeout(ageTimer);
+        ageTimer = null;
+      };
+      const scheduleAgeTick = () => {
+        clearAgeTimer();
+        const now = clock.now();
+        let next = Infinity;
+        for (const item of visibleItems()) {
+          if (!isLive(item)) continue;
+          next = Math.min(next, nextAgeBoundary(now, item.startedAt));
+        }
+        if (!Number.isFinite(next)) return;
+        ageTimer = clock.setTimeout(() => {
+          ageTimer = null;
+          tui.requestRender();
+          scheduleAgeTick();
+        }, next - now);
+        clock.unref?.(ageTimer);
+      };
+      const unsub = subscribe(() => {
+        tui.requestRender();
+        scheduleAgeTick();
+      });
       const border = new DynamicBorder((text) => theme.fg("border", text));
       const pageSize = () => Math.max(1, (tui.terminal?.rows ?? 24) - 8);
       const matches = (data: string, id: "tui.select.up" | "tui.select.down" | "tui.select.confirm" | "tui.select.cancel") => {
@@ -273,6 +299,7 @@ async function showTaskList(
         scope === "all" ? mergeItems(getItems(), allItems) : getItems(),
         filter,
       );
+      scheduleAgeTick();
       const choose = (id: string | undefined) => {
         selectedId = id;
         hint = "";
@@ -394,7 +421,10 @@ async function showTaskList(
             tui.requestRender();
           }
         },
-        dispose() { clock.clearInterval(ageTimer); unsub(); },
+        dispose() {
+          clearAgeTimer();
+          unsub();
+        },
       };
     },
     // Bottom sheet over the editor, where the user typed /tasks; the list is

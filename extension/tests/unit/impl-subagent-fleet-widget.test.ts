@@ -106,6 +106,87 @@ describe("FleetWidget", () => {
     widget.dispose();
   });
 
+  it("ticks exactly when a displayed age flips, per-item relative to startedAt", () => {
+    const ui = fakeUi();
+    // Start mid-second so the ticker must realign instead of inheriting phase.
+    const clock = new ManualClock(1_300);
+    const index = new WorkIndex({ clock });
+    // startedAt 0: offset 1_300 → next flip at 1_500 ("1s" → "2s").
+    index.upsert({ id: "ch_1", kind: "agent", status: "running", title: "alpha (worker)", name: "alpha", startedAt: 0, countsAsWorker: false });
+    // startedAt 400: offset 900 → next flip at 1_900 ("1s" → "2s"), a different phase.
+    index.upsert({ id: "ch_2", kind: "agent", status: "running", title: "beta (worker)", name: "beta", startedAt: 400, countsAsWorker: false });
+    const widget = new FleetWidget({ index, getUi: () => ui, clock });
+    widget.start();
+    // No render requested before the first boundary.
+    expect(ui.renders).toBe(0);
+    clock.advanceBy(99); // t=1_399
+    expect(ui.renders).toBe(0);
+    // beta (900ms old at start) turns "1s" at its 1s mark, 1_400.
+    clock.advanceBy(1); // t=1_400
+    expect(ui.renders).toBe(1);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("beta 1s");
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("alpha 1s");
+    // alpha flips at 1_500 — exactly one render.
+    clock.advanceBy(99);
+    expect(ui.renders).toBe(1);
+    clock.advanceBy(1); // t=1_500
+    expect(ui.renders).toBe(2);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("alpha 2s");
+    // Both items keep flipping on their own cadence: beta at 1_900 and 2_900,
+    // alpha at 2_500 and 3_500 — exactly one render per flip, none skipped.
+    clock.advanceBy(399);
+    expect(ui.renders).toBe(2);
+    clock.advanceBy(1); // t=1_900
+    expect(ui.renders).toBe(3);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("beta 2s");
+    clock.advanceBy(599); // t=2_499
+    expect(ui.renders).toBe(3);
+    clock.advanceBy(1); // t=2_500
+    expect(ui.renders).toBe(4);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("alpha 3s");
+    clock.advanceBy(399); // t=2_899
+    expect(ui.renders).toBe(4);
+    clock.advanceBy(1); // t=2_900
+    expect(ui.renders).toBe(5);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("beta 3s");
+    clock.advanceBy(599); // t=3_499
+    expect(ui.renders).toBe(5);
+    clock.advanceBy(1); // t=3_500
+    expect(ui.renders).toBe(6);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("alpha 4s");
+    widget.dispose();
+  });
+
+  it("reschedules when an item is added with an earlier boundary than the pending tick", () => {
+    const ui = fakeUi();
+    const clock = new ManualClock(1_000);
+    const index = new WorkIndex({ clock });
+    // startedAt 0 at t=1_000: offset 0 → next flip at 1_500.
+    index.upsert({ id: "ch_1", kind: "agent", status: "running", title: "alpha (worker)", name: "alpha", startedAt: 0, countsAsWorker: false });
+    const widget = new FleetWidget({ index, getUi: () => ui, clock });
+    widget.start();
+    // Add an item whose first scheduled update is earlier: startedAt 250 at
+    // t=1_100 is 850ms old ("850ms"), and its transition to "1s" lands at
+    // 1_250 — before ch_1's pending 1_500 tick.
+    clock.advanceBy(100);
+    index.upsert({ id: "ch_2", kind: "agent", status: "running", title: "beta (worker)", name: "beta", startedAt: 250, countsAsWorker: false });
+    // The index change itself re-renders; the ticker must add nothing more
+    // until the next boundary.
+    const rendersAfterAdd = ui.renders;
+    clock.advanceBy(149); // t=1_249
+    expect(ui.renders).toBe(rendersAfterAdd);
+    clock.advanceBy(1); // t=1_250 — beta turns "1s", on its boundary
+    expect(ui.renders).toBe(rendersAfterAdd + 1);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("beta 1s");
+    // alpha still flips at 1_500, one render, no duplicate.
+    clock.advanceBy(249); // t=1_499
+    expect(ui.renders).toBe(rendersAfterAdd + 1);
+    clock.advanceBy(1); // t=1_500
+    expect(ui.renders).toBe(rendersAfterAdd + 2);
+    expect(lastFactory(ui)?.(80).join("\n")).toContain("alpha 2s");
+    widget.dispose();
+  });
+
   it("counts only live work: finished or failed items drop out, and the line clears", () => {
     const ui = fakeUi();
     const clock = new ManualClock(1_000);

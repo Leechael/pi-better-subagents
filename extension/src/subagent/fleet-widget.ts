@@ -9,7 +9,7 @@
  * Driven by WorkIndex changes. Does not poll the manager.
  */
 import { realClock, type Clock, type ClockTimer } from "../clock";
-import { formatAge, type WorkIndex, type WorkItem } from "../work-index";
+import { formatAge, nextAgeBoundary, type WorkIndex, type WorkItem } from "../work-index";
 import { truncateToWidth } from "../tui/pi-tui-load";
 
 export const FLEET_WIDGET_KEY = "pi-famulus-fleet";
@@ -72,6 +72,7 @@ export class FleetWidget {
   private tui: FleetTui | null = null;
   private unsubscribe: (() => void) | null = null;
   private ageTimer: ClockTimer | null = null;
+  private ageTimerIsTimeout = false;
   private readonly clock: Clock;
 
   constructor(deps: FleetStatusDeps) {
@@ -93,10 +94,11 @@ export class FleetWidget {
     const counts = this.deps.index.counts();
     const activeAgents = items.filter((item) => item.kind === "agent" && isActive(item));
     const total = counts.workers + counts.subagents + counts.monitors;
-    if (activeAgents.length > 0 && !this.ageTimer) {
-      this.ageTimer = this.clock.setInterval(() => this.tui?.requestRender(), 5000);
-      this.clock.unref?.(this.ageTimer);
-    } else if (activeAgents.length === 0) {
+    // Always reschedule: an item added while a timeout is pending may have
+    // an earlier boundary, and a removed item must not tick for stale state.
+    if (activeAgents.length > 0) {
+      this.startAgeTicker();
+    } else {
       this.clearAgeTimer();
     }
     if (total === 0) {
@@ -109,6 +111,11 @@ export class FleetWidget {
         (tui, theme) => {
           this.tui = tui;
           this.widgetRegistered = true;
+          // The ticker refuses to schedule while no component is mounted
+          // (refresh may have run before the host invoked the factory).
+          if (!this.ageTimer && this.deps.index.list(this.clock.now()).some((item) => item.kind === "agent" && isActive(item))) {
+            this.scheduleNextAgeTick();
+          }
           return {
             render: (width) => this.renderLine(width, theme),
             invalidate: () => {},
@@ -136,10 +143,43 @@ export class FleetWidget {
     if (ui) this.clearWidget(ui);
   }
 
+  /**
+   * Tick exactly when a displayed age changes. formatAge rounds
+   * (now - startedAt) to the nearest second, so each live item's visible
+   * value flips on half-second boundaries relative to its own startedAt —
+   * a global phase would be early/late for items started off the second.
+   * Schedule the earliest pending flip and re-evaluate after every tick.
+   */
+  private startAgeTicker(): void {
+    this.clearAgeTimer();
+    this.scheduleNextAgeTick();
+  }
+
+  private scheduleNextAgeTick(): void {
+    const now = this.clock.now();
+    const items = this.deps.index.list(now).filter((item) => item.kind === "agent" && isActive(item));
+    if (items.length === 0 || !this.tui) return;
+    let next = Infinity;
+    for (const item of items) {
+      next = Math.min(next, nextAgeBoundary(now, item.startedAt));
+    }
+    this.ageTimerIsTimeout = true;
+    this.ageTimer = this.clock.setTimeout(() => {
+      this.ageTimer = null;
+      this.ageTimerIsTimeout = false;
+      this.tui?.requestRender();
+      // Phases and the active set may have changed; schedule the next flip.
+      this.scheduleNextAgeTick();
+    }, next - now);
+    this.clock.unref?.(this.ageTimer);
+  }
+
   private clearAgeTimer(): void {
     if (!this.ageTimer) return;
-    this.clock.clearInterval(this.ageTimer);
+    if (this.ageTimerIsTimeout) this.clock.clearTimeout(this.ageTimer);
+    else this.clock.clearInterval(this.ageTimer);
     this.ageTimer = null;
+    this.ageTimerIsTimeout = false;
   }
 
   private clearWidget(ui: FleetUi): void {
