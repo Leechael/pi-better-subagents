@@ -9,6 +9,7 @@ use crate::registry::{self, Access, Registry, TaskEntry};
 use crate::task;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -158,7 +159,16 @@ impl DaemonState {
 
 pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> i32 {
     if let Some(path) = handover {
-        return run_restored(home, path).await;
+        #[cfg(unix)]
+        {
+            return run_restored(home, path).await;
+        }
+        #[cfg(windows)]
+        {
+            let _ = path;
+            eprintln!("pi-famulus: in-place upgrade is not supported on Windows");
+            return 1;
+        }
     }
     if let Err(e) = std::fs::create_dir_all(&home) {
         eprintln!("pi-famulus: cannot create {}: {e}", home.display());
@@ -191,10 +201,9 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
         eprintln!("pi-famulus: cannot write pid file: {e}");
         return 1;
     }
-    // Bind the well-known socket (§3.1). A plain tokio UnixListener: the
-    // daemon owns its descriptor, which an in-place upgrade hands over.
+    // Bind the well-known socket / named pipe (§3.1).
     let sock = lifecycle::socket_path(&home);
-    let listener = match tokio::net::UnixListener::bind(&sock) {
+    let listener = match crate::ipc::bind(&home).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("pi-famulus: cannot listen on {}: {e}", sock.display());
@@ -251,6 +260,7 @@ pub async fn run(home: PathBuf, foreground: bool, handover: Option<PathBuf>) -> 
 const HANDOVER_GRACE: Duration = Duration::from_secs(30);
 
 /// The new image after an in-place upgrade (`daemon --handover <file>`).
+#[cfg(unix)]
 async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
     let restored = match crate::handover::restore(&path) {
         Ok(r) => r,
@@ -326,15 +336,38 @@ async fn run_restored(home: PathBuf, path: PathBuf) -> i32 {
     serve(state, listener, lock).await
 }
 
+/// Ctrl-C, or an injected stand-in. Pin the returned future once, outside
+/// the accept loop. A registration error completes the inner future with
+/// `Err`; polling that future again panics, so the `Err` is turned into a
+/// pending wait here and that wait must survive later iterations.
+#[cfg(any(windows, test))]
+fn ctrl_c_or_pending(
+    home: &std::path::Path,
+    ctrl_c: impl std::future::Future<Output = std::io::Result<()>>,
+) -> impl std::future::Future<Output = ()> {
+    let home = home.to_path_buf();
+    async move {
+        match ctrl_c.await {
+            Ok(()) => {}
+            Err(e) => {
+                lifecycle::log_line(&home, &format!("Ctrl-C listener error: {e}"));
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
 /// The accept loop, shared by a fresh daemon and one restored after an
 /// in-place upgrade. Also runs the upgrade itself when asked.
-async fn serve(state: Shared, listener: tokio::net::UnixListener, daemon_lock: lifecycle::DaemonLockGuard) -> i32 {
-    use std::os::fd::AsRawFd;
+/// The accept loop, shared by a fresh daemon and one restored after an
+/// in-place upgrade. Also runs the upgrade itself when asked.
+async fn serve(state: Shared, listener: crate::ipc::Listener, daemon_lock: lifecycle::DaemonLockGuard) -> i32 {
     let home = state.lock().unwrap().home.clone();
 
     // §3.2: forget gone sessions past their retention, now and periodically.
     spawn_session_gc(&state);
-    // In-place upgrade when the binary on disk changes.
+    // In-place upgrade when the binary on disk changes (Unix only).
+    #[cfg(unix)]
     spawn_exe_watch(&state);
     #[cfg(feature = "test-clock")]
     spawn_test_owner_watch(&home);
@@ -347,8 +380,14 @@ async fn serve(state: Shared, listener: tokio::net::UnixListener, daemon_lock: l
         let st = state.lock().unwrap();
         (st.shutdown_notify.clone(), st.upgrade_notify.clone())
     };
+    #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    #[cfg(unix)]
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+    #[cfg(windows)]
+    let ctrl_c = ctrl_c_or_pending(&home, tokio::signal::ctrl_c());
+    #[cfg(windows)]
+    tokio::pin!(ctrl_c);
 
     // Keep accepting while shutting down: a new client then gets a prompt
     // "manager is shutting down" instead of hanging until its hello timeout
@@ -357,7 +396,7 @@ async fn serve(state: Shared, listener: tokio::net::UnixListener, daemon_lock: l
     loop {
         tokio::select! {
             res = listener.accept() => match res {
-                Ok((stream, _addr)) => {
+                Ok(stream) => {
                     let s = state.clone();
                     tokio::spawn(async move { handle_conn(s, stream).await });
                 }
@@ -367,28 +406,59 @@ async fn serve(state: Shared, listener: tokio::net::UnixListener, daemon_lock: l
                 }
             },
             _ = upgrade_notify.notified(), if shutdown_task.is_none() => {
-                let ready = state.lock().unwrap().upgrade_ready.take();
-                if let Some(ready) = ready {
-                    // Returns only if the upgrade did not happen.
-                    let _ = crate::handover::perform(&state, listener.as_raw_fd(), daemon_lock.raw_fd(), ready).await;
+                #[cfg(unix)]
+                {
+                    let ready = state.lock().unwrap().upgrade_ready.take();
+                    if let Some(ready) = ready {
+                        // Returns only if the upgrade did not happen.
+                        let _ = crate::handover::perform(&state, listener.as_raw_fd(), daemon_lock.raw_fd(), ready).await;
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    let _ = &upgrade_notify;
+                    // Take the ready value out of the lock before fail_unsupported
+                    // re-locks the same non-reentrant Mutex (edition 2021 temporary scope
+                    // would otherwise hold the guard across that call).
+                    let ready = state.lock().unwrap().upgrade_ready.take();
+                    if let Some(ready) = ready {
+                        let _ = crate::handover::fail_unsupported(&state, ready);
+                    }
                 }
             }
             _ = shutdown_notify.notified(), if shutdown_task.is_none() => {
                 shutdown_task = Some(begin_shutdown(&state));
             }
             _ = async {
-                match sigterm.as_mut() {
-                    Some(s) => { s.recv().await; }
-                    None => std::future::pending::<()>().await,
+                #[cfg(unix)]
+                {
+                    match sigterm.as_mut() {
+                        Some(s) => { s.recv().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    // The adapter is pinned outside the loop. A fresh wrapper
+                    // here would poll the already-completed signal future
+                    // after a registration error and panic the daemon.
+                    (&mut ctrl_c).await;
                 }
             }, if shutdown_task.is_none() => {
-                lifecycle::log_line(&home, "received SIGTERM");
+                lifecycle::log_line(&home, if cfg!(windows) { "received Ctrl-C" } else { "received SIGTERM" });
                 shutdown_task = Some(begin_shutdown(&state));
             }
             _ = async {
-                match sigint.as_mut() {
-                    Some(s) => { s.recv().await; }
-                    None => std::future::pending::<()>().await,
+                #[cfg(unix)]
+                {
+                    match sigint.as_mut() {
+                        Some(s) => { s.recv().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    std::future::pending::<()>().await
                 }
             }, if shutdown_task.is_none() => {
                 lifecycle::log_line(&home, "received SIGINT");
@@ -410,6 +480,7 @@ async fn serve(state: Shared, listener: tokio::net::UnixListener, daemon_lock: l
 /// (another inode, size or mtime) and stays unchanged for one more poll,
 /// upgrade in place. A binary that fails the handover check is not retried
 /// until the file changes again.
+#[cfg(unix)]
 fn spawn_exe_watch(state: &Shared) {
     const POLL: Duration = Duration::from_secs(2);
     let Ok(exe) = crate::handover::exe_path() else { return };
@@ -513,7 +584,7 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin>(
     }
 }
 
-async fn handle_conn(state: Shared, stream: tokio::net::UnixStream) {
+async fn handle_conn(state: Shared, stream: crate::ipc::Incoming) {
     let (mut rd, wr) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<OutFrame>(1024);
     let die = Arc::new(Notify::new());
@@ -1318,6 +1389,8 @@ fn handle_start(state: &Shared, conn_id: u64, spec: StartSpec) -> Result<StartOk
     };
     if let Err(e) = registry::persist_record(&home, &record) {
         let _ = task::signal_group(pid, task::SIGKILL); // don't leak the child
+        #[cfg(windows)]
+        crate::sys::drop_job(pid, parts.job_generation);
         return Err(ProtoError::new(E_INTERNAL, format!("persist failed: {e}")));
     }
 
@@ -1609,9 +1682,10 @@ fn arm_kill_reaper(state: &Shared, task_id: &str, pid: u32, clock: crate::clock:
 }
 
 /// Track a process group whose leader exited while members remain, until the
-/// group empties. Polling keeps the pgid ours: POSIX does not reuse a pid
-/// while a group with that id exists.
-pub fn spawn_group_watcher(state: &Shared, task_id: &str, pgid: u32) {
+/// group empties. On POSIX the pid is not reused while that group exists.
+/// On Windows `job_generation` is the job assigned for this pid; a later
+/// task may reuse the pid, and a stale watcher must not drop that job.
+pub fn spawn_group_watcher(state: &Shared, task_id: &str, pgid: u32, job_generation: u64) {
     let state2 = state.clone();
     let tid = task_id.to_string();
     let clock = state.lock().unwrap().clock.clone();
@@ -1624,6 +1698,10 @@ pub fn spawn_group_watcher(state: &Shared, task_id: &str, pgid: u32) {
             if let Some(e) = state2.lock().unwrap().registry.tasks.get_mut(&tid) {
                 e.group_lingering = false;
             }
+            #[cfg(windows)]
+            crate::sys::drop_job(pgid, job_generation);
+            #[cfg(not(windows))]
+            let _ = job_generation;
             break;
         }
     });
@@ -1815,6 +1893,16 @@ fn handle_upgrade(state: &Shared, conn_id: u64) -> Result<UpgradeOk, ProtoError>
     if st.shutdown {
         return Err(ProtoError::new(E_INTERNAL, SHUTTING_DOWN));
     }
+    #[cfg(windows)]
+    {
+        let _ = state;
+        return Err(ProtoError::new(
+            E_INTERNAL,
+            "in-place upgrade is not supported on Windows; restart the manager after replacing the binary",
+        ));
+    }
+    #[cfg(unix)]
+    {
     let generation = st.generation;
     drop(st);
     if !crate::handover::request(state, "cli") {
@@ -1824,6 +1912,7 @@ fn handle_upgrade(state: &Shared, conn_id: u64) -> Result<UpgradeOk, ProtoError>
         from_version: crate::VERSION.to_string(),
         generation,
     })
+    }
 }
 
 fn handle_shutdown(state: &Shared, conn_id: u64) -> Result<UnitOk, ProtoError> {
@@ -1952,9 +2041,21 @@ struct Outcome {
 
 impl Outcome {
     fn of(status: Option<std::process::ExitStatus>) -> Self {
-        Outcome {
-            code: status.and_then(|s| s.code()),
-            signal: status.and_then(|s| s.signal()),
+        #[cfg(unix)]
+        {
+            Outcome {
+                code: status.and_then(|s| s.code()),
+                signal: status.and_then(|s| s.signal()),
+            }
+        }
+        #[cfg(windows)]
+        {
+            let code = status.and_then(|s| s.code());
+            match code {
+                Some(c) if c == 128 + task::SIGTERM => Outcome { code: None, signal: Some(task::SIGTERM) },
+                Some(c) if c == 128 + task::SIGKILL => Outcome { code: None, signal: Some(task::SIGKILL) },
+                other => Outcome { code: other, signal: None },
+            }
         }
     }
 }
@@ -1988,7 +2089,7 @@ enum FirstSeen {
 /// Read the runner's status line (see `crate::runner`). `line` keeps a
 /// partial read across calls. None at EOF without a well-formed line.
 async fn read_status_line(
-    rx: &mut tokio::net::unix::pipe::Receiver,
+    rx: &mut task::StatusRx,
     line: &mut Vec<u8>,
 ) -> Option<crate::runner::Reported> {
     use tokio::io::AsyncReadExt;
@@ -2046,7 +2147,7 @@ async fn run_exit_watch(state: Shared, tid: String) {
     let Some(mut runner) = runner else { return };
     let mut line = line;
     // Put everything back for whoever resumes the watch.
-    let put_back = |runner: task::RunnerProc, status_rx: Option<tokio::net::unix::pipe::Receiver>, line: Vec<u8>| {
+    let put_back = |runner: task::RunnerProc, status_rx: Option<task::StatusRx>, line: Vec<u8>| {
         if let Some(e) = state.lock().unwrap().registry.tasks.get_mut(&tid) {
             e.child = Some(runner);
             e.status_rx = status_rx;
@@ -2146,6 +2247,8 @@ async fn run_exit_watch(state: Shared, tid: String) {
     if let Some(e) = state.lock().unwrap().registry.tasks.get_mut(&tid) {
         e.group_lingering = false;
         e.exit_phase = registry::ExitPhase::Done;
+        #[cfg(windows)]
+        crate::sys::drop_job(e.record.pid, e.job_generation);
     }
 }
 
@@ -2198,13 +2301,17 @@ async fn wait_tee_drained(state: &Shared, tid: &str, alone: bool) {
 /// Map an observed exit to a terminal status, persist the record, wake
 /// `wait`ers, and push `task_exited` to the owning session (§3.3/§3.4).
 fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Leftover) {
-    let mut lingering = None;
+    let mut lingering: Option<(u32, u64)> = None;
     let (sid, event) = {
         let mut st = state.lock().unwrap();
         let home = st.home.clone();
         let Some(entry) = st.registry.tasks.get_mut(task_id) else {
             return;
         };
+        #[cfg(windows)]
+        let job_pid = entry.record.pid;
+        #[cfg(windows)]
+        let job_generation = entry.job_generation;
         if entry.record.status.is_terminal() {
             return; // already finalized (e.g. shutdown force-pass)
         }
@@ -2228,12 +2335,18 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         // The command is gone; descendants it backgrounded may not be.
         let pgid = entry.record.pid;
         match leftover {
-            Leftover::None => {}
+            Leftover::None => {
+                #[cfg(windows)]
+                crate::sys::drop_job(job_pid, job_generation);
+            }
             Leftover::Guarded => entry.group_lingering = true,
             Leftover::Probe => {
                 if crate::sys::group_has_others(pgid) {
                     entry.group_lingering = true;
-                    lingering = Some(pgid);
+                    lingering = Some((pgid, entry.job_generation));
+                } else {
+                    #[cfg(windows)]
+                    crate::sys::drop_job(job_pid, job_generation);
                 }
             }
         }
@@ -2255,8 +2368,8 @@ fn finalize_exit(state: &Shared, task_id: &str, outcome: Outcome, leftover: Left
         let _ = entry.status_tx.send(entry.record.status);
         (sid, event)
     };
-    if let Some(pgid) = lingering {
-        spawn_group_watcher(state, task_id, pgid);
+    if let Some((pgid, generation)) = lingering {
+        spawn_group_watcher(state, task_id, pgid, generation);
     }
     send_event_to_session(state, &sid, event);
 }
@@ -2454,5 +2567,51 @@ mod tests {
         let outcome = normalize_killed_outcome(true, Outcome { code: Some(143), signal: None });
         assert_eq!(outcome.code, None);
         assert_eq!(outcome.signal, Some(task::SIGTERM));
+    }
+
+    /// A Ctrl-C registration error must not complete the shutdown branch, and
+    /// the next accepted connection must not poll that future again.
+    #[tokio::test]
+    async fn ctrl_c_registration_error_survives_the_next_connection() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct OnceErr {
+            polled: bool,
+        }
+        impl Future for OnceErr {
+            type Output = std::io::Result<()>;
+            fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                assert!(!self.polled, "ctrl-c future polled after it completed");
+                self.polled = true;
+                Poll::Ready(Err(std::io::Error::other("ctrl-c handler already registered")))
+            }
+        }
+
+        let home = std::env::temp_dir().join(format!("pi-famulus-ctrlc-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&home);
+        let ctrl = super::ctrl_c_or_pending(&home, OnceErr { polled: false });
+        tokio::pin!(ctrl);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<&'static str>(2);
+        tx.try_send("conn").unwrap();
+        let mut accepted = 0u32;
+        for _ in 0..4 {
+            tokio::select! {
+                biased;
+                _ = &mut ctrl => panic!("registration failure must not shut the daemon down"),
+                msg = rx.recv() => {
+                    assert_eq!(msg, Some("conn"));
+                    accepted += 1;
+                    if accepted == 1 {
+                        tx.try_send("conn").unwrap();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(accepted, 2);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
