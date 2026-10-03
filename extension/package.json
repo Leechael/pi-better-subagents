@@ -1,6 +1,6 @@
 {
   "name": "pi-famulus",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Subagents, monitoring, and auto-backgrounding bash for pi",
   "type": "module",
   "license": "MIT",
@@ -15,10 +15,10 @@
   "files": ["src", "bin", "README.md"],
   "bin": { "pi-famulus": "./bin/pi-famulus.js" },
   "optionalDependencies": {
-    "pi-famulus-linux-x64": "0.1.1",
-    "pi-famulus-linux-arm64": "0.1.1",
-    "pi-famulus-darwin-x64": "0.1.1",
-    "pi-famulus-darwin-arm64": "0.1.1"
+    "pi-famulus-linux-x64": "0.1.2",
+    "pi-famulus-linux-arm64": "0.1.2",
+    "pi-famulus-darwin-x64": "0.1.2",
+    "pi-famulus-darwin-arm64": "0.1.2"
   },
   "pi": {
     "extensions": ["./src/index.ts"]
